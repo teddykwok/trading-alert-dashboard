@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: trading-alert-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trading_alert_dashboard
+    # Host port 55432 (not the default 5432) to avoid clashing with a
+    # locally installed Postgres. Update DATABASE_URL to match if you change this.
+    ports:
+      - "55432:5432"
+    volumes:
+      - trading-alert-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: trading-alert-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - trading-alert-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  trading-alert-postgres-data:
+  trading-alert-redis-data:

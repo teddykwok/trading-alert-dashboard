@@ -1,0 +1,82 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AssetType {
+  CRYPTO
+  STOCK
+}
+
+enum SignalType {
+  LONG
+  SHORT
+  WATCH
+  EXIT
+}
+
+enum AlertStatus {
+  RECEIVED
+  PROCESSING_SCREENSHOT
+  ANALYZING_WITH_AI
+  ANALYZED
+  FAILED
+  IGNORED_DUPLICATE
+}
+
+model Asset {
+  id        String    @id @default(cuid())
+  symbol    String
+  name      String?
+  assetType AssetType
+  exchange  String?
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  alerts    Alert[]
+
+  @@unique([symbol, assetType])
+}
+
+model Alert {
+  id              String      @id @default(cuid())
+  assetId         String?
+  asset           Asset?      @relation(fields: [assetId], references: [id])
+  symbol          String
+  assetType       AssetType
+  exchange        String?
+  timeframe       String
+  price           Float
+  signal          SignalType
+  indicatorName   String?
+  indicatorValue  Float?
+  rawPayload      Json
+  status          AlertStatus @default(RECEIVED)
+  screenshotUrl   String?
+  aiBias          String?
+  aiConfidence    Float?
+  aiPattern       String?
+  aiSummary       String?
+  aiRiskNotes     Json?
+  errorMessage    String?
+  triggeredAt     DateTime
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@index([status])
+  @@index([symbol])
+  @@index([signal])
+  @@index([createdAt])
+}
+
+model Setting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

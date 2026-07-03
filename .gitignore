@@ -1,0 +1,25 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Screenshots generated at runtime
+apps/backend/src/storage/screenshots/*
+!apps/backend/src/storage/screenshots/.gitkeep
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright
+apps/backend/test-results/
+apps/backend/playwright-report/
