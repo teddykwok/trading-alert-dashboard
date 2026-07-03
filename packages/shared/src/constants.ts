@@ -2,6 +2,7 @@ export const SOCKET_EVENTS = {
   NEW_ALERT: "new_alert",
   ALERT_UPDATED: "alert_updated",
   ALERT_FAILED: "alert_failed",
+  ALERT_DUPLICATE: "alert_duplicate",
 } as const;
 
 export const ASSET_TYPES = ["CRYPTO", "STOCK"] as const;

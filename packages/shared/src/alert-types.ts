@@ -20,6 +20,7 @@ export interface AiVisionResult {
   pattern: string;
   summary: string;
   riskNotes: string[];
+  provider: string;
 }
 
 export interface Alert {
@@ -41,6 +42,9 @@ export interface Alert {
   aiPattern: string | null;
   aiSummary: string | null;
   aiRiskNotes: string[] | null;
+  aiProvider: string | null;
+  duplicateCount: number;
+  lastDuplicateAt: string | null;
   errorMessage: string | null;
   triggeredAt: string;
   createdAt: string;

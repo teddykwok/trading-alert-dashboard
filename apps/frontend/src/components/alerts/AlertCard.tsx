@@ -2,6 +2,9 @@ import { Link } from "react-router-dom";
 import { Card } from "../ui/Card";
 import { SignalBadge } from "./SignalBadge";
 import { StatusBadge } from "./StatusBadge";
+import { MockAiBadge } from "./MockAiBadge";
+import { OpenAiBadge } from "./OpenAiBadge";
+import { DuplicateBadge } from "./DuplicateBadge";
 import { ScreenshotPreview } from "../charts/ScreenshotPreview";
 import { formatPrice } from "../../utils/formatPrice";
 import { formatRelativeTime } from "../../utils/formatDate";
@@ -23,6 +26,9 @@ export function AlertCard({ alert }: { alert: Alert }) {
             <span className="text-xs text-slate-500">{alert.timeframe}</span>
             <SignalBadge signal={alert.signal} />
             <StatusBadge status={alert.status} />
+            {alert.aiProvider === "mock" && <MockAiBadge />}
+            {alert.aiProvider === "openai" && <OpenAiBadge />}
+            {alert.duplicateCount > 0 && <DuplicateBadge count={alert.duplicateCount} />}
           </div>
 
           <div className="mt-1 flex items-center gap-3 text-xs text-slate-500">

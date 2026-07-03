@@ -1,5 +1,5 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
-import type { AlertListFilter, CreateAlertInput } from "./alerts.types";
+import type { AlertListFilter, CreateAlertInput, DuplicateLookupInput } from "./alerts.types";
 
 /**
  * Thin data-access layer over Prisma. Keeps raw `where`/`data` object
@@ -15,6 +15,36 @@ export class AlertsRepository {
 
   findById(id: string) {
     return this.prisma.alert.findUnique({ where: { id } });
+  }
+
+  /**
+   * Finds the most recent alert matching all duplicate-detection fields
+   * (symbol, assetType, timeframe, signal, indicatorName) created within
+   * the suppression window. Returns null when there's no recent match, in
+   * which case the caller should create a brand new alert as usual.
+   */
+  findRecentDuplicate(input: DuplicateLookupInput) {
+    return this.prisma.alert.findFirst({
+      where: {
+        symbol: input.symbol,
+        assetType: input.assetType,
+        timeframe: input.timeframe,
+        signal: input.signal,
+        indicatorName: input.indicatorName,
+        createdAt: { gte: input.since },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+  }
+
+  incrementDuplicate(id: string) {
+    return this.prisma.alert.update({
+      where: { id },
+      data: {
+        duplicateCount: { increment: 1 },
+        lastDuplicateAt: new Date(),
+      },
+    });
   }
 
   findMany(filter: AlertListFilter) {

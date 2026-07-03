@@ -4,9 +4,10 @@ import { tradingViewWebhookSchema, type TradingViewWebhookInput } from "./webhoo
 import { isValidWebhookSecret } from "./webhook.security";
 import { AlertsService } from "../alerts/alerts.service";
 import { enqueueVisionAnalysis } from "../jobs/queue";
-import { notifyNewAlert } from "../notifications/notification.service";
+import { notifyAlertDuplicate, notifyNewAlert } from "../notifications/notification.service";
 import { parseOrNowDate } from "../../utils/date";
 import { UnauthorizedError, ValidationError } from "../../utils/errors";
+import { env } from "../../config/env";
 
 function normalizeAssetType(value: string): AssetType {
   const upper = value.toUpperCase();
@@ -27,14 +28,18 @@ function normalizeSignal(value: string): SignalType {
 export interface WebhookResult {
   id: string;
   status: string;
+  duplicate?: boolean;
+  duplicateCount?: number;
 }
 
 /**
  * Handles the full webhook intake: validate -> authenticate -> normalize ->
- * persist -> broadcast -> enqueue. Everything after "persist" is either
- * fire-and-forget (socket emit) or queued for the worker, so this function
- * returns as soon as the alert row exists — no screenshot/AI work happens
- * on this path.
+ * duplicate check -> persist -> broadcast -> enqueue. Everything after
+ * "persist" is either fire-and-forget (socket emit) or queued for the
+ * worker, so this function returns as soon as the alert row exists — no
+ * screenshot/AI work happens on this path. If the normalized alert matches
+ * an existing one within DUPLICATE_SUPPRESSION_WINDOW_SECONDS, no new alert
+ * is created at all — see the duplicate-suppression block below.
  */
 export async function handleTradingViewWebhook(
   prisma: PrismaClient,
@@ -52,6 +57,37 @@ export async function handleTradingViewWebhook(
 
   const assetType = normalizeAssetType(payload.assetType);
   const signal = normalizeSignal(payload.signal);
+  const indicatorName = payload.indicatorName ?? null;
+
+  const alertsService = new AlertsService(prisma);
+
+  // Duplicate suppression: if the same symbol/assetType/timeframe/signal/
+  // indicatorName combination already fired within the suppression window,
+  // don't create a new alert, screenshot, or AI analysis job — just bump the
+  // existing alert's duplicate counter and tell the dashboard live.
+  const suppressionWindowStart = new Date(
+    Date.now() - env.DUPLICATE_SUPPRESSION_WINDOW_SECONDS * 1000
+  );
+  const existingDuplicate = await alertsService.findRecentDuplicate({
+    symbol: payload.symbol,
+    assetType,
+    timeframe: payload.timeframe,
+    signal,
+    indicatorName,
+    since: suppressionWindowStart,
+  });
+
+  if (existingDuplicate) {
+    const updated = await alertsService.registerDuplicate(existingDuplicate.id);
+    await notifyAlertDuplicate(updated);
+
+    return {
+      id: updated.id,
+      status: "IGNORED_DUPLICATE",
+      duplicate: true,
+      duplicateCount: updated.duplicateCount,
+    };
+  }
 
   const asset = await prisma.asset.upsert({
     where: { symbol_assetType: { symbol: payload.symbol, assetType } },
@@ -67,7 +103,6 @@ export async function handleTradingViewWebhook(
   // alert detail page.
   const { secret: _secret, ...payloadWithoutSecret } = payload;
 
-  const alertsService = new AlertsService(prisma);
   const alert = await alertsService.create({
     assetId: asset.id,
     symbol: payload.symbol,
@@ -76,7 +111,7 @@ export async function handleTradingViewWebhook(
     timeframe: payload.timeframe,
     price: payload.price,
     signal,
-    indicatorName: payload.indicatorName ?? null,
+    indicatorName,
     indicatorValue: payload.indicatorValue ?? null,
     rawPayload: payloadWithoutSecret,
     triggeredAt: parseOrNowDate(payload.triggeredAt),

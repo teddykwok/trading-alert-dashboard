@@ -1,5 +1,7 @@
 import { Card } from "../ui/Card";
 import { Badge } from "../ui/Badge";
+import { MockAiBadge } from "./MockAiBadge";
+import { OpenAiBadge } from "./OpenAiBadge";
 import { formatPercent } from "../../utils/formatPrice";
 import type { Alert } from "../../types/alert";
 
@@ -27,13 +29,31 @@ export function AiOpinionPanel({ alert }: AiOpinionPanelProps) {
   }
 
   const riskNotes = alert.aiRiskNotes ?? [];
+  const isMock = alert.aiProvider === "mock";
+  const isOpenAi = alert.aiProvider === "openai";
 
   return (
     <Card className="p-4">
       <div className="mb-3 flex items-center justify-between">
         <h3 className="text-sm font-semibold text-slate-200">AI Vision Opinion</h3>
-        {alert.aiBias && <Badge tone="blue">{alert.aiBias.replace(/_/g, " ")}</Badge>}
+        <div className="flex items-center gap-2">
+          {isMock && <MockAiBadge />}
+          {isOpenAi && <OpenAiBadge />}
+          {alert.aiBias && <Badge tone="blue">{alert.aiBias.replace(/_/g, " ")}</Badge>}
+        </div>
       </div>
+
+      {isMock && (
+        <p className="mb-3 rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-400">
+          This is mock AI analysis for pipeline testing only. Do not use it for trading decisions.
+        </p>
+      )}
+
+      {isOpenAi && (
+        <p className="mb-3 text-xs text-slate-500">
+          AI vision analysis is informational and based only on the chart screenshot.
+        </p>
+      )}
 
       {alert.aiConfidence !== null && (
         <div className="mb-3">

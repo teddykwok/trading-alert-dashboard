@@ -3,6 +3,8 @@ import { Link, useParams } from "react-router-dom";
 import { Card } from "../components/ui/Card";
 import { SignalBadge } from "../components/alerts/SignalBadge";
 import { StatusBadge } from "../components/alerts/StatusBadge";
+import { MockAiBadge } from "../components/alerts/MockAiBadge";
+import { OpenAiBadge } from "../components/alerts/OpenAiBadge";
 import { AiOpinionPanel } from "../components/alerts/AiOpinionPanel";
 import { ScreenshotPreview } from "../components/charts/ScreenshotPreview";
 import { alertsApi } from "../api/alerts.api";
@@ -45,10 +47,12 @@ export function AlertDetailPage() {
 
     socket.on(SOCKET_EVENTS.ALERT_UPDATED, handleUpdate);
     socket.on(SOCKET_EVENTS.ALERT_FAILED, handleUpdate);
+    socket.on(SOCKET_EVENTS.ALERT_DUPLICATE, handleUpdate);
 
     return () => {
       socket.off(SOCKET_EVENTS.ALERT_UPDATED, handleUpdate);
       socket.off(SOCKET_EVENTS.ALERT_FAILED, handleUpdate);
+      socket.off(SOCKET_EVENTS.ALERT_DUPLICATE, handleUpdate);
     };
   }, [id]);
 
@@ -57,6 +61,10 @@ export function AlertDetailPage() {
   if (!alert) return <p className="text-sm text-slate-500">Alert not found.</p>;
 
   const currentIndex = STATUS_TIMELINE.indexOf(alert.status);
+  const marketDataSource =
+    alert.assetType === "CRYPTO" && alert.exchange?.toUpperCase() === "BINANCE"
+      ? "Binance (real)"
+      : "Mock";
 
   return (
     <div className="flex flex-col gap-5">
@@ -69,6 +77,8 @@ export function AlertDetailPage() {
         <span className="text-sm text-slate-500">{alert.timeframe}</span>
         <SignalBadge signal={alert.signal} />
         <StatusBadge status={alert.status} />
+        {alert.aiProvider === "mock" && <MockAiBadge />}
+        {alert.aiProvider === "openai" && <OpenAiBadge />}
       </div>
 
       <div className="grid gap-5 lg:grid-cols-3">
@@ -97,6 +107,7 @@ export function AlertDetailPage() {
               <Row label="Price" value={formatPrice(alert.price)} />
               <Row label="Asset type" value={alert.assetType} />
               <Row label="Exchange" value={alert.exchange ?? "—"} />
+              <Row label="Market data source" value={marketDataSource} />
               <Row label="Indicator" value={alert.indicatorName ?? "—"} />
               <Row
                 label="Indicator value"

@@ -1,5 +1,5 @@
 import type { Alert } from "@prisma/client";
-import { emitAlertFailed, emitAlertUpdated, emitNewAlert } from "./socket-events";
+import { emitAlertDuplicate, emitAlertFailed, emitAlertUpdated, emitNewAlert } from "./socket-events";
 import { sendTelegramMessage } from "./telegram.service";
 
 export async function notifyNewAlert(alert: Alert): Promise<void> {
@@ -24,4 +24,13 @@ export async function notifyAlertFailed(alert: Alert): Promise<void> {
   await sendTelegramMessage(
     `⚠️ Processing failed for *${alert.symbol}*: ${alert.errorMessage ?? "unknown error"}`
   );
+}
+
+/**
+ * No Telegram message here on purpose — duplicate suppression exists to cut
+ * down on alert spam, so re-notifying on every duplicate would defeat the
+ * point. The dashboard still reflects it live via the socket event.
+ */
+export async function notifyAlertDuplicate(alert: Alert): Promise<void> {
+  emitAlertDuplicate(alert);
 }

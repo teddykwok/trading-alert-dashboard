@@ -31,4 +31,14 @@ export interface AiVisionUpdateInput {
   aiPattern: string;
   aiSummary: string;
   aiRiskNotes: string[];
+  aiProvider: string;
+}
+
+export interface DuplicateLookupInput {
+  symbol: string;
+  assetType: AssetType;
+  timeframe: string;
+  signal: SignalType;
+  indicatorName: string | null;
+  since: Date;
 }

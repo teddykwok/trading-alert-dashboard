@@ -28,7 +28,13 @@ async function processVisionAnalysisJob(job: Job<VisionAnalysisJobData>): Promis
     alert = await alertsService.markProcessingScreenshot(alertId);
     await notifyAlertUpdated(alert);
 
-    const candles = await getRecentCandles(alert.assetType, alert.symbol, alert.timeframe, alert.price);
+    const candles = await getRecentCandles(
+      alert.assetType,
+      alert.symbol,
+      alert.timeframe,
+      alert.price,
+      alert.exchange
+    );
 
     const screenshotUrl = await generateAndSaveScreenshot(alertId, {
       candles,
@@ -63,6 +69,7 @@ async function processVisionAnalysisJob(job: Job<VisionAnalysisJobData>): Promis
       aiPattern: aiResult.pattern,
       aiSummary: aiResult.summary,
       aiRiskNotes: aiResult.riskNotes,
+      aiProvider: aiResult.provider,
     });
     await notifyAlertUpdated(alert);
 

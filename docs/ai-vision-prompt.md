@@ -25,25 +25,27 @@ the same way the mock provider's output already is:
     pattern: string;     // 1-2 sentence description of visual structure
     summary: string;     // 1-2 sentence plain-language summary
     riskNotes: string[]; // invalidation notes / uncertainty callouts
+    provider: string;    // which provider produced this ("mock" for the placeholder provider)
   }
   ```
 
 ## Mock provider
 
-`AI_VISION_PROVIDER=mock` (the default) always returns:
+`AI_VISION_PROVIDER=mock` (the default) does **not** call any external API. It returns a fixed,
+canned response **per alert signal** (`MOCK_ANALYSIS_BY_SIGNAL` in `ai-vision.service.ts`) so a
+SHORT alert doesn't misleadingly come back bullish — this is still not real chart analysis, just
+signal-aware placeholder text:
 
-```json
-{
-  "bias": "bullish_continuation",
-  "confidence": 0.72,
-  "pattern": "Price appears to be holding above a recent support zone with higher lows.",
-  "summary": "The chart visually supports possible continuation, but confirmation is still needed.",
-  "riskNotes": [
-    "Possible fakeout near resistance.",
-    "Volume confirmation is not available in the mock chart."
-  ]
-}
-```
+| Alert signal | `bias` |
+| --- | --- |
+| `LONG` | `bullish_continuation` |
+| `SHORT` | `bearish_continuation` |
+| `WATCH` | `neutral_watch` |
+| `EXIT` | `risk_reduction` |
+
+Every mock result also sets `provider: "mock"`, which is persisted on the alert as `aiProvider` and
+surfaced in the frontend (a "Mock AI" badge on the alert card/detail page, plus a warning banner in
+the AI Opinion panel) so it's never mistaken for real AI output.
 
 It still builds the real prompt (`AI_VISION_SYSTEM_PROMPT` + `buildVisionUserPrompt(context)`) so
 the wiring is identical to what a real provider will use — swapping in a real model is a matter

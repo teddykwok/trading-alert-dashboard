@@ -12,7 +12,10 @@
     "build": "pnpm --filter @trading-alert-dashboard/shared build && pnpm --filter @trading-alert-dashboard/backend build && pnpm --filter @trading-alert-dashboard/frontend build",
     "db:migrate": "pnpm --filter @trading-alert-dashboard/backend prisma:migrate",
     "db:seed": "pnpm --filter @trading-alert-dashboard/backend prisma:seed",
-    "test": "pnpm --filter @trading-alert-dashboard/backend test"
+    "test": "pnpm --filter @trading-alert-dashboard/backend test",
+    "test:webhook": "node scripts/test-webhook.js",
+    "test:webhook:batch": "node scripts/test-webhook-batch.js",
+    "test:binance": "node scripts/test-binance-candles.js"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

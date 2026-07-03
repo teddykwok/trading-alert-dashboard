@@ -20,4 +20,6 @@ export interface TradingViewWebhookPayload {
 export interface WebhookAcceptedResponse {
   id: string;
   status: string;
+  duplicate?: boolean;
+  duplicateCount?: number;
 }

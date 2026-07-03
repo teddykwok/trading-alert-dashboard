@@ -1,7 +1,12 @@
 import type { PrismaClient, AlertStatus } from "@prisma/client";
 import { AlertsRepository } from "./alerts.repository";
 import { NotFoundError } from "../../utils/errors";
-import type { AiVisionUpdateInput, AlertListFilter, CreateAlertInput } from "./alerts.types";
+import type {
+  AiVisionUpdateInput,
+  AlertListFilter,
+  CreateAlertInput,
+  DuplicateLookupInput,
+} from "./alerts.types";
 
 export class AlertsService {
   private readonly repository: AlertsRepository;
@@ -26,6 +31,14 @@ export class AlertsService {
 
   create(input: CreateAlertInput) {
     return this.repository.create(input);
+  }
+
+  findRecentDuplicate(input: DuplicateLookupInput) {
+    return this.repository.findRecentDuplicate(input);
+  }
+
+  registerDuplicate(id: string) {
+    return this.repository.incrementDuplicate(id);
   }
 
   async setStatus(id: string, status: AlertStatus, errorMessage?: string) {
@@ -58,6 +71,7 @@ export class AlertsService {
       aiPattern: result.aiPattern,
       aiSummary: result.aiSummary,
       aiRiskNotes: result.aiRiskNotes,
+      aiProvider: result.aiProvider,
     });
   }
 

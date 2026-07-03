@@ -30,3 +30,7 @@ export function emitAlertUpdated(alert: Alert): void {
 export function emitAlertFailed(alert: Alert): void {
   emitter.emit(SOCKET_EVENTS.ALERT_FAILED, alert);
 }
+
+export function emitAlertDuplicate(alert: Alert): void {
+  emitter.emit(SOCKET_EVENTS.ALERT_DUPLICATE, alert);
+}
