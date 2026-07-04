@@ -7,7 +7,11 @@ import { AlertsService } from "../alerts/alerts.service";
 import { getRecentCandles } from "../market-data/market-data.service";
 import { generateAndSaveScreenshot } from "../chart-renderer/screenshot.service";
 import { analyzeChart } from "../ai-vision/ai-vision.service";
-import { notifyAlertFailed, notifyAlertUpdated } from "../notifications/notification.service";
+import {
+  notifyAlertFailed,
+  notifyAlertUpdated,
+  notifyAnalyzedAlert,
+} from "../notifications/notification.service";
 import { ensureScreenshotDir, screenshotFileName } from "../../utils/file";
 import { bullConnection, type VisionAnalysisJobData } from "./queue";
 import { startCleanupScheduler } from "./cleanup.worker";
@@ -72,6 +76,14 @@ async function processVisionAnalysisJob(job: Job<VisionAnalysisJobData>): Promis
       aiProvider: aiResult.provider,
     });
     await notifyAlertUpdated(alert);
+
+    // Best-effort Telegram notification. Wrapped so a notification failure can
+    // never fail the alert or the BullMQ job — the alert is already ANALYZED.
+    try {
+      await notifyAnalyzedAlert(alert);
+    } catch (notifyError) {
+      logger.warn({ alertId, error: notifyError }, "Telegram notification failed (non-fatal)");
+    }
 
     logger.info({ alertId }, "Vision analysis job completed");
   } catch (error) {

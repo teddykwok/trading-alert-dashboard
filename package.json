@@ -15,7 +15,8 @@
     "test": "pnpm --filter @trading-alert-dashboard/backend test",
     "test:webhook": "node scripts/test-webhook.js",
     "test:webhook:batch": "node scripts/test-webhook-batch.js",
-    "test:binance": "node scripts/test-binance-candles.js"
+    "test:binance": "node scripts/test-binance-candles.js",
+    "test:telegram": "node scripts/test-telegram.js"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

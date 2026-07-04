@@ -33,8 +33,28 @@ const envSchema = z.object({
     .optional()
     .default("false")
     .transform((value) => value === "true"),
+  // "true"/"false" rather than z.coerce.boolean() — coerce.boolean() treats
+  // any non-empty string (including the literal "false") as true.
+  TELEGRAM_NOTIFICATIONS_ENABLED: z
+    .string()
+    .optional()
+    .default("false")
+    .transform((value) => value === "true"),
   TELEGRAM_BOT_TOKEN: z.string().optional().default(""),
   TELEGRAM_CHAT_ID: z.string().optional().default(""),
+  TELEGRAM_SEND_SCREENSHOT: z
+    .string()
+    .optional()
+    .default("true")
+    .transform((value) => value === "true"),
+  TELEGRAM_NOTIFY_ON_FAILED: z
+    .string()
+    .optional()
+    .default("false")
+    .transform((value) => value === "true"),
+  // Skip the Telegram notification when aiConfidence is below this (0..1).
+  // 0 (default) means always notify regardless of confidence.
+  TELEGRAM_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0),
 }).superRefine((value, ctx) => {
   // Fail fast at startup rather than silently at the first alert: a real
   // OpenAI vision provider is useless without an API key.

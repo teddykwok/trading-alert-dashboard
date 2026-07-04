@@ -146,7 +146,11 @@ Backend (`apps/backend/.env`, see `.env.example` at the repo root):
 | `BINANCE_REST_BASE_URL` | Binance public REST base URL, no API key needed (default `https://api.binance.com`) |
 | `MARKET_DATA_PROVIDER` | See [Using real Binance market data](#using-real-binance-market-data) (default `binance`) |
 | `MARKET_DATA_FALLBACK_TO_MOCK` | See [Using real Binance market data](#using-real-binance-market-data) (default `false`) |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Optional; leave blank to disable Telegram notifications |
+| `TELEGRAM_NOTIFICATIONS_ENABLED` | Master switch for Telegram — see [Telegram Notifications](#telegram-notifications) (default `false`) |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Telegram bot token + target chat id (required when notifications are enabled) |
+| `TELEGRAM_SEND_SCREENSHOT` | Send the chart screenshot as a photo, else text-only (default `true`) |
+| `TELEGRAM_NOTIFY_ON_FAILED` | Also notify when an alert becomes `FAILED` (default `false`) |
+| `TELEGRAM_MIN_CONFIDENCE` | Skip notifications below this AI confidence, 0..1 (default `0` = always) |
 
 Frontend (`apps/frontend/.env`, see `apps/frontend/.env.example`):
 
@@ -294,6 +298,67 @@ node scripts/test-webhook.js --symbol BTCUSDT --assetType crypto --exchange BINA
 # 4. Fallback: AI_VISION_PROVIDER=openai + AI_VISION_FALLBACK_TO_MOCK=true with a bad/missing key at runtime
 #    -> worker logs a warning and the alert still reaches ANALYZED as a mock result.
 ```
+
+## Telegram Notifications
+
+Get a Telegram message when an alert finishes analysis, so you don't have to watch the dashboard.
+
+**When it's sent:** the notification is sent by the **worker**, *after* the alert reaches `ANALYZED`
+(screenshot generated + AI analysis done) — never inside the webhook request. This means the message
+already contains the AI bias, confidence, summary, and (optionally) the chart screenshot.
+
+**What's never notified:** duplicate alerts. Duplicate suppression exists to reduce spam, so a
+suppressed duplicate only bumps the counter and updates the dashboard — it does not send Telegram.
+
+**Failures are non-fatal:** if Telegram is down, misconfigured, or rejects the message, the alert
+pipeline is unaffected — the alert still reaches `ANALYZED`; the Telegram error is just logged.
+
+### 1. Create a bot and get your chat id
+
+1. In Telegram, message **@BotFather**, send `/newbot`, and copy the **bot token** it gives you.
+2. Send any message to your new bot (bots can't message you until you've talked to them first).
+3. Get your **chat id**: open `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a browser and
+   read `result[].message.chat.id` (or use a chat-id helper bot).
+
+### 2. Configure `apps/backend/.env`
+
+```bash
+TELEGRAM_NOTIFICATIONS_ENABLED=true
+TELEGRAM_BOT_TOKEN=123456:ABC-your-bot-token
+TELEGRAM_CHAT_ID=123456789
+TELEGRAM_SEND_SCREENSHOT=true    # send the chart image (falls back to text on failure)
+TELEGRAM_NOTIFY_ON_FAILED=false  # set true to also get a message on FAILED alerts
+TELEGRAM_MIN_CONFIDENCE=0        # e.g. 0.6 to only notify when AI confidence >= 60%
+```
+
+With `TELEGRAM_NOTIFICATIONS_ENABLED=false` (the default) nothing is ever sent. If it's `true` but the
+token or chat id is missing, the worker logs a clear warning (never the token) and skips sending.
+
+### 3. Verify credentials without the pipeline
+
+```bash
+pnpm test:telegram
+```
+
+This reads `apps/backend/.env` and sends `"Trading Alert Dashboard Telegram test message"` straight to
+your chat, printing success or a helpful error (e.g. "chat not found" / "unauthorized"). The bot token
+is never printed in full.
+
+### 4. End-to-end test
+
+Start the stack, then fire a real alert:
+
+```bash
+pnpm dev
+pnpm dev:worker   # the worker is what sends Telegram — it must be running
+
+node scripts/test-webhook.js --symbol BTCUSDT --assetType crypto --exchange BINANCE --signal LONG --price 64000 --timeframe 1h
+```
+
+Watch the alert progress to `ANALYZED` on the dashboard; a Telegram message (with the screenshot, if
+enabled) arrives right after. Fire the **same** webhook again within the duplicate window
+(`DUPLICATE_SUPPRESSION_WINDOW_SECONDS`, default 60s) — the dashboard shows the duplicate counter tick
+up, but **no** second Telegram message is sent.
 
 ## TradingView webhook setup
 
