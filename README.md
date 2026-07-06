@@ -369,6 +369,12 @@ up, but **no** second Telegram message is sent.
 3. In the **Message** box, paste JSON matching the shape below, replacing `secret` with your
    `WEBHOOK_SECRET` value. See `docs/tradingview-setup.md` for more detail.
 
+> **Live testing with real TradingView alerts:** TradingView can't reach `localhost`. See
+> [docs/tradingview-live-test.md](docs/tradingview-live-test.md) for the full walkthrough using a
+> free Cloudflare Tunnel (`cloudflared tunnel --url http://localhost:4000`), including prefixed
+> symbols like `BINANCE:BTCUSDT` (normalized automatically) and making Telegram dashboard links
+> work on your phone via `PUBLIC_DASHBOARD_URL`.
+
 ### Example webhook payload
 
 ```json

@@ -53,7 +53,9 @@ export async function notifyAlertFailed(alert: Alert): Promise<void> {
 }
 
 function dashboardAlertUrl(alert: Alert): string {
-  return `${env.FRONTEND_URL.replace(/\/$/, "")}/alerts/${alert.id}`;
+  // PUBLIC_DASHBOARD_URL (not FRONTEND_URL) so links in Telegram messages
+  // work from a phone when the dashboard is exposed via a tunnel.
+  return `${env.PUBLIC_DASHBOARD_URL.replace(/\/$/, "")}/alerts/${alert.id}`;
 }
 
 function formatConfidence(confidence: number | null): string {

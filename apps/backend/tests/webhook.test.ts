@@ -90,6 +90,90 @@ describe("handleTradingViewWebhook", () => {
     expect(prisma.asset.upsert).not.toHaveBeenCalled();
   });
 
+  describe("symbol normalization", () => {
+    function createCall(prisma: PrismaClient) {
+      return (prisma.alert.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    }
+
+    it("stores the bare symbol and prefix exchange for BINANCE:BTCUSDT when exchange is missing", async () => {
+      const prisma = createMockPrisma(null);
+      const { exchange: _exchange, ...noExchange } = validPayload;
+
+      await handleTradingViewWebhook(prisma, { ...noExchange, symbol: "BINANCE:BTCUSDT" });
+
+      expect(createCall(prisma).data).toEqual(
+        expect.objectContaining({ symbol: "BTCUSDT", exchange: "BINANCE" })
+      );
+      expect(prisma.asset.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { symbol_assetType: { symbol: "BTCUSDT", assetType: "CRYPTO" } },
+        })
+      );
+    });
+
+    it("uses NASDAQ from the prefix for NASDAQ:AAPL when exchange is missing", async () => {
+      const prisma = createMockPrisma(null);
+      const { exchange: _exchange, ...noExchange } = validPayload;
+
+      await handleTradingViewWebhook(prisma, {
+        ...noExchange,
+        symbol: "NASDAQ:AAPL",
+        assetType: "stock",
+      });
+
+      expect(createCall(prisma).data).toEqual(
+        expect.objectContaining({ symbol: "AAPL", exchange: "NASDAQ" })
+      );
+    });
+
+    it("lets an explicit payload.exchange win over the symbol prefix", async () => {
+      const prisma = createMockPrisma(null);
+
+      await handleTradingViewWebhook(prisma, {
+        ...validPayload,
+        symbol: "COINBASE:BTCUSDT",
+        exchange: "BINANCE",
+      });
+
+      expect(createCall(prisma).data).toEqual(
+        expect.objectContaining({ symbol: "BTCUSDT", exchange: "BINANCE" })
+      );
+    });
+
+    it("preserves the original prefixed symbol inside rawPayload", async () => {
+      const prisma = createMockPrisma(null);
+
+      await handleTradingViewWebhook(prisma, { ...validPayload, symbol: "BINANCE:BTCUSDT" });
+
+      expect(createCall(prisma).data.rawPayload).toEqual(
+        expect.objectContaining({ symbol: "BINANCE:BTCUSDT" })
+      );
+    });
+
+    it("rejects an empty symbol", async () => {
+      const prisma = createMockPrisma(null);
+
+      await expect(
+        handleTradingViewWebhook(prisma, { ...validPayload, symbol: "   " })
+      ).rejects.toBeInstanceOf(ValidationError);
+      expect(prisma.alert.create).not.toHaveBeenCalled();
+    });
+
+    it("runs duplicate suppression against the normalized symbol", async () => {
+      const prisma = createMockPrisma(NEW_ALERT_FIXTURE); // existing bare-symbol alert
+
+      const result = await handleTradingViewWebhook(prisma, {
+        ...validPayload,
+        symbol: "BINANCE:BTCUSDT", // prefixed re-fire of the same alert
+      });
+
+      const lookupArgs = (prisma.alert.findFirst as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(lookupArgs.where.symbol).toBe("BTCUSDT");
+      expect(result.status).toBe("IGNORED_DUPLICATE");
+      expect(prisma.alert.create).not.toHaveBeenCalled();
+    });
+  });
+
   describe("duplicate suppression", () => {
     it("increments duplicateCount instead of creating a new alert when a matching alert exists within the window", async () => {
       const existing = { ...NEW_ALERT_FIXTURE, duplicateCount: 0 };
