@@ -1,0 +1,169 @@
+//@version=5
+// Dibuat oleh Gemini berdasarkan strategi pengguna
+// Versi 5.5: Perbaikan final 'line.new' untuk Sinar Horizontal
+// Versi 5.5-webhook: Menambahkan alert() webhook JSON untuk trading-alert-dashboard.
+//                    Semua logika visual (line.new / label.new / input) TIDAK diubah.
+//                    "timeframe" di JSON = timeframe CHART saat ini (format backend,
+//                    mis. "1h"), agar screenshot Binance selalu memakai interval yang
+//                    didukung. Timeframe sumber sinyal (1D/1W/3M/dst) tetap terlihat
+//                    di field "note" (mis. "... sinar 1D | chartTf=1h").
+indicator("teddy v5.5 (Sinar Final)", overlay=true)
+
+// =================================================================================
+// BAGIAN 1: PENGATURAN INPUT DARI PENGGUNA
+// =================================================================================
+
+// (Bagian ini tidak ada perubahan)
+var GRP_GENERAL = "Pengaturan Umum"
+minPercentInput = input.float(15.0, "Persentase Pergerakan Harga Minimal (%)", group = GRP_GENERAL) / 100
+labelTextColor = input.color(color.white, "Warna Teks Label", group = GRP_GENERAL)
+labelTextSizeInput = input.string("small", "Ukuran Teks Label", options=["tiny", "small", "normal", "large"], group = GRP_GENERAL)
+
+f_stringToSize(sizeString) =>
+    switch sizeString
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        => size.small
+labelTextSize = f_stringToSize(labelTextSizeInput)
+
+var GRP_RED = "Warna Garis Merah"
+colorRedD1 = input.color(color.new(#ff8787, 0), "1D", group = GRP_RED, inline = "R1")
+colorRedW1 = input.color(color.new(#ff5d5d, 0), "1W", group = GRP_RED, inline = "R1")
+colorRedM1 = input.color(color.new(#ff3333, 0), "1M", group = GRP_RED, inline = "R2")
+colorRedM3 = input.color(color.new(#f01111, 0), "3M", group = GRP_RED, inline = "R2")
+colorRedM6 = input.color(color.new(#d40000, 0), "6M", group = GRP_RED, inline = "R3")
+colorRedM12 = input.color(color.new(#aa0000, 0), "12M", group = GRP_RED, inline = "R3")
+
+var GRP_GREEN = "Warna Garis Hijau"
+colorGreenD1 = input.color(color.new(#7fff87, 0), "1D", group = GRP_GREEN, inline = "G1")
+colorGreenW1 = input.color(color.new(#57ff5d, 0), "1W", group = GRP_GREEN, inline = "G1")
+colorGreenM1 = input.color(color.new(#33ff33, 0), "1M", group = GRP_GREEN, inline = "G2")
+colorGreenM3 = input.color(color.new(#11f011, 0), "3M", group = GRP_GREEN, inline = "G2")
+colorGreenM6 = input.color(color.new(#00d400, 0), "6M", group = GRP_GREEN, inline = "G3")
+colorGreenM12 = input.color(color.new(#00aa00, 0), "12M", group = GRP_GREEN, inline = "G3")
+
+var GRP_TF = "Pengaturan Tampilan Timeframe"
+showD1 = input.bool(true, "1D", group = GRP_TF, inline = "T1")
+widthD1 = input.int(1, "Tebal", minval=1, maxval=5, group = GRP_TF, inline = "T1")
+showW1 = input.bool(true, "1W", group = GRP_TF, inline = "T2")
+widthW1 = input.int(1, "Tebal", minval=1, maxval=5, group = GRP_TF, inline = "T2")
+showM1 = input.bool(true, "1M", group = GRP_TF, inline = "T3")
+widthM1 = input.int(2, "Tebal", minval=1, maxval=5, group = GRP_TF, inline = "T3")
+showM3 = input.bool(true, "3M", group = GRP_TF, inline = "T4")
+widthM3 = input.int(3, "Tebal", minval=1, maxval=5, group = GRP_TF, inline = "T4")
+showM6 = input.bool(true, "6M", group = GRP_TF, inline = "T5")
+widthM6 = input.int(4, "Tebal", minval=1, maxval=5, group = GRP_TF, inline = "T5")
+showM12 = input.bool(true, "12M", group = GRP_TF, inline = "T6")
+widthM12 = input.int(2, "Tebal", minval=1, maxval=5, group = GRP_TF, inline = "T6")
+
+// --- BARU: Pengaturan Webhook ---
+var GRP_WEBHOOK = "Webhook"
+webhookSecret = input.string("", "Webhook Secret", group = GRP_WEBHOOK)
+assetTypeInput = input.string("crypto", "Asset Type", options=["crypto", "stock"], group = GRP_WEBHOOK)
+exchangeInput = input.string("BINANCE", "Exchange", group = GRP_WEBHOOK)
+enableWebhookAlerts = input.bool(true, "Enable Webhook Alerts", group = GRP_WEBHOOK)
+
+// =================================================================================
+// BAGIAN 1B: HELPER JSON WEBHOOK (BARU)
+// =================================================================================
+
+// Mengubah timeframe CHART aktif (timeframe.period, mis. "60", "240", "D")
+// menjadi token yang dimengerti backend/Binance: "1m","5m","15m","1h","4h","1d".
+// Chart mingguan/bulanan menghasilkan "1w"/"1M" (belum didukung provider
+// Binance backend — alert akan FAILED di tahap market data kecuali
+// MARKET_DATA_FALLBACK_TO_MOCK=true).
+f_chartTimeframeForBackend() =>
+    tfMult = timeframe.multiplier
+    timeframe.isminutes ?
+         (tfMult % 60 == 0 ? str.tostring(tfMult / 60) + "h" : str.tostring(tfMult) + "m") :
+     timeframe.isdaily ? str.tostring(tfMult) + "d" :
+     timeframe.isweekly ? str.tostring(tfMult) + "w" :
+     timeframe.ismonthly ? str.tostring(tfMult) + "M" :
+     timeframe.period
+
+chartTfForBackend = f_chartTimeframeForBackend()
+
+// Membangun payload JSON yang cocok dengan POST /api/webhooks/tradingview.
+// - "timeframe" = timeframe CHART (bukan timeframe sumber sinyal), supaya
+//   screenshot backend dirender dari interval Binance yang valid. Timeframe
+//   sumber sinyal (sourceTf: 1D/1W/1M/3M/6M/12M) dicantumkan di "note"
+//   sebagai "... | chartTf=..." — TIDAK dikirim sebagai field JSON terpisah
+//   karena validasi backend (Zod) membuang field yang tidak dikenal, sehingga
+//   field ekstra tidak akan pernah tersimpan/terlihat.
+// - price dikirim sebagai angka polos (tanpa tanda kutip, tanpa pemisah ribuan).
+// - triggeredAt memakai format ISO-8601 UTC agar backend bisa mem-parse waktu
+//   trigger yang sebenarnya.
+// - symbol memakai syminfo.tickerid (mis. "BINANCE:BTCUSDT"); backend sudah
+//   menormalkan prefix exchange secara otomatis.
+f_buildWebhookJson(signal, sourceTf, levelPrice, note) =>
+    '{'
+     + '"secret":"' + webhookSecret + '",'
+     + '"symbol":"' + syminfo.tickerid + '",'
+     + '"assetType":"' + assetTypeInput + '",'
+     + '"timeframe":"' + chartTfForBackend + '",'
+     + '"price":' + str.tostring(levelPrice, "#.##########") + ','
+     + '"signal":"' + signal + '",'
+     + '"indicatorName":"teddy v5.5",'
+     + '"indicatorValue":0,'
+     + '"triggeredAt":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '",'
+     + '"exchange":"' + exchangeInput + '",'
+     + '"note":"' + note + ' sinar ' + sourceTf + ' | chartTf=' + chartTfForBackend + '"'
+     + '}'
+
+// =================================================================================
+// BAGIAN 2: FUNGSI UNTUK MENDETEKSI SINYAL DAN MENGGAMBAR GARIS/LABEL
+// =================================================================================
+
+f_processTimeframe(timeframe, labelText, show, colorRed, colorGreen, width) =>
+    isRedCandle = close < open
+    isGreenCandle = close > open
+
+    signalGreenOnRed = isRedCandle and (math.abs(high - open) / open >= minPercentInput)
+    signalRedOnRed   = isRedCandle and (math.abs(close - low) / close >= minPercentInput)
+
+    signalGreenOnGreen = isGreenCandle and (math.abs(high - close) / open >= minPercentInput)
+    signalRedOnGreen   = isGreenCandle and (math.abs(open - low) / open >= minPercentInput)
+
+    [tf_high, tf_low, tf_sGOR, tf_sROR, tf_sGOG, tf_sROG] = request.security(syminfo.tickerid, timeframe,
+     [high, low, signalGreenOnRed, signalRedOnRed, signalGreenOnGreen, signalRedOnGreen], lookahead=barmerge.lookahead_on)
+
+    // --- PERBAIKAN DI 4 BLOK DI BAWAH INI ---
+    // Menambahkan `x2` dan `y2` agar fungsi `line.new` valid
+    // --- WEBHOOK: setiap blok sinyal memanggil alert() setelah menggambar ---
+
+    if show and tf_sGOR and not tf_sGOR[1]
+        line.new(x1=bar_index, y1=tf_high, x2=bar_index + 1, y2=tf_high, color=colorGreen, style=line.style_solid, width=width, extend=extend.right)
+        label.new(bar_index, tf_high, text=labelText + " " + str.tostring(tf_high, format.mintick), color=colorGreen, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
+        if enableWebhookAlerts and webhookSecret != ""
+            alert(f_buildWebhookJson("LONG", labelText, tf_high, "teddy GreenOnRed"), alert.freq_once_per_bar_close)
+
+    if show and tf_sROR and not tf_sROR[1]
+        line.new(x1=bar_index, y1=tf_low, x2=bar_index + 1, y2=tf_low, color=colorRed, style=line.style_solid, width=width, extend=extend.right)
+        label.new(bar_index, tf_low, text=labelText + " " + str.tostring(tf_low, format.mintick), color=colorRed, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
+        if enableWebhookAlerts and webhookSecret != ""
+            alert(f_buildWebhookJson("SHORT", labelText, tf_low, "teddy RedOnRed"), alert.freq_once_per_bar_close)
+
+    if show and tf_sGOG and not tf_sGOG[1]
+        line.new(x1=bar_index, y1=tf_high, x2=bar_index + 1, y2=tf_high, color=colorGreen, style=line.style_solid, width=width, extend=extend.right)
+        label.new(bar_index, tf_high, text=labelText + " " + str.tostring(tf_high, format.mintick), color=colorGreen, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
+        if enableWebhookAlerts and webhookSecret != ""
+            alert(f_buildWebhookJson("LONG", labelText, tf_high, "teddy GreenOnGreen"), alert.freq_once_per_bar_close)
+
+    if show and tf_sROG and not tf_sROG[1]
+        line.new(x1=bar_index, y1=tf_low, x2=bar_index + 1, y2=tf_low, color=colorRed, style=line.style_solid, width=width, extend=extend.right)
+        label.new(bar_index, tf_low, text=labelText + " " + str.tostring(tf_low, format.mintick), color=colorRed, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
+        if enableWebhookAlerts and webhookSecret != ""
+            alert(f_buildWebhookJson("SHORT", labelText, tf_low, "teddy RedOnGreen"), alert.freq_once_per_bar_close)
+
+// =================================================================================
+// BAGIAN 3: MENJALANKAN FUNGSI UNTUK SETIAP TIMEFRAME
+// =================================================================================
+
+f_processTimeframe("D", "1D", showD1, colorRedD1, colorGreenD1, widthD1)
+f_processTimeframe("W", "1W", showW1, colorRedW1, colorGreenW1, widthW1)
+f_processTimeframe("M", "1M", showM1, colorRedM1, colorGreenM1, widthM1)
+f_processTimeframe("3M", "3M", showM3, colorRedM3, colorGreenM3, widthM3)
+f_processTimeframe("6M", "6M", showM6, colorRedM6, colorGreenM6, widthM6)
+f_processTimeframe("12M", "12M", showM12, colorRedM12, colorGreenM12, widthM12)

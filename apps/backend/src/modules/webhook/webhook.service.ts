@@ -6,6 +6,7 @@ import { AlertsService } from "../alerts/alerts.service";
 import { enqueueVisionAnalysis } from "../jobs/queue";
 import { notifyAlertDuplicate, notifyNewAlert } from "../notifications/notification.service";
 import { parseOrNowDate } from "../../utils/date";
+import { normalizeTradingSymbol } from "../../utils/symbol";
 import { UnauthorizedError, ValidationError } from "../../utils/errors";
 import { env } from "../../config/env";
 
@@ -59,6 +60,14 @@ export async function handleTradingViewWebhook(
   const signal = normalizeSignal(payload.signal);
   const indicatorName = payload.indicatorName ?? null;
 
+  // TradingView may send "BINANCE:BTCUSDT" / "NASDAQ:AAPL" instead of a bare
+  // symbol. Everything downstream (Binance klines, duplicate suppression,
+  // Asset upsert) uses the normalized bare symbol; the original stays intact
+  // inside rawPayload. An explicit payload.exchange always wins over an
+  // exchange parsed from the symbol prefix.
+  const { normalizedSymbol, exchangeFromSymbol } = normalizeTradingSymbol(payload.symbol);
+  const exchange = payload.exchange ?? exchangeFromSymbol ?? null;
+
   const alertsService = new AlertsService(prisma);
 
   // Duplicate suppression: if the same symbol/assetType/timeframe/signal/
@@ -69,7 +78,7 @@ export async function handleTradingViewWebhook(
     Date.now() - env.DUPLICATE_SUPPRESSION_WINDOW_SECONDS * 1000
   );
   const existingDuplicate = await alertsService.findRecentDuplicate({
-    symbol: payload.symbol,
+    symbol: normalizedSymbol,
     assetType,
     timeframe: payload.timeframe,
     signal,
@@ -90,24 +99,24 @@ export async function handleTradingViewWebhook(
   }
 
   const asset = await prisma.asset.upsert({
-    where: { symbol_assetType: { symbol: payload.symbol, assetType } },
-    update: { exchange: payload.exchange ?? undefined },
+    where: { symbol_assetType: { symbol: normalizedSymbol, assetType } },
+    update: { exchange: exchange ?? undefined },
     create: {
-      symbol: payload.symbol,
+      symbol: normalizedSymbol,
       assetType,
-      exchange: payload.exchange ?? null,
+      exchange,
     },
   });
 
   // Never persist the shared secret — rawPayload is exposed verbatim on the
-  // alert detail page.
+  // alert detail page (and keeps the original, un-normalized symbol).
   const { secret: _secret, ...payloadWithoutSecret } = payload;
 
   const alert = await alertsService.create({
     assetId: asset.id,
-    symbol: payload.symbol,
+    symbol: normalizedSymbol,
     assetType,
-    exchange: payload.exchange ?? null,
+    exchange,
     timeframe: payload.timeframe,
     price: payload.price,
     signal,
