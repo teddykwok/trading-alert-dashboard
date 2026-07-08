@@ -10,7 +10,7 @@ services:
     # Host port 55432 (not the default 5432) to avoid clashing with a
     # locally installed Postgres. Update DATABASE_URL to match if you change this.
     ports:
-      - "55432:5432"
+      - "15432:5432"
     volumes:
       - trading-alert-postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -18,7 +18,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-
+git add docker-compose.yml
+git commit -m "Use safe Postgres host port"
+git push origin main
   redis:
     image: redis:7-alpine
     container_name: trading-alert-redis
