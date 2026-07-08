@@ -18,9 +18,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-git add docker-compose.yml
-git commit -m "Use safe Postgres host port"
-git push origin main
+
   redis:
     image: redis:7-alpine
     container_name: trading-alert-redis
