@@ -1,6 +1,7 @@
 import type { AssetType } from "@prisma/client";
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
+import type { MarketType } from "../../utils/symbol";
 import { BinanceProvider } from "./binance.provider";
 import { StocksProvider } from "./stocks.provider";
 import { generateMockCandles } from "./mock-candles";
@@ -19,7 +20,9 @@ function shouldUseRealBinance(assetType: AssetType, exchange: string | null): bo
 
 /**
  * Picks the right market data source for an alert:
- * - CRYPTO on the BINANCE exchange -> real Binance klines (binance.provider.ts).
+ * - CRYPTO on the BINANCE exchange -> real Binance klines (binance.provider.ts),
+ *   hitting the spot or USD-M futures endpoint depending on `marketType`
+ *   (TradingView ".P" perpetual symbols -> "futures").
  * - Everything else (STOCK, or crypto on another/unset exchange) -> mock provider.
  *
  * If the real Binance fetch fails, behavior is controlled by
@@ -32,17 +35,18 @@ export async function getRecentCandles(
   symbol: string,
   timeframe: string,
   referencePrice: number,
-  exchange: string | null = null
+  exchange: string | null = null,
+  marketType: MarketType = "spot"
 ): Promise<OhlcvCandle[]> {
   if (shouldUseRealBinance(assetType, exchange)) {
     try {
-      return await binanceProvider.getRecentCandles(symbol, timeframe, referencePrice);
+      return await binanceProvider.getRecentCandles(symbol, timeframe, referencePrice, marketType);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
 
       if (env.MARKET_DATA_FALLBACK_TO_MOCK) {
         logger.warn(
-          { provider: "binance", symbol, timeframe, error: message },
+          { provider: "binance", marketType, symbol, timeframe, error: message },
           "Binance market data fetch failed — falling back to mock candles (MARKET_DATA_FALLBACK_TO_MOCK=true)"
         );
         return generateMockCandles(referencePrice, timeframe);

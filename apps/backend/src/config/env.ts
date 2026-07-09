@@ -26,6 +26,9 @@ const envSchema = z.object({
   AI_VISION_MAX_IMAGE_BYTES: z.coerce.number().int().positive().default(5_000_000),
   DUPLICATE_SUPPRESSION_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
   BINANCE_REST_BASE_URL: z.string().min(1).default("https://api.binance.com"),
+  // USD-M futures REST host, used for TradingView ".P" perpetual symbols
+  // (GET /fapi/v1/klines). Spot keeps using BINANCE_REST_BASE_URL.
+  BINANCE_FUTURES_REST_BASE_URL: z.string().min(1).default("https://fapi.binance.com"),
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value
   // fall back to mock candles, same as STOCK alerts.

@@ -140,6 +140,19 @@ describe("handleTradingViewWebhook", () => {
       );
     });
 
+    it("strips the .P perpetual suffix for storage while preserving it in rawPayload", async () => {
+      const prisma = createMockPrisma(null);
+
+      await handleTradingViewWebhook(prisma, { ...validPayload, symbol: "BINANCE:GRASSUSDT.P" });
+
+      expect(createCall(prisma).data).toEqual(
+        expect.objectContaining({ symbol: "GRASSUSDT", exchange: "BINANCE" })
+      );
+      expect(createCall(prisma).data.rawPayload).toEqual(
+        expect.objectContaining({ symbol: "BINANCE:GRASSUSDT.P" })
+      );
+    });
+
     it("preserves the original prefixed symbol inside rawPayload", async () => {
       const prisma = createMockPrisma(null);
 

@@ -1,5 +1,6 @@
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
+import type { MarketType } from "../../utils/symbol";
 import { MarketDataError, type MarketDataProvider, type OhlcvCandle } from "./market-data.types";
 
 const DEFAULT_LIMIT = 120;
@@ -8,13 +9,15 @@ const MAX_ATTEMPTS = 2;
 const RETRY_DELAY_MS = 500;
 
 // TradingView webhook timeframes map 1:1 onto Binance's interval tokens for
-// the timeframes this dashboard supports; kept as an explicit allow-list
-// (rather than a passthrough) so unsupported values fail with a clear error
-// instead of silently reaching Binance with a bad `interval`.
+// the timeframes this dashboard supports (valid on both spot and USD-M
+// futures klines); kept as an explicit allow-list (rather than a passthrough)
+// so unsupported values fail with a clear error instead of silently reaching
+// Binance with a bad `interval`.
 const TIMEFRAME_TO_BINANCE_INTERVAL: Record<string, string> = {
   "1m": "1m",
   "5m": "5m",
   "15m": "15m",
+  "30m": "30m",
   "1h": "1h",
   "4h": "4h",
   "1d": "1d",
@@ -77,32 +80,46 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function klinesUrl(marketType: MarketType, symbol: string, interval: string, limit: number): string {
+  const query = `symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
+  return marketType === "futures"
+    ? `${env.BINANCE_FUTURES_REST_BASE_URL}/fapi/v1/klines?${query}`
+    : `${env.BINANCE_REST_BASE_URL}/api/v3/klines?${query}`;
+}
+
 /**
- * Real Binance Spot public market data provider — GET /api/v3/klines.
- * Public market data endpoint, no API key required.
+ * Real Binance public market data provider, no API key required:
+ * - spot:    GET {BINANCE_REST_BASE_URL}/api/v3/klines
+ * - futures: GET {BINANCE_FUTURES_REST_BASE_URL}/fapi/v1/klines (USD-M
+ *            perpetuals, i.e. TradingView ".P" symbols)
+ * Both endpoints share the same kline response shape and interval tokens.
  */
 export class BinanceProvider implements MarketDataProvider {
   async getRecentCandles(
     symbol: string,
     timeframe: string,
     _referencePrice: number,
+    marketType: MarketType = "spot",
     limit: number = DEFAULT_LIMIT
   ): Promise<OhlcvCandle[]> {
     const interval = toBinanceInterval(timeframe);
-    const url = `${env.BINANCE_REST_BASE_URL}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
+    const url = klinesUrl(marketType, symbol, interval, limit);
 
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       try {
-        logger.info({ provider: "binance", symbol, interval, limit, attempt }, "Fetching Binance klines");
+        logger.info(
+          { provider: "binance", marketType, symbol, interval, limit, attempt },
+          "Fetching Binance klines"
+        );
 
         const response = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS);
 
         if (!response.ok) {
           const body = await response.text().catch(() => "");
           throw new MarketDataError(
-            `Binance klines request failed with status ${response.status}${body ? `: ${body}` : ""}`
+            `Binance ${marketType} klines request failed with status ${response.status}${body ? `: ${body}` : ""}`
           );
         }
 
@@ -110,7 +127,7 @@ export class BinanceProvider implements MarketDataProvider {
         const candles = parseKlines(json, symbol);
 
         logger.info(
-          { provider: "binance", symbol, interval, candleCount: candles.length },
+          { provider: "binance", marketType, symbol, interval, candleCount: candles.length },
           "Fetched Binance klines"
         );
 
@@ -121,7 +138,7 @@ export class BinanceProvider implements MarketDataProvider {
         const message = error instanceof Error ? error.message : String(error);
 
         logger.warn(
-          { provider: "binance", symbol, interval, attempt, error: message },
+          { provider: "binance", marketType, symbol, interval, attempt, error: message },
           "Binance klines fetch attempt failed"
         );
 
@@ -133,7 +150,7 @@ export class BinanceProvider implements MarketDataProvider {
 
     const message = lastError instanceof Error ? lastError.message : String(lastError);
     throw new MarketDataError(
-      `Binance klines fetch failed for ${symbol} (${interval}) after ${MAX_ATTEMPTS} attempt(s): ${message}`
+      `Binance ${marketType} klines fetch failed for ${symbol} (${interval}) after ${MAX_ATTEMPTS} attempt(s): ${message}`
     );
   }
 }
