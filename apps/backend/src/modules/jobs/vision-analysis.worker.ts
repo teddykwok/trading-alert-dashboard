@@ -13,6 +13,7 @@ import {
   notifyAnalyzedAlert,
 } from "../notifications/notification.service";
 import { ensureScreenshotDir, screenshotFileName } from "../../utils/file";
+import { inferMarketType } from "../../utils/symbol";
 import { bullConnection, type VisionAnalysisJobData } from "./queue";
 import { startCleanupScheduler } from "./cleanup.worker";
 
@@ -32,12 +33,19 @@ async function processVisionAnalysisJob(job: Job<VisionAnalysisJobData>): Promis
     alert = await alertsService.markProcessingScreenshot(alertId);
     await notifyAlertUpdated(alert);
 
+    // Alert.symbol is stored normalized (no ".P"), so the spot-vs-futures
+    // distinction is re-derived from the original TradingView symbol kept in
+    // rawPayload. Falls back to alert.symbol (-> "spot") if absent.
+    const rawPayloadSymbol = (alert.rawPayload as { symbol?: unknown } | null)?.symbol;
+    const marketType = inferMarketType(rawPayloadSymbol ?? alert.symbol);
+
     const candles = await getRecentCandles(
       alert.assetType,
       alert.symbol,
       alert.timeframe,
       alert.price,
-      alert.exchange
+      alert.exchange,
+      marketType
     );
 
     const screenshotUrl = await generateAndSaveScreenshot(alertId, {

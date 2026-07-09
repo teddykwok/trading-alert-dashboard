@@ -77,20 +77,66 @@ describe("BinanceProvider", () => {
     expect(calledUrl).toContain("limit=120");
   });
 
+  it("supports the 30m interval", async () => {
+    mockFetchOk(SAMPLE_KLINES);
+    const provider = new BinanceProvider();
+
+    await provider.getRecentCandles("BTCUSDT", "30m", 64200);
+
+    const calledUrl = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(calledUrl).toContain("interval=30m");
+  });
+
   it("throws on an unsupported interval without making a network request", async () => {
     global.fetch = vi.fn();
     const provider = new BinanceProvider();
 
-    await expect(provider.getRecentCandles("BTCUSDT", "30m", 64200)).rejects.toThrow(
-      "Unsupported Binance interval: 30m"
+    await expect(provider.getRecentCandles("BTCUSDT", "45m", 64200)).rejects.toThrow(
+      "Unsupported Binance interval: 45m"
     );
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
-  it("throws a clear error on a non-2xx response", async () => {
+  it("throws a clear spot error on a non-2xx response", async () => {
     mockFetchError(400, JSON.stringify({ code: -1121, msg: "Invalid symbol." }));
     const provider = new BinanceProvider();
 
-    await expect(provider.getRecentCandles("NOTREAL", "1h", 100)).rejects.toThrow(/status 400/);
+    await expect(provider.getRecentCandles("NOTREAL", "1h", 100)).rejects.toThrow(
+      /Binance spot klines fetch failed for NOTREAL/
+    );
+  });
+
+  describe("USD-M futures market", () => {
+    it("uses the futures endpoint when marketType is futures", async () => {
+      mockFetchOk(SAMPLE_KLINES);
+      const provider = new BinanceProvider();
+
+      await provider.getRecentCandles("GRASSUSDT", "1h", 1.5, "futures");
+
+      const calledUrl = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+      expect(calledUrl).toContain("https://fapi.binance.com/fapi/v1/klines");
+      expect(calledUrl).toContain("symbol=GRASSUSDT");
+      expect(calledUrl).not.toContain("/api/v3/klines");
+    });
+
+    it("keeps using the spot endpoint by default", async () => {
+      mockFetchOk(SAMPLE_KLINES);
+      const provider = new BinanceProvider();
+
+      await provider.getRecentCandles("BTCUSDT", "1h", 64200);
+
+      const calledUrl = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+      expect(calledUrl).toContain("/api/v3/klines");
+      expect(calledUrl).not.toContain("/fapi/");
+    });
+
+    it("throws a futures-specific error message on an invalid futures symbol", async () => {
+      mockFetchError(400, JSON.stringify({ code: -1121, msg: "Invalid symbol." }));
+      const provider = new BinanceProvider();
+
+      await expect(provider.getRecentCandles("NOTREAL", "1h", 100, "futures")).rejects.toThrow(
+        /Binance futures klines fetch failed for NOTREAL/
+      );
+    });
   });
 });
