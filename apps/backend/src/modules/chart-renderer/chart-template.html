@@ -87,7 +87,9 @@
     <script>
       // Populated by chart-renderer.service.ts via page.evaluate after the
       // lightweight-charts UMD bundle has been injected with addScriptTag.
-      window.renderChart = function renderChart({ candles, priceLine, label }) {
+      // `priceFormat` ({ precision, minMove }) is precomputed in Node from the
+      // alert price's magnitude so small-cap prices don't render as "0.00".
+      window.renderChart = function renderChart({ candles, priceLine, priceFormat, label }) {
         const container = document.getElementById("chart-container");
 
         const chart = LightweightCharts.createChart(container, {
@@ -116,6 +118,12 @@
           borderVisible: false,
           wickUpColor: "#22c55e",
           wickDownColor: "#ef4444",
+          // Governs the y-axis labels AND the alert price line's axis label.
+          priceFormat: {
+            type: "price",
+            precision: priceFormat.precision,
+            minMove: priceFormat.minMove,
+          },
         });
 
         candleSeries.setData(candles);
