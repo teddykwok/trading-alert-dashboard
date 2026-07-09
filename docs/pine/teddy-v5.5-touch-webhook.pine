@@ -76,6 +76,10 @@ enableLevelTouchedAlerts = input.bool(true, "Alert When Price Touches Existing L
 touchTolerancePct = input.float(0.2, "Touch Tolerance (%)", group = GRP_WEBHOOK) / 100
 touchCooldownBars = input.int(10, "Touch Alert Cooldown Bars", minval=1, group = GRP_WEBHOOK)
 minBarsAfterCreation = input.int(5, "Min Bars After Level Creation Before Touch Alert", minval=1, group = GRP_WEBHOOK)
+// "Immediate" = alert LEVEL_TOUCHED terkirim saat tick pertama harga menyentuh
+// level (sekali per bar per level); "Bar Close" = tunggu candle chart ditutup.
+// Hanya memengaruhi LEVEL_TOUCHED; LEVEL_CREATED tetap menunggu bar close.
+touchAlertTiming = input.string("Immediate", "Touch Alert Timing", options=["Immediate", "Bar Close"], group = GRP_WEBHOOK)
 
 // =================================================================================
 // BAGIAN 1B: HELPER JSON WEBHOOK
@@ -236,7 +240,11 @@ if enableWebhookAlerts and enableLevelTouchedAlerts and webhookSecret != "" and 
             // RED diretest dari bawah = resistance -> SHORT. Lainnya WATCH.
             touchSignal = levelColor == "GREEN" and touchDirection == "FROM_ABOVE" ? "LONG" : levelColor == "RED" and touchDirection == "FROM_BELOW" ? "SHORT" : "WATCH"
 
-            touchNote = "eventType=LEVEL_TOUCHED | levelColor=" + levelColor + " | sourceTf=" + array.get(lvlTf, i) + " | touchDirection=" + touchDirection + " | levelPrice=" + f_formatPrice(levelPrice) + " | chartTf=" + chartTfForBackend
+            touchNote = "eventType=LEVEL_TOUCHED | levelColor=" + levelColor + " | sourceTf=" + array.get(lvlTf, i) + " | touchDirection=" + touchDirection + " | levelPrice=" + f_formatPrice(levelPrice) + " | chartTf=" + chartTfForBackend + " | alertTiming=" + touchAlertTiming
 
-            alert(f_buildWebhookJson(touchSignal, levelPrice, touchNote), alert.freq_once_per_bar_close)
+            // Timing hanya untuk LEVEL_TOUCHED (LEVEL_CREATED tetap bar close).
+            if touchAlertTiming == "Immediate"
+                alert(f_buildWebhookJson(touchSignal, levelPrice, touchNote), alert.freq_once_per_bar)
+            else
+                alert(f_buildWebhookJson(touchSignal, levelPrice, touchNote), alert.freq_once_per_bar_close)
             array.set(lvlLastTouchBar, i, bar_index)
