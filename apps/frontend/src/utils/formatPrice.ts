@@ -1,9 +1,11 @@
+import { formatDynamicPrice } from "@trading-alert-dashboard/shared";
+
+/**
+ * Magnitude-aware price formatting (shared with the backend chart renderer)
+ * so small-cap/perpetual prices like 0.004086 never display as "0.00".
+ */
 export function formatPrice(value: number): string {
-  const decimals = value >= 100 ? 2 : value >= 1 ? 4 : 6;
-  return value.toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: decimals,
-  });
+  return formatDynamicPrice(value);
 }
 
 export function formatPercent(value: number): string {

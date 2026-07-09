@@ -1,5 +1,6 @@
 import path from "node:path";
 import { chromium } from "playwright";
+import { formatDynamicPrice, pricePrecisionFor } from "@trading-alert-dashboard/shared";
 import type { OhlcvCandle } from "../market-data/market-data.types";
 import type { SignalType } from "@prisma/client";
 
@@ -39,16 +40,31 @@ export async function renderChartScreenshot(input: RenderChartInput): Promise<Bu
     await page.goto(`file://${TEMPLATE_PATH}`);
     await page.addScriptTag({ path: LIGHTWEIGHT_CHARTS_SCRIPT });
 
+    // Decimals scale with the alert price's magnitude so small-cap/perp
+    // prices (e.g. 0.004086) don't collapse to "0.00" on the axis, the alert
+    // marker, or the overlay label. Candles share the asset's magnitude.
+    const priceFormat = pricePrecisionFor(input.price);
+    const priceText = formatDynamicPrice(input.price);
+
     await page.evaluate(
-      ({ candles, price, symbol, timeframe, signal }) => {
+      ({ candles, price, symbol, timeframe, signal, priceFormat, priceText }) => {
         // @ts-expect-error - renderChart is defined in chart-template.html
         window.renderChart({
           candles,
           priceLine: { price },
-          label: { symbol, timeframe, signal, price },
+          priceFormat,
+          label: { symbol, timeframe, signal, price: priceText },
         });
       },
-      { candles: input.candles, price: input.price, symbol: input.symbol, timeframe: input.timeframe, signal: input.signal }
+      {
+        candles: input.candles,
+        price: input.price,
+        symbol: input.symbol,
+        timeframe: input.timeframe,
+        signal: input.signal,
+        priceFormat,
+        priceText,
+      }
     );
 
     await page.waitForFunction(() => (window as unknown as { __CHART_READY__?: boolean }).__CHART_READY__ === true);
