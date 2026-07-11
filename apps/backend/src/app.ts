@@ -13,6 +13,7 @@ import { webhookRoutes } from "./routes/webhook.routes";
 import { alertsRoutes } from "./routes/alerts.routes";
 import { assetsRoutes } from "./routes/assets.routes";
 import { settingsRoutes } from "./routes/settings.routes";
+import { tradeReviewsRoutes } from "./routes/trade-reviews.routes";
 import { AppError } from "./utils/errors";
 import { ensureScreenshotDir } from "./utils/file";
 
@@ -36,6 +37,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(alertsRoutes);
   await app.register(assetsRoutes);
   await app.register(settingsRoutes);
+  await app.register(tradeReviewsRoutes);
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof AppError) {

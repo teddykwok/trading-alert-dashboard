@@ -19,3 +19,12 @@ export const ALERT_STATUSES = [
 ] as const;
 
 export const VISION_ANALYSIS_QUEUE_NAME = "vision-analysis";
+
+export const TRADE_REVIEW_STATUSES = [
+  "UNREVIEWED",
+  "IGNORED",
+  "OPEN",
+  "WIN",
+  "LOSS",
+  "BREAKEVEN",
+] as const;

@@ -28,6 +28,15 @@ enum AlertStatus {
   IGNORED_DUPLICATE
 }
 
+enum TradeReviewStatus {
+  UNREVIEWED
+  IGNORED
+  OPEN
+  WIN
+  LOSS
+  BREAKEVEN
+}
+
 model Asset {
   id        String    @id @default(cuid())
   symbol    String
@@ -69,12 +78,34 @@ model Alert {
   triggeredAt     DateTime
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
+  tradeReview     TradeReview?
 
   @@index([status])
   @@index([symbol])
   @@index([signal])
   @@index([createdAt])
   @@index([symbol, assetType, timeframe, signal, indicatorName])
+}
+
+// Manual live-outcome tracking: one review per alert, filled in by the user
+// after the fact (ignored / opened / won / lost / breakeven). Deliberately a
+// separate one-to-one model so mutable trading fields don't live on the
+// immutable-ish Alert row. Prices are Decimal (not Float) to preserve
+// small-cap precision like 0.004086 exactly.
+model TradeReview {
+  id         String            @id @default(cuid())
+  alertId    String            @unique
+  alert      Alert             @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  status     TradeReviewStatus @default(UNREVIEWED)
+  entryPrice Decimal?          @db.Decimal(30, 12)
+  exitPrice  Decimal?          @db.Decimal(30, 12)
+  notes      String?
+  openedAt   DateTime?
+  closedAt   DateTime?
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+
+  @@index([status])
 }
 
 model Setting {

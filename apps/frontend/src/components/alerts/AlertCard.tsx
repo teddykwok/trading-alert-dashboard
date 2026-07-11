@@ -5,6 +5,7 @@ import { StatusBadge } from "./StatusBadge";
 import { MockAiBadge } from "./MockAiBadge";
 import { OpenAiBadge } from "./OpenAiBadge";
 import { DuplicateBadge } from "./DuplicateBadge";
+import { OutcomeBadge } from "./OutcomeBadge";
 import { ScreenshotPreview } from "../charts/ScreenshotPreview";
 import { formatPrice } from "../../utils/formatPrice";
 import { formatRelativeTime } from "../../utils/formatDate";
@@ -29,6 +30,9 @@ export function AlertCard({ alert }: { alert: Alert }) {
             {alert.aiProvider === "mock" && <MockAiBadge />}
             {alert.aiProvider === "openai" && <OpenAiBadge />}
             {alert.duplicateCount > 0 && <DuplicateBadge count={alert.duplicateCount} />}
+            {alert.tradeReview && alert.tradeReview.status !== "UNREVIEWED" && (
+              <OutcomeBadge status={alert.tradeReview.status} />
+            )}
           </div>
 
           <div className="mt-1 flex items-center gap-3 text-xs text-slate-500">
