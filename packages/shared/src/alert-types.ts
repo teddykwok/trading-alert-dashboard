@@ -49,6 +49,11 @@ export interface Alert {
   triggeredAt: string;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Present on list responses (and undefined on socket-pushed alerts): the
+   * manual trade review's status, used for the outcome badge on alert cards.
+   */
+  tradeReview?: { status: import("./trade-review-types").TradeReviewStatus } | null;
 }
 
 export interface Asset {

@@ -6,6 +6,7 @@ import { StatusBadge } from "../components/alerts/StatusBadge";
 import { MockAiBadge } from "../components/alerts/MockAiBadge";
 import { OpenAiBadge } from "../components/alerts/OpenAiBadge";
 import { AiOpinionPanel } from "../components/alerts/AiOpinionPanel";
+import { TradeOutcomePanel } from "../components/alerts/TradeOutcomePanel";
 import { ScreenshotPreview } from "../components/charts/ScreenshotPreview";
 import { alertsApi } from "../api/alerts.api";
 import { getSocket } from "../sockets/socket";
@@ -117,6 +118,8 @@ export function AlertDetailPage() {
               <Row label="Received at" value={formatDateTime(alert.createdAt)} />
             </dl>
           </Card>
+
+          <TradeOutcomePanel alertId={alert.id} />
 
           <AiOpinionPanel alert={alert} />
 

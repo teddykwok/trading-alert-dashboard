@@ -20,7 +20,10 @@ export {
   SIGNAL_TYPES,
   ALERT_STATUSES,
   VISION_ANALYSIS_QUEUE_NAME,
+  TRADE_REVIEW_STATUSES,
 } from "./constants";
+
+export type { TradeReview, TradeReviewStats, TradeReviewStatus } from "./trade-review-types";
 
 export type { ChartPriceFormat } from "./format-price";
 export { formatDynamicPrice, priceDecimalsFor, pricePrecisionFor } from "./format-price";

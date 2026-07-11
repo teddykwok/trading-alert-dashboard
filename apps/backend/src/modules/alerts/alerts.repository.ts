@@ -60,6 +60,9 @@ export class AlertsRepository {
       orderBy: { createdAt: "desc" },
       take: filter.limit,
       skip: filter.offset,
+      // Manual trade-review status rides along so alert cards can show an
+      // outcome badge without a request per alert.
+      include: { tradeReview: { select: { status: true } } },
     });
   }
 
