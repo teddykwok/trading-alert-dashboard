@@ -23,6 +23,11 @@ function matchesFilters(alert: Alert, filters: ReturnType<typeof useFilters>["fi
   if (filters.signal && alert.signal !== filters.signal) return false;
   if (filters.assetType && alert.assetType !== filters.assetType) return false;
   if (filters.symbol && !alert.symbol.toLowerCase().includes(filters.symbol.toLowerCase())) return false;
+  // Level-context filters match on alertContext, which the backend derives
+  // from structured columns with a note-parsing fallback — so legacy alerts
+  // whose metadata only lives in the note are filtered correctly too.
+  if (filters.sourceTimeframe && alert.alertContext?.sourceTimeframe !== filters.sourceTimeframe) return false;
+  if (filters.levelColor && alert.alertContext?.levelColor !== filters.levelColor) return false;
   return true;
 }
 

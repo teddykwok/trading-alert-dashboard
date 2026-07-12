@@ -1,5 +1,5 @@
 import type { PrismaClient, AssetType, SignalType } from "@prisma/client";
-import { ASSET_TYPES, SIGNAL_TYPES } from "@trading-alert-dashboard/shared";
+import { ASSET_TYPES, SIGNAL_TYPES, parseAlertNote } from "@trading-alert-dashboard/shared";
 import { tradingViewWebhookSchema, type TradingViewWebhookInput } from "./webhook.schema";
 import { isValidWebhookSecret } from "./webhook.security";
 import { AlertsService } from "../alerts/alerts.service";
@@ -112,6 +112,12 @@ export async function handleTradingViewWebhook(
   // alert detail page (and keeps the original, un-normalized symbol).
   const { secret: _secret, ...payloadWithoutSecret } = payload;
 
+  // Level context is parsed once here and stored as structured columns for
+  // filtering/analytics. The original note stays untouched inside rawPayload;
+  // levelPrice/chartTf are not stored (chart timeframe already lives in
+  // `timeframe`, levelPrice is derived from the note on read).
+  const levelContext = parseAlertNote(payload.note);
+
   const alert = await alertsService.create({
     assetId: asset.id,
     symbol: normalizedSymbol,
@@ -124,6 +130,10 @@ export async function handleTradingViewWebhook(
     indicatorValue: payload.indicatorValue ?? null,
     rawPayload: payloadWithoutSecret,
     triggeredAt: parseOrNowDate(payload.triggeredAt),
+    eventType: levelContext.eventType,
+    levelColor: levelContext.levelColor,
+    sourceTimeframe: levelContext.sourceTimeframe,
+    touchDirection: levelContext.touchDirection,
   });
 
   await notifyNewAlert(alert);

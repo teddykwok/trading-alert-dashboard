@@ -1,4 +1,10 @@
-import { ALERT_STATUSES, ASSET_TYPES, SIGNAL_TYPES } from "@trading-alert-dashboard/shared";
+import {
+  ALERT_STATUSES,
+  ASSET_TYPES,
+  LEVEL_COLORS,
+  SIGNAL_TYPES,
+  SOURCE_TIMEFRAMES,
+} from "@trading-alert-dashboard/shared";
 import { Button } from "../ui/Button";
 import type { AlertListQuery } from "../../types/api";
 
@@ -58,6 +64,35 @@ export function AlertFilters({ filters, setFilter, reset, hasActiveFilters }: Al
         {ASSET_TYPES.map((assetType) => (
           <option key={assetType} value={assetType}>
             {assetType}
+          </option>
+        ))}
+      </select>
+
+      <select
+        value={filters.sourceTimeframe ?? ""}
+        onChange={(e) =>
+          setFilter("sourceTimeframe", (e.target.value || undefined) as AlertListQuery["sourceTimeframe"])
+        }
+        className={selectClass}
+        title="Timeframe the level originated on"
+      >
+        <option value="">All source TFs</option>
+        {SOURCE_TIMEFRAMES.map((tf) => (
+          <option key={tf} value={tf}>
+            Level {tf}
+          </option>
+        ))}
+      </select>
+
+      <select
+        value={filters.levelColor ?? ""}
+        onChange={(e) => setFilter("levelColor", (e.target.value || undefined) as AlertListQuery["levelColor"])}
+        className={selectClass}
+      >
+        <option value="">All level colors</option>
+        {LEVEL_COLORS.map((color) => (
+          <option key={color} value={color}>
+            {color === "GREEN" ? "Green" : "Red"}
           </option>
         ))}
       </select>

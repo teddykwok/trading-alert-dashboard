@@ -53,6 +53,8 @@ export class AlertsRepository {
       symbol: filter.symbol,
       signal: filter.signal,
       assetType: filter.assetType,
+      sourceTimeframe: filter.sourceTimeframe,
+      levelColor: filter.levelColor,
     };
 
     return this.prisma.alert.findMany({
@@ -73,6 +75,8 @@ export class AlertsRepository {
         symbol: filter.symbol,
         signal: filter.signal,
         assetType: filter.assetType,
+        sourceTimeframe: filter.sourceTimeframe,
+        levelColor: filter.levelColor,
       },
     });
   }

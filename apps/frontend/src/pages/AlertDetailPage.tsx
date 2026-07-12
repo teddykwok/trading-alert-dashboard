@@ -14,7 +14,7 @@ import { getSocket } from "../sockets/socket";
 import { SOCKET_EVENTS } from "../sockets/socket-events";
 import { formatDateTime } from "../utils/formatDate";
 import { formatPrice } from "../utils/formatPrice";
-import type { Alert, AlertStatus } from "../types/alert";
+import type { Alert, AlertContext, AlertStatus } from "../types/alert";
 
 const STATUS_TIMELINE: AlertStatus[] = [
   "RECEIVED",
@@ -122,6 +122,8 @@ export function AlertDetailPage() {
             </dl>
           </Card>
 
+          {alert.alertContext && <LevelContextCard context={alert.alertContext} />}
+
           <TradeOutcomePanel alertId={alert.id} />
 
           <AiOpinionPanel alert={alert} />
@@ -152,6 +154,50 @@ export function AlertDetailPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+const EVENT_LABEL: Record<string, string> = {
+  LEVEL_TOUCHED: "Level touched",
+  LEVEL_CREATED: "Level created",
+};
+
+const DIRECTION_LABEL: Record<string, string> = {
+  FROM_ABOVE: "From above",
+  FROM_BELOW: "From below",
+  UNKNOWN: "Unknown",
+};
+
+const COLOR_LABEL: Record<string, string> = {
+  GREEN: "Green",
+  RED: "Red",
+};
+
+/**
+ * Structured level metadata from the Pine webhook note. "Source timeframe"
+ * is where the red/green line originated (1D…12M); "Chart timeframe" is the
+ * chart the alert fired on — shown together here precisely so the two are
+ * never confused.
+ */
+function LevelContextCard({ context }: { context: AlertContext }) {
+  return (
+    <Card className="p-4">
+      <h2 className="mb-3 text-sm font-semibold text-slate-200">Level context</h2>
+      <dl className="space-y-2 text-sm">
+        <Row label="Event" value={context.eventType ? EVENT_LABEL[context.eventType] : "—"} />
+        <Row label="Source timeframe" value={context.sourceTimeframe ?? "—"} />
+        <Row label="Level color" value={context.levelColor ? COLOR_LABEL[context.levelColor] : "—"} />
+        <Row
+          label="Touch direction"
+          value={context.touchDirection ? DIRECTION_LABEL[context.touchDirection] : "—"}
+        />
+        <Row
+          label="Level price"
+          value={context.levelPrice !== null ? formatPrice(context.levelPrice) : "—"}
+        />
+        <Row label="Chart timeframe" value={context.chartTimeframe ?? "—"} />
+      </dl>
+    </Card>
   );
 }
 
