@@ -9,7 +9,11 @@ export class TradeReviewRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
   findAlertById(alertId: string) {
-    return this.prisma.alert.findUnique({ where: { id: alertId }, select: { id: true } });
+    // `signal` is the ONLY source of trade direction for the risk plan.
+    return this.prisma.alert.findUnique({
+      where: { id: alertId },
+      select: { id: true, signal: true },
+    });
   }
 
   findByAlertId(alertId: string) {
