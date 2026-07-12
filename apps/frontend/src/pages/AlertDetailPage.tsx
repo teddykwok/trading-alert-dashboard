@@ -7,6 +7,7 @@ import { MockAiBadge } from "../components/alerts/MockAiBadge";
 import { OpenAiBadge } from "../components/alerts/OpenAiBadge";
 import { AiOpinionPanel } from "../components/alerts/AiOpinionPanel";
 import { TradeOutcomePanel } from "../components/alerts/TradeOutcomePanel";
+import { FuturesRiskPlanner } from "../components/alerts/FuturesRiskPlanner";
 import { ScreenshotPreview } from "../components/charts/ScreenshotPreview";
 import { alertsApi } from "../api/alerts.api";
 import { getSocket } from "../sockets/socket";
@@ -92,6 +93,8 @@ export function AlertDetailPage() {
               className="h-auto w-full"
             />
           </Card>
+
+          <FuturesRiskPlanner alert={alert} />
 
           <Card className="p-4">
             <h2 className="mb-3 text-sm font-semibold text-slate-200">Raw webhook payload</h2>

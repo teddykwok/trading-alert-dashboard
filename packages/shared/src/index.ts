@@ -23,7 +23,30 @@ export {
   TRADE_REVIEW_STATUSES,
 } from "./constants";
 
-export type { TradeReview, TradeReviewStats, TradeReviewStatus } from "./trade-review-types";
+export type {
+  TradeReview,
+  TradeReviewStats,
+  TradeReviewStatus,
+  TradeReviewWithPlan,
+} from "./trade-review-types";
+
+export type {
+  FuturesRiskPlan,
+  FuturesRiskPlanInput,
+  PlanDirection,
+  TradeMarginMode,
+} from "./futures-risk";
+export {
+  calculateFuturesRiskPlan,
+  TRADE_MARGIN_MODES,
+  HIGH_LEVERAGE_WARNING_THRESHOLD,
+  NON_DIRECTIONAL_PLAN_MESSAGE,
+  ISOLATED_MARGIN_WARNING,
+  LIQUIDATION_BEFORE_STOP_WARNING,
+  LIQUIDATION_BEFORE_STOP_WARNING_SHORT,
+  CROSS_MARGIN_WARNING,
+  HIGH_LEVERAGE_WARNING,
+} from "./futures-risk";
 
 export type { ChartPriceFormat } from "./format-price";
 export { formatDynamicPrice, priceDecimalsFor, pricePrecisionFor } from "./format-price";

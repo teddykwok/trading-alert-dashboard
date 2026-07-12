@@ -37,6 +37,11 @@ enum TradeReviewStatus {
   BREAKEVEN
 }
 
+enum TradeMarginMode {
+  ISOLATED
+  CROSS
+}
+
 model Asset {
   id        String    @id @default(cuid())
   symbol    String
@@ -102,8 +107,21 @@ model TradeReview {
   notes      String?
   openedAt   DateTime?
   closedAt   DateTime?
-  createdAt  DateTime          @default(now())
-  updatedAt  DateTime          @updatedAt
+
+  // Futures risk-planner INPUTS only. Derived values (risk budget, quantity,
+  // notional, required margin, R:R, expected profit, …) are deliberately NOT
+  // stored — they are recalculated from these inputs on every read so they
+  // can never drift out of sync.
+  stopLossPrice    Decimal?         @db.Decimal(30, 12)
+  takeProfitPrice  Decimal?         @db.Decimal(30, 12)
+  accountBalance   Decimal?         @db.Decimal(30, 12)
+  riskPercent      Decimal?         @db.Decimal(10, 6)
+  leverage         Decimal?         @db.Decimal(10, 4)
+  marginMode       TradeMarginMode?
+  liquidationPrice Decimal?         @db.Decimal(30, 12)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([status])
 }

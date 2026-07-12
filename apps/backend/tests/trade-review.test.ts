@@ -7,6 +7,7 @@ import {
 } from "../src/modules/trade-review/trade-review.service";
 import { tradeReviewUpsertSchema } from "../src/modules/trade-review/trade-review.schema";
 import { NotFoundError } from "../src/utils/errors";
+import { NON_DIRECTIONAL_PLAN_MESSAGE } from "@trading-alert-dashboard/shared";
 
 const NOW = new Date("2026-07-11T10:00:00Z");
 const OPENED = new Date("2026-07-10T08:00:00Z");
@@ -14,6 +15,8 @@ const CLOSED = new Date("2026-07-10T20:00:00Z");
 
 interface MockOptions {
   alertExists?: boolean;
+  /** Alert.signal — the only source of plan direction. */
+  signal?: string;
   existingReview?: Record<string, unknown> | null;
   groupBy?: Array<{ status: string; _count: { _all: number } }>;
   alertCount?: number;
@@ -31,7 +34,9 @@ function createMockPrisma(options: MockOptions = {}) {
     alert: {
       findUnique: vi
         .fn()
-        .mockResolvedValue(options.alertExists === false ? null : { id: "alert_1" }),
+        .mockResolvedValue(
+          options.alertExists === false ? null : { id: "alert_1", signal: options.signal }
+        ),
       count: vi.fn().mockResolvedValue(options.alertCount ?? 0),
     },
     tradeReview: {
@@ -91,12 +96,16 @@ describe("resolveReviewTimestamps", () => {
 
 describe("TradeReviewService.getForAlert", () => {
   it("returns a default UNREVIEWED representation when no review exists", async () => {
-    const prisma = createMockPrisma({ existingReview: null });
+    const prisma = createMockPrisma({ existingReview: null, signal: "LONG" });
     const service = new TradeReviewService(prisma);
 
     const result = await service.getForAlert("alert_1");
 
-    expect(result).toEqual(defaultTradeReview("alert_1"));
+    expect(result).toEqual({
+      ...defaultTradeReview("alert_1"),
+      futuresRiskPlan: null, // planner inputs incomplete -> no computed plan
+      futuresRiskPlanMessage: null,
+    });
     expect(result.status).toBe("UNREVIEWED");
     expect(result.id).toBeNull();
   });
@@ -227,6 +236,169 @@ describe("TradeReviewService.upsertForAlert", () => {
       NotFoundError
     );
     expect(prisma.tradeReview.upsert).not.toHaveBeenCalled();
+  });
+});
+
+describe("TradeReviewService.upsertForAlert — futures risk plan fields", () => {
+  it("saves every planner field with exact decimal strings", async () => {
+    const prisma = createMockPrisma({ existingReview: null, signal: "LONG" });
+    const service = new TradeReviewService(prisma);
+
+    await service.upsertForAlert("alert_1", {
+      entryPrice: "0.004086",
+      stopLossPrice: "0.003950",
+      takeProfitPrice: "0.004358",
+      accountBalance: "1000",
+      riskPercent: "1",
+      leverage: "25",
+      marginMode: "ISOLATED",
+      liquidationPrice: "0.003900",
+    });
+
+    const { create } = upsertDataOf(prisma);
+    expect(create.entryPrice).toBe("0.004086"); // exact strings, no float trip
+    expect(create.stopLossPrice).toBe("0.003950");
+    expect(create.takeProfitPrice).toBe("0.004358");
+    expect(create.accountBalance).toBe("1000");
+    expect(create.riskPercent).toBe("1");
+    expect(create.leverage).toBe("25");
+    expect(create.marginMode).toBe("ISOLATED");
+    expect(create.liquidationPrice).toBe("0.003900");
+  });
+
+  it("partial update touches only the provided planner fields", async () => {
+    const prisma = createMockPrisma({
+      existingReview: { status: "OPEN", stopLossPrice: "95", leverage: "25" },
+      signal: "LONG",
+    });
+    const service = new TradeReviewService(prisma);
+
+    await service.upsertForAlert("alert_1", { leverage: "100" });
+
+    const { update } = upsertDataOf(prisma);
+    expect(update.leverage).toBe("100");
+    expect(update).not.toHaveProperty("stopLossPrice");
+    expect(update).not.toHaveProperty("takeProfitPrice");
+    expect(update).not.toHaveProperty("accountBalance");
+    expect(update).not.toHaveProperty("status");
+  });
+
+  it("clears optional planner fields on explicit null", async () => {
+    const prisma = createMockPrisma({
+      existingReview: { liquidationPrice: "90", takeProfitPrice: "110" },
+      signal: "LONG",
+    });
+    const service = new TradeReviewService(prisma);
+
+    await service.upsertForAlert("alert_1", { liquidationPrice: null, takeProfitPrice: null });
+
+    const { update } = upsertDataOf(prisma);
+    expect(update.liquidationPrice).toBeNull();
+    expect(update.takeProfitPrice).toBeNull();
+  });
+});
+
+describe("TradeReviewService — computed futuresRiskPlan", () => {
+  const LONG_PLAN_REVIEW = {
+    status: "OPEN",
+    entryPrice: "100",
+    stopLossPrice: "95",
+    takeProfitPrice: "110",
+    accountBalance: "1000",
+    riskPercent: "1",
+    leverage: "25",
+    marginMode: "ISOLATED",
+    liquidationPrice: null,
+  };
+
+  it("attaches a computed plan for a LONG alert", async () => {
+    const prisma = createMockPrisma({ existingReview: LONG_PLAN_REVIEW, signal: "LONG" });
+    const service = new TradeReviewService(prisma);
+
+    const result = await service.getForAlert("alert_1");
+
+    expect(result.futuresRiskPlanMessage).toBeNull();
+    expect(result.futuresRiskPlan?.valid).toBe(true);
+    expect(result.futuresRiskPlan?.riskBudget).toBe("10");
+    expect(result.futuresRiskPlan?.positionQuantity).toBe("2");
+    expect(result.futuresRiskPlan?.positionNotional).toBe("200");
+    expect(result.futuresRiskPlan?.requiredMargin).toBe("8");
+    expect(result.futuresRiskPlan?.riskRewardRatio).toBe("2");
+  });
+
+  it("attaches a computed plan for a SHORT alert", async () => {
+    const prisma = createMockPrisma({
+      existingReview: { ...LONG_PLAN_REVIEW, stopLossPrice: "105", takeProfitPrice: "90" },
+      signal: "SHORT",
+    });
+    const service = new TradeReviewService(prisma);
+
+    const result = await service.getForAlert("alert_1");
+
+    expect(result.futuresRiskPlan?.valid).toBe(true);
+    expect(result.futuresRiskPlan?.positionQuantity).toBe("2");
+    expect(result.futuresRiskPlan?.expectedProfitAtTakeProfit).toBe("20");
+  });
+
+  it("returns the directional message instead of a plan for WATCH alerts", async () => {
+    const prisma = createMockPrisma({ existingReview: LONG_PLAN_REVIEW, signal: "WATCH" });
+    const service = new TradeReviewService(prisma);
+
+    const result = await service.getForAlert("alert_1");
+
+    expect(result.futuresRiskPlan).toBeNull();
+    expect(result.futuresRiskPlanMessage).toBe(NON_DIRECTIONAL_PLAN_MESSAGE);
+    // plan inputs are still stored/returned for later use
+    expect(result.entryPrice).toBe("100");
+  });
+
+  it("returns a null plan without a message when inputs are incomplete", async () => {
+    const prisma = createMockPrisma({
+      existingReview: { ...LONG_PLAN_REVIEW, accountBalance: null },
+      signal: "LONG",
+    });
+    const service = new TradeReviewService(prisma);
+
+    const result = await service.getForAlert("alert_1");
+
+    expect(result.futuresRiskPlan).toBeNull();
+    expect(result.futuresRiskPlanMessage).toBeNull();
+  });
+
+  it("also enriches the upsert response with the plan", async () => {
+    const prisma = createMockPrisma({ existingReview: LONG_PLAN_REVIEW, signal: "LONG" });
+    const service = new TradeReviewService(prisma);
+
+    const result = await service.upsertForAlert("alert_1", { leverage: "100" });
+
+    expect(result.futuresRiskPlan?.valid).toBe(true);
+    expect(result.futuresRiskPlan?.requiredMargin).toBe("2"); // 200 / 100
+    // leverage change: risk/size identical to the 25x plan
+    expect(result.futuresRiskPlan?.riskBudget).toBe("10");
+    expect(result.futuresRiskPlan?.positionQuantity).toBe("2");
+    expect(result.futuresRiskPlan?.positionNotional).toBe("200");
+  });
+});
+
+describe("tradeReviewUpsertSchema — planner fields", () => {
+  it("rejects invalid marginMode and leverage below 1", () => {
+    expect(tradeReviewUpsertSchema.safeParse({ marginMode: "HEDGE" }).success).toBe(false);
+    expect(tradeReviewUpsertSchema.safeParse({ leverage: "0" }).success).toBe(false);
+    expect(tradeReviewUpsertSchema.safeParse({ leverage: 0.5 }).success).toBe(false);
+  });
+
+  it("accepts valid planner payloads", () => {
+    expect(
+      tradeReviewUpsertSchema.safeParse({
+        stopLossPrice: "0.003950",
+        takeProfitPrice: "0.004358",
+        accountBalance: "1000",
+        riskPercent: "1",
+        leverage: "25",
+        marginMode: "CROSS",
+        liquidationPrice: null,
+      }).success
+    ).toBe(true);
   });
 });
 
