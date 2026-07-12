@@ -14,7 +14,7 @@
 //     TIDAK diubah.
 //   - "timeframe" di JSON = timeframe CHART (format backend, mis. "1h") agar
 //     screenshot Binance memakai interval yang valid; detail level ada di "note".
-indicator("teddy v5.5 (Sinar Final)", overlay=true)
+indicator("teddy v5.5 (Sinar Final)", overlay=true, max_labels_count=500, max_lines_count=500)
 
 // =================================================================================
 // BAGIAN 1: PENGATURAN INPUT DARI PENGGUNA
@@ -80,6 +80,17 @@ minBarsAfterCreation = input.int(5, "Min Bars After Level Creation Before Touch 
 // level (sekali per bar per level); "Bar Close" = tunggu candle chart ditutup.
 // Hanya memengaruhi LEVEL_TOUCHED; LEVEL_CREATED tetap menunggu bar close.
 touchAlertTiming = input.string("Immediate", "Touch Alert Timing", options=["Immediate", "Bar Close"], group = GRP_WEBHOOK)
+
+// --- Marker visual untuk event LEVEL_TOUCHED (BAGIAN 4). Murni tampilan;
+//     tidak mengubah alert, cooldown, atau JSON webhook. ---
+var GRP_MARKERS = "Visual Touch Markers"
+showTouchSignalMarkers = input.bool(true, "Show LONG / SHORT Markers", group = GRP_MARKERS)
+showWatchMarkers = input.bool(false, "Show WATCH Markers", group = GRP_MARKERS)
+touchMarkerTextSizeInput = input.string("small", "Marker Text Size", options = ["tiny", "small", "normal"], group = GRP_MARKERS)
+touchMarkerTextSize = f_stringToSize(touchMarkerTextSizeInput)
+longMarkerColor = input.color(color.green, "LONG Marker Color", group = GRP_MARKERS)
+shortMarkerColor = input.color(color.red, "SHORT Marker Color", group = GRP_MARKERS)
+watchMarkerColor = input.color(color.yellow, "WATCH Marker Color", group = GRP_MARKERS)
 
 // =================================================================================
 // BAGIAN 1B: HELPER JSON WEBHOOK
@@ -248,3 +259,13 @@ if enableWebhookAlerts and enableLevelTouchedAlerts and webhookSecret != "" and 
             else
                 alert(f_buildWebhookJson(touchSignal, levelPrice, touchNote), alert.freq_once_per_bar_close)
             array.set(lvlLastTouchBar, i, bar_index)
+
+            // Marker visual: satu label per event sentuhan yang sama (mengikuti
+            // aturan cooldown/min-bars di atas). Teks ringkas: sinyal + TF sumber.
+            markerTf = array.get(lvlTf, i)
+            if showTouchSignalMarkers and touchSignal == "LONG"
+                label.new(bar_index, low, text="LONG " + markerTf, color=longMarkerColor, textcolor=labelTextColor, style=label.style_label_up, size=touchMarkerTextSize)
+            if showTouchSignalMarkers and touchSignal == "SHORT"
+                label.new(bar_index, high, text="SHORT " + markerTf, color=shortMarkerColor, textcolor=labelTextColor, style=label.style_label_down, size=touchMarkerTextSize)
+            if showWatchMarkers and touchSignal == "WATCH"
+                label.new(bar_index, levelPrice, text="WATCH " + markerTf, color=watchMarkerColor, textcolor=labelTextColor, style=label.style_label_left, size=touchMarkerTextSize)
