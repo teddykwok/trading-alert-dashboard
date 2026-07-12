@@ -6,6 +6,7 @@ import { MockAiBadge } from "./MockAiBadge";
 import { OpenAiBadge } from "./OpenAiBadge";
 import { DuplicateBadge } from "./DuplicateBadge";
 import { OutcomeBadge } from "./OutcomeBadge";
+import { LevelContextBadges } from "./LevelContextBadges";
 import { ScreenshotPreview } from "../charts/ScreenshotPreview";
 import { formatPrice } from "../../utils/formatPrice";
 import { formatRelativeTime } from "../../utils/formatDate";
@@ -35,9 +36,10 @@ export function AlertCard({ alert }: { alert: Alert }) {
             )}
           </div>
 
-          <div className="mt-1 flex items-center gap-3 text-xs text-slate-500">
+          <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-slate-500">
             <span>{formatPrice(alert.price)}</span>
             <span>{formatRelativeTime(alert.createdAt)}</span>
+            <LevelContextBadges context={alert.alertContext} />
           </div>
 
           {alert.aiSummary && (

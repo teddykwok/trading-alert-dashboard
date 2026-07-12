@@ -1,4 +1,4 @@
-import type { Alert, AlertStatus, AssetType, SignalType } from "./alert";
+import type { Alert, AlertStatus, AssetType, LevelColor, SignalType, SourceTimeframe } from "./alert";
 
 export interface AlertListResponse {
   items: Alert[];
@@ -12,6 +12,9 @@ export interface AlertListQuery {
   symbol?: string;
   signal?: SignalType;
   assetType?: AssetType;
+  /** Timeframe the level originated on (1D…12M) — not the chart timeframe. */
+  sourceTimeframe?: SourceTimeframe;
+  levelColor?: LevelColor;
   limit?: number;
   offset?: number;
 }

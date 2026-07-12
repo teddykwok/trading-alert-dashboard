@@ -1,3 +1,10 @@
+import type {
+  AlertContext,
+  AlertEventType,
+  LevelColor,
+  TouchDirection,
+} from "./alert-context";
+
 export type AssetType = "CRYPTO" | "STOCK";
 
 export type SignalType = "LONG" | "SHORT" | "WATCH" | "EXIT";
@@ -43,6 +50,23 @@ export interface Alert {
   aiSummary: string | null;
   aiRiskNotes: string[] | null;
   aiProvider: string | null;
+  /**
+   * Structured level context parsed from the webhook note at ingestion time.
+   * Null on alerts received before these columns existed (their context is
+   * still derived on read — see `alertContext`) and on notes without metadata.
+   * `sourceTimeframe` is where the level originated (1D…12M) — NOT the chart
+   * timeframe, which lives in `timeframe`.
+   */
+  eventType: AlertEventType | null;
+  levelColor: LevelColor | null;
+  sourceTimeframe: string | null;
+  touchDirection: TouchDirection | null;
+  /**
+   * Derived level context attached by the API/socket serializer: structured
+   * columns when present, else parsed from the original note; null when the
+   * alert carries no level metadata at all.
+   */
+  alertContext?: AlertContext | null;
   duplicateCount: number;
   lastDuplicateAt: string | null;
   errorMessage: string | null;

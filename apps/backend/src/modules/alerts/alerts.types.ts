@@ -1,6 +1,15 @@
-import type { Alert, AlertStatus, AssetType, SignalType, Prisma } from "@prisma/client";
+import type {
+  Alert,
+  AlertEventType,
+  AlertStatus,
+  AssetType,
+  LevelColor,
+  SignalType,
+  TouchDirection,
+  Prisma,
+} from "@prisma/client";
 
-export type { Alert, AlertStatus, AssetType, SignalType };
+export type { Alert, AlertEventType, AlertStatus, AssetType, LevelColor, SignalType, TouchDirection };
 
 export interface CreateAlertInput {
   assetId: string | null;
@@ -14,6 +23,13 @@ export interface CreateAlertInput {
   indicatorValue: number | null;
   rawPayload: Prisma.InputJsonValue;
   triggeredAt: Date;
+  // Level context parsed from the webhook note (all null when the note has
+  // no structured metadata). sourceTimeframe = level origin tf, NOT the
+  // chart timeframe stored in `timeframe`.
+  eventType: AlertEventType | null;
+  levelColor: LevelColor | null;
+  sourceTimeframe: string | null;
+  touchDirection: TouchDirection | null;
 }
 
 export interface AlertListFilter {
@@ -21,6 +37,8 @@ export interface AlertListFilter {
   symbol?: string;
   signal?: SignalType;
   assetType?: AssetType;
+  sourceTimeframe?: string;
+  levelColor?: LevelColor;
   limit: number;
   offset: number;
 }

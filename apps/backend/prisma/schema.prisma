@@ -42,6 +42,22 @@ enum TradeMarginMode {
   CROSS
 }
 
+enum AlertEventType {
+  LEVEL_CREATED
+  LEVEL_TOUCHED
+}
+
+enum LevelColor {
+  GREEN
+  RED
+}
+
+enum TouchDirection {
+  FROM_ABOVE
+  FROM_BELOW
+  UNKNOWN
+}
+
 model Asset {
   id        String    @id @default(cuid())
   symbol    String
@@ -69,6 +85,17 @@ model Alert {
   indicatorName   String?
   indicatorValue  Float?
   rawPayload      Json
+  // Level context parsed once from the webhook note at ingestion. All
+  // nullable: pre-existing alerts and notes without metadata leave them null
+  // (API responses then fall back to parsing the note in rawPayload).
+  // sourceTimeframe is a validated string ("1D".."12M") rather than an enum
+  // because values like "12M" can't be Prisma enum members. It is the
+  // timeframe the LEVEL originated on — `timeframe` above remains the chart
+  // timeframe; the two must never be conflated.
+  eventType       AlertEventType?
+  levelColor      LevelColor?
+  sourceTimeframe String?
+  touchDirection  TouchDirection?
   status          AlertStatus @default(RECEIVED)
   screenshotUrl   String?
   aiBias          String?
@@ -90,6 +117,8 @@ model Alert {
   @@index([signal])
   @@index([createdAt])
   @@index([symbol, assetType, timeframe, signal, indicatorName])
+  @@index([sourceTimeframe])
+  @@index([levelColor])
 }
 
 // Manual live-outcome tracking: one review per alert, filled in by the user

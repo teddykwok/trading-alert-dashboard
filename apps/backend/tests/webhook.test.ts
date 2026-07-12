@@ -187,6 +187,89 @@ describe("handleTradingViewWebhook", () => {
     });
   });
 
+  describe("level context ingestion", () => {
+    const TOUCH_NOTE =
+      "eventType=LEVEL_TOUCHED | levelColor=RED | sourceTf=12M | touchDirection=FROM_BELOW | levelPrice=0.123 | chartTf=1h | alertTiming=Immediate";
+
+    function createData(prisma: PrismaClient) {
+      return (prisma.alert.create as ReturnType<typeof vi.fn>).mock.calls[0][0].data;
+    }
+
+    it("stores the parsed source timeframe, color, event type, and direction", async () => {
+      const prisma = createMockPrisma(null);
+
+      await handleTradingViewWebhook(prisma, { ...validPayload, note: TOUCH_NOTE });
+
+      expect(createData(prisma)).toEqual(
+        expect.objectContaining({
+          eventType: "LEVEL_TOUCHED",
+          levelColor: "RED",
+          sourceTimeframe: "12M",
+          touchDirection: "FROM_BELOW",
+        })
+      );
+    });
+
+    it("keeps sourceTimeframe distinct from the chart timeframe field", async () => {
+      const prisma = createMockPrisma(null);
+
+      await handleTradingViewWebhook(prisma, { ...validPayload, note: TOUCH_NOTE });
+
+      const data = createData(prisma);
+      expect(data.timeframe).toBe("1h"); // chart timeframe from the payload
+      expect(data.sourceTimeframe).toBe("12M"); // level origin from the note
+    });
+
+    it("preserves the original note verbatim inside rawPayload", async () => {
+      const prisma = createMockPrisma(null);
+
+      await handleTradingViewWebhook(prisma, { ...validPayload, note: TOUCH_NOTE });
+
+      expect(createData(prisma).rawPayload).toEqual(expect.objectContaining({ note: TOUCH_NOTE }));
+    });
+
+    it("stores null context fields for a free-text note without guessing from the signal", async () => {
+      const prisma = createMockPrisma(null);
+
+      await handleTradingViewWebhook(prisma, { ...validPayload, note: "Bullish reversal zone detected" });
+
+      expect(createData(prisma)).toEqual(
+        expect.objectContaining({
+          eventType: null,
+          levelColor: null,
+          sourceTimeframe: null,
+          touchDirection: null,
+        })
+      );
+    });
+
+    it("stores null context fields when the note is missing", async () => {
+      const prisma = createMockPrisma(null);
+      const { note: _note, ...noNote } = validPayload;
+
+      await handleTradingViewWebhook(prisma, noNote);
+
+      expect(createData(prisma)).toEqual(
+        expect.objectContaining({ eventType: null, sourceTimeframe: null })
+      );
+    });
+
+    it("still suppresses duplicates identically when the note carries level context", async () => {
+      const prisma = createMockPrisma(NEW_ALERT_FIXTURE);
+
+      const result = await handleTradingViewWebhook(prisma, { ...validPayload, note: TOUCH_NOTE });
+
+      expect(result.status).toBe("IGNORED_DUPLICATE");
+      expect(prisma.alert.create).not.toHaveBeenCalled();
+
+      // The duplicate lookup must not have gained any level-context fields.
+      const lookupWhere = (prisma.alert.findFirst as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+      expect(Object.keys(lookupWhere).sort()).toEqual(
+        ["assetType", "createdAt", "indicatorName", "signal", "symbol", "timeframe"].sort()
+      );
+    });
+  });
+
   describe("duplicate suppression", () => {
     it("increments duplicateCount instead of creating a new alert when a matching alert exists within the window", async () => {
       const existing = { ...NEW_ALERT_FIXTURE, duplicateCount: 0 };
