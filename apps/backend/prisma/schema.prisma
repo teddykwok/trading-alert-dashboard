@@ -42,6 +42,17 @@ enum TradeMarginMode {
   CROSS
 }
 
+enum TradeEmotion {
+  CALM
+  ANXIOUS
+  EXCITED
+  FRUSTRATED
+  TIRED
+  FOMO
+  REVENGE
+  UNCERTAIN
+}
+
 enum AlertEventType {
   LEVEL_CREATED
   LEVEL_TOUCHED
@@ -111,6 +122,7 @@ model Alert {
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
   tradeReview     TradeReview?
+  tradeJournal    TradeJournal?
 
   @@index([status])
   @@index([symbol])
@@ -153,6 +165,41 @@ model TradeReview {
   updatedAt DateTime @updatedAt
 
   @@index([status])
+}
+
+// Pre-trade checklist + psychology journal: one journal per alert, filled in
+// manually by the user. Separate from TradeReview for the same reason
+// TradeReview is separate from Alert — a distinct concern with its own
+// lifecycle. Derived values (completed count, percentage, completeness) are
+// deliberately NOT stored; they are recomputed from the booleans on every
+// read so they can never drift. No score of any kind is stored or computed.
+// Checklist keys mirror TRADE_CHECKLIST_ITEMS in packages/shared.
+model TradeJournal {
+  id      String @id @default(cuid())
+  alertId String @unique
+  alert   Alert  @relation(fields: [alertId], references: [id], onDelete: Cascade)
+
+  // Pre-trade checklist (unchecked by default).
+  signalMatchesPlan      Boolean @default(false)
+  entryStopTargetDefined Boolean @default(false)
+  riskWithinLimit        Boolean @default(false)
+  leverageReviewed       Boolean @default(false)
+  notFomo                Boolean @default(false)
+  notRevengeTrade        Boolean @default(false)
+  acceptsPotentialLoss   Boolean @default(false)
+
+  // Psychology — all self-reported, all optional.
+  emotion             TradeEmotion?
+  confidenceLevel     Int? // 1–5, validated at the API boundary
+  reasonForEntry      String? @db.Text
+  preTradeNotes       String? @db.Text
+  postTradeReflection String? @db.Text
+  lessonLearned       String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([emotion])
 }
 
 model Setting {

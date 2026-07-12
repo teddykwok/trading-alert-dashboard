@@ -62,9 +62,24 @@ export class AlertsRepository {
       orderBy: { createdAt: "desc" },
       take: filter.limit,
       skip: filter.offset,
-      // Manual trade-review status rides along so alert cards can show an
-      // outcome badge without a request per alert.
-      include: { tradeReview: { select: { status: true } } },
+      // Manual trade-review status and journal checklist ride along so alert
+      // cards can show outcome / "Checklist n/7" badges without a request per
+      // alert. The summary itself is derived client-side from the booleans.
+      include: {
+        tradeReview: { select: { status: true } },
+        tradeJournal: {
+          select: {
+            signalMatchesPlan: true,
+            entryStopTargetDefined: true,
+            riskWithinLimit: true,
+            leverageReviewed: true,
+            notFomo: true,
+            notRevengeTrade: true,
+            acceptsPotentialLoss: true,
+            emotion: true,
+          },
+        },
+      },
     });
   }
 

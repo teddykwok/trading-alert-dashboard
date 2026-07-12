@@ -7,6 +7,7 @@ import { OpenAiBadge } from "./OpenAiBadge";
 import { DuplicateBadge } from "./DuplicateBadge";
 import { OutcomeBadge } from "./OutcomeBadge";
 import { LevelContextBadges } from "./LevelContextBadges";
+import { ChecklistBadge } from "./ChecklistBadge";
 import { ScreenshotPreview } from "../charts/ScreenshotPreview";
 import { formatPrice } from "../../utils/formatPrice";
 import { formatRelativeTime } from "../../utils/formatDate";
@@ -40,6 +41,7 @@ export function AlertCard({ alert }: { alert: Alert }) {
             <span>{formatPrice(alert.price)}</span>
             <span>{formatRelativeTime(alert.createdAt)}</span>
             <LevelContextBadges context={alert.alertContext} />
+            <ChecklistBadge journal={alert.tradeJournal} />
           </div>
 
           {alert.aiSummary && (
