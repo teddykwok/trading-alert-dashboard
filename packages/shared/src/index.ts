@@ -67,5 +67,24 @@ export {
   HIGH_LEVERAGE_WARNING,
 } from "./futures-risk";
 
+export type {
+  TradeChecklist,
+  TradeChecklistKey,
+  TradeChecklistSummary,
+  TradeDisciplineStats,
+  TradeEmotion,
+  TradeJournal,
+  TradeJournalWithSummary,
+} from "./trade-journal";
+export {
+  TRADE_CHECKLIST_ITEMS,
+  TRADE_CONFIDENCE_MAX,
+  TRADE_CONFIDENCE_MIN,
+  TRADE_EMOTIONS,
+  TRADE_EMOTION_LABELS,
+  TRADE_JOURNAL_TEXT_LIMITS,
+  summarizeChecklist,
+} from "./trade-journal";
+
 export type { ChartPriceFormat } from "./format-price";
 export { formatDynamicPrice, priceDecimalsFor, pricePrecisionFor } from "./format-price";

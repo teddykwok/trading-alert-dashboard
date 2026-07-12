@@ -7,6 +7,7 @@ import { MockAiBadge } from "../components/alerts/MockAiBadge";
 import { OpenAiBadge } from "../components/alerts/OpenAiBadge";
 import { AiOpinionPanel } from "../components/alerts/AiOpinionPanel";
 import { TradeOutcomePanel } from "../components/alerts/TradeOutcomePanel";
+import { TradeJournalPanel } from "../components/alerts/TradeJournalPanel";
 import { FuturesRiskPlanner } from "../components/alerts/FuturesRiskPlanner";
 import { ScreenshotPreview } from "../components/charts/ScreenshotPreview";
 import { alertsApi } from "../api/alerts.api";
@@ -125,6 +126,8 @@ export function AlertDetailPage() {
           {alert.alertContext && <LevelContextCard context={alert.alertContext} />}
 
           <TradeOutcomePanel alertId={alert.id} />
+
+          <TradeJournalPanel alertId={alert.id} />
 
           <AiOpinionPanel alert={alert} />
 

@@ -3,6 +3,7 @@ import { Card } from "../components/ui/Card";
 import { AlertFeed } from "../components/alerts/AlertFeed";
 import { AlertFilters } from "../components/alerts/AlertFilters";
 import { OutcomeSummary } from "../components/alerts/OutcomeSummary";
+import { TradeDisciplineSummary } from "../components/alerts/TradeDisciplineSummary";
 import { useAlerts } from "../hooks/useAlerts";
 import { useSocketAlerts } from "../hooks/useSocketAlerts";
 import { useFilters } from "../hooks/useFilters";
@@ -72,6 +73,8 @@ export function DashboardPage() {
       </div>
 
       <OutcomeSummary />
+
+      <TradeDisciplineSummary />
 
       <AlertFilters filters={filters} setFilter={setFilter} reset={reset} hasActiveFilters={hasActiveFilters} />
 

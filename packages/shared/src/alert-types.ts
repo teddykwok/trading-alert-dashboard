@@ -78,6 +78,16 @@ export interface Alert {
    * manual trade review's status, used for the outcome badge on alert cards.
    */
   tradeReview?: { status: import("./trade-review-types").TradeReviewStatus } | null;
+  /**
+   * Present on list responses (and undefined on socket-pushed alerts): the
+   * journal's checklist booleans + emotion, used for the "Checklist n/7"
+   * badge on alert cards. Null when no journal exists for the alert.
+   */
+  tradeJournal?:
+    | (import("./trade-journal").TradeChecklist & {
+        emotion: import("./trade-journal").TradeEmotion | null;
+      })
+    | null;
 }
 
 export interface Asset {
