@@ -7,7 +7,11 @@ interface ScreenshotPreviewProps {
 }
 
 export function resolveScreenshotUrl(screenshotUrl: string): string {
-  return `${import.meta.env.VITE_API_URL}${screenshotUrl}`;
+  // Same base-URL rule as the API client: explicit VITE_API_URL wins, otherwise
+  // same-origin ("/screenshots/…" via the Vite proxy). Never falls back to
+  // localhost so screenshots load for remote (Tailscale) viewers too.
+  const base = import.meta.env.VITE_API_URL?.trim() || "";
+  return `${base}${screenshotUrl}`;
 }
 
 export function ScreenshotPreview({ screenshotUrl, alt, className }: ScreenshotPreviewProps) {

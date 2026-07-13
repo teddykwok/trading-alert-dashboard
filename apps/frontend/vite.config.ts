@@ -24,6 +24,19 @@ export default defineConfig(({ mode }) => {
       // Explicit allow-list (never `true`). localhost/IP access is still
       // permitted by Vite regardless of this list.
       allowedHosts,
+      // Same-origin proxy so the browser only ever talks to this dev-server
+      // origin (e.g. the Tailscale hostname) and never needs to reach the
+      // backend on localhost:4000 directly — on a remote machine "localhost"
+      // would be that machine, not the backend host. The backend serves these
+      // exact prefixes; none are rewritten:
+      //   /api/*        -> Fastify routes
+      //   /socket.io/*  -> Socket.IO (default path; ws:true for the upgrade)
+      //   /screenshots/*-> Fastify static (used by ScreenshotPreview)
+      proxy: {
+        "/api": { target: "http://127.0.0.1:4000", changeOrigin: true },
+        "/socket.io": { target: "http://127.0.0.1:4000", changeOrigin: true, ws: true },
+        "/screenshots": { target: "http://127.0.0.1:4000", changeOrigin: true },
+      },
     },
   };
 });

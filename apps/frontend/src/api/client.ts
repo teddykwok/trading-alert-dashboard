@@ -1,6 +1,11 @@
 import type { ApiErrorBody } from "../types/api";
 
-const API_BASE_URL = import.meta.env.VITE_API_URL;
+// An explicit VITE_API_URL overrides everything (e.g. pointing at a separate
+// API host). When empty/unset we use same-origin relative requests ("/api/…"),
+// so remote access through Tailscale Serve + the Vite proxy just works and the
+// browser never has to reach localhost:4000 directly. No localhost fallback.
+const configuredApiUrl = import.meta.env.VITE_API_URL?.trim();
+const API_BASE_URL = configuredApiUrl || "";
 
 export class ApiRequestError extends Error {
   status: number;
