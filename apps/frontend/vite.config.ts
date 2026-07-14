@@ -16,6 +16,13 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     server: {
+      // Bind IPv4 loopback explicitly. Without this Vite listens on "localhost",
+      // which on IPv6-first machines resolves to ::1 and binds IPv6 ONLY — then
+      // Tailscale Serve / Test-NetConnection (which target 127.0.0.1) get a
+      // connection refused (502). 127.0.0.1 stays loopback-only (no LAN
+      // exposure; remote access is via Tailscale Serve) and is deterministic
+      // regardless of a machine's localhost resolution order.
+      host: "127.0.0.1",
       port: 5173,
       // Exit instead of silently falling back to 5174 when 5173 is taken, so
       // Tailscale Serve (which proxies to localhost:5173) never points at the
