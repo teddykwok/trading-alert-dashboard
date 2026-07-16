@@ -11,6 +11,7 @@ export function App() {
       <Routes>
         <Route path="/" element={<DashboardPage />} />
         <Route path="/alerts/:id" element={<AlertDetailPage />} />
+        {/* Not linked from the sidebar — kept reachable by URL for debugging. */}
         <Route path="/assets" element={<AssetsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Routes>

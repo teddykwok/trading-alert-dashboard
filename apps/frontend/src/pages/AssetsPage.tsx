@@ -4,7 +4,9 @@ import { Button } from "../components/ui/Button";
 import { Badge } from "../components/ui/Badge";
 import { Modal } from "../components/ui/Modal";
 import { EmptyState } from "../components/ui/EmptyState";
+import { getSymbolInputError } from "@trading-alert-dashboard/shared";
 import { assetsApi } from "../api/assets.api";
+import { ApiRequestError } from "../api/client";
 import type { Asset } from "../types/asset";
 
 interface AssetFormState {
@@ -22,6 +24,8 @@ export function AssetsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState<AssetFormState>(EMPTY_FORM);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   async function refetch() {
     setLoading(true);
@@ -37,6 +41,7 @@ export function AssetsPage() {
   function openCreate() {
     setEditingId(null);
     setForm(EMPTY_FORM);
+    setFormError(null);
     setModalOpen(true);
   }
 
@@ -48,20 +53,38 @@ export function AssetsPage() {
       name: asset.name ?? "",
       exchange: asset.exchange ?? "",
     });
+    setFormError(null);
     setModalOpen(true);
   }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    if (editingId) {
-      await assetsApi.update(editingId, { name: form.name || undefined, exchange: form.exchange || undefined });
-    } else {
-      await assetsApi.create({
-        symbol: form.symbol,
-        assetType: form.assetType,
-        name: form.name || undefined,
-        exchange: form.exchange || undefined,
-      });
+    setFormError(null);
+
+    const symbol = form.symbol.trim();
+    if (!editingId) {
+      // Same rule the backend enforces: one ticker, no pasted watchlists.
+      const symbolError = getSymbolInputError(symbol);
+      if (symbolError) {
+        setFormError(symbolError);
+        return;
+      }
+    }
+
+    try {
+      if (editingId) {
+        await assetsApi.update(editingId, { name: form.name || undefined, exchange: form.exchange || undefined });
+      } else {
+        await assetsApi.create({
+          symbol,
+          assetType: form.assetType,
+          name: form.name || undefined,
+          exchange: form.exchange || undefined,
+        });
+      }
+    } catch (error) {
+      setFormError(error instanceof ApiRequestError ? error.message : "Request failed — please try again.");
+      return;
     }
     setModalOpen(false);
     await refetch();
@@ -72,8 +95,23 @@ export function AssetsPage() {
     await refetch();
   }
 
-  async function handleDelete(id: string) {
-    await assetsApi.remove(id);
+  async function handleDelete(asset: Asset) {
+    // Deleting an asset never deletes alerts — the Alert.assetId FK is
+    // ON DELETE SET NULL, so alert history is kept, just detached.
+    if (!window.confirm(`Delete ${asset.symbol}? Alert history is kept, but will no longer link to this asset.`)) {
+      return;
+    }
+    setActionError(null);
+    try {
+      await assetsApi.remove(asset.id);
+    } catch (error) {
+      setActionError(
+        error instanceof ApiRequestError
+          ? `Could not delete ${asset.symbol}: ${error.message}`
+          : `Could not delete ${asset.symbol} — please try again.`
+      );
+      return;
+    }
     await refetch();
   }
 
@@ -83,6 +121,8 @@ export function AssetsPage() {
         <h1 className="text-lg font-semibold text-slate-100">Assets</h1>
         <Button onClick={openCreate}>Add asset</Button>
       </div>
+
+      {actionError && <p className="text-sm text-red-400">{actionError}</p>}
 
       {loading ? (
         <p className="text-sm text-slate-500">Loading…</p>
@@ -114,7 +154,7 @@ export function AssetsPage() {
                 <Button variant="secondary" onClick={() => openEdit(asset)}>
                   Edit
                 </Button>
-                <Button variant="danger" onClick={() => handleDelete(asset.id)}>
+                <Button variant="danger" onClick={() => handleDelete(asset)}>
                   Delete
                 </Button>
               </div>
@@ -154,6 +194,7 @@ export function AssetsPage() {
             onChange={(e) => setForm((f) => ({ ...f, exchange: e.target.value }))}
             className="rounded-lg border border-surface-border bg-surface px-3 py-2 text-sm"
           />
+          {formError && <p className="text-sm text-red-400">{formError}</p>}
           <Button type="submit">{editingId ? "Save changes" : "Add asset"}</Button>
         </form>
       </Modal>

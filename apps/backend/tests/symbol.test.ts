@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { getSymbolInputError } from "@trading-alert-dashboard/shared";
 import { inferMarketType, normalizeTradingSymbol } from "../src/utils/symbol";
 import { ValidationError } from "../src/utils/errors";
 
@@ -48,6 +49,32 @@ describe("normalizeTradingSymbol", () => {
     expect(() => normalizeTradingSymbol("BINANCE:")).toThrow(/no symbol/);
   });
 
+  describe("multi-symbol paste guard", () => {
+    it("rejects comma-separated watchlist pastes", () => {
+      expect(() => normalizeTradingSymbol("BTCUSDT,ETHUSDT")).toThrow(ValidationError);
+      expect(() => normalizeTradingSymbol("BTCUSDT, ETHUSDT, SOLUSDT")).toThrow(/single ticker/);
+      expect(() => normalizeTradingSymbol("BINANCE:BTCUSDT,BINANCE:ETHUSDT")).toThrow(ValidationError);
+    });
+
+    it("rejects internal whitespace and newlines", () => {
+      expect(() => normalizeTradingSymbol("BTCUSDT ETHUSDT")).toThrow(ValidationError);
+      expect(() => normalizeTradingSymbol("BTCUSDT\nETHUSDT")).toThrow(ValidationError);
+    });
+
+    it("rejects absurdly long symbols", () => {
+      expect(() => normalizeTradingSymbol("A".repeat(65))).toThrow(/at most 64/);
+    });
+
+    it("still accepts legitimate single tickers", () => {
+      expect(normalizeTradingSymbol("1000XECUSDT").normalizedSymbol).toBe("1000XECUSDT");
+      expect(normalizeTradingSymbol("AAPL").normalizedSymbol).toBe("AAPL");
+      expect(normalizeTradingSymbol("BINANCE:1000XECUSDT.P")).toMatchObject({
+        normalizedSymbol: "1000XECUSDT",
+        marketType: "futures",
+      });
+    });
+  });
+
   describe("perpetual futures (.P) symbols", () => {
     it("normalizes BINANCE:GRASSUSDT.P to GRASSUSDT with marketType futures", () => {
       expect(normalizeTradingSymbol("BINANCE:GRASSUSDT.P")).toEqual({
@@ -83,6 +110,28 @@ describe("normalizeTradingSymbol", () => {
     it("rejects a .P suffix with no symbol", () => {
       expect(() => normalizeTradingSymbol("BINANCE:.P")).toThrow(ValidationError);
     });
+  });
+});
+
+describe("getSymbolInputError (shared UI/API guard)", () => {
+  it("accepts single tickers, with or without exchange prefix or .P suffix", () => {
+    for (const symbol of ["BTCUSDT", "ETHUSDT", "1000XECUSDT", "AAPL", "BINANCE:BTCUSDT", "BINANCE:GRASSUSDT.P", "BRK.B", "BTC-USD"]) {
+      expect(getSymbolInputError(symbol)).toBeNull();
+    }
+  });
+
+  it("tolerates outer whitespace (callers trim before storing)", () => {
+    expect(getSymbolInputError("  BTCUSDT  ")).toBeNull();
+  });
+
+  it("rejects empty, pasted lists, whitespace, newlines, and overlong input", () => {
+    expect(getSymbolInputError("")).toMatch(/required/);
+    expect(getSymbolInputError("   ")).toMatch(/required/);
+    expect(getSymbolInputError("BTCUSDT,ETHUSDT")).toMatch(/single ticker/);
+    expect(getSymbolInputError("BTCUSDT; ETHUSDT")).toMatch(/single ticker/);
+    expect(getSymbolInputError("BTCUSDT ETHUSDT")).toMatch(/single ticker/);
+    expect(getSymbolInputError("BTCUSDT\nETHUSDT")).toMatch(/single ticker/);
+    expect(getSymbolInputError("A".repeat(65))).toMatch(/at most 64/);
   });
 });
 

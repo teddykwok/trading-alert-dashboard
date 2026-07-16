@@ -1,9 +1,10 @@
 import { NavLink } from "react-router-dom";
 import { classNames } from "../../utils/classNames";
 
+// Assets is intentionally not listed: the /assets route still exists for
+// manual/debugging access, but day-to-day workflow is signals-only.
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", end: true },
-  { to: "/assets", label: "Assets" },
   { to: "/settings", label: "Settings" },
 ];
 

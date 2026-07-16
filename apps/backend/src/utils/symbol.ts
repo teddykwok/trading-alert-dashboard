@@ -1,3 +1,4 @@
+import { getSymbolInputError } from "@trading-alert-dashboard/shared";
 import { ValidationError } from "./errors";
 
 /**
@@ -68,6 +69,14 @@ export function normalizeTradingSymbol(input: string): NormalizedTradingSymbol {
         field: "symbol",
       });
     }
+  }
+
+  // Guard against multi-symbol pastes ("BTCUSDT, ETHUSDT, …") reaching the
+  // Asset upsert as one giant symbol. Checked on the parsed parts (not the
+  // raw input) so outer whitespace and "EXCHANGE: SYMBOL" spacing still work.
+  const symbolError = getSymbolInputError(symbolPart) ?? (exchangePart ? getSymbolInputError(exchangePart) : null);
+  if (symbolError) {
+    throw new ValidationError(`Invalid symbol "${input}": ${symbolError}`, { field: "symbol" });
   }
 
   return {

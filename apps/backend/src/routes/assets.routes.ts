@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { ASSET_TYPES } from "@trading-alert-dashboard/shared";
+import { ASSET_TYPES, getSymbolInputError } from "@trading-alert-dashboard/shared";
 import { NotFoundError, ValidationError } from "../utils/errors";
 
 const createAssetSchema = z.object({
@@ -28,9 +28,17 @@ export async function assetsRoutes(app: FastifyInstance): Promise<void> {
       throw new ValidationError("Invalid asset payload", parsed.error.flatten());
     }
 
+    // Rejects pasted watchlists ("BTCUSDT, ETHUSDT, …") and other
+    // whitespace/separator garbage; single tickers of any exchange pass.
+    const symbol = parsed.data.symbol.trim();
+    const symbolError = getSymbolInputError(symbol);
+    if (symbolError) {
+      throw new ValidationError(symbolError, { field: "symbol" });
+    }
+
     const asset = await app.prisma.asset.create({
       data: {
-        symbol: parsed.data.symbol,
+        symbol,
         assetType: parsed.data.assetType,
         name: parsed.data.name ?? null,
         exchange: parsed.data.exchange ?? null,

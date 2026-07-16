@@ -172,6 +172,16 @@ describe("handleTradingViewWebhook", () => {
       expect(prisma.alert.create).not.toHaveBeenCalled();
     });
 
+    it("rejects a comma-separated multi-symbol paste before any DB write", async () => {
+      const prisma = createMockPrisma(null);
+
+      await expect(
+        handleTradingViewWebhook(prisma, { ...validPayload, symbol: "BTCUSDT, ETHUSDT, SOLUSDT" })
+      ).rejects.toBeInstanceOf(ValidationError);
+      expect(prisma.asset.upsert).not.toHaveBeenCalled();
+      expect(prisma.alert.create).not.toHaveBeenCalled();
+    });
+
     it("runs duplicate suppression against the normalized symbol", async () => {
       const prisma = createMockPrisma(NEW_ALERT_FIXTURE); // existing bare-symbol alert
 
