@@ -6,7 +6,28 @@ import {
   SOURCE_TIMEFRAMES,
 } from "@trading-alert-dashboard/shared";
 import { Button } from "../ui/Button";
+import { ACTIONABLE_SIGNALS } from "../../hooks/useFilters";
+import type { SignalType } from "../../types/alert";
 import type { AlertListQuery } from "../../types/api";
+
+// Dropdown option value for the LONG+SHORT group. WATCH/EXIT remain fully
+// selectable — they are just not part of the default "Actionable only" view.
+const ACTIONABLE_OPTION = "ACTIONABLE";
+const ACTIONABLE_KEY = [...ACTIONABLE_SIGNALS].sort().join(",");
+
+/** Maps the current signals filter back to the <select> value. */
+function signalSelectValue(signals: SignalType[] | undefined): string {
+  if (!signals || signals.length === 0) return ""; // All signals
+  if (signals.length === 1) return signals[0];
+  return [...signals].sort().join(",") === ACTIONABLE_KEY ? ACTIONABLE_OPTION : "";
+}
+
+/** Maps a <select> value to the signals filter (undefined = all signals). */
+function signalsForSelectValue(value: string): SignalType[] | undefined {
+  if (value === "") return undefined;
+  if (value === ACTIONABLE_OPTION) return [...ACTIONABLE_SIGNALS];
+  return [value as SignalType];
+}
 
 interface AlertFiltersProps {
   filters: AlertListQuery;
@@ -30,10 +51,12 @@ export function AlertFilters({ filters, setFilter, reset, hasActiveFilters }: Al
       />
 
       <select
-        value={filters.signal ?? ""}
-        onChange={(e) => setFilter("signal", (e.target.value || undefined) as AlertListQuery["signal"])}
+        value={signalSelectValue(filters.signals)}
+        onChange={(e) => setFilter("signals", signalsForSelectValue(e.target.value))}
         className={selectClass}
+        title="Actionable only = LONG + SHORT; WATCH/EXIT are still available below"
       >
+        <option value={ACTIONABLE_OPTION}>Actionable only</option>
         <option value="">All signals</option>
         {SIGNAL_TYPES.map((signal) => (
           <option key={signal} value={signal}>

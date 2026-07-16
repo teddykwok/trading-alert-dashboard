@@ -22,6 +22,12 @@ function isToday(value: string): boolean {
 function matchesFilters(alert: Alert, filters: ReturnType<typeof useFilters>["filters"]): boolean {
   if (filters.status && alert.status !== filters.status) return false;
   if (filters.signal && alert.signal !== filters.signal) return false;
+  // Multi-signal filter from the dashboard dropdown: "Actionable only"
+  // (the default) = ["LONG", "SHORT"]; a single choice = one-element array;
+  // undefined = "All signals" (nothing excluded, WATCH/EXIT included).
+  if (filters.signals && filters.signals.length > 0 && !filters.signals.includes(alert.signal)) {
+    return false;
+  }
   if (filters.assetType && alert.assetType !== filters.assetType) return false;
   if (filters.symbol && !alert.symbol.toLowerCase().includes(filters.symbol.toLowerCase())) return false;
   // Level-context filters match on alertContext, which the backend derives

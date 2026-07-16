@@ -10,7 +10,15 @@ export interface AlertListResponse {
 export interface AlertListQuery {
   status?: AlertStatus;
   symbol?: string;
+  /** Single-signal filter as supported by the backend list API. */
   signal?: SignalType;
+  /**
+   * Multi-signal filter used by the dashboard's CLIENT-SIDE filtering (like
+   * every other dashboard filter, it is applied to the fetched alert window,
+   * never sent to the server). "Actionable only" = ["LONG", "SHORT"];
+   * undefined = all signals.
+   */
+  signals?: SignalType[];
   assetType?: AssetType;
   /** Timeframe the level originated on (1D…12M) — not the chart timeframe. */
   sourceTimeframe?: SourceTimeframe;
