@@ -5,10 +5,11 @@
   "description": "Personal trading alert dashboard: TradingView webhooks -> Postgres -> BullMQ worker -> chart screenshot -> AI vision analysis -> realtime dashboard.",
   "scripts": {
     "postinstall": "pnpm --filter @trading-alert-dashboard/shared build",
-    "dev": "concurrently -k -n backend,frontend -c blue,green \"pnpm dev:backend\" \"pnpm dev:frontend\"",
+    "build:shared": "pnpm --filter @trading-alert-dashboard/shared build",
+    "dev": "pnpm build:shared && concurrently -k -n backend,frontend -c blue,green \"pnpm dev:backend\" \"pnpm dev:frontend\"",
     "dev:backend": "pnpm --filter @trading-alert-dashboard/backend dev",
     "dev:frontend": "pnpm --filter @trading-alert-dashboard/frontend dev",
-    "dev:worker": "pnpm --filter @trading-alert-dashboard/backend worker",
+    "dev:worker": "pnpm build:shared && pnpm --filter @trading-alert-dashboard/backend worker",
     "build": "pnpm --filter @trading-alert-dashboard/shared build && pnpm --filter @trading-alert-dashboard/backend build && pnpm --filter @trading-alert-dashboard/frontend build",
     "db:migrate": "pnpm --filter @trading-alert-dashboard/backend prisma:migrate",
     "db:seed": "pnpm --filter @trading-alert-dashboard/backend prisma:seed",
