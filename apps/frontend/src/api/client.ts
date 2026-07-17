@@ -44,8 +44,38 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
+/**
+ * Concurrent identical GETs share a single network request.
+ *
+ * Two things make duplicate reads easy to issue here, and this collapses both
+ * without changing component code or disabling React StrictMode:
+ *  - StrictMode intentionally double-invokes effects in development, so every
+ *    fetch-on-mount effect runs twice in the same tick.
+ *  - Independent panels legitimately need the same resource on one page (e.g.
+ *    TradeOutcomePanel and FuturesRiskPlanner both read the alert's
+ *    trade-review), and they mount together.
+ *
+ * Only GETs are deduped — mutations must always execute. The entry is dropped
+ * as soon as the request settles, so this is request coalescing, not a cache:
+ * a later refetch (say, after a save) still hits the network and sees fresh
+ * data.
+ */
+const inFlightGets = new Map<string, Promise<unknown>>();
+
+function dedupedGet<T>(path: string): Promise<T> {
+  const existing = inFlightGets.get(path) as Promise<T> | undefined;
+  if (existing) return existing;
+
+  const pending = request<T>(path, { method: "GET" }).finally(() => {
+    inFlightGets.delete(path);
+  });
+
+  inFlightGets.set(path, pending);
+  return pending;
+}
+
 export const apiClient = {
-  get: <T>(path: string) => request<T>(path, { method: "GET" }),
+  get: <T>(path: string) => dedupedGet<T>(path),
   post: <T>(path: string, data?: unknown) =>
     request<T>(path, { method: "POST", body: data ? JSON.stringify(data) : undefined }),
   put: <T>(path: string, data?: unknown) =>
