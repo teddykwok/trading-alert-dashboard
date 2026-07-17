@@ -10,19 +10,55 @@ import {
 import { AlertsService } from "../modules/alerts/alerts.service";
 import { withAlertContext } from "../modules/alerts/alert-context";
 import { ValidationError } from "../utils/errors";
+import { env } from "../config/env";
 
-const listQuerySchema = z.object({
+// Exported for tests. Page size defaults/caps are env-driven
+// (DASHBOARD_DEFAULT_LIMIT / DASHBOARD_MAX_LIMIT): the default is one page,
+// not the accessible history — older retained alerts are reached via offset.
+export const listQuerySchema = z.object({
   status: z.enum(ALERT_STATUSES).optional(),
   symbol: z.string().min(1).optional(),
   signal: z.enum(SIGNAL_TYPES).optional(),
+  // Comma-separated multi-signal filter, e.g. "LONG,SHORT" for the
+  // dashboard's "Actionable only" view. Wins over `signal` when present.
+  signals: z
+    .string()
+    .min(1)
+    .optional()
+    .transform((value) =>
+      value === undefined
+        ? undefined
+        : value
+            .split(",")
+            .map((entry) => entry.trim())
+            .filter((entry) => entry.length > 0)
+    )
+    .pipe(z.array(z.enum(SIGNAL_TYPES)).min(1).optional()),
   assetType: z.enum(ASSET_TYPES).optional(),
   // Level-context filters: match the structured columns only, so alerts from
   // before those columns existed (all-null) are not returned by these filters.
   sourceTimeframe: z.enum(SOURCE_TIMEFRAMES).optional(),
   levelColor: z.enum(LEVEL_COLORS).optional(),
-  limit: z.coerce.number().int().positive().max(200).default(50),
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(env.DASHBOARD_MAX_LIMIT)
+    .default(env.DASHBOARD_DEFAULT_LIMIT),
   offset: z.coerce.number().int().min(0).default(0),
 });
+
+/**
+ * Stat-card range. Both bounds are REQUIRED and explicit: "today" depends on
+ * the viewer's timezone, which the server cannot infer, so the client sends
+ * the exact instants bounding its local day. Exported for tests.
+ */
+export const statsQuerySchema = z
+  .object({
+    from: z.coerce.date(),
+    to: z.coerce.date(),
+  })
+  .refine((value) => value.from < value.to, { message: "`from` must be before `to`" });
 
 const statusUpdateSchema = z.object({
   status: z.enum(ALERT_STATUSES),
@@ -45,6 +81,16 @@ export async function alertsRoutes(app: FastifyInstance): Promise<void> {
       limit: parsed.data.limit,
       offset: parsed.data.offset,
     };
+  });
+
+  // Registered before "/api/alerts/:id" so the static segment reads
+  // unambiguously as a collection-level resource, not an alert id.
+  app.get("/api/alerts/stats", async (request) => {
+    const parsed = statsQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      throw new ValidationError("Invalid stats query", parsed.error.flatten());
+    }
+    return alertsService.statsForRange(parsed.data);
   });
 
   app.get<{ Params: { id: string } }>("/api/alerts/:id", async (request) => {

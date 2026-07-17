@@ -25,6 +25,24 @@ const envSchema = z.object({
     .transform((value) => value === "true"),
   AI_VISION_MAX_IMAGE_BYTES: z.coerce.number().int().positive().default(5_000_000),
   DUPLICATE_SUPPRESSION_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
+  // --- Bounded data retention (see modules/retention) ---
+  // The dashboard is a short-lived inspection window; Excel (outside this app)
+  // is the permanent record. Retention deletes old screenshots first, then old
+  // terminal alerts, on a daily schedule run by the worker process.
+  DATA_RETENTION_ENABLED: z
+    .string()
+    .optional()
+    .default("true")
+    .transform((value) => value === "true"),
+  SCREENSHOT_RETENTION_DAYS: z.coerce.number().int().positive().default(3),
+  ALERT_RETENTION_DAYS: z.coerce.number().int().positive().default(7),
+  DATA_CLEANUP_CRON: z.string().min(1).default("0 3 * * *"),
+  DATA_CLEANUP_TIMEZONE: z.string().min(1).default("Asia/Singapore"),
+  // Dashboard list paging: default page size when the client sends no limit,
+  // and the hard cap a client may request. 100 is a PAGE, not the accessible
+  // history — older retained alerts are reachable via offset paging.
+  DASHBOARD_DEFAULT_LIMIT: z.coerce.number().int().positive().default(100),
+  DASHBOARD_MAX_LIMIT: z.coerce.number().int().positive().default(200),
   // Rate limiting is split into two policies (see plugins/rate-limit.ts):
   //
   // Private dashboard reads + screenshot statics. A single dashboard load can

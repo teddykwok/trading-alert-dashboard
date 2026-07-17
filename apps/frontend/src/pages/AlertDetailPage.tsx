@@ -90,6 +90,7 @@ export function AlertDetailPage() {
             <h2 className="mb-3 text-sm font-semibold text-slate-200">Chart screenshot</h2>
             <ScreenshotPreview
               screenshotUrl={alert.screenshotUrl}
+              status={alert.status}
               alt={`${alert.symbol} chart`}
               className="h-auto w-full"
             />

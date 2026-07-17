@@ -1,12 +1,21 @@
 import type { PrismaClient, AlertStatus } from "@prisma/client";
+import type { AlertStats } from "@trading-alert-dashboard/shared";
 import { AlertsRepository } from "./alerts.repository";
 import { NotFoundError } from "../../utils/errors";
 import type {
   AiVisionUpdateInput,
   AlertListFilter,
+  AlertStatsRange,
   CreateAlertInput,
   DuplicateLookupInput,
 } from "./alerts.types";
+
+/** Pipeline states where the alert is still being worked on by the worker. */
+export const PROCESSING_ALERT_STATUSES: AlertStatus[] = [
+  "RECEIVED",
+  "PROCESSING_SCREENSHOT",
+  "ANALYZING_WITH_AI",
+];
 
 export class AlertsService {
   private readonly repository: AlertsRepository;
@@ -21,6 +30,35 @@ export class AlertsService {
       this.repository.count(filter),
     ]);
     return { items, total };
+  }
+
+  /**
+   * Dashboard stat cards for a time range (the client's "today").
+   *
+   * Counted by the database across every matching alert, so the numbers are
+   * unaffected by the list's page size or filters — loading one 100-alert page
+   * can never make the cards undercount. `total` is the sum of the status
+   * groups, which is every alert in the range whatever its status.
+   */
+  async statsForRange(range: AlertStatsRange): Promise<AlertStats> {
+    const [statusGroups, signalGroups] = await Promise.all([
+      this.repository.groupByStatus(range),
+      this.repository.groupBySignal(range),
+    ]);
+
+    const statusCount = (status: AlertStatus): number =>
+      statusGroups.find((group) => group.status === status)?._count._all ?? 0;
+
+    return {
+      from: range.from.toISOString(),
+      to: range.to.toISOString(),
+      total: statusGroups.reduce((sum, group) => sum + group._count._all, 0),
+      long: signalGroups.find((group) => group.signal === "LONG")?._count._all ?? 0,
+      short: signalGroups.find((group) => group.signal === "SHORT")?._count._all ?? 0,
+      processing: PROCESSING_ALERT_STATUSES.reduce((sum, status) => sum + statusCount(status), 0),
+      analyzed: statusCount("ANALYZED"),
+      failed: statusCount("FAILED"),
+    };
   }
 
   async getByIdOrThrow(id: string) {

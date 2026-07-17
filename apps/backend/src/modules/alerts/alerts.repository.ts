@@ -1,5 +1,10 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
-import type { AlertListFilter, CreateAlertInput, DuplicateLookupInput } from "./alerts.types";
+import type {
+  AlertListFilter,
+  AlertStatsRange,
+  CreateAlertInput,
+  DuplicateLookupInput,
+} from "./alerts.types";
 
 /**
  * Thin data-access layer over Prisma. Keeps raw `where`/`data` object
@@ -47,19 +52,32 @@ export class AlertsRepository {
     });
   }
 
-  findMany(filter: AlertListFilter) {
-    const where: Prisma.AlertWhereInput = {
+  /**
+   * Shared list/count where-clause. Server-side filtering is what keeps
+   * offset paging honest: a page is always "the next N matching alerts",
+   * never a browser-side subset of an arbitrary window.
+   * - symbol: case-insensitive substring, matching the dashboard search box.
+   * - signals (multi, e.g. actionable LONG+SHORT) wins over single `signal`.
+   */
+  private listWhere(filter: Omit<AlertListFilter, "limit" | "offset">): Prisma.AlertWhereInput {
+    return {
       status: filter.status,
-      symbol: filter.symbol,
-      signal: filter.signal,
+      symbol: filter.symbol
+        ? { contains: filter.symbol, mode: "insensitive" }
+        : undefined,
+      signal: filter.signals?.length ? { in: filter.signals } : filter.signal,
       assetType: filter.assetType,
       sourceTimeframe: filter.sourceTimeframe,
       levelColor: filter.levelColor,
     };
+  }
 
+  findMany(filter: AlertListFilter) {
     return this.prisma.alert.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
+      where: this.listWhere(filter),
+      // `id` tiebreak makes paging deterministic when alerts share the same
+      // createdAt timestamp (bursts arrive within the same millisecond).
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       take: filter.limit,
       skip: filter.offset,
       // Manual trade-review status and journal checklist ride along so alert
@@ -84,15 +102,36 @@ export class AlertsRepository {
   }
 
   count(filter: Omit<AlertListFilter, "limit" | "offset">) {
-    return this.prisma.alert.count({
-      where: {
-        status: filter.status,
-        symbol: filter.symbol,
-        signal: filter.signal,
-        assetType: filter.assetType,
-        sourceTimeframe: filter.sourceTimeframe,
-        levelColor: filter.levelColor,
-      },
+    return this.prisma.alert.count({ where: this.listWhere(filter) });
+  }
+
+  /**
+   * Stat-card aggregation. Note the deliberate absence of listWhere: the
+   * cards count the whole day regardless of the list filters, and the range
+   * is the ONLY predicate.
+   */
+  private rangeWhere(range: AlertStatsRange): Prisma.AlertWhereInput {
+    return { createdAt: { gte: range.from, lt: range.to } };
+  }
+
+  /**
+   * Counts are aggregated by Postgres (GROUP BY), so the whole day is counted
+   * without ever loading alert rows — the result size is bounded by the number
+   * of distinct statuses, not by how many alerts exist.
+   */
+  groupByStatus(range: AlertStatsRange) {
+    return this.prisma.alert.groupBy({
+      by: ["status"],
+      _count: { _all: true },
+      where: this.rangeWhere(range),
+    });
+  }
+
+  groupBySignal(range: AlertStatsRange) {
+    return this.prisma.alert.groupBy({
+      by: ["signal"],
+      _count: { _all: true },
+      where: this.rangeWhere(range),
     });
   }
 

@@ -34,13 +34,26 @@ export interface CreateAlertInput {
 
 export interface AlertListFilter {
   status?: AlertStatus;
+  /** Case-insensitive substring match (matches the dashboard search box). */
   symbol?: string;
   signal?: SignalType;
+  /** Multi-signal filter (e.g. actionable = LONG+SHORT); wins over `signal`. */
+  signals?: SignalType[];
   assetType?: AssetType;
   sourceTimeframe?: string;
   levelColor?: LevelColor;
   limit: number;
   offset: number;
+}
+
+/**
+ * Range for the dashboard stat cards. Both bounds are explicit because the
+ * server cannot know the viewer's timezone — the client states which instants
+ * bound its "today". `from` is inclusive, `to` exclusive.
+ */
+export interface AlertStatsRange {
+  from: Date;
+  to: Date;
 }
 
 export interface AiVisionUpdateInput {
