@@ -19,6 +19,7 @@ export function AlertCard({ alert }: { alert: Alert }) {
       <Card className="flex gap-3 p-3 transition-colors hover:border-slate-600">
         <ScreenshotPreview
           screenshotUrl={alert.screenshotUrl}
+          status={alert.status}
           alt={`${alert.symbol} chart`}
           className="h-16 w-28 flex-shrink-0"
         />

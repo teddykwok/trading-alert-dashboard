@@ -13,10 +13,9 @@ export interface AlertListQuery {
   /** Single-signal filter as supported by the backend list API. */
   signal?: SignalType;
   /**
-   * Multi-signal filter used by the dashboard's CLIENT-SIDE filtering (like
-   * every other dashboard filter, it is applied to the fetched alert window,
-   * never sent to the server). "Actionable only" = ["LONG", "SHORT"];
-   * undefined = all signals.
+   * Multi-signal filter, sent to the server as comma-separated values
+   * (`signals=LONG,SHORT`). Wins over `signal` when both are set.
+   * "Actionable only" = ["LONG", "SHORT"]; undefined = all signals.
    */
   signals?: SignalType[];
   assetType?: AssetType;
@@ -25,6 +24,15 @@ export interface AlertListQuery {
   levelColor?: LevelColor;
   limit?: number;
   offset?: number;
+}
+
+/**
+ * Bounds of the stat cards' range as ISO instants. The client sends its local
+ * day boundaries because only the browser knows the viewer's timezone.
+ */
+export interface AlertStatsQuery {
+  from: string;
+  to: string;
 }
 
 export interface ApiErrorBody {

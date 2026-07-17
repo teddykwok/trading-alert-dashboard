@@ -12,6 +12,8 @@
     "dev:worker": "pnpm build:shared && pnpm --filter @trading-alert-dashboard/backend worker",
     "build": "pnpm --filter @trading-alert-dashboard/shared build && pnpm --filter @trading-alert-dashboard/backend build && pnpm --filter @trading-alert-dashboard/frontend build",
     "db:migrate": "pnpm --filter @trading-alert-dashboard/backend prisma:migrate",
+    "retention:dry-run": "pnpm --filter @trading-alert-dashboard/backend retention:dry-run",
+    "retention:apply": "pnpm --filter @trading-alert-dashboard/backend retention:apply",
     "db:seed": "pnpm --filter @trading-alert-dashboard/backend prisma:seed",
     "test": "pnpm --filter @trading-alert-dashboard/backend test",
     "test:webhook": "node scripts/test-webhook.js",

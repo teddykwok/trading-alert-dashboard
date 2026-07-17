@@ -12,6 +12,8 @@ export type {
   Asset,
 } from "./alert-types";
 
+export type { AlertStats } from "./alert-stats-types";
+
 export type { TradingViewWebhookPayload, WebhookAcceptedResponse } from "./webhook-types";
 
 export type {

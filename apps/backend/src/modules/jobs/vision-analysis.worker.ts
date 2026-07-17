@@ -16,6 +16,7 @@ import { ensureScreenshotDir, screenshotFileName } from "../../utils/file";
 import { inferMarketType } from "../../utils/symbol";
 import { bullConnection, type VisionAnalysisJobData } from "./queue";
 import { startCleanupScheduler } from "./cleanup.worker";
+import { setupRetentionSchedule } from "./retention.worker";
 
 const alertsService = new AlertsService(prisma);
 
@@ -120,11 +121,23 @@ worker.on("failed", (job, error) => {
 
 const cleanupTimer = startCleanupScheduler();
 
+// Daily bounded-data-retention cleanup (03:00 Asia/Singapore by default).
+// Failure to schedule must never take down the vision worker.
+let retentionWorker: Awaited<ReturnType<typeof setupRetentionSchedule>> = null;
+setupRetentionSchedule()
+  .then((created) => {
+    retentionWorker = created;
+  })
+  .catch((error) => {
+    logger.error({ error }, "Failed to set up data-retention schedule (worker continues)");
+  });
+
 logger.info("vision-analysis worker started, waiting for jobs...");
 
 process.on("SIGTERM", async () => {
   clearInterval(cleanupTimer);
   await worker.close();
+  await retentionWorker?.close();
   await prisma.$disconnect();
   process.exit(0);
 });
