@@ -25,6 +25,20 @@ const envSchema = z.object({
     .transform((value) => value === "true"),
   AI_VISION_MAX_IMAGE_BYTES: z.coerce.number().int().positive().default(5_000_000),
   DUPLICATE_SUPPRESSION_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
+  // Rate limiting is split into two policies (see plugins/rate-limit.ts):
+  //
+  // Private dashboard reads + screenshot statics. A single dashboard load can
+  // issue one /screenshots/* request per alert card (hundreds), so this budget
+  // must comfortably absorb several page loads — it is NOT a security control,
+  // the dashboard is private (Tailscale) and unauthenticated traffic never
+  // reaches it.
+  DASHBOARD_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(2000),
+  DASHBOARD_RATE_LIMIT_WINDOW: z.string().min(1).default("1 minute"),
+  // Public TradingView webhook. This IS a security control: it is internet
+  // facing via the Cloudflare tunnel, so it keeps its own strict budget and
+  // can never be exhausted by (or exhaust) dashboard traffic.
+  WEBHOOK_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(60),
+  WEBHOOK_RATE_LIMIT_WINDOW: z.string().min(1).default("1 minute"),
   BINANCE_REST_BASE_URL: z.string().min(1).default("https://api.binance.com"),
   // USD-M futures REST host, used for TradingView ".P" perpetual symbols
   // (GET /fapi/v1/klines). Spot keeps using BINANCE_REST_BASE_URL.
