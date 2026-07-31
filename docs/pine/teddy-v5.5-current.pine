@@ -1,17 +1,22 @@
 //@version=5
 // Dibuat oleh Gemini berdasarkan strategi pengguna
 // Versi 5.5: Perbaikan final 'line.new' untuk Sinar Horizontal
-// Versi 5.5-touch-webhook:
-//   - Level "sinar" (whale footprint) sekarang DISIMPAN di array saat terbentuk.
-//   - Pembentukan level TIDAK lagi mengirim sinyal LONG/SHORT. Opsional kirim
-//     WATCH (eventType=LEVEL_CREATED) jika enableLevelCreatedAlerts aktif.
-//   - Alert entry dikirim saat harga KEMBALI menyentuh level lama
-//     (eventType=LEVEL_TOUCHED), dengan arah berdasarkan arah sentuhan:
-//       GREEN disentuh dari ATAS  -> LONG  (retest sebagai support)
-//       RED   disentuh dari BAWAH -> SHORT (retest sebagai resistance)
-//       sentuhan lain             -> WATCH
-//   - Semua logika visual (line.new / label.new / input warna & timeframe)
-//     TIDAK diubah.
+// Versi 5.5-retest (model breakout/acceptance -> retest):
+//   - Level "sinar" (whale footprint) DISIMPAN di array saat terbentuk.
+//     Pembentukan level murni visual + registrasi — TIDAK mengirim alert.
+//   - Script ini TIDAK PERNAH mengirim sinyal WATCH.
+//   - Level harus ARMED dulu lewat candle chart CONFIRMED (bar close):
+//       GREEN armed saat close > upperBand (harga diterima DI ATAS level)
+//       RED   armed saat close < lowerBand (harga diterima DI BAWAH level)
+//     Disarm saat close confirmed menembus sisi sebaliknya; level yang patah
+//     harus diterima ulang sebelum retest berikutnya bisa valid.
+//   - Retest valid (eventType=LEVEL_TOUCHED):
+//       GREEN armed, disentuh TURUN dari atas  -> LONG  (retest support)
+//       RED   armed, disentuh NAIK  dari bawah -> SHORT (retest resistance)
+//       sentuhan sisi salah / level belum armed -> TIDAK ada alert sama sekali
+//   - Cooldown per level hanya terpakai saat alert LONG/SHORT benar terkirim.
+//   - Semua logika visual pembentukan level (line.new / label.new / input
+//     warna & timeframe) TIDAK diubah.
 //   - "timeframe" di JSON = timeframe CHART (format backend, mis. "1h") agar
 //     screenshot Binance memakai interval yang valid; detail level ada di "note".
 indicator("teddy v5.5 (Sinar Final)", overlay=true)
@@ -71,26 +76,26 @@ webhookSecret = input.string("", "Webhook Secret", group = GRP_WEBHOOK)
 assetTypeInput = input.string("crypto", "Asset Type", options=["crypto", "stock"], group = GRP_WEBHOOK)
 exchangeInput = input.string("BINANCE", "Exchange", group = GRP_WEBHOOK)
 enableWebhookAlerts = input.bool(true, "Enable Webhook Alerts", group = GRP_WEBHOOK)
-enableLevelCreatedAlerts = input.bool(false, "Alert When Level Is Created", group = GRP_WEBHOOK)
 enableLevelTouchedAlerts = input.bool(true, "Alert When Price Touches Existing Level", group = GRP_WEBHOOK)
 touchTolerancePct = input.float(0.2, "Touch Tolerance (%)", group = GRP_WEBHOOK) / 100
 touchCooldownBars = input.int(10, "Touch Alert Cooldown Bars", minval=1, group = GRP_WEBHOOK)
 minBarsAfterCreation = input.int(5, "Min Bars After Level Creation Before Touch Alert", minval=1, group = GRP_WEBHOOK)
-// "Immediate" = alert LEVEL_TOUCHED terkirim saat tick pertama harga menyentuh
-// level (sekali per bar per level); "Bar Close" = tunggu candle chart ditutup.
-// Hanya memengaruhi LEVEL_TOUCHED; LEVEL_CREATED tetap menunggu bar close.
+// Jarak minimal antara bar ARMED dan retest — retest tidak boleh terjadi di
+// bar yang sama dengan arming (aturan terpisah dari minBarsAfterCreation).
+minBarsAfterArming = input.int(1, "Min Bars After Arming Before Retest", minval=1, group = GRP_WEBHOOK)
+// "Immediate" = LONG/SHORT dikirim saat tick pertama sentuhan valid pada level
+// yang SUDAH armed (sekali per bar per level); "Bar Close" = tunggu candle
+// chart ditutup. ARMED/DISARM selalu memakai close confirmed, apa pun mode ini.
 touchAlertTiming = input.string("Immediate", "Touch Alert Timing", options=["Immediate", "Bar Close"], group = GRP_WEBHOOK)
 
-// --- Marker visual untuk event LEVEL_TOUCHED (BAGIAN 4). Murni tampilan;
-//     tidak mengubah alert, cooldown, atau JSON webhook. ---
+// --- Marker visual untuk retest LONG/SHORT (BAGIAN 4). Murni tampilan;
+//     muncul HANYA saat alert actionable yang sama lolos semua syarat. ---
 var GRP_MARKERS = "Visual Touch Markers"
 showTouchSignalMarkers = input.bool(true, "Show LONG / SHORT Markers", group = GRP_MARKERS)
-showWatchMarkers = input.bool(false, "Show WATCH Markers", group = GRP_MARKERS)
 touchMarkerTextSizeInput = input.string("small", "Marker Text Size", options = ["tiny", "small", "normal"], group = GRP_MARKERS)
 touchMarkerTextSize = f_stringToSize(touchMarkerTextSizeInput)
 longMarkerColor = input.color(color.green, "LONG Marker Color", group = GRP_MARKERS)
 shortMarkerColor = input.color(color.red, "SHORT Marker Color", group = GRP_MARKERS)
-watchMarkerColor = input.color(color.yellow, "WATCH Marker Color", group = GRP_MARKERS)
 
 // =================================================================================
 // BAGIAN 1B: HELPER JSON WEBHOOK
@@ -141,7 +146,13 @@ var lvlPrice = array.new_float()
 var lvlColor = array.new_string()      // "GREEN" / "RED"
 var lvlTf = array.new_string()         // "1D","1W","1M","3M","6M","12M"
 var lvlCreatedBar = array.new_int()
-var lvlLastTouchBar = array.new_int()  // -1 = belum pernah kirim alert sentuhan
+var lvlLastTouchBar = array.new_int()  // -1 = belum pernah kirim alert retest
+// Status acceptance per level (model breakout -> retest):
+// GREEN armed = harga sudah DITERIMA di atas level (close confirmed > upperBand)
+// RED   armed = harga sudah DITERIMA di bawah level (close confirmed < lowerBand)
+// Hanya level armed yang boleh menghasilkan alert retest.
+var lvlArmed = array.new_bool()
+var lvlArmedBar = array.new_int()      // -1 = belum/tidak armed
 
 f_registerLevel(levelPrice, colorName, tfLabel) =>
     array.push(lvlPrice, levelPrice)
@@ -149,19 +160,18 @@ f_registerLevel(levelPrice, colorName, tfLabel) =>
     array.push(lvlTf, tfLabel)
     array.push(lvlCreatedBar, bar_index)
     array.push(lvlLastTouchBar, -1)
-    // Batasi jumlah level agar loop sentuhan tetap ringan; buang yang tertua.
+    array.push(lvlArmed, false)
+    array.push(lvlArmedBar, -1)
+    // Batasi jumlah level agar loop retest tetap ringan; buang yang tertua.
+    // Semua array paralel HARUS di-shift bersama agar index tetap sejajar.
     if array.size(lvlPrice) > MAX_LEVELS
         array.shift(lvlPrice)
         array.shift(lvlColor)
         array.shift(lvlTf)
         array.shift(lvlCreatedBar)
         array.shift(lvlLastTouchBar)
-
-// Alert opsional saat level BARU terbentuk (bukan sinyal entry -> WATCH).
-f_maybeAlertLevelCreated(levelPrice, colorName, tfLabel) =>
-    if enableWebhookAlerts and enableLevelCreatedAlerts and webhookSecret != ""
-        note = "eventType=LEVEL_CREATED | levelColor=" + colorName + " | sourceTf=" + tfLabel + " | levelPrice=" + f_formatPrice(levelPrice) + " | chartTf=" + chartTfForBackend
-        alert(f_buildWebhookJson("WATCH", levelPrice, note), alert.freq_once_per_bar_close)
+        array.shift(lvlArmed)
+        array.shift(lvlArmedBar)
 
 // =================================================================================
 // BAGIAN 2: FUNGSI UNTUK MENDETEKSI SINYAL DAN MENGGAMBAR GARIS/LABEL
@@ -182,33 +192,29 @@ f_processTimeframe(timeframe, labelText, show, colorRed, colorGreen, width) =>
 
     // --- PERBAIKAN DI 4 BLOK DI BAWAH INI ---
     // Menambahkan `x2` dan `y2` agar fungsi `line.new` valid
-    // --- TOUCH-WEBHOOK: level disimpan (f_registerLevel); pembentukan level
-    //     TIDAK mengirim sinyal entry, hanya WATCH opsional. Entry dikirim
-    //     oleh loop sentuhan di BAGIAN 4. ---
+    // --- Pembentukan level murni visual + registrasi (f_registerLevel);
+    //     TIDAK ada alert apa pun di sini. Alert entry LONG/SHORT hanya
+    //     dikirim oleh loop retest di BAGIAN 4. ---
 
     if show and tf_sGOR and not tf_sGOR[1]
         line.new(x1=bar_index, y1=tf_high, x2=bar_index + 1, y2=tf_high, color=colorGreen, style=line.style_solid, width=width, extend=extend.right)
         label.new(bar_index, tf_high, text=labelText + " " + str.tostring(tf_high, format.mintick), color=colorGreen, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
         f_registerLevel(tf_high, "GREEN", labelText)
-        f_maybeAlertLevelCreated(tf_high, "GREEN", labelText)
 
     if show and tf_sROR and not tf_sROR[1]
         line.new(x1=bar_index, y1=tf_low, x2=bar_index + 1, y2=tf_low, color=colorRed, style=line.style_solid, width=width, extend=extend.right)
         label.new(bar_index, tf_low, text=labelText + " " + str.tostring(tf_low, format.mintick), color=colorRed, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
         f_registerLevel(tf_low, "RED", labelText)
-        f_maybeAlertLevelCreated(tf_low, "RED", labelText)
 
     if show and tf_sGOG and not tf_sGOG[1]
         line.new(x1=bar_index, y1=tf_high, x2=bar_index + 1, y2=tf_high, color=colorGreen, style=line.style_solid, width=width, extend=extend.right)
         label.new(bar_index, tf_high, text=labelText + " " + str.tostring(tf_high, format.mintick), color=colorGreen, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
         f_registerLevel(tf_high, "GREEN", labelText)
-        f_maybeAlertLevelCreated(tf_high, "GREEN", labelText)
 
     if show and tf_sROG and not tf_sROG[1]
         line.new(x1=bar_index, y1=tf_low, x2=bar_index + 1, y2=tf_low, color=colorRed, style=line.style_solid, width=width, extend=extend.right)
         label.new(bar_index, tf_low, text=labelText + " " + str.tostring(tf_low, format.mintick), color=colorRed, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
         f_registerLevel(tf_low, "RED", labelText)
-        f_maybeAlertLevelCreated(tf_low, "RED", labelText)
 
 // =================================================================================
 // BAGIAN 3: MENJALANKAN FUNGSI UNTUK SETIAP TIMEFRAME
@@ -222,50 +228,89 @@ f_processTimeframe("6M", "6M", showM6, colorRedM6, colorGreenM6, widthM6)
 f_processTimeframe("12M", "12M", showM12, colorRedM12, colorGreenM12, widthM12)
 
 // =================================================================================
-// BAGIAN 4: DETEKSI SENTUHAN LEVEL LAMA (BARU) -> ALERT ENTRY
+// BAGIAN 4A: UPDATE STATUS ARMED PER LEVEL (HANYA CLOSE CONFIRMED)
 // =================================================================================
 
-// Setiap bar chart, periksa semua level tersimpan:
-// - "Disentuh" jika range bar ini overlap dengan pita toleransi level.
-// - Arah sentuhan dari posisi close bar sebelumnya terhadap level.
-// - Anti-spam: tunggu minBarsAfterCreation setelah level dibuat (otomatis
-//   mencegah alert di bar pembuatan), lalu cooldown touchCooldownBars antar
-//   alert untuk level yang sama. Duplicate suppression backend tetap menjadi
-//   lapisan kedua.
+// Acceptance dinilai dari candle chart yang DITUTUP, apa pun touchAlertTiming:
+// - GREEN: close > upperBand  -> armed (support tervalidasi dari atas);
+//          close < lowerBand  -> disarm (support patah, harus diterima ulang).
+// - RED  : close < lowerBand  -> armed (resistance tervalidasi dari bawah);
+//          close > upperBand  -> disarm (resistance patah).
+// armedBar hanya di-set saat TRANSISI unarmed -> armed (tidak di-reset setiap
+// bar selama harga bertahan), supaya minBarsAfterArming mengukur umur arming.
+// Status ini selalu di-update, terlepas dari toggle webhook, agar state tetap
+// benar saat alert diaktifkan kembali.
+if barstate.isconfirmed and array.size(lvlPrice) > 0
+    for i = 0 to array.size(lvlPrice) - 1
+        levelPrice = array.get(lvlPrice, i)
+        upperBand = levelPrice * (1 + touchTolerancePct)
+        lowerBand = levelPrice * (1 - touchTolerancePct)
+        isGreen = array.get(lvlColor, i) == "GREEN"
+        armed = array.get(lvlArmed, i)
+
+        armNow = isGreen ? close > upperBand : close < lowerBand
+        breakNow = isGreen ? close < lowerBand : close > upperBand
+
+        if not armed and armNow
+            array.set(lvlArmed, i, true)
+            array.set(lvlArmedBar, i, bar_index)
+        else if armed and breakNow
+            array.set(lvlArmed, i, false)
+            array.set(lvlArmedBar, i, -1)
+
+// =================================================================================
+// BAGIAN 4B: DETEKSI RETEST LEVEL ARMED -> ALERT ENTRY LONG/SHORT
+// =================================================================================
+
+// Retest valid harus memenuhi SEMUA syarat:
+// - level armed, dan arming berumur >= minBarsAfterArming (tidak boleh di bar
+//   yang sama dengan arming — di close tick, 4A di atas berjalan lebih dulu);
+// - level berumur >= minBarsAfterCreation sejak dibuat;
+// - cooldown touchCooldownBars terpenuhi;
+// - geometri approach benar: close bar SEBELUMNYA masih di luar pita pada sisi
+//   yang benar, dan bar INI masuk ke pita toleransi. GREEN disentuh dari bawah
+//   atau RED dari atas TIDAK menghasilkan apa pun — tanpa alert, tanpa marker,
+//   dan TANPA memakai cooldown (lvlLastTouchBar hanya di-set saat alert
+//   LONG/SHORT benar-benar terkirim).
+// Duplicate suppression backend tetap menjadi lapisan kedua.
 if enableWebhookAlerts and enableLevelTouchedAlerts and webhookSecret != "" and array.size(lvlPrice) > 0
     for i = 0 to array.size(lvlPrice) - 1
         levelPrice = array.get(lvlPrice, i)
         upperBand = levelPrice * (1 + touchTolerancePct)
         lowerBand = levelPrice * (1 - touchTolerancePct)
+        levelColor = array.get(lvlColor, i)
 
-        isTouched = high >= lowerBand and low <= upperBand
+        armedBar = array.get(lvlArmedBar, i)
+        armedReady = array.get(lvlArmed, i) and armedBar >= 0 and bar_index - armedBar >= minBarsAfterArming
         oldEnough = bar_index - array.get(lvlCreatedBar, i) >= minBarsAfterCreation
         lastTouch = array.get(lvlLastTouchBar, i)
         cooledDown = lastTouch < 0 or bar_index - lastTouch >= touchCooldownBars
+        inBand = low <= upperBand and high >= lowerBand
 
-        if isTouched and oldEnough and cooledDown
-            touchDirection = close[1] > levelPrice and low <= upperBand ? "FROM_ABOVE" : close[1] < levelPrice and high >= lowerBand ? "FROM_BELOW" : "UNKNOWN"
-            levelColor = array.get(lvlColor, i)
+        // LONG: support GREEN diretest TURUN dari atas — close sebelumnya di
+        // atas pita, bar ini turun menyentuh pita. Naik dari bawah menembus
+        // level tidak akan lolos karena close[1] tidak di atas pita.
+        longRetest = levelColor == "GREEN" and close[1] > upperBand and inBand
+        // SHORT: resistance RED diretest NAIK dari bawah (cermin LONG).
+        shortRetest = levelColor == "RED" and close[1] < lowerBand and inBand
 
-            // GREEN diretest dari atas = support -> LONG.
-            // RED diretest dari bawah = resistance -> SHORT. Lainnya WATCH.
-            touchSignal = levelColor == "GREEN" and touchDirection == "FROM_ABOVE" ? "LONG" : levelColor == "RED" and touchDirection == "FROM_BELOW" ? "SHORT" : "WATCH"
-
+        if (longRetest or shortRetest) and armedReady and oldEnough and cooledDown
+            touchSignal = longRetest ? "LONG" : "SHORT"
+            touchDirection = longRetest ? "FROM_ABOVE" : "FROM_BELOW"
             touchNote = "eventType=LEVEL_TOUCHED | levelColor=" + levelColor + " | sourceTf=" + array.get(lvlTf, i) + " | touchDirection=" + touchDirection + " | levelPrice=" + f_formatPrice(levelPrice) + " | chartTf=" + chartTfForBackend + " | alertTiming=" + touchAlertTiming
 
-            // Timing hanya untuk LEVEL_TOUCHED (LEVEL_CREATED tetap bar close).
+            // "Immediate" boleh intrabar KARENA arming sudah dari close
+            // confirmed sebelumnya: breakout terkonfirmasi + retest instan.
             if touchAlertTiming == "Immediate"
                 alert(f_buildWebhookJson(touchSignal, levelPrice, touchNote), alert.freq_once_per_bar)
             else
                 alert(f_buildWebhookJson(touchSignal, levelPrice, touchNote), alert.freq_once_per_bar_close)
             array.set(lvlLastTouchBar, i, bar_index)
 
-            // Marker visual: satu label per event sentuhan yang sama (mengikuti
-            // aturan cooldown/min-bars di atas). Teks ringkas: sinyal + TF sumber.
+            // Marker visual: hanya untuk event LONG/SHORT yang sama persis
+            // dengan alert di atas. Teks ringkas: sinyal + TF sumber level.
             markerTf = array.get(lvlTf, i)
             if showTouchSignalMarkers and touchSignal == "LONG"
                 label.new(bar_index, low, text="LONG " + markerTf, color=longMarkerColor, textcolor=labelTextColor, style=label.style_label_up, size=touchMarkerTextSize)
             if showTouchSignalMarkers and touchSignal == "SHORT"
                 label.new(bar_index, high, text="SHORT " + markerTf, color=shortMarkerColor, textcolor=labelTextColor, style=label.style_label_down, size=touchMarkerTextSize)
-            if showWatchMarkers and touchSignal == "WATCH"
-                label.new(bar_index, levelPrice, text="WATCH " + markerTf, color=watchMarkerColor, textcolor=labelTextColor, style=label.style_label_left, size=touchMarkerTextSize)
