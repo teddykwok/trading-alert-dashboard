@@ -5,6 +5,8 @@ import { NotFoundError } from "../../utils/errors";
 import type {
   AiVisionUpdateInput,
   AlertListFilter,
+  AlertNeighborFilter,
+  AlertNeighborsResult,
   AlertStatsRange,
   CreateAlertInput,
   DuplicateLookupInput,
@@ -59,6 +61,22 @@ export class AlertsService {
       analyzed: statusCount("ANALYZED"),
       failed: statusCount("FAILED"),
     };
+  }
+
+  /**
+   * The alerts adjacent to `id` in the dashboard ordering, restricted to the
+   * supplied filters. The current alert anchors the position but is NOT
+   * required to match the filters itself — neighbors are resolved around its
+   * canonical createdAt/id position within the filtered set.
+   */
+  async neighbors(id: string, filter: AlertNeighborFilter): Promise<AlertNeighborsResult> {
+    const current = await this.getByIdOrThrow(id);
+    const anchor = { createdAt: current.createdAt, id: current.id };
+    const [newer, older] = await Promise.all([
+      this.repository.findNewerNeighbor(anchor, filter),
+      this.repository.findOlderNeighbor(anchor, filter),
+    ]);
+    return { newer, older };
   }
 
   async getByIdOrThrow(id: string) {

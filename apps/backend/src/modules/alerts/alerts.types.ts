@@ -41,9 +41,26 @@ export interface AlertListFilter {
   signals?: SignalType[];
   assetType?: AssetType;
   sourceTimeframe?: string;
+  /** Multi-source-timeframe filter (OR semantics); wins over `sourceTimeframe`. */
+  sourceTimeframes?: string[];
   levelColor?: LevelColor;
   limit: number;
   offset: number;
+}
+
+/** List filters without paging — the predicate shared with neighbor lookup. */
+export type AlertNeighborFilter = Omit<AlertListFilter, "limit" | "offset">;
+
+/** Minimal identity of an adjacent alert in the dashboard ordering. */
+export interface AlertNeighbor {
+  id: string;
+  symbol: string;
+  createdAt: Date;
+}
+
+export interface AlertNeighborsResult {
+  newer: AlertNeighbor | null;
+  older: AlertNeighbor | null;
 }
 
 /**

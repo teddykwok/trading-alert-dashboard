@@ -7,7 +7,8 @@ import {
 } from "@trading-alert-dashboard/shared";
 import { Button } from "../ui/Button";
 import { ACTIONABLE_SIGNALS } from "../../hooks/useFilters";
-import type { SignalType } from "../../types/alert";
+import { classNames } from "../../utils/classNames";
+import type { SignalType, SourceTimeframe } from "../../types/alert";
 import type { AlertListQuery } from "../../types/api";
 
 // Dropdown option value for the LONG+SHORT group. WATCH/EXIT remain fully
@@ -27,6 +28,17 @@ function signalsForSelectValue(value: string): SignalType[] | undefined {
   if (value === "") return undefined;
   if (value === ACTIONABLE_OPTION) return [...ACTIONABLE_SIGNALS];
   return [value as SignalType];
+}
+
+/** Chip toggle: add/remove one TF; an emptied selection means "all" (undefined). */
+function toggleSourceTimeframe(
+  current: SourceTimeframe[] | undefined,
+  tf: SourceTimeframe
+): SourceTimeframe[] | undefined {
+  const next = current?.includes(tf)
+    ? current.filter((entry) => entry !== tf)
+    : [...(current ?? []), tf];
+  return next.length > 0 ? next : undefined;
 }
 
 interface AlertFiltersProps {
@@ -91,21 +103,33 @@ export function AlertFilters({ filters, setFilter, reset, hasActiveFilters }: Al
         ))}
       </select>
 
-      <select
-        value={filters.sourceTimeframe ?? ""}
-        onChange={(e) =>
-          setFilter("sourceTimeframe", (e.target.value || undefined) as AlertListQuery["sourceTimeframe"])
-        }
-        className={selectClass}
-        title="Timeframe the level originated on"
+      {/* Multi-select source-timeframe chips (OR semantics): click to toggle,
+          no selection = all source TFs. */}
+      <div
+        className="flex items-center gap-1 rounded-lg border border-surface-border bg-surface px-2 py-1"
+        title="Timeframe the level originated on — select several; none = all"
       >
-        <option value="">All source TFs</option>
-        {SOURCE_TIMEFRAMES.map((tf) => (
-          <option key={tf} value={tf}>
-            Level {tf}
-          </option>
-        ))}
-      </select>
+        <span className="pr-1 text-xs text-slate-500">Source TF</span>
+        {SOURCE_TIMEFRAMES.map((tf) => {
+          const selected = filters.sourceTimeframes?.includes(tf) ?? false;
+          return (
+            <button
+              key={tf}
+              type="button"
+              aria-pressed={selected}
+              onClick={() => setFilter("sourceTimeframes", toggleSourceTimeframe(filters.sourceTimeframes, tf))}
+              className={classNames(
+                "rounded-md px-1.5 py-0.5 text-xs transition-colors",
+                selected
+                  ? "bg-blue-600 font-semibold text-white"
+                  : "text-slate-400 hover:bg-surface-border hover:text-slate-200"
+              )}
+            >
+              {tf}
+            </button>
+          );
+        })}
+      </div>
 
       <select
         value={filters.levelColor ?? ""}
