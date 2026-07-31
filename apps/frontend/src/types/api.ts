@@ -21,9 +21,32 @@ export interface AlertListQuery {
   assetType?: AssetType;
   /** Timeframe the level originated on (1D…12M) — not the chart timeframe. */
   sourceTimeframe?: SourceTimeframe;
+  /**
+   * Multi-source-timeframe filter (OR semantics), sent as comma-separated
+   * values (`sourceTimeframes=1D,1W`). Wins over `sourceTimeframe` when both
+   * are set; undefined/empty = all source timeframes.
+   */
+  sourceTimeframes?: SourceTimeframe[];
   levelColor?: LevelColor;
   limit?: number;
   offset?: number;
+}
+
+/** Minimal identity of an adjacent alert in the dashboard ordering. */
+export interface AlertNeighbor {
+  id: string;
+  symbol: string;
+  createdAt: string;
+}
+
+/**
+ * Response of GET /api/alerts/:id/neighbors — the alerts adjacent to the
+ * current one in dashboard ordering (createdAt DESC, id DESC), restricted to
+ * the supplied filters. Null at the newest/oldest boundary respectively.
+ */
+export interface AlertNeighborsResponse {
+  newer: AlertNeighbor | null;
+  older: AlertNeighbor | null;
 }
 
 /**

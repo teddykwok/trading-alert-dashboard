@@ -1,6 +1,8 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
 import type {
   AlertListFilter,
+  AlertNeighbor,
+  AlertNeighborFilter,
   AlertStatsRange,
   CreateAlertInput,
   DuplicateLookupInput,
@@ -58,8 +60,13 @@ export class AlertsRepository {
    * never a browser-side subset of an arbitrary window.
    * - symbol: case-insensitive substring, matching the dashboard search box.
    * - signals (multi, e.g. actionable LONG+SHORT) wins over single `signal`.
+   * - sourceTimeframes (multi, OR across level-origin timeframes) wins over
+   *   single `sourceTimeframe`.
+   *
+   * Also the predicate for neighbor lookup (findNewer/findOlder), so "next
+   * matching alert" can never drift from what the list itself would show.
    */
-  private listWhere(filter: Omit<AlertListFilter, "limit" | "offset">): Prisma.AlertWhereInput {
+  private listWhere(filter: AlertNeighborFilter): Prisma.AlertWhereInput {
     return {
       status: filter.status,
       symbol: filter.symbol
@@ -67,7 +74,9 @@ export class AlertsRepository {
         : undefined,
       signal: filter.signals?.length ? { in: filter.signals } : filter.signal,
       assetType: filter.assetType,
-      sourceTimeframe: filter.sourceTimeframe,
+      sourceTimeframe: filter.sourceTimeframes?.length
+        ? { in: filter.sourceTimeframes }
+        : filter.sourceTimeframe,
       levelColor: filter.levelColor,
     };
   }
@@ -101,8 +110,60 @@ export class AlertsRepository {
     });
   }
 
-  count(filter: Omit<AlertListFilter, "limit" | "offset">) {
+  count(filter: AlertNeighborFilter) {
     return this.prisma.alert.count({ where: this.listWhere(filter) });
+  }
+
+  /**
+   * Neighbor lookup in the dashboard's canonical ordering
+   * (createdAt DESC, id DESC), anchored on the current alert's createdAt/id.
+   *
+   * "Newer" = the closest matching row that sorts immediately BEFORE the
+   * anchor: strictly greater createdAt, or the same createdAt with a greater
+   * id (the same tiebreak the list uses). Scanning ascending and taking the
+   * first row yields the immediate neighbor, not the newest overall.
+   */
+  findNewerNeighbor(
+    anchor: { createdAt: Date; id: string },
+    filter: AlertNeighborFilter
+  ): Promise<AlertNeighbor | null> {
+    return this.prisma.alert.findFirst({
+      where: {
+        AND: [
+          this.listWhere(filter),
+          {
+            OR: [
+              { createdAt: { gt: anchor.createdAt } },
+              { createdAt: anchor.createdAt, id: { gt: anchor.id } },
+            ],
+          },
+        ],
+      },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+      select: { id: true, symbol: true, createdAt: true },
+    });
+  }
+
+  /** "Older" = the closest matching row that sorts immediately AFTER the anchor. */
+  findOlderNeighbor(
+    anchor: { createdAt: Date; id: string },
+    filter: AlertNeighborFilter
+  ): Promise<AlertNeighbor | null> {
+    return this.prisma.alert.findFirst({
+      where: {
+        AND: [
+          this.listWhere(filter),
+          {
+            OR: [
+              { createdAt: { lt: anchor.createdAt } },
+              { createdAt: anchor.createdAt, id: { lt: anchor.id } },
+            ],
+          },
+        ],
+      },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      select: { id: true, symbol: true, createdAt: true },
+    });
   }
 
   /**

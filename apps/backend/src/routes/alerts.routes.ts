@@ -38,6 +38,21 @@ export const listQuerySchema = z.object({
   // Level-context filters: match the structured columns only, so alerts from
   // before those columns existed (all-null) are not returned by these filters.
   sourceTimeframe: z.enum(SOURCE_TIMEFRAMES).optional(),
+  // Comma-separated multi-source-timeframe filter (OR semantics), e.g.
+  // "1D,1W". Wins over `sourceTimeframe` when present.
+  sourceTimeframes: z
+    .string()
+    .min(1)
+    .optional()
+    .transform((value) =>
+      value === undefined
+        ? undefined
+        : value
+            .split(",")
+            .map((entry) => entry.trim())
+            .filter((entry) => entry.length > 0)
+    )
+    .pipe(z.array(z.enum(SOURCE_TIMEFRAMES)).min(1).optional()),
   levelColor: z.enum(LEVEL_COLORS).optional(),
   limit: z.coerce
     .number()
@@ -47,6 +62,12 @@ export const listQuerySchema = z.object({
     .default(env.DASHBOARD_DEFAULT_LIMIT),
   offset: z.coerce.number().int().min(0).default(0),
 });
+
+/**
+ * Neighbor lookup accepts the list's filter set but never paging — neighbors
+ * are position-based, not page-based. Exported for tests.
+ */
+export const neighborsQuerySchema = listQuerySchema.omit({ limit: true, offset: true });
 
 /**
  * Stat-card range. Both bounds are REQUIRED and explicit: "today" depends on
@@ -95,6 +116,19 @@ export async function alertsRoutes(app: FastifyInstance): Promise<void> {
 
   app.get<{ Params: { id: string } }>("/api/alerts/:id", async (request) => {
     return withAlertContext(await alertsService.getByIdOrThrow(request.params.id));
+  });
+
+  // Adjacent alerts (dashboard ordering: createdAt DESC, id DESC) within the
+  // supplied filter set. Powers the detail page's filter-aware Newer/Older
+  // navigation without depending on what pages the browser happens to have
+  // loaded. 404s when the current alert doesn't exist; `newer`/`older` are
+  // null at the respective boundary.
+  app.get<{ Params: { id: string } }>("/api/alerts/:id/neighbors", async (request) => {
+    const parsed = neighborsQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      throw new ValidationError("Invalid query parameters", parsed.error.flatten());
+    }
+    return alertsService.neighbors(request.params.id, parsed.data);
   });
 
   app.patch<{ Params: { id: string } }>("/api/alerts/:id/status", async (request) => {

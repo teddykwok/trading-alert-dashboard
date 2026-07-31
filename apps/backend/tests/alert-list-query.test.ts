@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { listQuerySchema } from "../src/routes/alerts.routes";
+import { listQuerySchema, neighborsQuerySchema } from "../src/routes/alerts.routes";
 import { env } from "../src/config/env";
 
 /**
@@ -52,5 +52,55 @@ describe("listQuerySchema", () => {
       levelColor: "RED",
       offset: 100,
     });
+  });
+
+  it("parses comma-separated sourceTimeframes with whitespace tolerance", () => {
+    expect(listQuerySchema.parse({ sourceTimeframes: "1D,1W" }).sourceTimeframes).toEqual([
+      "1D",
+      "1W",
+    ]);
+    expect(listQuerySchema.parse({ sourceTimeframes: " 1D , 1W " }).sourceTimeframes).toEqual([
+      "1D",
+      "1W",
+    ]);
+    expect(listQuerySchema.parse({ sourceTimeframes: "6M" }).sourceTimeframes).toEqual(["6M"]);
+    expect(
+      listQuerySchema.parse({ sourceTimeframes: "1D,1W,1M,3M,6M,12M" }).sourceTimeframes
+    ).toEqual(["1D", "1W", "1M", "3M", "6M", "12M"]);
+    expect(listQuerySchema.parse({}).sourceTimeframes).toBeUndefined();
+  });
+
+  it("rejects invalid or empty sourceTimeframes values", () => {
+    expect(listQuerySchema.safeParse({ sourceTimeframes: "1D,2H" }).success).toBe(false);
+    expect(listQuerySchema.safeParse({ sourceTimeframes: "" }).success).toBe(false);
+    expect(listQuerySchema.safeParse({ sourceTimeframes: " , " }).success).toBe(false);
+  });
+
+  it("keeps the singular sourceTimeframe filter working alongside the plural", () => {
+    const parsed = listQuerySchema.parse({ sourceTimeframe: "1W", sourceTimeframes: "1D,1M" });
+    expect(parsed.sourceTimeframe).toBe("1W");
+    expect(parsed.sourceTimeframes).toEqual(["1D", "1M"]);
+  });
+});
+
+describe("neighborsQuerySchema", () => {
+  it("accepts the list filter set but never paging parameters", () => {
+    const parsed = neighborsQuerySchema.parse({
+      signals: "SHORT",
+      sourceTimeframes: "1W,1M",
+      levelColor: "GREEN",
+    });
+    expect(parsed).toMatchObject({
+      signals: ["SHORT"],
+      sourceTimeframes: ["1W", "1M"],
+      levelColor: "GREEN",
+    });
+    expect(parsed).not.toHaveProperty("limit");
+    expect(parsed).not.toHaveProperty("offset");
+  });
+
+  it("rejects invalid filter values just like the list schema", () => {
+    expect(neighborsQuerySchema.safeParse({ sourceTimeframes: "1D,BOGUS" }).success).toBe(false);
+    expect(neighborsQuerySchema.safeParse({ signals: "NOPE" }).success).toBe(false);
   });
 });

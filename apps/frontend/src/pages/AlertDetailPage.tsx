@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useLocation, useParams } from "react-router-dom";
 import { Card } from "../components/ui/Card";
 import { SignalBadge } from "../components/alerts/SignalBadge";
 import { StatusBadge } from "../components/alerts/StatusBadge";
@@ -11,11 +11,13 @@ import { TradeJournalPanel } from "../components/alerts/TradeJournalPanel";
 import { FuturesRiskPlanner } from "../components/alerts/FuturesRiskPlanner";
 import { ScreenshotPreview } from "../components/charts/ScreenshotPreview";
 import { alertsApi } from "../api/alerts.api";
+import { parseFiltersFromSearch } from "../hooks/useFilters";
 import { getSocket } from "../sockets/socket";
 import { SOCKET_EVENTS } from "../sockets/socket-events";
 import { formatDateTime } from "../utils/formatDate";
 import { formatPrice } from "../utils/formatPrice";
 import type { Alert, AlertContext, AlertStatus } from "../types/alert";
+import type { AlertNeighbor, AlertNeighborsResponse } from "../types/api";
 
 const STATUS_TIMELINE: AlertStatus[] = [
   "RECEIVED",
@@ -26,19 +28,50 @@ const STATUS_TIMELINE: AlertStatus[] = [
 
 export function AlertDetailPage() {
   const { id } = useParams<{ id: string }>();
+  // The dashboard's filter query travels in this page's URL (not router
+  // state), so the review context survives refreshes and can be handed back
+  // to "/" or to a neighboring alert unchanged.
+  const { search } = useLocation();
   const [alert, setAlert] = useState<Alert | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [neighbors, setNeighbors] = useState<AlertNeighborsResponse | null>(null);
+  const [neighborsLoading, setNeighborsLoading] = useState(false);
+
+  const filterQuery = useMemo(() => parseFiltersFromSearch(new URLSearchParams(search)), [search]);
 
   useEffect(() => {
     if (!id) return;
     setLoading(true);
+    setError(null);
     alertsApi
       .getById(id)
       .then(setAlert)
       .catch((err) => setError(err instanceof Error ? err.message : "Failed to load alert"))
       .finally(() => setLoading(false));
   }, [id]);
+
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    setNeighborsLoading(true);
+    setNeighbors(null);
+    alertsApi
+      .neighbors(id, filterQuery)
+      .then((response) => {
+        if (!cancelled) setNeighbors(response);
+      })
+      .catch(() => {
+        // Neighbor navigation is an extra — a failure here must never break
+        // the alert detail itself. Both directions just stay unavailable.
+      })
+      .finally(() => {
+        if (!cancelled) setNeighborsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, filterQuery]);
 
   useEffect(() => {
     if (!id) return;
@@ -71,9 +104,29 @@ export function AlertDetailPage() {
 
   return (
     <div className="flex flex-col gap-5">
-      <Link to="/" className="text-xs text-slate-500 hover:text-slate-300">
-        ← Back to dashboard
-      </Link>
+      {/* Filter-aware review navigation: both neighbors and the back link keep
+          the filter query, so the whole loop stays inside the same filtered
+          result set. */}
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <NeighborLink
+          direction="newer"
+          neighbor={neighbors?.newer ?? null}
+          loading={neighborsLoading}
+          search={search}
+        />
+        <Link
+          to={{ pathname: "/", search }}
+          className="text-slate-500 hover:text-slate-300"
+        >
+          {search ? "Back to filtered results" : "Back to dashboard"}
+        </Link>
+        <NeighborLink
+          direction="older"
+          neighbor={neighbors?.older ?? null}
+          loading={neighborsLoading}
+          search={search}
+        />
+      </div>
 
       <div className="flex flex-wrap items-center gap-2">
         <h1 className="text-xl font-semibold text-slate-100">{alert.symbol}</h1>
@@ -158,6 +211,45 @@ export function AlertDetailPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * One side of the Newer/Older navigation. "Newer/Older" (not Previous/Next)
+ * because the dashboard is ordered newest-first — direction is unambiguous.
+ * Rendered as inert text while neighbors load (subtle: same label, dimmed)
+ * and when there is no neighbor in that direction.
+ */
+function NeighborLink({
+  direction,
+  neighbor,
+  loading,
+  search,
+}: {
+  direction: "newer" | "older";
+  neighbor: AlertNeighbor | null;
+  loading: boolean;
+  search: string;
+}) {
+  const label = direction === "newer" ? "← Newer alert" : "Older alert →";
+  if (loading) {
+    return <span className="animate-pulse text-slate-700">{label}</span>;
+  }
+  if (!neighbor) {
+    return (
+      <span aria-disabled="true" className="cursor-default select-none text-slate-700">
+        {label}
+      </span>
+    );
+  }
+  return (
+    <Link
+      to={{ pathname: `/alerts/${neighbor.id}`, search }}
+      title={neighbor.symbol}
+      className="text-slate-400 hover:text-slate-200"
+    >
+      {label}
+    </Link>
   );
 }
 

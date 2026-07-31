@@ -1,7 +1,12 @@
 import type { AlertStats } from "@trading-alert-dashboard/shared";
 import { apiClient } from "./client";
 import type { Alert, AlertStatus } from "../types/alert";
-import type { AlertListQuery, AlertStatsQuery, AlertListResponse } from "../types/api";
+import type {
+  AlertListQuery,
+  AlertNeighborsResponse,
+  AlertStatsQuery,
+  AlertListResponse,
+} from "../types/api";
 
 function toQueryString(query: AlertListQuery | AlertStatsQuery): string {
   const params = new URLSearchParams();
@@ -30,6 +35,11 @@ export const alertsApi = {
     apiClient.get<AlertStats>(`/api/alerts/stats${toQueryString(query)}`),
 
   getById: (id: string) => apiClient.get<Alert>(`/api/alerts/${id}`),
+
+  // Adjacent alerts in dashboard ordering within the given filter set —
+  // resolved server-side, so a neighbor outside the loaded pages is found too.
+  neighbors: (id: string, query: AlertListQuery = {}) =>
+    apiClient.get<AlertNeighborsResponse>(`/api/alerts/${id}/neighbors${toQueryString(query)}`),
 
   updateStatus: (id: string, status: AlertStatus, errorMessage?: string) =>
     apiClient.patch<Alert>(`/api/alerts/${id}/status`, { status, errorMessage }),

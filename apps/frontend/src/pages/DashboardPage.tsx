@@ -34,6 +34,16 @@ function matchesFilters(alert: Alert, filters: ReturnType<typeof useFilters>["fi
   // from structured columns with a note-parsing fallback — so legacy alerts
   // whose metadata only lives in the note are filtered correctly too.
   if (filters.sourceTimeframe && alert.alertContext?.sourceTimeframe !== filters.sourceTimeframe) return false;
+  // Multi-source-timeframe filter (OR semantics): the alert's level-origin TF
+  // must be one of the selected values; undefined/empty = all source TFs.
+  if (
+    filters.sourceTimeframes &&
+    filters.sourceTimeframes.length > 0 &&
+    (alert.alertContext?.sourceTimeframe == null ||
+      !filters.sourceTimeframes.includes(alert.alertContext.sourceTimeframe))
+  ) {
+    return false;
+  }
   if (filters.levelColor && alert.alertContext?.levelColor !== filters.levelColor) return false;
   return true;
 }

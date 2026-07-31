@@ -64,6 +64,24 @@ describe("AlertsService.list", () => {
     );
   });
 
+  it("applies the multi-source-timeframe filter as an in-list, winning over the singular", async () => {
+    const prisma = createMockPrisma([], 0);
+    const service = new AlertsService(prisma);
+
+    await service.list({
+      sourceTimeframe: "3M",
+      sourceTimeframes: ["1D", "1W"],
+      limit: 10,
+      offset: 0,
+    });
+
+    expect(prisma.alert.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ sourceTimeframe: { in: ["1D", "1W"] } }),
+      })
+    );
+  });
+
   it("uses the identical where-clause for count so total matches the paged filter", async () => {
     const prisma = createMockPrisma([], 0);
     const service = new AlertsService(prisma);
