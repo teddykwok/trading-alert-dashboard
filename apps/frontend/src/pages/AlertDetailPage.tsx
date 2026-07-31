@@ -116,6 +116,10 @@ export function AlertDetailPage() {
         />
         <Link
           to={{ pathname: "/", search }}
+          // Router-state hint (NOT a URL param — scroll position is UI state,
+          // not a filter): tells the dashboard this is a return from alert
+          // review, so it may restore its saved pagination depth + scrollY.
+          state={{ restoreDashboardScroll: true }}
           className="text-slate-500 hover:text-slate-300"
         >
           {search ? "Back to filtered results" : "Back to dashboard"}

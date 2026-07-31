@@ -124,6 +124,16 @@ function serializeFiltersToParams(
 }
 
 /**
+ * Canonical string identity of a filter state — the same omit-defaults
+ * serialization the URL uses, so equivalent views (e.g. explicit
+ * "Actionable only" vs a clean "/") share one identity. Used to key
+ * per-filter-context UI state such as scroll restoration; "" = default view.
+ */
+export function canonicalFilterSearch(filters: AlertListQuery): string {
+  return serializeFiltersToParams(filters).toString();
+}
+
+/**
  * Dashboard filter state, backed by the URL query string instead of React
  * state: refreshing, browser back/forward, bookmarks and returning from an
  * alert detail page all restore the same filtered view.
