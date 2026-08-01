@@ -16,6 +16,7 @@ import { getSocket } from "../sockets/socket";
 import { SOCKET_EVENTS } from "../sockets/socket-events";
 import { formatDateTime } from "../utils/formatDate";
 import { formatPrice } from "../utils/formatPrice";
+import { formatMinMovementPercent, isTeddyIndicator } from "../utils/minMovement";
 import type { Alert, AlertContext, AlertStatus } from "../types/alert";
 import type { AlertNeighbor, AlertNeighborsResponse } from "../types/api";
 
@@ -172,10 +173,21 @@ export function AlertDetailPage() {
               <Row label="Exchange" value={alert.exchange ?? "—"} />
               <Row label="Market data source" value={marketDataSource} />
               <Row label="Indicator" value={alert.indicatorName ?? "—"} />
-              <Row
-                label="Indicator value"
-                value={alert.indicatorValue !== null ? String(alert.indicatorValue) : "—"}
-              />
+              {/* teddy alerts carry the script's minimum-movement threshold in
+                  indicatorValue (percentage points); historical teddy alerts
+                  hardcoded 0, which means "not recorded" — never a real 0%.
+                  Other indicators keep the generic raw-value row. */}
+              {isTeddyIndicator(alert.indicatorName) ? (
+                <Row
+                  label="Minimum movement"
+                  value={formatMinMovementPercent(alert.indicatorValue) ?? "Not recorded"}
+                />
+              ) : (
+                <Row
+                  label="Indicator value"
+                  value={alert.indicatorValue !== null ? String(alert.indicatorValue) : "—"}
+                />
+              )}
               <Row label="Triggered at" value={formatDateTime(alert.triggeredAt)} />
               <Row label="Received at" value={formatDateTime(alert.createdAt)} />
             </dl>

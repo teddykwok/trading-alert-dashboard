@@ -4,6 +4,7 @@ import { SignalBadge } from "./SignalBadge";
 import { StatusBadge } from "./StatusBadge";
 import { MockAiBadge } from "./MockAiBadge";
 import { OpenAiBadge } from "./OpenAiBadge";
+import { MinMovementBadge } from "./MinMovementBadge";
 import { DuplicateBadge } from "./DuplicateBadge";
 import { OutcomeBadge } from "./OutcomeBadge";
 import { LevelContextBadges } from "./LevelContextBadges";
@@ -36,6 +37,7 @@ export function AlertCard({ alert }: { alert: Alert }) {
             <StatusBadge status={alert.status} />
             {alert.aiProvider === "mock" && <MockAiBadge />}
             {alert.aiProvider === "openai" && <OpenAiBadge />}
+            <MinMovementBadge indicatorName={alert.indicatorName} value={alert.indicatorValue} />
             {alert.duplicateCount > 0 && <DuplicateBadge count={alert.duplicateCount} />}
             {alert.tradeReview && alert.tradeReview.status !== "UNREVIEWED" && (
               <OutcomeBadge status={alert.tradeReview.status} />
