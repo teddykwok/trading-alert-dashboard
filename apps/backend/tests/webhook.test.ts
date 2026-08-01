@@ -71,6 +71,19 @@ describe("handleTradingViewWebhook", () => {
     expect(visionAnalysisQueue.add).toHaveBeenCalledTimes(1);
   });
 
+  // The teddy Pine script sends its minimum-movement threshold here in
+  // percentage points (15 = 15%); the exact number must reach the database
+  // untouched — integers and decimals alike.
+  it("stores indicatorValue exactly as received, for integers and decimals", async () => {
+    for (const indicatorValue of [15, 12.5]) {
+      const prisma = createMockPrisma(null);
+      await handleTradingViewWebhook(prisma, { ...validPayload, indicatorValue });
+      expect((prisma.alert.create as ReturnType<typeof vi.fn>).mock.calls[0][0].data).toEqual(
+        expect.objectContaining({ indicatorValue })
+      );
+    }
+  });
+
   it("rejects a webhook whose secret does not match WEBHOOK_SECRET", async () => {
     const prisma = createMockPrisma(null);
 

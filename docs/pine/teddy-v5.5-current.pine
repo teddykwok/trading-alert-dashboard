@@ -120,6 +120,10 @@ f_formatPrice(value) =>
 // Payload JSON untuk POST /api/webhooks/tradingview. Field ekstra sengaja
 // TIDAK ditambahkan (validasi Zod backend membuang field tak dikenal) —
 // semua detail level/sentuhan dimasukkan ke "note".
+// "indicatorValue" = input "Persentase Pergerakan Harga Minimal (%)" dalam
+// POIN PERSEN (input 15.0 -> 15, 12.5 -> 12.5), BUKAN pecahan 0.15 — dashboard
+// menampilkannya sebagai "MOVE ≥15%". Format "#.####" menjaga angka JSON tetap
+// valid: tanpa notasi ilmiah, tanpa ekor desimal float, desimal berguna utuh.
 f_buildWebhookJson(signal, levelPrice, note) =>
     '{'
      + '"secret":"' + webhookSecret + '",'
@@ -129,7 +133,7 @@ f_buildWebhookJson(signal, levelPrice, note) =>
      + '"price":' + f_formatPrice(levelPrice) + ','
      + '"signal":"' + signal + '",'
      + '"indicatorName":"teddy v5.5",'
-     + '"indicatorValue":0,'
+     + '"indicatorValue":' + str.tostring(minPercentInput * 100, "#.####") + ','
      + '"triggeredAt":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '",'
      + '"exchange":"' + exchangeInput + '",'
      + '"note":"' + note + '"'
