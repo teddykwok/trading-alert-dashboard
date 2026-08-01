@@ -77,12 +77,12 @@ assetTypeInput = input.string("crypto", "Asset Type", options=["crypto", "stock"
 exchangeInput = input.string("BINANCE", "Exchange", group = GRP_WEBHOOK)
 enableWebhookAlerts = input.bool(true, "Enable Webhook Alerts", group = GRP_WEBHOOK)
 enableLevelTouchedAlerts = input.bool(true, "Alert When Price Touches Existing Level", group = GRP_WEBHOOK)
-touchTolerancePct = input.float(0.2, "Touch Tolerance (%)", group = GRP_WEBHOOK) / 100
+touchTolerancePct = input.float(1.0, "Touch Tolerance (%)", group = GRP_WEBHOOK) / 100
 touchCooldownBars = input.int(10, "Touch Alert Cooldown Bars", minval=1, group = GRP_WEBHOOK)
 minBarsAfterCreation = input.int(5, "Min Bars After Level Creation Before Touch Alert", minval=1, group = GRP_WEBHOOK)
 // Jarak minimal antara bar ARMED dan retest — retest tidak boleh terjadi di
 // bar yang sama dengan arming (aturan terpisah dari minBarsAfterCreation).
-minBarsAfterArming = input.int(1, "Min Bars After Arming Before Retest", minval=1, group = GRP_WEBHOOK)
+minBarsAfterArming = input.int(4, "Min Bars After Arming Before Retest", minval=1, group = GRP_WEBHOOK)
 // "Immediate" = LONG/SHORT dikirim saat tick pertama sentuhan valid pada level
 // yang SUDAH armed (sekali per bar per level); "Bar Close" = tunggu candle
 // chart ditutup. ARMED/DISARM selalu memakai close confirmed, apa pun mode ini.
