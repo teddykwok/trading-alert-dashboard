@@ -95,3 +95,35 @@ export { SYMBOL_INPUT_MAX_LENGTH, getSymbolInputError } from "./symbol-validatio
 
 export type { RiskTemplate, RiskTemplateAmounts } from "./risk-template";
 export { calculateRiskTemplateAmounts } from "./risk-template";
+
+export type {
+  ExtremeCandidateGeometry,
+  ExtremeCandidateInput,
+  ExtremeLeverageAnalysis,
+  ExtremeLeverageOption,
+  ExtremeMoney,
+  ExtremeMoneyInput,
+  ExtremeRRCandidate,
+  ExtremeRRLeverage,
+  ExtremeRRLookback,
+  ExtremeRRPlanDto,
+  ExtremeRRPlanStatus,
+  ExtremeRRTemplateSnapshot,
+  ExtremeType,
+} from "./extreme-rr";
+export {
+  EXTREME_RR_DEFAULT_LOOKBACK,
+  EXTREME_RR_LEVERAGE_PRESETS,
+  EXTREME_RR_LEVERAGE_UNVERIFIED_NOTE,
+  EXTREME_RR_LOOKBACKS,
+  EXTREME_RR_MARGIN_DISCLAIMER,
+  EXTREME_RR_PREFERRED_MARGIN_MAX,
+  EXTREME_RR_PREFERRED_MARGIN_MIN,
+  EXTREME_RR_QUEUE_NAME,
+  EXTREME_RR_STATUSES,
+  EXTREME_RR_UNROUNDED_NOTE,
+  buildLeverageAnalysis,
+  calculateExtremeCandidate,
+  calculateExtremeMoney,
+  extremeOfDecimalStrings,
+} from "./extreme-rr";

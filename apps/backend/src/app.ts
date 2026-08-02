@@ -16,6 +16,7 @@ import { settingsRoutes } from "./routes/settings.routes";
 import { tradeReviewsRoutes } from "./routes/trade-reviews.routes";
 import { tradeJournalsRoutes } from "./routes/trade-journals.routes";
 import { riskTemplatesRoutes } from "./routes/risk-templates.routes";
+import { extremeRRRoutes } from "./routes/extreme-rr.routes";
 import { AppError } from "./utils/errors";
 import { ensureScreenshotDir } from "./utils/file";
 
@@ -42,6 +43,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(tradeReviewsRoutes);
   await app.register(tradeJournalsRoutes);
   await app.register(riskTemplatesRoutes);
+  await app.register(extremeRRRoutes);
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof AppError) {

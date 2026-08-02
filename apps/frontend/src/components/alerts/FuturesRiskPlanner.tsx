@@ -213,15 +213,16 @@ export function FuturesRiskPlanner({ alert }: { alert: Alert }) {
   return (
     <Card className="p-4">
       <div className="mb-3 flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-slate-200">Futures Risk Planner</h2>
+        <h2 className="text-sm font-semibold text-slate-200">Manual Risk Calculator</h2>
         <span className="text-xs text-slate-500">
           Direction: <span className="font-semibold text-slate-200">{alert.signal}</span>
         </span>
       </div>
 
       <p className="mb-3 text-xs text-slate-500">
-        Position size is derived from your risk budget and stop distance — leverage only changes
-        the margin required, never the risk taken.
+        Manual what-if calculator with your own entry/stop/target — the automatic, frozen Extreme
+        RR Plan above is the authoritative one. Position size is derived from your risk budget and
+        stop distance — leverage only changes the margin required, never the risk taken.
       </p>
 
       {/* Trade setup */}

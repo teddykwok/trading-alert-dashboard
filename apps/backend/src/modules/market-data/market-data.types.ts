@@ -7,6 +7,19 @@ export interface OhlcvCandle {
   volume: number;
 }
 
+/**
+ * A COMPLETED candle for Extreme RR snapshots. Unlike OhlcvCandle (chart
+ * rendering, plain numbers), high/low stay exact decimal STRINGS straight
+ * from Binance so extremes never round-trip through floats, and closeTime is
+ * kept so "closed before the alert's triggeredAt" can be enforced.
+ */
+export interface SnapshotCandle {
+  openTimeMs: number;
+  closeTimeMs: number;
+  high: string;
+  low: string;
+}
+
 export interface MarketDataProvider {
   getRecentCandles(symbol: string, timeframe: string, referencePrice: number): Promise<OhlcvCandle[]>;
 }

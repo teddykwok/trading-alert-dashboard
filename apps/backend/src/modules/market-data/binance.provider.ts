@@ -1,7 +1,12 @@
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import type { MarketType } from "../../utils/symbol";
-import { MarketDataError, type MarketDataProvider, type OhlcvCandle } from "./market-data.types";
+import {
+  MarketDataError,
+  type MarketDataProvider,
+  type OhlcvCandle,
+  type SnapshotCandle,
+} from "./market-data.types";
 
 const DEFAULT_LIMIT = 120;
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -80,11 +85,42 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function klinesUrl(marketType: MarketType, symbol: string, interval: string, limit: number): string {
-  const query = `symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
+function klinesUrl(
+  marketType: MarketType,
+  symbol: string,
+  interval: string,
+  limit: number,
+  endTimeMs?: number
+): string {
+  const endTime = endTimeMs !== undefined ? `&endTime=${endTimeMs}` : "";
+  const query = `symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}${endTime}`;
   return marketType === "futures"
     ? `${env.BINANCE_FUTURES_REST_BASE_URL}/fapi/v1/klines?${query}`
     : `${env.BINANCE_REST_BASE_URL}/api/v3/klines?${query}`;
+}
+
+/**
+ * Parses klines into snapshot candles, keeping high/low as the exact decimal
+ * STRINGS Binance sent (no float round-trip) plus open/close times in ms.
+ */
+function parseSnapshotKlines(raw: unknown, symbol: string): SnapshotCandle[] {
+  if (!Array.isArray(raw)) {
+    throw new MarketDataError(`Unexpected Binance klines response shape for ${symbol}`);
+  }
+
+  return raw.map((entry, index) => {
+    if (!Array.isArray(entry) || entry.length < 7) {
+      throw new MarketDataError(`Malformed kline entry at index ${index} for ${symbol}`);
+    }
+    const openTimeMs = Number(entry[0]);
+    const closeTimeMs = Number(entry[6]);
+    const high = String(entry[2]);
+    const low = String(entry[3]);
+    if (Number.isNaN(openTimeMs) || Number.isNaN(closeTimeMs) || !/^\d+(\.\d+)?$/.test(high) || !/^\d+(\.\d+)?$/.test(low)) {
+      throw new MarketDataError(`Malformed kline values at index ${index} for ${symbol}`);
+    }
+    return { openTimeMs, closeTimeMs, high, low };
+  });
 }
 
 /**
@@ -152,5 +188,45 @@ export class BinanceProvider implements MarketDataProvider {
     throw new MarketDataError(
       `Binance ${marketType} klines fetch failed for ${symbol} (${interval}) after ${MAX_ATTEMPTS} attempt(s): ${message}`
     );
+  }
+
+  /**
+   * Fetches up to `limit` candles that CLOSED at or before `cutoff` — the
+   * frozen dataset for Extreme RR snapshots. Uses Binance's `endTime` filter
+   * (openTime <= endTime), then drops any candle whose closeTime is after the
+   * cutoff (i.e. the candle still forming at alert time). Historical klines
+   * are immutable, so refetching with the same cutoff reproduces the same
+   * dataset. One shot, no retry-hiding: callers surface errors as plan ERROR.
+   */
+  async getClosedCandlesBefore(
+    symbol: string,
+    timeframe: string,
+    cutoff: Date,
+    marketType: MarketType = "spot",
+    limit: number = 300
+  ): Promise<SnapshotCandle[]> {
+    const interval = toBinanceInterval(timeframe);
+    // Small overfetch: the forming candle at the cutoff gets filtered out.
+    const url = klinesUrl(marketType, symbol, interval, Math.min(limit + 5, 1000), cutoff.getTime());
+
+    logger.info(
+      { provider: "binance", marketType, symbol, interval, limit, cutoff: cutoff.toISOString() },
+      "Fetching Binance snapshot klines (closed before cutoff)"
+    );
+
+    const response = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS);
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new MarketDataError(
+        `Binance ${marketType} klines request failed with status ${response.status}${body ? `: ${body}` : ""}`
+      );
+    }
+
+    const cutoffMs = cutoff.getTime();
+    const candles = parseSnapshotKlines(await response.json(), symbol)
+      .filter((candle) => candle.closeTimeMs <= cutoffMs)
+      .sort((a, b) => a.openTimeMs - b.openTimeMs);
+
+    return candles.slice(-limit);
   }
 }

@@ -8,6 +8,7 @@ import { OpenAiBadge } from "../components/alerts/OpenAiBadge";
 import { AiOpinionPanel } from "../components/alerts/AiOpinionPanel";
 import { TradeOutcomePanel } from "../components/alerts/TradeOutcomePanel";
 import { TradeJournalPanel } from "../components/alerts/TradeJournalPanel";
+import { ExtremeRRPlanner } from "../components/alerts/ExtremeRRPlanner";
 import { FuturesRiskPlanner } from "../components/alerts/FuturesRiskPlanner";
 import { ScreenshotPreview } from "../components/charts/ScreenshotPreview";
 import { alertsApi } from "../api/alerts.api";
@@ -153,6 +154,10 @@ export function AlertDetailPage() {
               className="h-auto w-full"
             />
           </Card>
+
+          {/* Automatic frozen plan first; the manual calculator below is the
+              what-if tool. ExtremeRRPlanner renders nothing for WATCH/EXIT. */}
+          <ExtremeRRPlanner alert={alert} />
 
           <FuturesRiskPlanner alert={alert} />
 
