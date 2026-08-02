@@ -53,6 +53,13 @@ enum TradeEmotion {
   UNCERTAIN
 }
 
+enum ExtremeRRPlanStatus {
+  PENDING
+  READY
+  INVALID
+  ERROR
+}
+
 enum AlertEventType {
   LEVEL_CREATED
   LEVEL_TOUCHED
@@ -123,6 +130,7 @@ model Alert {
   updatedAt       DateTime    @updatedAt
   tradeReview     TradeReview?
   tradeJournal    TradeJournal?
+  extremeRRPlan   ExtremeRRPlan?
 
   @@index([status])
   @@index([symbol])
@@ -219,6 +227,49 @@ model RiskTemplate {
   updatedAt        DateTime @updatedAt
 
   @@index([isActive])
+}
+
+// One authoritative Extreme RR plan per alert (unique alertId). Everything a
+// plan needs to be reproduced is snapshotted at generation time: the entry
+// (alert price), the candle cutoff (alert triggeredAt), the risk-template
+// values, and the three frozen lookback candidates (100/200/300 closed
+// candles ending before the cutoff, as JSON of exact decimal strings).
+// Candidates NEVER drift with later market prices; money-management numbers
+// are recomputed on read from these frozen fields only — never from an
+// exchange balance and never accepted from a client.
+model ExtremeRRPlan {
+  id         String              @id @default(cuid())
+  alertId    String              @unique
+  alert      Alert               @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  status     ExtremeRRPlanStatus @default(PENDING)
+  direction  SignalType
+  entryBasis String              @default("ALERT_PRICE")
+  entryPrice Decimal             @db.Decimal(30, 12)
+  cutoffAt   DateTime
+  timeframe  String
+  marketType String?
+
+  // Risk-template snapshot at generation time (all null when none was
+  // active). Later template edits must never mutate an existing plan.
+  riskTemplateId   String?
+  templateName     String?
+  referenceCapital Decimal? @db.Decimal(30, 12)
+  riskPercent      Decimal? @db.Decimal(10, 6)
+  rewardRatio      Decimal? @db.Decimal(10, 4)
+  riskAmount       Decimal? @db.Decimal(30, 12)
+  targetAmount     Decimal? @db.Decimal(30, 12)
+
+  // Frozen lookback candidates (see ExtremeRRCandidate in packages/shared).
+  candidates       Json?
+  selectedLookback Int     @default(300)
+  selectedLeverage Int?
+
+  errorReason String?
+  generatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status])
 }
 
 model Setting {

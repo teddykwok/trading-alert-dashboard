@@ -3,7 +3,9 @@ import { ASSET_TYPES, SIGNAL_TYPES, parseAlertNote } from "@trading-alert-dashbo
 import { tradingViewWebhookSchema, type TradingViewWebhookInput } from "./webhook.schema";
 import { isValidWebhookSecret } from "./webhook.security";
 import { AlertsService } from "../alerts/alerts.service";
-import { enqueueVisionAnalysis } from "../jobs/queue";
+import { ExtremeRRService } from "../extreme-rr/extreme-rr.service";
+import { enqueueExtremeRRPlan, enqueueVisionAnalysis } from "../jobs/queue";
+import { logger } from "../../config/logger";
 import { notifyAlertDuplicate, notifyNewAlert } from "../notifications/notification.service";
 import { parseOrNowDate } from "../../utils/date";
 import { normalizeTradingSymbol } from "../../utils/symbol";
@@ -138,6 +140,19 @@ export async function handleTradingViewWebhook(
 
   await notifyNewAlert(alert);
   await enqueueVisionAnalysis(alert.id);
+
+  // Extreme RR plan generation for actionable alerts: create the PENDING row
+  // and enqueue the background job. Strictly best-effort — a plan scheduling
+  // failure must never reject or delete an otherwise valid alert.
+  if (signal === "LONG" || signal === "SHORT") {
+    try {
+      await new ExtremeRRService(prisma).ensurePendingPlan(alert);
+      await enqueueExtremeRRPlan(alert.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.warn({ alertId: alert.id, error: message }, "Extreme RR plan scheduling failed (alert kept)");
+    }
+  }
 
   return { id: alert.id, status: alert.status };
 }

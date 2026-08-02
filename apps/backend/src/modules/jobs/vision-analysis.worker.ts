@@ -1,6 +1,6 @@
 import path from "node:path";
 import { Worker, type Job } from "bullmq";
-import { VISION_ANALYSIS_QUEUE_NAME } from "@trading-alert-dashboard/shared";
+import { EXTREME_RR_QUEUE_NAME, VISION_ANALYSIS_QUEUE_NAME } from "@trading-alert-dashboard/shared";
 import { logger } from "../../config/logger";
 import { prisma } from "../../plugins/prisma";
 import { AlertsService } from "../alerts/alerts.service";
@@ -14,7 +14,8 @@ import {
 } from "../notifications/notification.service";
 import { ensureScreenshotDir, screenshotFileName } from "../../utils/file";
 import { inferMarketType } from "../../utils/symbol";
-import { bullConnection, type VisionAnalysisJobData } from "./queue";
+import { ExtremeRRService } from "../extreme-rr/extreme-rr.service";
+import { bullConnection, type ExtremeRRJobData, type VisionAnalysisJobData } from "./queue";
 import { startCleanupScheduler } from "./cleanup.worker";
 import { setupRetentionSchedule } from "./retention.worker";
 
@@ -106,9 +107,36 @@ async function processVisionAnalysisJob(job: Job<VisionAnalysisJobData>): Promis
   }
 }
 
+/**
+ * Extreme RR plan generation. Runs in this same worker process (one worker
+ * architecture, two queues). Unlike the vision pipeline, a plan failure never
+ * touches the alert: the service records status ERROR on the PLAN and
+ * returns; we then throw so BullMQ retries — a later success simply
+ * overwrites the ERROR row (same frozen triggeredAt cutoff, immutable data).
+ */
+async function processExtremeRRJob(job: Job<ExtremeRRJobData>): Promise<void> {
+  const { alertId } = job.data;
+  const plan = await extremeRRService.generateForAlert(alertId);
+  if (plan.status === "ERROR") {
+    throw new Error(plan.errorReason ?? "Extreme RR plan generation failed");
+  }
+  logger.info({ alertId, status: plan.status }, "Extreme RR plan generated");
+}
+
+const extremeRRService = new ExtremeRRService(prisma);
+
 const worker = new Worker<VisionAnalysisJobData>(VISION_ANALYSIS_QUEUE_NAME, processVisionAnalysisJob, {
   connection: bullConnection,
   concurrency: 2,
+});
+
+const extremeRRWorker = new Worker<ExtremeRRJobData>(EXTREME_RR_QUEUE_NAME, processExtremeRRJob, {
+  connection: bullConnection,
+  concurrency: 2,
+});
+
+extremeRRWorker.on("failed", (job, error) => {
+  logger.error({ jobId: job?.id, error }, "Extreme RR plan job failed");
 });
 
 worker.on("completed", (job) => {
@@ -137,6 +165,7 @@ logger.info("vision-analysis worker started, waiting for jobs...");
 process.on("SIGTERM", async () => {
   clearInterval(cleanupTimer);
   await worker.close();
+  await extremeRRWorker.close();
   await retentionWorker?.close();
   await prisma.$disconnect();
   process.exit(0);

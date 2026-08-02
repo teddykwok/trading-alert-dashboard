@@ -351,4 +351,39 @@ describe("handleTradingViewWebhook", () => {
       expect(Math.abs(since.getTime() - expectedSince)).toBeLessThan(2000);
     });
   });
+
+  describe("extreme RR plan scheduling", () => {
+    it("keeps the alert even when plan scheduling fails entirely", async () => {
+      // createMockPrisma has NO extremeRRPlan model, so ensurePendingPlan
+      // throws internally — the webhook must swallow that, never the alert.
+      const prisma = createMockPrisma(null);
+
+      const result = await handleTradingViewWebhook(prisma, validPayload);
+
+      expect(result).toEqual({ id: "alert_1", status: "RECEIVED" });
+      expect(prisma.alert.create).toHaveBeenCalledTimes(1);
+    });
+
+    it("creates a PENDING plan row for actionable alerts, but not for WATCH", async () => {
+      const prisma = createMockPrisma(null);
+      const extremeRRPlan = {
+        findUnique: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockResolvedValue({ id: "plan_1" }),
+      };
+      (prisma as unknown as Record<string, unknown>).extremeRRPlan = extremeRRPlan;
+
+      await handleTradingViewWebhook(prisma, validPayload); // signal LONG
+      expect(extremeRRPlan.create).toHaveBeenCalledTimes(1);
+      expect(extremeRRPlan.create.mock.calls[0][0].data).toEqual(
+        expect.objectContaining({ alertId: "alert_1", status: "PENDING" })
+      );
+
+      const prismaWatch = createMockPrisma(null);
+      const watchPlan = { findUnique: vi.fn(), create: vi.fn() };
+      (prismaWatch as unknown as Record<string, unknown>).extremeRRPlan = watchPlan;
+
+      await handleTradingViewWebhook(prismaWatch, { ...validPayload, signal: "WATCH" });
+      expect(watchPlan.create).not.toHaveBeenCalled();
+    });
+  });
 });

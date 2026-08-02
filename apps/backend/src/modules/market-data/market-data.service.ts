@@ -5,7 +5,7 @@ import type { MarketType } from "../../utils/symbol";
 import { BinanceProvider } from "./binance.provider";
 import { StocksProvider } from "./stocks.provider";
 import { generateMockCandles } from "./mock-candles";
-import { MarketDataError, type OhlcvCandle } from "./market-data.types";
+import { MarketDataError, type OhlcvCandle, type SnapshotCandle } from "./market-data.types";
 
 const binanceProvider = new BinanceProvider();
 const stocksProvider = new StocksProvider();
@@ -57,4 +57,27 @@ export async function getRecentCandles(
   }
 
   return stocksProvider.getRecentCandles(symbol, timeframe, referencePrice);
+}
+
+/**
+ * Frozen historical dataset for Extreme RR plans: candles that CLOSED at or
+ * before `cutoff`. Deliberately NO mock fallback — a plan's SL/TP must never
+ * be derived from synthetic candles, so anything that is not real Binance
+ * data surfaces as a MarketDataError and the plan is marked ERROR instead.
+ */
+export async function getClosedCandlesBefore(
+  assetType: AssetType,
+  symbol: string,
+  timeframe: string,
+  cutoff: Date,
+  exchange: string | null = null,
+  marketType: MarketType = "spot",
+  limit = 300
+): Promise<SnapshotCandle[]> {
+  if (!shouldUseRealBinance(assetType, exchange)) {
+    throw new MarketDataError(
+      `Historical Binance data is not available for ${symbol} (assetType=${assetType}, exchange=${exchange ?? "unset"}) — Extreme RR plans require real Binance candles`
+    );
+  }
+  return binanceProvider.getClosedCandlesBefore(symbol, timeframe, cutoff, marketType, limit);
 }
