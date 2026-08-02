@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Card } from "../ui/Card";
 import { Button } from "../ui/Button";
 import { tradeReviewsApi } from "../../api/trade-reviews.api";
+import { riskTemplatesApi } from "../../api/risk-templates.api";
 import { formatPrice } from "../../utils/formatPrice";
 import {
   calculateFuturesRiskPlan,
@@ -69,16 +70,24 @@ export function FuturesRiskPlanner({ alert }: { alert: Alert }) {
   useEffect(() => {
     setLoading(true);
     setError(null);
-    tradeReviewsApi
-      .getForAlert(alert.id)
-      .then((review) => {
+    // The active risk template only PREFILLS capital and risk % when the
+    // saved plan has none (saved values always win). Prefill is best-effort
+    // (failure falls back to blanks), edits here are local until "Save plan",
+    // and nothing in this component ever writes back to the template.
+    // The template's rewardRatio is not prefilled: the planner has no R:R
+    // input — R:R is derived from entry/stop/target prices.
+    Promise.all([
+      tradeReviewsApi.getForAlert(alert.id),
+      riskTemplatesApi.getActive().catch(() => null),
+    ])
+      .then(([review, activeTemplate]) => {
         setFields({
           entryPrice: review.entryPrice ?? "",
           stopLossPrice: review.stopLossPrice ?? "",
           takeProfitPrice: review.takeProfitPrice ?? "",
           liquidationPrice: review.liquidationPrice ?? "",
-          accountBalance: review.accountBalance ?? "",
-          riskPercent: review.riskPercent ?? "",
+          accountBalance: review.accountBalance ?? activeTemplate?.referenceCapital ?? "",
+          riskPercent: review.riskPercent ?? activeTemplate?.riskPercent ?? "",
           leverage: review.leverage ?? "",
           marginMode: review.marginMode ?? "ISOLATED",
         });

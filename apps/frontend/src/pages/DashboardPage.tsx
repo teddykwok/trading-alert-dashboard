@@ -5,6 +5,7 @@ import { Card } from "../components/ui/Card";
 import { AlertFeed } from "../components/alerts/AlertFeed";
 import { AlertFilters } from "../components/alerts/AlertFilters";
 import { OutcomeSummary } from "../components/alerts/OutcomeSummary";
+import { ActiveRiskTemplateCard } from "../components/risk/ActiveRiskTemplateCard";
 import { TradeDisciplineSummary } from "../components/alerts/TradeDisciplineSummary";
 import { useAlerts } from "../hooks/useAlerts";
 import { useAlertStats } from "../hooks/useAlertStats";
@@ -173,6 +174,8 @@ export function DashboardPage() {
           </Card>
         ))}
       </div>
+
+      <ActiveRiskTemplateCard />
 
       <OutcomeSummary />
 

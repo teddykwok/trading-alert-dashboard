@@ -202,6 +202,25 @@ model TradeJournal {
   @@index([emotion])
 }
 
+// Step-based fixed-capital money management: referenceCapital is a manually
+// chosen planning value (e.g. 400), NEVER synced from any exchange balance or
+// PnL — the user edits it explicitly when stepping up/down. Derived amounts
+// (riskAmount, targetAmount) are deliberately NOT stored; the API recomputes
+// them from these fields on every read so they can never drift. At most one
+// template is active at a time, enforced transactionally at activation.
+model RiskTemplate {
+  id               String   @id @default(cuid())
+  name             String
+  referenceCapital Decimal  @db.Decimal(30, 12)
+  riskPercent      Decimal  @db.Decimal(10, 6)
+  rewardRatio      Decimal  @db.Decimal(10, 4)
+  isActive         Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([isActive])
+}
+
 model Setting {
   id        String   @id @default(cuid())
   key       String   @unique
