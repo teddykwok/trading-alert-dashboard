@@ -24,12 +24,13 @@ export function Topbar() {
 
   return (
     <header className="flex items-center justify-between border-b border-surface-border bg-surface-raised px-4 py-3 md:px-6">
+      {/* Mobile nav — mirrors the sidebar's items (Assets stays URL-only). */}
       <nav className="flex gap-3 md:hidden">
         <NavLink to="/" className="text-sm text-slate-300">
           Dashboard
         </NavLink>
-        <NavLink to="/assets" className="text-sm text-slate-300">
-          Assets
+        <NavLink to="/risk-templates" className="text-sm text-slate-300">
+          Risk Templates
         </NavLink>
         <NavLink to="/settings" className="text-sm text-slate-300">
           Settings
