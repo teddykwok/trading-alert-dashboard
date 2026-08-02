@@ -48,7 +48,12 @@ interface PlannerFields {
   marginMode: TradeMarginMode;
 }
 
-export function FuturesRiskPlanner({ alert }: { alert: Alert }) {
+/**
+ * `embedded` drops the surrounding Card and heading so the component can sit
+ * inside a Disclosure that already provides them. Behavior, fields, saved
+ * review data and API calls are identical in both modes.
+ */
+export function FuturesRiskPlanner({ alert, embedded = false }: { alert: Alert; embedded?: boolean }) {
   const directional = alert.signal === "LONG" || alert.signal === "SHORT";
 
   const [fields, setFields] = useState<PlannerFields>({
@@ -202,19 +207,23 @@ export function FuturesRiskPlanner({ alert }: { alert: Alert }) {
   const labelClass = "mb-1 block text-xs text-slate-500";
 
   if (loading) {
+    const loadingText = <p className="text-sm text-slate-500">Loading…</p>;
+    if (embedded) return loadingText;
     return (
       <Card className="p-4">
-        <h2 className="mb-3 text-sm font-semibold text-slate-200">Futures Risk Planner</h2>
-        <p className="text-sm text-slate-500">Loading…</p>
+        <h2 className="mb-3 text-sm font-semibold text-slate-200">Manual Risk Calculator</h2>
+        {loadingText}
       </Card>
     );
   }
 
-  return (
-    <Card className="p-4">
-      <div className="mb-3 flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-slate-200">Manual Risk Calculator</h2>
-        <span className="text-xs text-slate-500">
+  const content = (
+    <>
+      <div className="mb-3 flex items-center justify-between gap-2">
+        {!embedded && (
+          <h2 className="text-sm font-semibold text-slate-200">Manual Risk Calculator</h2>
+        )}
+        <span className="ml-auto text-xs text-slate-500">
           Direction: <span className="font-semibold text-slate-200">{alert.signal}</span>
         </span>
       </div>
@@ -400,8 +409,10 @@ export function FuturesRiskPlanner({ alert }: { alert: Alert }) {
           )}
         </>
       )}
-    </Card>
+    </>
   );
+
+  return embedded ? content : <Card className="p-4">{content}</Card>;
 }
 
 function ResultRow({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {

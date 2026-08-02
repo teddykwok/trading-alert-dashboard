@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useParams } from "react-router-dom";
 import { Card } from "../components/ui/Card";
+import { Disclosure } from "../components/ui/Disclosure";
+import { TabList, TabPanel, type TabDefinition } from "../components/ui/Tabs";
 import { SignalBadge } from "../components/alerts/SignalBadge";
 import { StatusBadge } from "../components/alerts/StatusBadge";
 import { MockAiBadge } from "../components/alerts/MockAiBadge";
@@ -21,6 +23,18 @@ import { formatMinMovementPercent, isTeddyIndicator } from "../utils/minMovement
 import type { Alert, AlertContext, AlertStatus } from "../types/alert";
 import type { AlertNeighbor, AlertNeighborsResponse } from "../types/api";
 
+/**
+ * Trade Plan first: the planning workflow is what this page is for. Review &
+ * Journal stays available but out of the way (the user's primary journal is
+ * an external spreadsheet). Selection is local UI state only — a refresh
+ * returns to Trade Plan by design.
+ */
+const WORKFLOW_TABS: TabDefinition[] = [
+  { id: "plan", label: "Trade Plan" },
+  { id: "review", label: "Review & Journal" },
+  { id: "ai", label: "AI Vision" },
+];
+
 const STATUS_TIMELINE: AlertStatus[] = [
   "RECEIVED",
   "PROCESSING_SCREENSHOT",
@@ -39,6 +53,7 @@ export function AlertDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [neighbors, setNeighbors] = useState<AlertNeighborsResponse | null>(null);
   const [neighborsLoading, setNeighborsLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState<string>(WORKFLOW_TABS[0].id);
 
   const filterQuery = useMemo(() => parseFiltersFromSearch(new URLSearchParams(search)), [search]);
 
@@ -99,6 +114,40 @@ export function AlertDetailPage() {
   if (!alert) return <p className="text-sm text-slate-500">Alert not found.</p>;
 
   const currentIndex = STATUS_TIMELINE.indexOf(alert.status);
+  const isDirectional = alert.signal === "LONG" || alert.signal === "SHORT";
+
+  /**
+   * Rendered once, in whichever core-context column keeps the two balanced:
+   * the chart is shorter than the context stack when a level-context card is
+   * present, so the timeline joins the chart column there; without it the
+   * context column is already the same height as the chart and the timeline
+   * belongs beside it.
+   */
+  const statusTimelineCard = (
+    <Card className="p-4">
+      <h2 className="mb-3 text-sm font-semibold text-slate-200">Status timeline</h2>
+      {alert.status === "FAILED" ? (
+        <p className="text-sm text-red-400">Failed: {alert.errorMessage}</p>
+      ) : (
+        <ol className="space-y-2">
+          {STATUS_TIMELINE.map((status, index) => (
+            <li key={status} className="flex items-center gap-2 text-sm">
+              <span
+                className={
+                  index <= currentIndex
+                    ? "h-2 w-2 rounded-full bg-blue-500"
+                    : "h-2 w-2 rounded-full bg-surface-border"
+                }
+              />
+              <span className={index <= currentIndex ? "text-slate-200" : "text-slate-600"}>
+                {status.replace(/_/g, " ")}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </Card>
+  );
   const marketDataSource =
     alert.assetType === "CRYPTO" && alert.exchange?.toUpperCase() === "BINANCE"
       ? "Binance (real)"
@@ -155,18 +204,7 @@ export function AlertDetailPage() {
             />
           </Card>
 
-          {/* Automatic frozen plan first; the manual calculator below is the
-              what-if tool. ExtremeRRPlanner renders nothing for WATCH/EXIT. */}
-          <ExtremeRRPlanner alert={alert} />
-
-          <FuturesRiskPlanner alert={alert} />
-
-          <Card className="p-4">
-            <h2 className="mb-3 text-sm font-semibold text-slate-200">Raw webhook payload</h2>
-            <pre className="max-h-80 overflow-auto rounded-lg bg-surface p-3 text-xs text-slate-400">
-              {JSON.stringify(alert.rawPayload, null, 2)}
-            </pre>
-          </Card>
+          {alert.alertContext && statusTimelineCard}
         </div>
 
         <div className="flex flex-col gap-5">
@@ -200,37 +238,54 @@ export function AlertDetailPage() {
 
           {alert.alertContext && <LevelContextCard context={alert.alertContext} />}
 
-          <TradeOutcomePanel alertId={alert.id} />
-
-          <TradeJournalPanel alertId={alert.id} />
-
-          <AiOpinionPanel alert={alert} />
-
-          <Card className="p-4">
-            <h2 className="mb-3 text-sm font-semibold text-slate-200">Status timeline</h2>
-            {alert.status === "FAILED" ? (
-              <p className="text-sm text-red-400">Failed: {alert.errorMessage}</p>
-            ) : (
-              <ol className="space-y-2">
-                {STATUS_TIMELINE.map((status, index) => (
-                  <li key={status} className="flex items-center gap-2 text-sm">
-                    <span
-                      className={
-                        index <= currentIndex
-                          ? "h-2 w-2 rounded-full bg-blue-500"
-                          : "h-2 w-2 rounded-full bg-surface-border"
-                      }
-                    />
-                    <span className={index <= currentIndex ? "text-slate-200" : "text-slate-600"}>
-                      {status.replace(/_/g, " ")}
-                    </span>
-                  </li>
-                ))}
-              </ol>
-            )}
-          </Card>
+          {!alert.alertContext && statusTimelineCard}
         </div>
       </div>
+
+      {/* Primary workflow. Both panels stay mounted after first activation
+          (see TabPanel), so switching tabs never discards unsaved input or
+          refetches — and the review/journal panels make no request at all
+          until their tab is opened. */}
+      <div className="flex flex-col gap-4">
+        <TabList tabs={WORKFLOW_TABS} activeId={activeTab} onChange={setActiveTab} label="Alert workflow" />
+
+        <TabPanel id="plan" activeId={activeTab}>
+          <ExtremeRRPlanner alert={alert} />
+
+          {!isDirectional && (
+            <Card className="p-4">
+              <p className="text-sm text-slate-500">
+                Extreme RR plans are generated for LONG and SHORT alerts only. Use the manual
+                calculator below to work through this alert by hand.
+              </p>
+            </Card>
+          )}
+
+          {/* Secondary: the manual what-if calculator, collapsed by default. */}
+          <Disclosure
+            title="Manual Risk Calculator"
+            description="Optional manual calculation and saved review values"
+          >
+            <FuturesRiskPlanner alert={alert} embedded />
+          </Disclosure>
+        </TabPanel>
+
+        <TabPanel id="review" activeId={activeTab}>
+          <TradeOutcomePanel alertId={alert.id} />
+          <TradeJournalPanel alertId={alert.id} />
+        </TabPanel>
+
+        <TabPanel id="ai" activeId={activeTab}>
+          <AiOpinionPanel alert={alert} />
+        </TabPanel>
+      </div>
+
+      <Card className="p-4">
+        <h2 className="mb-3 text-sm font-semibold text-slate-200">Raw webhook payload</h2>
+        <pre className="max-h-80 overflow-auto rounded-lg bg-surface p-3 text-xs text-slate-400">
+          {JSON.stringify(alert.rawPayload, null, 2)}
+        </pre>
+      </Card>
     </div>
   );
 }

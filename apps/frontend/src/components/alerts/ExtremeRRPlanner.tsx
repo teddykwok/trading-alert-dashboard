@@ -15,6 +15,7 @@ import {
 import { Card } from "../ui/Card";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
+import { Disclosure } from "../ui/Disclosure";
 import { extremeRRApi } from "../../api/extreme-rr.api";
 import { formatDateTime } from "../../utils/formatDate";
 import { formatPrice } from "../../utils/formatPrice";
@@ -237,53 +238,48 @@ export function ExtremeRRPlanner({ alert }: { alert: Alert }) {
 
               {candidate && (
                 <>
-                  {/* Price plan */}
+                  {/* Price plan — the fields needed to place the trade. Cutoff,
+                      candle counts and raw distances live in Calculation
+                      details below; the invalid reason is never hidden. */}
                   <h3 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500">
                     Price plan
                   </h3>
-                  <dl className="mb-3 space-y-1 text-sm">
-                    <Row label="Direction" value={plan.direction} highlight />
-                    <Row label="Entry basis" value="Alert price" />
-                    <Row label="Entry" value={px(plan.entryPrice)} />
-                    <Row
-                      label={`Extreme (${candidate.extremeType === "HIGHEST_HIGH" ? "Highest High" : "Lowest Low"})`}
-                      value={px(candidate.extremePrice)}
+                  <dl className="mb-3 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-3">
+                    <Field label="Direction" value={plan.direction} strong />
+                    <Field label="Entry" value={px(plan.entryPrice)} />
+                    <Field label="Lookback" value={`${candidate.actualCandles} candles`} />
+                    <Field label="Stop-loss" value={px(candidate.stopLoss)} strong />
+                    <Field
+                      label={`Take-profit (${candidate.extremeType === "HIGHEST_HIGH" ? "Highest High" : "Lowest Low"})`}
+                      value={px(candidate.takeProfit)}
+                      strong
                     />
-                    <Row label="Candle cutoff" value={formatDateTime(plan.cutoffAt)} />
-                    <Row
-                      label="Candles (requested / actual)"
-                      value={`${candidate.requestedCandles} / ${candidate.actualCandles}`}
-                    />
-                    <Row label="Stop-loss" value={px(candidate.stopLoss)} highlight />
-                    <Row label="Take-profit" value={px(candidate.takeProfit)} highlight />
-                    <Row label="Reward distance" value={px(candidate.rewardDistance)} />
-                    <Row label="Risk distance" value={px(candidate.riskDistance)} />
-                    <Row
+                    <Field
                       label="Risk / reward"
                       value={candidate.riskRewardRatio ? `1:${Number(candidate.riskRewardRatio).toFixed(2)}` : "—"}
                     />
-                    <Row
-                      label="Validation"
-                      value={candidate.valid ? "Valid" : `Invalid — ${candidate.invalidReason ?? "unknown"}`}
-                      highlight={!candidate.valid}
-                    />
                   </dl>
 
+                  {!candidate.valid && (
+                    <p className="mb-3 rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-400">
+                      Invalid candidate — {candidate.invalidReason ?? "unknown reason"}
+                    </p>
+                  )}
+
                   {/* Money management */}
-                  <h3 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                    Money management
-                  </h3>
+                  <div className="mb-1.5 flex items-baseline justify-between gap-2">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                      Money management
+                    </h3>
+                    {plan.template && (
+                      <span className="truncate text-xs text-slate-500">{plan.template.name}</span>
+                    )}
+                  </div>
                   {plan.template ? (
-                    <dl className="mb-3 space-y-1 text-sm">
-                      <Row label="Template" value={plan.template.name} />
-                      <Row label="Reference capital" value={`$${plan.template.referenceCapital}`} />
-                      <Row label="Risk %" value={`${plan.template.riskPercent}%`} />
-                      <Row label="Risk amount" value={`$${plan.template.riskAmount}`} highlight />
-                      <Row label="Reward ratio" value={`1:${plan.template.rewardRatio}`} />
-                      <Row label="Target amount" value={`$${plan.template.targetAmount}`} highlight />
-                      <Row label="Quantity (unrounded)" value={qty(candidate.money?.quantityRaw)} highlight />
-                      <Row label="Planned loss" value={usd(candidate.money?.plannedLossRaw)} />
-                      <Row label="Planned profit" value={usd(candidate.money?.plannedProfitRaw)} />
+                    <dl className="mb-3 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-3">
+                      <Field label="Risk amount" value={`$${plan.template.riskAmount}`} strong />
+                      <Field label="Target amount" value={`$${plan.template.targetAmount}`} strong />
+                      <Field label="Quantity" value={qty(candidate.money?.quantityRaw)} strong />
                     </dl>
                   ) : (
                     <p className="mb-3 rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-400">
@@ -328,16 +324,20 @@ export function ExtremeRRPlanner({ alert }: { alert: Alert }) {
                           by default.
                         </p>
                       ) : (
-                        <dl className="mb-3 space-y-1 text-sm">
-                          <Row label="Selected leverage" value={`${plan.selectedLeverage}x`} highlight />
-                          <Row label="Position notional" value={usd(candidate.money.positionNotionalRaw)} />
-                          <Row
-                            label="Estimated isolated margin"
+                        <dl className="mb-3 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-3">
+                          <Field label="Selected leverage" value={`${plan.selectedLeverage}x`} strong />
+                          <Field
+                            label="Estimated margin"
                             value={usd(selectedMargin?.estimatedInitialMargin)}
-                            highlight
+                            strong
                           />
+                          <Field label="Position notional" value={usd(candidate.money.positionNotionalRaw)} />
                           {selectedMargin?.preferred && (
-                            <Row label="Preferred margin band" value="Yes (inside the configured range)" />
+                            <Field
+                              label="Preferred band"
+                              value="Yes (inside the configured range)"
+                              className="col-span-2 sm:col-span-3"
+                            />
                           )}
                         </dl>
                       )}
@@ -350,13 +350,14 @@ export function ExtremeRRPlanner({ alert }: { alert: Alert }) {
                         </p>
                       )}
 
+                      {/* Safety statements stay visible; the precision note is
+                          in Calculation details. */}
                       <div className="mb-3 space-y-1 text-[11px] text-slate-500">
                         <p>{EXTREME_RR_MARGIN_DISCLAIMER}</p>
                         <p>{EXTREME_RR_LEVERAGE_UNVERIFIED_NOTE}</p>
-                        <p>{EXTREME_RR_UNROUNDED_NOTE}</p>
                       </div>
 
-                      <div className="flex items-center gap-2">
+                      <div className="mb-3 flex items-center gap-2">
                         <Button variant="secondary" onClick={() => copyPlan(candidate)}>
                           Copy Plan
                         </Button>
@@ -364,6 +365,56 @@ export function ExtremeRRPlanner({ alert }: { alert: Alert }) {
                       </div>
                     </>
                   )}
+
+                  {/* Everything needed to reproduce the frozen plan, kept out
+                      of the way of the trading decision. */}
+                  <Disclosure
+                    title="Calculation details"
+                    description="Cutoff, candle counts, raw distances and precision notes"
+                  >
+                    <dl className="space-y-1 text-sm">
+                      <Row label="Entry basis" value="Alert price" />
+                      <Row
+                        label={candidate.extremeType === "HIGHEST_HIGH" ? "Highest high" : "Lowest low"}
+                        value={px(candidate.extremePrice)}
+                      />
+                      <Row label="Timeframe" value={plan.timeframe} />
+                      <Row label="Candle cutoff" value={formatDateTime(plan.cutoffAt)} />
+                      <Row
+                        label="Candles (requested / actual)"
+                        value={`${candidate.requestedCandles} / ${candidate.actualCandles}${candidate.complete ? "" : " (incomplete history)"}`}
+                      />
+                      <Row
+                        label="Oldest candle open"
+                        value={candidate.oldestCandleOpenTime ? formatDateTime(candidate.oldestCandleOpenTime) : "—"}
+                      />
+                      <Row
+                        label="Newest candle close"
+                        value={candidate.newestCandleCloseTime ? formatDateTime(candidate.newestCandleCloseTime) : "—"}
+                      />
+                      <Row label="Reward distance" value={px(candidate.rewardDistance)} />
+                      <Row label="Risk distance" value={px(candidate.riskDistance)} />
+                      <Row label="Validation" value={candidate.valid ? "Valid" : "Invalid"} />
+                      {plan.template && (
+                        <>
+                          <Row label="Reference capital" value={`$${plan.template.referenceCapital}`} />
+                          <Row label="Risk %" value={`${plan.template.riskPercent}%`} />
+                          <Row label="Reward ratio" value={`1:${plan.template.rewardRatio}`} />
+                        </>
+                      )}
+                      {candidate.money && (
+                        <>
+                          <Row label="Planned loss" value={usd(candidate.money.plannedLossRaw)} />
+                          <Row label="Planned profit" value={usd(candidate.money.plannedProfitRaw)} />
+                        </>
+                      )}
+                      <Row
+                        label="Generated at"
+                        value={plan.generatedAt ? formatDateTime(plan.generatedAt) : "—"}
+                      />
+                    </dl>
+                    <p className="mt-2 text-[11px] text-slate-500">{EXTREME_RR_UNROUNDED_NOTE}</p>
+                  </Disclosure>
                 </>
               )}
             </>
@@ -374,13 +425,34 @@ export function ExtremeRRPlanner({ alert }: { alert: Alert }) {
   );
 }
 
-function Row({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
+/** Compact labelled value used by the primary summary grids. */
+function Field({
+  label,
+  value,
+  strong,
+  className,
+}: {
+  label: string;
+  value: string;
+  strong?: boolean;
+  className?: string;
+}) {
   return (
-    <div className="flex items-center justify-between gap-3">
-      <dt className="text-slate-500">{label}</dt>
-      <dd className={highlight ? "text-right font-semibold text-slate-100" : "text-right text-slate-200"}>
+    <div className={className}>
+      <dt className="text-[11px] uppercase tracking-wide text-slate-500">{label}</dt>
+      <dd className={strong ? "text-sm font-semibold text-slate-100" : "text-sm text-slate-200"}>
         {value}
       </dd>
+    </div>
+  );
+}
+
+/** Label/value row used inside the Calculation details disclosure. */
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <dt className="text-slate-500">{label}</dt>
+      <dd className="text-right text-slate-200">{value}</dd>
     </div>
   );
 }
