@@ -5,6 +5,7 @@ import { classNames } from "../../utils/classNames";
 // manual/debugging access, but day-to-day workflow is signals-only.
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", end: true },
+  { to: "/risk-templates", label: "Risk Templates" },
   { to: "/settings", label: "Settings" },
 ];
 
