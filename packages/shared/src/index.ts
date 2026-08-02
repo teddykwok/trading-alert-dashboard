@@ -92,3 +92,6 @@ export type { ChartPriceFormat } from "./format-price";
 export { formatDynamicPrice, priceDecimalsFor, pricePrecisionFor } from "./format-price";
 
 export { SYMBOL_INPUT_MAX_LENGTH, getSymbolInputError } from "./symbol-validation";
+
+export type { RiskTemplate, RiskTemplateAmounts } from "./risk-template";
+export { calculateRiskTemplateAmounts } from "./risk-template";
