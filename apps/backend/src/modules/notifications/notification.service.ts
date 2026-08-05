@@ -4,10 +4,12 @@ import type { ExtremeRRPlanDto } from "@trading-alert-dashboard/shared";
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import { ensureScreenshotDir, screenshotFileName } from "../../utils/file";
+import { buildAlertContext } from "../alerts/alert-context";
 import {
   buildExtremeRRErrorMessage,
   buildExtremeRRInvalidMessage,
   buildExtremeRRReadyMessage,
+  type AlertMessageContext,
 } from "./extreme-rr-telegram";
 import { publicAlertUrl } from "../../utils/dashboard-url";
 import { emitAlertDuplicate, emitAlertFailed, emitAlertUpdated, emitNewAlert } from "./socket-events";
@@ -167,7 +169,7 @@ function telegramConfigured(): boolean {
 export async function notifyExtremeRRPlanOutcome(
   prisma: PrismaClient,
   plan: ExtremeRRPlanDto,
-  symbol: string
+  alert: Alert
 ): Promise<void> {
   if (plan.status === "PENDING") return;
 
@@ -185,12 +187,22 @@ export async function notifyExtremeRRPlanOutcome(
     return;
   }
 
+  // Exchange / chart timeframe come straight from the persisted alert; level
+  // context comes from the SHARED builder (structured columns first, note
+  // fallback) — no second parsing implementation.
+  const context: AlertMessageContext = {
+    symbol: alert.symbol,
+    exchange: alert.exchange,
+    timeframe: alert.timeframe,
+    levelContext: buildAlertContext(alert),
+  };
+
   const text =
     plan.status === "READY"
-      ? buildExtremeRRReadyMessage(plan, symbol)
+      ? buildExtremeRRReadyMessage(plan, context)
       : plan.status === "INVALID"
-        ? buildExtremeRRInvalidMessage(plan, symbol)
-        : buildExtremeRRErrorMessage(plan, symbol);
+        ? buildExtremeRRInvalidMessage(plan, context)
+        : buildExtremeRRErrorMessage(plan, context);
 
   if (!text) {
     // READY without a usable candidate should not happen; record and move on.

@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PrismaClient } from "@prisma/client";
+import type { Alert, PrismaClient } from "@prisma/client";
 import {
   buildLeverageAnalysis,
   calculateExtremeMoney,
   type ExtremeRRCandidate,
   type ExtremeRRPlanDto,
 } from "@trading-alert-dashboard/shared";
+import type { AlertMessageContext } from "../src/modules/notifications/extreme-rr-telegram";
 
 vi.mock("../src/modules/notifications/socket-events", () => ({
   emitNewAlert: vi.fn(),
@@ -98,6 +99,51 @@ function candidate(
   };
 }
 
+/**
+ * Alert-side context passed to the builders. Defaults mirror a real teddy
+ * alert: BINANCE, 15m chart, 1W GREEN level touched from above.
+ */
+function ctx(overrides: Partial<AlertMessageContext> = {}): AlertMessageContext {
+  return {
+    symbol: "USELESSUSDT",
+    exchange: "BINANCE",
+    timeframe: "15m",
+    levelContext: {
+      eventType: "LEVEL_TOUCHED",
+      levelColor: "GREEN",
+      sourceTimeframe: "1W",
+      touchDirection: "FROM_ABOVE",
+      levelPrice: 0.2707,
+      chartTimeframe: "15m",
+    },
+    ...overrides,
+  };
+}
+
+/**
+ * A persisted alert row as the worker hands it to the notifier. Structured
+ * level-context columns are populated the way real ingested alerts are, so
+ * these tests exercise the shared buildAlertContext path end to end.
+ */
+function alertRow(overrides: Record<string, unknown> = {}): Alert {
+  return {
+    id: "alert_tg_1",
+    symbol: "USELESSUSDT",
+    exchange: "BINANCE",
+    timeframe: "15m",
+    signal: "LONG",
+    status: "ANALYZED",
+    eventType: "LEVEL_TOUCHED",
+    levelColor: "GREEN",
+    sourceTimeframe: "1W",
+    touchDirection: "FROM_ABOVE",
+    rawPayload: {
+      note: "eventType=LEVEL_TOUCHED | levelColor=GREEN | sourceTf=1W | touchDirection=FROM_ABOVE | chartTf=15m",
+    },
+    ...overrides,
+  } as unknown as Alert;
+}
+
 function plan(overrides: Partial<ExtremeRRPlanDto> = {}): ExtremeRRPlanDto {
   return {
     id: "plan_tg_1",
@@ -155,7 +201,7 @@ afterEach(() => {
 describe("buildExtremeRRReadyMessage content", () => {
   it("LONG uses the green heading; execution info precedes alternatives", async () => {
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(plan(), ctx())!;
     const lines = text.split("\n");
 
     expect(lines[0]).toBe("🟢 LONG — USELESSUSDT");
@@ -183,7 +229,7 @@ describe("buildExtremeRRReadyMessage content", () => {
         candidate(300, "0.0449", "0.04902", { extremeType: "LOWEST_LOW" }),
       ],
     });
-    const text = buildExtremeRRReadyMessage(short, "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(short, ctx())!;
     expect(text.startsWith("🔴 SHORT — USELESSUSDT")).toBe(true);
     // SHORT TP is the frozen lowest low of the selected (300) candidate.
     expect(text).toContain("Take-profit: 0.0449");
@@ -192,7 +238,7 @@ describe("buildExtremeRRReadyMessage content", () => {
 
   it("contains no AI summary, confidence or risk-note content", async () => {
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(plan(), ctx())!;
     for (const forbidden of ["AI", "confidence", "Confidence", "Risks", "Summary", "analysis"]) {
       expect(text).not.toContain(forbidden);
     }
@@ -201,7 +247,7 @@ describe("buildExtremeRRReadyMessage content", () => {
   it("links the public dashboard alert URL with trailing slash normalized", async () => {
     setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "https://public.example/" });
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(plan(), ctx())!;
     expect(text).toContain("Open Trade Plan:\nhttps://public.example/alerts/alert_tg_1");
     expect(text).not.toContain("public.example//alerts");
   });
@@ -216,7 +262,7 @@ describe("buildExtremeRRReadyMessage content", () => {
         candidate(300, "0.002286", "0.001866"),
       ],
     });
-    const text = buildExtremeRRReadyMessage(tiny, "TACUSDT")!;
+    const text = buildExtremeRRReadyMessage(tiny, ctx({ symbol: "TACUSDT" }))!;
     expect(text).toContain("Entry: 0.002034");
     expect(text).toContain("Take-profit: 0.002286");
 
@@ -224,7 +270,7 @@ describe("buildExtremeRRReadyMessage content", () => {
       entryPrice: "188",
       candidates: [candidate(100, "200", "180"), candidate(200, "200", "180"), candidate(300, "200", "180")],
     });
-    const roundText = buildExtremeRRReadyMessage(round, "BTCUSDT")!;
+    const roundText = buildExtremeRRReadyMessage(round, ctx({ symbol: "BTCUSDT" }))!;
     expect(roundText).toContain("Entry: 188");
     expect(roundText).toContain("Take-profit: 200");
     expect(roundText).toContain("Stop-loss: 180");
@@ -232,8 +278,239 @@ describe("buildExtremeRRReadyMessage content", () => {
 
   it("never calls fetch (no market data, no recalculation)", async () => {
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    buildExtremeRRReadyMessage(plan(), "USELESSUSDT");
+    buildExtremeRRReadyMessage(plan(), ctx());
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Exchange / chart and level-context lines
+// ---------------------------------------------------------------------------
+
+describe("exchange, chart and level context lines", () => {
+  it("renders both lines for a LONG alert in the required position", async () => {
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const text = buildExtremeRRReadyMessage(plan(), ctx())!;
+
+    expect(text).toContain("Exchange: BINANCE · Chart: 15m");
+    expect(text).toContain("Level: 1W GREEN · From above");
+
+    // After the lookback block, before the Binance warning and the link.
+    const lines = text.split("\n");
+    const lastAlternative = lines.findIndex((l) => l.startsWith("300c →"));
+    const exchangeIndex = lines.indexOf("Exchange: BINANCE · Chart: 15m");
+    const levelIndex = lines.indexOf("Level: 1W GREEN · From above");
+    const warningIndex = lines.indexOf("Verify leverage support on Binance.");
+    const linkIndex = lines.indexOf("Open Trade Plan:");
+
+    expect(exchangeIndex).toBe(lastAlternative + 2); // blank separator between
+    expect(levelIndex).toBe(exchangeIndex + 1);
+    expect(warningIndex).toBeGreaterThan(levelIndex);
+    expect(linkIndex).toBeGreaterThan(warningIndex);
+  });
+
+  it("renders a SHORT alert's RED level touched from below", async () => {
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const short = plan({
+      direction: "SHORT",
+      candidates: [
+        candidate(100, "0.0455", "0.04862", { extremeType: "LOWEST_LOW" }),
+        candidate(200, "0.0451", "0.04888", { extremeType: "LOWEST_LOW" }),
+        candidate(300, "0.0449", "0.04902", { extremeType: "LOWEST_LOW" }),
+      ],
+    });
+    const text = buildExtremeRRReadyMessage(
+      short,
+      ctx({
+        levelContext: {
+          eventType: "LEVEL_TOUCHED",
+          levelColor: "RED",
+          sourceTimeframe: "1D",
+          touchDirection: "FROM_BELOW",
+          levelPrice: 0.045,
+          chartTimeframe: "15m",
+        },
+      })
+    )!;
+
+    expect(text).toContain("Level: 1D RED · From below");
+    expect(text).toContain("Exchange: BINANCE · Chart: 15m");
+  });
+
+  it("never confuses the level's source timeframe with the chart timeframe", async () => {
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const text = buildExtremeRRReadyMessage(
+      plan(),
+      ctx({
+        timeframe: "1h",
+        levelContext: {
+          eventType: "LEVEL_TOUCHED",
+          levelColor: "GREEN",
+          sourceTimeframe: "3M",
+          touchDirection: "FROM_ABOVE",
+          levelPrice: null,
+          // A stale/other chartTf in the note must not win over the alert's.
+          chartTimeframe: "5m",
+        },
+      })
+    )!;
+
+    expect(text).toContain("Exchange: BINANCE · Chart: 1h");
+    expect(text).toContain("Level: 3M GREEN · From above");
+    expect(text).not.toContain("Chart: 3M");
+    expect(text).not.toContain("Chart: 5m");
+    expect(text).not.toContain("Level: 1h");
+  });
+
+  it("omits ONLY the level line when level context is missing", async () => {
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const text = buildExtremeRRReadyMessage(plan(), ctx({ levelContext: null }))!;
+
+    expect(text).toContain("Exchange: BINANCE · Chart: 15m");
+    expect(text).not.toContain("Level:");
+    expect(text).not.toContain("Unknown");
+    expect(text).not.toContain("N/A");
+  });
+
+  it("omits the level line when the level's timeframe or colour is missing", async () => {
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const partials = [
+      { levelColor: "GREEN", sourceTimeframe: null },
+      { levelColor: null, sourceTimeframe: "1W" },
+      { levelColor: null, sourceTimeframe: null },
+    ] as const;
+
+    for (const partial of partials) {
+      const text = buildExtremeRRReadyMessage(
+        plan(),
+        ctx({
+          levelContext: {
+            eventType: "LEVEL_TOUCHED",
+            touchDirection: "FROM_ABOVE",
+            levelPrice: null,
+            chartTimeframe: "15m",
+            ...partial,
+          },
+        })
+      )!;
+      expect(text).not.toContain("Level:");
+      expect(text).toContain("Exchange: BINANCE · Chart: 15m");
+    }
+  });
+
+  it("drops an unknown touch direction instead of printing it", async () => {
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const text = buildExtremeRRReadyMessage(
+      plan(),
+      ctx({
+        levelContext: {
+          eventType: "LEVEL_TOUCHED",
+          levelColor: "GREEN",
+          sourceTimeframe: "1W",
+          touchDirection: "UNKNOWN",
+          levelPrice: null,
+          chartTimeframe: "15m",
+        },
+      })
+    )!;
+
+    expect(text).toContain("Level: 1W GREEN");
+    expect(text).not.toContain("UNKNOWN");
+    expect(text).not.toContain("Level: 1W GREEN ·");
+  });
+
+  it("never invents BINANCE when the exchange is absent", async () => {
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    for (const exchange of [null, undefined, "  "]) {
+      const text = buildExtremeRRReadyMessage(plan(), ctx({ exchange }))!;
+      expect(text).toContain("Chart: 15m");
+      expect(text).not.toContain("Exchange:");
+      // "Binance" only remains in the leverage-verification sentence.
+      expect(text).not.toContain("BINANCE");
+      expect(text).not.toContain("· Chart");
+    }
+  });
+
+  it("keeps a different exchange verbatim", async () => {
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const text = buildExtremeRRReadyMessage(plan(), ctx({ exchange: "BYBIT" }))!;
+    expect(text).toContain("Exchange: BYBIT · Chart: 15m");
+  });
+
+  it("produces no dangling separator when the chart timeframe is missing", async () => {
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const text = buildExtremeRRReadyMessage(plan(), ctx({ timeframe: null }))!;
+
+    expect(text).toContain("Exchange: BINANCE");
+    expect(text).not.toContain("Chart:");
+    expect(text).not.toContain("Exchange: BINANCE ·");
+  });
+
+  it("omits the whole context block (and its blank line) when nothing is known", async () => {
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const bare = buildExtremeRRReadyMessage(
+      plan(),
+      { symbol: "USELESSUSDT", exchange: null, timeframe: null, levelContext: null }
+    )!;
+
+    expect(bare).not.toContain("Exchange:");
+    expect(bare).not.toContain("Chart:");
+    expect(bare).not.toContain("Level:");
+    expect(bare).not.toContain("\n\n\n"); // no doubled blank separator
+    expect(bare).toContain("300c → TP 0.05061 · SL 0.04521 ← Selected\n\nVerify leverage support on Binance.");
+  });
+
+  it("does not crash on a legacy free-text note (no level metadata)", async () => {
+    const { buildAlertContext } = await import("../src/modules/alerts/alert-context");
+    const legacy = buildAlertContext({
+      eventType: null,
+      levelColor: null,
+      sourceTimeframe: null,
+      touchDirection: null,
+      timeframe: "1h",
+      rawPayload: { note: "Bullish reversal zone detected!!! ==== |||| " },
+    } as unknown as Alert);
+    expect(legacy).toBeNull();
+
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const text = buildExtremeRRReadyMessage(plan(), ctx({ timeframe: "1h", levelContext: legacy }))!;
+    expect(text).toContain("Exchange: BINANCE · Chart: 1h");
+    expect(text).not.toContain("Level:");
+  });
+
+  it("derives the context from a real alert row through the shared parser", async () => {
+    setEnv(ENABLED);
+    const { notifyExtremeRRPlanOutcome } = await loadService();
+    const { prisma } = mockPrisma();
+
+    await notifyExtremeRRPlanOutcome(prisma, plan(), alertRow());
+
+    const body = JSON.parse(String((global.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body));
+    expect(body.text).toContain("Exchange: BINANCE · Chart: 15m");
+    expect(body.text).toContain("Level: 1W GREEN · From above");
+  });
+
+  it("falls back to the note when structured columns are empty (legacy rows)", async () => {
+    setEnv(ENABLED);
+    const { notifyExtremeRRPlanOutcome } = await loadService();
+    const { prisma } = mockPrisma();
+
+    await notifyExtremeRRPlanOutcome(
+      prisma,
+      plan(),
+      alertRow({
+        eventType: null,
+        levelColor: null,
+        sourceTimeframe: null,
+        touchDirection: null,
+        rawPayload: {
+          note: "eventType=LEVEL_TOUCHED | levelColor=RED | sourceTf=6M | touchDirection=FROM_BELOW | chartTf=15m",
+        },
+      })
+    );
+
+    const body = JSON.parse(String((global.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body));
+    expect(body.text).toContain("Level: 6M RED · From below");
   });
 });
 
@@ -265,7 +542,7 @@ describe("optional PUBLIC_DASHBOARD_URL link section", () => {
     it(`omits the whole link section when the URL is ${label} (READY)`, async () => {
       setEnv({ ...ENABLED, ...override });
       const { buildExtremeRRReadyMessage } = await loadFormatter();
-      const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+      const text = buildExtremeRRReadyMessage(plan(), ctx())!;
 
       expect(text).not.toContain("Open Trade Plan:");
       expect(text).not.toContain("/alerts/alert_tg_1");
@@ -277,11 +554,11 @@ describe("optional PUBLIC_DASHBOARD_URL link section", () => {
   it("keeps the rest of the READY message identical when the link is omitted", async () => {
     setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "" });
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    const withoutLink = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+    const withoutLink = buildExtremeRRReadyMessage(plan(), ctx())!;
 
     setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "https://public.example" });
     const { buildExtremeRRReadyMessage: buildWithLink } = await loadFormatter();
-    const withLink = buildWithLink(plan(), "USELESSUSDT")!;
+    const withLink = buildWithLink(plan(), ctx())!;
 
     // The only difference is the appended link section.
     expect(withLink).toBe(`${withoutLink}\n\nOpen Trade Plan:\nhttps://public.example/alerts/alert_tg_1`);
@@ -304,12 +581,12 @@ describe("optional PUBLIC_DASHBOARD_URL link section", () => {
     setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "http://localhost:5173" });
     const { buildExtremeRRInvalidMessage, buildExtremeRRErrorMessage } = await loadFormatter();
 
-    const invalid = buildExtremeRRInvalidMessage(plan({ status: "INVALID" }), "USELESSUSDT");
+    const invalid = buildExtremeRRInvalidMessage(plan({ status: "INVALID" }), ctx());
     expect(invalid).not.toContain("Open Alert:");
     expect(invalid.startsWith("⚠️ PLAN INVALID — USELESSUSDT")).toBe(true);
     expectNoTrailingBlankLine(invalid);
 
-    const error = buildExtremeRRErrorMessage(plan({ status: "ERROR" }), "USELESSUSDT");
+    const error = buildExtremeRRErrorMessage(plan({ status: "ERROR" }), ctx());
     expect(error).not.toContain("Open Alert:");
     expect(error.endsWith("Reason: Unable to generate the frozen Extreme RR plan.")).toBe(true);
     expectNoTrailingBlankLine(error);
@@ -319,10 +596,10 @@ describe("optional PUBLIC_DASHBOARD_URL link section", () => {
     setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "https://public.example" });
     const { buildExtremeRRInvalidMessage, buildExtremeRRErrorMessage } = await loadFormatter();
 
-    expect(buildExtremeRRInvalidMessage(plan({ status: "INVALID" }), "X")).toContain(
+    expect(buildExtremeRRInvalidMessage(plan({ status: "INVALID" }), ctx({ symbol: "X" }))).toContain(
       "Open Alert:\nhttps://public.example/alerts/alert_tg_1"
     );
-    expect(buildExtremeRRErrorMessage(plan({ status: "ERROR" }), "X")).toContain(
+    expect(buildExtremeRRErrorMessage(plan({ status: "ERROR" }), ctx({ symbol: "X" }))).toContain(
       "Open Alert:\nhttps://public.example/alerts/alert_tg_1"
     );
   });
@@ -330,14 +607,14 @@ describe("optional PUBLIC_DASHBOARD_URL link section", () => {
   it("treats a LAN/tailnet host as public (not auto-detected, just not loopback)", async () => {
     setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "http://192.168.1.50:5173" });
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(plan(), ctx())!;
     expect(text).toContain("Open Trade Plan:\nhttp://192.168.1.50:5173/alerts/alert_tg_1");
   });
 
   it("READY message still ends correctly with a valid URL (no trailing blank line)", async () => {
     setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "https://public.example//" });
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(plan(), ctx())!;
     expect(text.endsWith("https://public.example/alerts/alert_tg_1")).toBe(true);
     expectNoTrailingBlankLine(text);
   });
@@ -350,7 +627,7 @@ describe("optional PUBLIC_DASHBOARD_URL link section", () => {
 describe("lookback alternatives", () => {
   it("shows 100/200/300 in order with the default 300 marked selected", async () => {
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(plan(), ctx())!;
     const i100 = text.indexOf("100c → TP 0.0491 · SL 0.04622");
     const i200 = text.indexOf("200c → TP 0.04985 · SL 0.04572");
     const i300 = text.indexOf("300c → TP 0.05061 · SL 0.04521 ← Selected");
@@ -362,12 +639,12 @@ describe("lookback alternatives", () => {
 
   it("respects a persisted selected 100 or 200 for marker AND main values", async () => {
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    const text = buildExtremeRRReadyMessage(plan({ selectedLookback: 200 }), "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(plan({ selectedLookback: 200 }), ctx())!;
     expect(text).toContain("200c → TP 0.04985 · SL 0.04572 ← Selected");
     expect(text).toContain("Stop-loss: 0.04572");
     expect(text).toContain("Take-profit: 0.04985");
 
-    const text100 = buildExtremeRRReadyMessage(plan({ selectedLookback: 100 }), "USELESSUSDT")!;
+    const text100 = buildExtremeRRReadyMessage(plan({ selectedLookback: 100 }), ctx())!;
     expect(text100).toContain("100c → TP 0.0491 · SL 0.04622 ← Selected");
     expect(text100).toContain("Take-profit: 0.0491");
   });
@@ -387,7 +664,7 @@ describe("lookback alternatives", () => {
         candidate(300, "0.05061", "0.04521"),
       ],
     });
-    const text = buildExtremeRRReadyMessage(withInvalid, "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(withInvalid, ctx())!;
     expect(text).toContain("100c → Invalid target");
     expect(text).not.toContain("100c → TP");
   });
@@ -409,7 +686,7 @@ describe("lookback alternatives", () => {
         candidate(300, "0.05061", "0.04521"),
       ],
     });
-    const text = buildExtremeRRReadyMessage(short, "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(short, ctx())!;
     // Valid-but-incomplete keeps honest prices plus the actual count.
     expect(text).toContain("100c → TP 0.0491 · SL 0.04622 (82/100)");
     expect(text).toContain("200c → Insufficient candles (0/200)");
@@ -424,7 +701,7 @@ describe("lookback alternatives", () => {
 describe("leverage recommendation", () => {
   it("recommends the single in-range preset ($8.77 at 10x for the spec notional)", async () => {
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(plan(), ctx())!;
     expect(text).toContain("LEVERAGE: 10x · Estimated isolated margin: $8.77");
     expect(text).not.toContain("SUGGESTED");
     expect(text).not.toContain("selected ·");
@@ -451,29 +728,29 @@ describe("leverage recommendation", () => {
     const choice = resolveLeverageChoice(p, c)!;
     expect(choice).toMatchObject({ leverage: 5, kind: "suggested" });
 
-    const text = buildExtremeRRReadyMessage(p, "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(p, ctx())!;
     expect(text).toContain("SUGGESTED LEVERAGE: 5x · Estimated isolated margin: $4.00");
   });
 
   it("persisted selected leverage takes precedence and is labelled", async () => {
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    const text = buildExtremeRRReadyMessage(plan({ selectedLeverage: 20 }), "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(plan({ selectedLeverage: 20 }), ctx())!;
     expect(text).toMatch(/LEVERAGE: 20x selected · Estimated isolated margin: \$\d+\.\d{2}/);
   });
 
   it("position notional line is identical regardless of leverage", async () => {
     const { buildExtremeRRReadyMessage } = await loadFormatter();
     const notionalLine = (text: string) => text.split("\n").find((l) => l.startsWith("Position notional:"));
-    const none = buildExtremeRRReadyMessage(plan(), "X")!;
-    const at5 = buildExtremeRRReadyMessage(plan({ selectedLeverage: 5 }), "X")!;
-    const at25 = buildExtremeRRReadyMessage(plan({ selectedLeverage: 25 }), "X")!;
+    const none = buildExtremeRRReadyMessage(plan(), ctx({ symbol: "X" }))!;
+    const at5 = buildExtremeRRReadyMessage(plan({ selectedLeverage: 5 }), ctx({ symbol: "X" }))!;
+    const at25 = buildExtremeRRReadyMessage(plan({ selectedLeverage: 25 }), ctx({ symbol: "X" }))!;
     expect(notionalLine(at5)).toBe(notionalLine(none));
     expect(notionalLine(at25)).toBe(notionalLine(none));
   });
 
   it("always includes the unverified-limit reminder after the execution block", async () => {
     const { buildExtremeRRReadyMessage } = await loadFormatter();
-    const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+    const text = buildExtremeRRReadyMessage(plan(), ctx())!;
     const reminder = text.indexOf("Verify leverage support on Binance.");
     expect(reminder).toBeGreaterThan(text.indexOf("Position notional:"));
     expect(reminder).toBeLessThan(text.indexOf("Open Trade Plan:"));
@@ -498,7 +775,7 @@ describe("INVALID and ERROR fallback messages", () => {
         money: null,
       })),
     });
-    const text = buildExtremeRRInvalidMessage(invalid, "USELESSUSDT");
+    const text = buildExtremeRRInvalidMessage(invalid, ctx());
     expect(text.startsWith("⚠️ PLAN INVALID — USELESSUSDT")).toBe(true);
     expect(text).toContain("Direction: LONG");
     expect(text).toContain("Reason: Highest high");
@@ -511,7 +788,7 @@ describe("INVALID and ERROR fallback messages", () => {
       status: "ERROR",
       errorReason: "Binance futures klines request failed with status 500: Internal Server Error at fetchWithTimeout (...)",
     });
-    const text = buildExtremeRRErrorMessage(error, "USELESSUSDT");
+    const text = buildExtremeRRErrorMessage(error, ctx());
     expect(text.startsWith("❌ PLAN ERROR — USELESSUSDT")).toBe(true);
     expect(text).toContain("Reason: Unable to generate the frozen Extreme RR plan.");
     expect(text).not.toContain("500");
@@ -558,7 +835,7 @@ describe("notifyExtremeRRPlanOutcome lifecycle", () => {
     const { notifyExtremeRRPlanOutcome } = await loadService();
     const { prisma } = mockPrisma();
 
-    await notifyExtremeRRPlanOutcome(prisma, plan({ status: "PENDING" }), "USELESSUSDT");
+    await notifyExtremeRRPlanOutcome(prisma, plan({ status: "PENDING" }), alertRow());
 
     expect(global.fetch).not.toHaveBeenCalled();
     expect(prisma.extremeRRPlan.updateMany).not.toHaveBeenCalled();
@@ -569,7 +846,7 @@ describe("notifyExtremeRRPlanOutcome lifecycle", () => {
     const { notifyExtremeRRPlanOutcome } = await loadService();
     const { prisma, state } = mockPrisma();
 
-    await notifyExtremeRRPlanOutcome(prisma, plan(), "USELESSUSDT");
+    await notifyExtremeRRPlanOutcome(prisma, plan(), alertRow());
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
     expect(state.telegramStatus).toBe("SENT");
@@ -581,7 +858,7 @@ describe("notifyExtremeRRPlanOutcome lifecycle", () => {
     const { notifyExtremeRRPlanOutcome } = await loadService();
     const { prisma } = mockPrisma("SENT");
 
-    await notifyExtremeRRPlanOutcome(prisma, plan(), "USELESSUSDT");
+    await notifyExtremeRRPlanOutcome(prisma, plan(), alertRow());
 
     expect(global.fetch).not.toHaveBeenCalled();
   });
@@ -592,8 +869,8 @@ describe("notifyExtremeRRPlanOutcome lifecycle", () => {
     const { prisma } = mockPrisma();
 
     await Promise.all([
-      notifyExtremeRRPlanOutcome(prisma, plan(), "USELESSUSDT"),
-      notifyExtremeRRPlanOutcome(prisma, plan(), "USELESSUSDT"),
+      notifyExtremeRRPlanOutcome(prisma, plan(), alertRow()),
+      notifyExtremeRRPlanOutcome(prisma, plan(), alertRow()),
     ]);
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
@@ -605,12 +882,12 @@ describe("notifyExtremeRRPlanOutcome lifecycle", () => {
     const { notifyExtremeRRPlanOutcome } = await loadService();
     const { prisma, state } = mockPrisma();
 
-    await expect(notifyExtremeRRPlanOutcome(prisma, plan(), "USELESSUSDT")).rejects.toThrow(/Telegram notification failed/);
+    await expect(notifyExtremeRRPlanOutcome(prisma, plan(), alertRow())).rejects.toThrow(/Telegram notification failed/);
     expect(state.telegramStatus).toBe("FAILED");
 
     // Retry: FAILED is claimable; a now-healthy Telegram succeeds.
     global.fetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" }) as unknown as typeof fetch;
-    await notifyExtremeRRPlanOutcome(prisma, plan(), "USELESSUSDT");
+    await notifyExtremeRRPlanOutcome(prisma, plan(), alertRow());
     expect(state.telegramStatus).toBe("SENT");
   });
 
@@ -621,7 +898,7 @@ describe("notifyExtremeRRPlanOutcome lifecycle", () => {
     const { prisma, state } = mockPrisma();
 
     await expect(
-      notifyExtremeRRPlanOutcome(prisma, plan({ status: "INVALID" }), "USELESSUSDT")
+      notifyExtremeRRPlanOutcome(prisma, plan({ status: "INVALID" }), alertRow())
     ).resolves.toBeUndefined();
     expect(state.telegramStatus).toBe("FAILED");
   });
@@ -631,7 +908,7 @@ describe("notifyExtremeRRPlanOutcome lifecycle", () => {
     const { notifyExtremeRRPlanOutcome } = await loadService();
     const { prisma, state } = mockPrisma();
 
-    await notifyExtremeRRPlanOutcome(prisma, plan(), "USELESSUSDT");
+    await notifyExtremeRRPlanOutcome(prisma, plan(), alertRow());
 
     expect(global.fetch).not.toHaveBeenCalled();
     expect(state.telegramStatus).toBe("SKIPPED");
@@ -642,7 +919,7 @@ describe("notifyExtremeRRPlanOutcome lifecycle", () => {
     const { notifyExtremeRRPlanOutcome } = await loadService();
     const { prisma } = mockPrisma();
 
-    await notifyExtremeRRPlanOutcome(prisma, plan(), "USELESSUSDT");
+    await notifyExtremeRRPlanOutcome(prisma, plan(), alertRow());
 
     const updates = (prisma.extremeRRPlan.update as ReturnType<typeof vi.fn>).mock.calls;
     for (const [args] of updates) {
