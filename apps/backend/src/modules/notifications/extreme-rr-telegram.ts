@@ -5,7 +5,7 @@ import {
   type ExtremeRRLeverage,
   type ExtremeRRPlanDto,
 } from "@trading-alert-dashboard/shared";
-import { env } from "../../config/env";
+import { publicAlertUrl } from "../../utils/dashboard-url";
 
 /**
  * Concise Extreme RR Telegram messages. Pure formatting only:
@@ -29,9 +29,14 @@ function usd(value: string): string {
   return `$${Number(value).toFixed(2)}`;
 }
 
-function alertUrl(alertId: string): string {
-  // PUBLIC_DASHBOARD_URL (not FRONTEND_URL) so the link works from a phone.
-  return `${env.PUBLIC_DASHBOARD_URL.replace(/\/$/, "")}/alerts/${alertId}`;
+/**
+ * Trailing link section, or nothing at all when no public dashboard URL is
+ * configured (PUBLIC_DASHBOARD_URL unset/empty/loopback). Returning an empty
+ * array keeps the message free of dangling blank lines.
+ */
+function linkSection(label: string, alertId: string): string[] {
+  const url = publicAlertUrl(alertId);
+  return url === null ? [] : ["", label, url];
 }
 
 function heading(direction: "LONG" | "SHORT", symbol: string): string {
@@ -154,9 +159,7 @@ export function buildExtremeRRReadyMessage(plan: ExtremeRRPlanDto, symbol: strin
     // No verified symbol leverage-limit source exists — keep the one-line
     // reminder near the bottom, never above the execution block.
     "Verify leverage support on Binance.",
-    "",
-    "Open Trade Plan:",
-    alertUrl(plan.alertId),
+    ...linkSection("Open Trade Plan:", plan.alertId),
   ];
 
   return lines.join("\n");
@@ -180,9 +183,7 @@ export function buildExtremeRRInvalidMessage(plan: ExtremeRRPlanDto, symbol: str
     `⚠️ PLAN INVALID — ${symbol}`,
     `Direction: ${plan.direction}`,
     `Reason: ${reason}`,
-    "",
-    "Open Alert:",
-    alertUrl(plan.alertId),
+    ...linkSection("Open Alert:", plan.alertId),
   ].join("\n");
 }
 
@@ -191,8 +192,6 @@ export function buildExtremeRRErrorMessage(plan: ExtremeRRPlanDto, symbol: strin
     `❌ PLAN ERROR — ${symbol}`,
     `Direction: ${plan.direction}`,
     "Reason: Unable to generate the frozen Extreme RR plan.",
-    "",
-    "Open Alert:",
-    alertUrl(plan.alertId),
+    ...linkSection("Open Alert:", plan.alertId),
   ].join("\n");
 }

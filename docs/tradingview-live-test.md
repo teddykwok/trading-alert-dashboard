@@ -91,9 +91,9 @@ the normalized symbol.
 
 ## 5. Make Telegram links work on your phone
 
-Telegram messages include a dashboard link built from `PUBLIC_DASHBOARD_URL` (default
-`http://localhost:5173`, which is useless on a phone). To get tappable links, expose the frontend
-too, in another terminal:
+`PUBLIC_DASHBOARD_URL` is optional. While it is empty (or set to a localhost address, which is
+useless on a phone), Telegram messages simply leave the link section out. To get tappable links,
+expose the frontend too, in another terminal:
 
 ```bash
 cloudflared tunnel --url http://localhost:5173

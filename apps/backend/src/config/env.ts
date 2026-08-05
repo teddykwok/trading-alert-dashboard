@@ -6,10 +6,12 @@ const envSchema = z.object({
   REDIS_URL: z.string().min(1, "REDIS_URL is required"),
   BACKEND_PORT: z.coerce.number().int().positive().default(4000),
   FRONTEND_URL: z.string().min(1).default("http://localhost:5173"),
-  // Base URL used when building dashboard links shared OUTSIDE the app (e.g.
-  // Telegram messages opened on a phone). Set to your tunnel/public frontend
-  // URL when testing remotely; falls back to the local dev URL.
-  PUBLIC_DASHBOARD_URL: z.string().min(1).default("http://localhost:5173"),
+  // OPTIONAL base URL for dashboard links shared OUTSIDE the app (e.g.
+  // Telegram messages opened on a phone). Leave unset/empty when the
+  // dashboard is only reachable locally: notifications then omit the link
+  // section entirely instead of sending an unopenable localhost URL (see
+  // utils/dashboard-url.ts, which also treats loopback hosts as "not public").
+  PUBLIC_DASHBOARD_URL: z.string().optional().default(""),
   WEBHOOK_SECRET: z.string().min(1, "WEBHOOK_SECRET is required"),
   SCREENSHOT_STORAGE_DIR: z.string().min(1).default("src/storage/screenshots"),
   AI_VISION_PROVIDER: z.enum(["mock", "openai"]).default("mock"),

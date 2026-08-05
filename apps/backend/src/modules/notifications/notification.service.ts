@@ -9,6 +9,7 @@ import {
   buildExtremeRRInvalidMessage,
   buildExtremeRRReadyMessage,
 } from "./extreme-rr-telegram";
+import { publicAlertUrl } from "../../utils/dashboard-url";
 import { emitAlertDuplicate, emitAlertFailed, emitAlertUpdated, emitNewAlert } from "./socket-events";
 import { sendTelegramMessage, sendTelegramPhoto } from "./telegram.service";
 
@@ -58,10 +59,14 @@ export async function notifyAlertFailed(alert: Alert): Promise<void> {
   await sendTelegramMessage(text);
 }
 
-function dashboardAlertUrl(alert: Alert): string {
-  // PUBLIC_DASHBOARD_URL (not FRONTEND_URL) so links in Telegram messages
-  // work from a phone when the dashboard is exposed via a tunnel.
-  return `${env.PUBLIC_DASHBOARD_URL.replace(/\/$/, "")}/alerts/${alert.id}`;
+/**
+ * PUBLIC_DASHBOARD_URL (not FRONTEND_URL) so links in Telegram messages work
+ * from a phone when the dashboard is exposed via a tunnel. It is optional:
+ * null means no public dashboard is configured, and the caller omits the
+ * whole line rather than sending an unopenable link.
+ */
+function dashboardAlertUrl(alert: Alert): string | null {
+  return publicAlertUrl(alert.id);
 }
 
 function formatConfidence(confidence: number | null): string {
@@ -87,7 +92,9 @@ function buildAnalyzedMessage(alert: Alert): string {
     for (const note of riskNotes) lines.push(`• ${note}`);
   }
 
-  lines.push("", `Dashboard: ${dashboardAlertUrl(alert)}`);
+  const url = dashboardAlertUrl(alert);
+  if (url) lines.push("", `Dashboard: ${url}`);
+
   return lines.join("\n");
 }
 

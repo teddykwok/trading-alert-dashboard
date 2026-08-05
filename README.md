@@ -251,7 +251,7 @@ the root `.env.example` (identical to `apps/backend/.env.example`); the frontend
 | --- | --- | --- |
 | `BACKEND_PORT` | Port the Fastify server listens on (binds `0.0.0.0`). | `4000` |
 | `FRONTEND_URL` | Allowed CORS origin + Socket.IO origin. | `http://localhost:5173` |
-| `PUBLIC_DASHBOARD_URL` | Base URL used for dashboard links shared outside the app (e.g. Telegram messages opened on a phone). | `http://localhost:5173` |
+| `PUBLIC_DASHBOARD_URL` | Optional base URL for dashboard links shared outside the app (e.g. Telegram messages opened on a phone). Empty — or any localhost/127.0.0.1 value — means "no public dashboard", and notifications omit the link section instead of sending an unopenable URL. | _(empty)_ |
 
 ### Backend — webhook
 
