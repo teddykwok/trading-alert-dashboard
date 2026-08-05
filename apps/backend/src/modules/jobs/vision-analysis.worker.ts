@@ -11,6 +11,7 @@ import {
   notifyAlertFailed,
   notifyAlertUpdated,
   notifyAnalyzedAlert,
+  notifyExtremeRRPlanOutcome,
 } from "../notifications/notification.service";
 import { ensureScreenshotDir, screenshotFileName } from "../../utils/file";
 import { inferMarketType } from "../../utils/symbol";
@@ -108,18 +109,38 @@ async function processVisionAnalysisJob(job: Job<VisionAnalysisJobData>): Promis
 }
 
 /**
- * Extreme RR plan generation. Runs in this same worker process (one worker
- * architecture, two queues). Unlike the vision pipeline, a plan failure never
- * touches the alert: the service records status ERROR on the PLAN and
- * returns; we then throw so BullMQ retries — a later success simply
- * overwrites the ERROR row (same frozen triggeredAt cutoff, immutable data).
+ * Extreme RR plan generation + the ONE Telegram notification for its final
+ * outcome. Runs in this same worker process (one worker architecture, two
+ * queues). Unlike the vision pipeline, a plan failure never touches the
+ * alert: the service records status ERROR on the PLAN and returns; we then
+ * throw so BullMQ retries — a later success simply overwrites the ERROR row
+ * (same frozen triggeredAt cutoff, immutable data).
+ *
+ * Notification rules:
+ * - READY: send the concise trade-plan message. A Telegram failure throws so
+ *   BullMQ retries the job — regeneration short-circuits on READY, so the
+ *   retry only re-attempts the (idempotent, claim-guarded) send.
+ * - INVALID: send the concise fallback once, best-effort.
+ * - ERROR: only after the FINAL attempt (never for transient failures that
+ *   still have retries left), best-effort — then rethrow for BullMQ.
  */
 async function processExtremeRRJob(job: Job<ExtremeRRJobData>): Promise<void> {
   const { alertId } = job.data;
   const plan = await extremeRRService.generateForAlert(alertId);
+
   if (plan.status === "ERROR") {
+    const totalAttempts = job.opts.attempts ?? 1;
+    const isFinalAttempt = job.attemptsMade + 1 >= totalAttempts;
+    if (isFinalAttempt) {
+      const alert = await alertsService.getByIdOrThrow(alertId);
+      await notifyExtremeRRPlanOutcome(prisma, plan, alert.symbol);
+    }
     throw new Error(plan.errorReason ?? "Extreme RR plan generation failed");
   }
+
+  const alert = await alertsService.getByIdOrThrow(alertId);
+  await notifyExtremeRRPlanOutcome(prisma, plan, alert.symbol);
+
   logger.info({ alertId, status: plan.status }, "Extreme RR plan generated");
 }
 

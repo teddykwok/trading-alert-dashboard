@@ -60,6 +60,17 @@ enum ExtremeRRPlanStatus {
   ERROR
 }
 
+// Telegram delivery state for a plan's ONE lifecycle notification. Null means
+// "not attempted yet"; SENDING is a short-lived atomic claim that makes
+// concurrent/retried worker attempts idempotent (claim via updateMany, only
+// null/FAILED are claimable).
+enum ExtremeRRTelegramStatus {
+  SENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
 enum AlertEventType {
   LEVEL_CREATED
   LEVEL_TOUCHED
@@ -266,8 +277,16 @@ model ExtremeRRPlan {
 
   errorReason String?
   generatedAt DateTime?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+
+  // One Telegram notification per plan lifecycle (READY / INVALID / final
+  // ERROR). Reset when a plan is explicitly regenerated so the new outcome
+  // notifies again. telegramLastError never contains tokens or chat ids.
+  telegramStatus     ExtremeRRTelegramStatus?
+  telegramNotifiedAt DateTime?
+  telegramLastError  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([status])
 }
