@@ -1,11 +1,29 @@
 import {
   EXTREME_RR_LOOKBACKS,
   formatDynamicPrice,
+  type AlertContext,
   type ExtremeRRCandidate,
   type ExtremeRRLeverage,
   type ExtremeRRPlanDto,
+  type TouchDirection,
 } from "@trading-alert-dashboard/shared";
 import { publicAlertUrl } from "../../utils/dashboard-url";
+
+/**
+ * The alert-side context a message needs. All fields come from the
+ * authoritative persisted alert (see notification.service.ts, which fills
+ * `levelContext` from the shared level-context builder) — nothing here is
+ * parsed a second time, derived, or guessed.
+ */
+export interface AlertMessageContext {
+  symbol: string;
+  /** Persisted Alert.exchange. Null/absent when unknown — never invented. */
+  exchange?: string | null;
+  /** Persisted Alert.timeframe: the CHART timeframe, never the level's sourceTf. */
+  timeframe?: string | null;
+  /** Frozen level context, or null for legacy alerts / other indicators. */
+  levelContext?: AlertContext | null;
+}
 
 /**
  * Concise Extreme RR Telegram messages. Pure formatting only:
@@ -41,6 +59,58 @@ function linkSection(label: string, alertId: string): string[] {
 
 function heading(direction: "LONG" | "SHORT", symbol: string): string {
   return `${direction === "LONG" ? "🟢" : "🔴"} ${direction} — ${symbol}`;
+}
+
+/** UNKNOWN maps to null: an unknown direction is omitted, never displayed. */
+const TOUCH_DIRECTION_LABELS: Record<TouchDirection, string | null> = {
+  FROM_ABOVE: "From above",
+  FROM_BELOW: "From below",
+  UNKNOWN: null,
+};
+
+/**
+ * "Exchange: BINANCE · Chart: 15m" — each half is included only when the
+ * stored value exists, so a missing exchange yields "Chart: 15m" rather than
+ * a dangling separator or an invented venue. Values are shown exactly as
+ * stored (there is no display-normalization convention in this repo, and the
+ * stored value must not be altered).
+ */
+function exchangeChartLine(context: AlertMessageContext): string | null {
+  const parts: string[] = [];
+  const exchange = context.exchange?.trim();
+  const timeframe = context.timeframe?.trim();
+
+  if (exchange) parts.push(`Exchange: ${exchange}`);
+  if (timeframe) parts.push(`Chart: ${timeframe}`);
+
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/**
+ * "Level: 1W GREEN · From above" from the FROZEN level context. The level's
+ * own timeframe and colour are the minimum reliable pair; without both the
+ * whole line is omitted (never "Unknown"/"N/A", never inferred from
+ * LONG/SHORT). A known touch direction is appended when present.
+ */
+function levelLine(context: AlertMessageContext): string | null {
+  const level = context.levelContext;
+  if (!level || !level.sourceTimeframe || !level.levelColor) return null;
+
+  const direction = level.touchDirection ? TOUCH_DIRECTION_LABELS[level.touchDirection] : null;
+  const base = `Level: ${level.sourceTimeframe} ${level.levelColor}`;
+  return direction ? `${base} · ${direction}` : base;
+}
+
+/**
+ * The two context lines, preceded by a blank separator. Returns an empty
+ * array when neither line has content, so the message never grows a stray
+ * blank line.
+ */
+function contextSection(context: AlertMessageContext): string[] {
+  const lines = [exchangeChartLine(context), levelLine(context)].filter(
+    (line): line is string => line !== null
+  );
+  return lines.length > 0 ? ["", ...lines] : [];
 }
 
 /**
@@ -139,14 +209,17 @@ export function lookbackLine(plan: ExtremeRRPlanDto, lookback: number): string {
 }
 
 /** Concise READY trade-plan message. Execution information first. */
-export function buildExtremeRRReadyMessage(plan: ExtremeRRPlanDto, symbol: string): string | null {
+export function buildExtremeRRReadyMessage(
+  plan: ExtremeRRPlanDto,
+  context: AlertMessageContext
+): string | null {
   const candidate = resolveMainCandidate(plan);
   if (plan.status !== "READY" || !candidate || !candidate.money) return null;
 
   const choice = resolveLeverageChoice(plan, candidate);
 
   const lines = [
-    heading(plan.direction, symbol),
+    heading(plan.direction, context.symbol),
     ...(choice ? [leverageLine(choice)] : []),
     `Entry: ${px(plan.entryPrice)}`,
     `Stop-loss: ${px(candidate.stopLoss)}`,
@@ -155,6 +228,8 @@ export function buildExtremeRRReadyMessage(plan: ExtremeRRPlanDto, symbol: strin
     "",
     "LOOKBACK ALTERNATIVES",
     ...EXTREME_RR_LOOKBACKS.map((lookback) => lookbackLine(plan, lookback)),
+    // Context sits below the execution block and above the warning/link.
+    ...contextSection(context),
     "",
     // No verified symbol leverage-limit source exists — keep the one-line
     // reminder near the bottom, never above the execution block.
@@ -172,7 +247,10 @@ function safeReason(reason: string | null, fallback: string): string {
   return reason.split("\n")[0].slice(0, 180);
 }
 
-export function buildExtremeRRInvalidMessage(plan: ExtremeRRPlanDto, symbol: string): string {
+export function buildExtremeRRInvalidMessage(
+  plan: ExtremeRRPlanDto,
+  context: AlertMessageContext
+): string {
   const selected = plan.candidates.find((c) => c.requestedCandles === plan.selectedLookback);
   const reason = safeReason(
     selected?.invalidReason ?? plan.candidates.find((c) => c.invalidReason)?.invalidReason ?? null,
@@ -180,16 +258,19 @@ export function buildExtremeRRInvalidMessage(plan: ExtremeRRPlanDto, symbol: str
   );
 
   return [
-    `⚠️ PLAN INVALID — ${symbol}`,
+    `⚠️ PLAN INVALID — ${context.symbol}`,
     `Direction: ${plan.direction}`,
     `Reason: ${reason}`,
     ...linkSection("Open Alert:", plan.alertId),
   ].join("\n");
 }
 
-export function buildExtremeRRErrorMessage(plan: ExtremeRRPlanDto, symbol: string): string {
+export function buildExtremeRRErrorMessage(
+  plan: ExtremeRRPlanDto,
+  context: AlertMessageContext
+): string {
   return [
-    `❌ PLAN ERROR — ${symbol}`,
+    `❌ PLAN ERROR — ${context.symbol}`,
     `Direction: ${plan.direction}`,
     "Reason: Unable to generate the frozen Extreme RR plan.",
     ...linkSection("Open Alert:", plan.alertId),

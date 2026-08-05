@@ -133,13 +133,13 @@ async function processExtremeRRJob(job: Job<ExtremeRRJobData>): Promise<void> {
     const isFinalAttempt = job.attemptsMade + 1 >= totalAttempts;
     if (isFinalAttempt) {
       const alert = await alertsService.getByIdOrThrow(alertId);
-      await notifyExtremeRRPlanOutcome(prisma, plan, alert.symbol);
+      await notifyExtremeRRPlanOutcome(prisma, plan, alert);
     }
     throw new Error(plan.errorReason ?? "Extreme RR plan generation failed");
   }
 
   const alert = await alertsService.getByIdOrThrow(alertId);
-  await notifyExtremeRRPlanOutcome(prisma, plan, alert.symbol);
+  await notifyExtremeRRPlanOutcome(prisma, plan, alert);
 
   logger.info({ alertId, status: plan.status }, "Extreme RR plan generated");
 }
