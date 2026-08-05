@@ -45,6 +45,12 @@ async function loadService() {
   return import("../src/modules/notifications/notification.service");
 }
 
+/**
+ * Default signal is WATCH: since the Extreme RR Telegram feature, actionable
+ * LONG/SHORT alerts no longer receive the verbose ANALYZED message (they get
+ * the concise trade-plan message from the plan worker instead), so the legacy
+ * message path under test here is the non-actionable one.
+ */
 function analyzedAlert(overrides: Partial<Alert> = {}): Alert {
   return {
     id: "alert_test_1",
@@ -53,7 +59,7 @@ function analyzedAlert(overrides: Partial<Alert> = {}): Alert {
     exchange: "BINANCE",
     timeframe: "1h",
     price: 64000,
-    signal: "LONG",
+    signal: "WATCH",
     status: "ANALYZED",
     screenshotUrl: null,
     aiBias: "bullish_continuation",
@@ -151,6 +157,26 @@ describe("notifyAnalyzedAlert", () => {
     await notifyAnalyzedAlert(analyzedAlert({ status: "IGNORED_DUPLICATE" }));
 
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("suppresses the verbose message for actionable LONG/SHORT alerts (Extreme RR message replaces it)", async () => {
+    setEnv({ ...ENABLED, TELEGRAM_SEND_SCREENSHOT: "false" });
+    const { notifyAnalyzedAlert } = await loadService();
+
+    await notifyAnalyzedAlert(analyzedAlert({ signal: "LONG" }));
+    await notifyAnalyzedAlert(analyzedAlert({ signal: "SHORT" }));
+
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("still sends the legacy message for WATCH and EXIT signals", async () => {
+    setEnv({ ...ENABLED, TELEGRAM_SEND_SCREENSHOT: "false" });
+    const { notifyAnalyzedAlert } = await loadService();
+
+    await notifyAnalyzedAlert(analyzedAlert({ signal: "WATCH" }));
+    await notifyAnalyzedAlert(analyzedAlert({ signal: "EXIT" }));
+
+    expect(global.fetch).toHaveBeenCalledTimes(2);
   });
 });
 

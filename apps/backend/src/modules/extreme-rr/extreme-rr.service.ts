@@ -254,6 +254,12 @@ export class ExtremeRRService {
           candidates: candidates as object[],
           errorReason: null,
           generatedAt: new Date(),
+          // Regeneration produces a new outcome — reset the Telegram cycle so
+          // the new result may notify once. (READY plans never reach here;
+          // they short-circuit above, so a sent notification stays sent.)
+          telegramStatus: null,
+          telegramNotifiedAt: null,
+          telegramLastError: null,
         },
       });
       return this.serialize(saved);
@@ -264,7 +270,16 @@ export class ExtremeRRService {
       const saved = await this.prisma.extremeRRPlan.upsert({
         where: { alertId },
         create: { alertId, ...baseData, status: "ERROR", errorReason: message },
-        update: { ...baseData, status: "ERROR", errorReason: message },
+        update: {
+          ...baseData,
+          status: "ERROR",
+          errorReason: message,
+          // Same reset as the success path: a regenerated outcome starts a
+          // fresh (single) notification cycle.
+          telegramStatus: null,
+          telegramNotifiedAt: null,
+          telegramLastError: null,
+        },
       });
       return this.serialize(saved);
     }
