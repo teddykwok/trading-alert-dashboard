@@ -29,10 +29,21 @@ const ENABLED = {
   TELEGRAM_CHAT_ID: "123456",
 };
 
-function setEnv(overrides: Record<string, string>): void {
+/**
+ * Applies a deterministic Telegram env. PUBLIC_DASHBOARD_URL always gets an
+ * explicit value (a real public URL unless a test overrides it), because
+ * config/env.ts loads dotenv — without this, the developer's local .env would
+ * decide whether the link section appears.
+ */
+function setEnv(overrides: Record<string, string> = {}): void {
   for (const key of TELEGRAM_KEYS) delete process.env[key];
+  process.env.PUBLIC_DASHBOARD_URL = "https://public.example";
   Object.assign(process.env, overrides);
 }
+
+// Every test needs the deterministic baseline, including those that don't
+// otherwise touch env.
+beforeEach(() => setEnv(ENABLED));
 
 async function loadFormatter() {
   vi.resetModules();
@@ -191,7 +202,7 @@ describe("buildExtremeRRReadyMessage content", () => {
     setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "https://public.example/" });
     const { buildExtremeRRReadyMessage } = await loadFormatter();
     const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
-    expect(text).toContain("https://public.example/alerts/alert_tg_1");
+    expect(text).toContain("Open Trade Plan:\nhttps://public.example/alerts/alert_tg_1");
     expect(text).not.toContain("public.example//alerts");
   });
 
@@ -223,6 +234,112 @@ describe("buildExtremeRRReadyMessage content", () => {
     const { buildExtremeRRReadyMessage } = await loadFormatter();
     buildExtremeRRReadyMessage(plan(), "USELESSUSDT");
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Optional PUBLIC_DASHBOARD_URL
+// ---------------------------------------------------------------------------
+
+describe("optional PUBLIC_DASHBOARD_URL link section", () => {
+  /** Every message must end with real content — never a blank/whitespace line. */
+  function expectNoTrailingBlankLine(text: string): void {
+    expect(text).toBe(text.trimEnd());
+    expect(text.endsWith("\n")).toBe(false);
+    const lines = text.split("\n");
+    expect(lines[lines.length - 1].trim()).not.toBe("");
+  }
+
+  // A genuinely missing value resolves to "" via the schema default and is
+  // covered end-to-end in dashboard-url.test.ts (dotenv makes "absent"
+  // untestable here without leaking the local .env).
+  const OMITTED = [
+    ["empty", { PUBLIC_DASHBOARD_URL: "" }],
+    ["whitespace only", { PUBLIC_DASHBOARD_URL: "   " }],
+    ["localhost", { PUBLIC_DASHBOARD_URL: "http://localhost:5173" }],
+    ["127.0.0.1", { PUBLIC_DASHBOARD_URL: "http://127.0.0.1:5173" }],
+    ["not an absolute URL", { PUBLIC_DASHBOARD_URL: "my-dashboard" }],
+  ] as const;
+
+  for (const [label, override] of OMITTED) {
+    it(`omits the whole link section when the URL is ${label} (READY)`, async () => {
+      setEnv({ ...ENABLED, ...override });
+      const { buildExtremeRRReadyMessage } = await loadFormatter();
+      const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+
+      expect(text).not.toContain("Open Trade Plan:");
+      expect(text).not.toContain("/alerts/alert_tg_1");
+      expect(text.endsWith("Verify leverage support on Binance.")).toBe(true);
+      expectNoTrailingBlankLine(text);
+    });
+  }
+
+  it("keeps the rest of the READY message identical when the link is omitted", async () => {
+    setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "" });
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const withoutLink = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+
+    setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "https://public.example" });
+    const { buildExtremeRRReadyMessage: buildWithLink } = await loadFormatter();
+    const withLink = buildWithLink(plan(), "USELESSUSDT")!;
+
+    // The only difference is the appended link section.
+    expect(withLink).toBe(`${withoutLink}\n\nOpen Trade Plan:\nhttps://public.example/alerts/alert_tg_1`);
+    // Everything else survives untouched.
+    for (const needle of [
+      "🟢 LONG — USELESSUSDT",
+      "LEVERAGE: 10x · Estimated isolated margin: $8.77",
+      "Entry: 0.04737",
+      "Stop-loss: 0.04521",
+      "Take-profit: 0.05061",
+      "LOOKBACK ALTERNATIVES",
+      "300c → TP 0.05061 · SL 0.04521 ← Selected",
+      "Verify leverage support on Binance.",
+    ]) {
+      expect(withoutLink).toContain(needle);
+    }
+  });
+
+  it("omits the link section for INVALID and ERROR too, with no trailing blank line", async () => {
+    setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "http://localhost:5173" });
+    const { buildExtremeRRInvalidMessage, buildExtremeRRErrorMessage } = await loadFormatter();
+
+    const invalid = buildExtremeRRInvalidMessage(plan({ status: "INVALID" }), "USELESSUSDT");
+    expect(invalid).not.toContain("Open Alert:");
+    expect(invalid.startsWith("⚠️ PLAN INVALID — USELESSUSDT")).toBe(true);
+    expectNoTrailingBlankLine(invalid);
+
+    const error = buildExtremeRRErrorMessage(plan({ status: "ERROR" }), "USELESSUSDT");
+    expect(error).not.toContain("Open Alert:");
+    expect(error.endsWith("Reason: Unable to generate the frozen Extreme RR plan.")).toBe(true);
+    expectNoTrailingBlankLine(error);
+  });
+
+  it("keeps the link section for INVALID and ERROR when a public URL is configured", async () => {
+    setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "https://public.example" });
+    const { buildExtremeRRInvalidMessage, buildExtremeRRErrorMessage } = await loadFormatter();
+
+    expect(buildExtremeRRInvalidMessage(plan({ status: "INVALID" }), "X")).toContain(
+      "Open Alert:\nhttps://public.example/alerts/alert_tg_1"
+    );
+    expect(buildExtremeRRErrorMessage(plan({ status: "ERROR" }), "X")).toContain(
+      "Open Alert:\nhttps://public.example/alerts/alert_tg_1"
+    );
+  });
+
+  it("treats a LAN/tailnet host as public (not auto-detected, just not loopback)", async () => {
+    setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "http://192.168.1.50:5173" });
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+    expect(text).toContain("Open Trade Plan:\nhttp://192.168.1.50:5173/alerts/alert_tg_1");
+  });
+
+  it("READY message still ends correctly with a valid URL (no trailing blank line)", async () => {
+    setEnv({ ...ENABLED, PUBLIC_DASHBOARD_URL: "https://public.example//" });
+    const { buildExtremeRRReadyMessage } = await loadFormatter();
+    const text = buildExtremeRRReadyMessage(plan(), "USELESSUSDT")!;
+    expect(text.endsWith("https://public.example/alerts/alert_tg_1")).toBe(true);
+    expectNoTrailingBlankLine(text);
   });
 });
 
