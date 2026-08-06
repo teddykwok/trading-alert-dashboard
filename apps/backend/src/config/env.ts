@@ -1,6 +1,41 @@
 import "dotenv/config";
 import { z } from "zod";
 
+/**
+ * Decimal-string config values. Validated as plain decimal literals and kept
+ * as strings so decimal.js receives the exact configured value — no float
+ * parsing anywhere on the authoritative path.
+ */
+const DECIMAL_PATTERN = /^\d+(\.\d+)?$/;
+
+const positiveDecimalString = z
+  .string()
+  .trim()
+  .regex(DECIMAL_PATTERN, "must be a plain decimal string, e.g. \"2.5\"")
+  .refine((value) => /[1-9]/.test(value), "must be greater than zero");
+
+const nonNegativeDecimalString = z
+  .string()
+  .trim()
+  .regex(DECIMAL_PATTERN, "must be a plain decimal string, e.g. \"0.5\"");
+
+/**
+ * Compares two validated non-negative decimal strings digit-wise (no float
+ * conversion). Returns -1, 0 or 1.
+ */
+export function compareDecimalStrings(a: string, b: string): number {
+  const [aInt, aFrac = ""] = a.trim().split(".");
+  const [bInt, bFrac = ""] = b.trim().split(".");
+
+  const intWidth = Math.max(aInt.length, bInt.length);
+  const fracWidth = Math.max(aFrac.length, bFrac.length);
+  const left = aInt.padStart(intWidth, "0") + aFrac.padEnd(fracWidth, "0");
+  const right = bInt.padStart(intWidth, "0") + bFrac.padEnd(fracWidth, "0");
+
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
   REDIS_URL: z.string().min(1, "REDIS_URL is required"),
@@ -77,6 +112,19 @@ const envSchema = z.object({
   BINANCE_API_SECRET: z.string().optional().default(""),
   // Binance rejects recvWindow above 60000 ms; 5000 is the documented default.
   BINANCE_RECV_WINDOW_MS: z.coerce.number().int().positive().max(60_000).default(5000),
+  // --- Phase 3 dynamic leverage / isolated margin policy (calculation only) ---
+  // Kept as decimal STRINGS: they feed decimal.js directly and must never be
+  // round-tripped through a JS float. Target is the preferred isolated margin
+  // (risk × multiplier); maximum is a hard capital ceiling.
+  BINANCE_TARGET_MARGIN_MULTIPLIER: positiveDecimalString.default("2.5"),
+  BINANCE_MAX_MARGIN_MULTIPLIER: positiveDecimalString.default("3.333333"),
+  // Liquidation must sit at least stopDistance × ratio beyond the stop loss.
+  BINANCE_LIQUIDATION_BUFFER_RATIO: nonNegativeDecimalString.default("0.5"),
+  // User-side automation leverage ceiling. The engine's usable maximum is
+  // min(bracket initialLeverage, this). Capped at 125 — the highest initial
+  // leverage Binance currently publishes in USDⓈ-M brackets — so a typo like
+  // 250 cannot silently promise an unusable leverage.
+  BINANCE_MAX_AUTOMATION_LEVERAGE: z.coerce.number().int().positive().max(125).default(25),
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value
   // fall back to mock candles, same as STOCK alerts.
@@ -118,6 +166,17 @@ const envSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ["OPENAI_API_KEY"],
       message: "OPENAI_API_KEY is required when AI_VISION_PROVIDER=openai",
+    });
+  }
+
+  // The maximum isolated margin is a ceiling above the preferred target, so
+  // it can never be the smaller of the two. Compared as decimal strings via
+  // padded numeric comparison to avoid float parsing.
+  if (compareDecimalStrings(value.BINANCE_MAX_MARGIN_MULTIPLIER, value.BINANCE_TARGET_MARGIN_MULTIPLIER) < 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["BINANCE_MAX_MARGIN_MULTIPLIER"],
+      message: "BINANCE_MAX_MARGIN_MULTIPLIER must be greater than or equal to BINANCE_TARGET_MARGIN_MULTIPLIER",
     });
   }
 

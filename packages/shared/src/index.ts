@@ -93,6 +93,30 @@ export { formatDynamicPrice, priceDecimalsFor, pricePrecisionFor } from "./forma
 
 export { SYMBOL_INPUT_MAX_LENGTH, getSymbolInputError } from "./symbol-validation";
 
+export type {
+  DynamicLeveragePlan,
+  DynamicLeveragePlanInput,
+  LeverageCandidateSummary,
+  LiquidationEstimate,
+  LiquidationEstimateInput,
+  MarginPlanLeverageBracket,
+  MarginPlanReason,
+  MarginPlanStatus,
+  MarginPlanSymbolFilters,
+  ResolvedBracketSummary,
+  StopLossSource,
+} from "./binance-margin-engine";
+export {
+  MARGIN_ENGINE_DEFAULTS,
+  MARGIN_PLAN_REASONS,
+  MARGIN_PLAN_STATUSES,
+  STOP_LOSS_SOURCES,
+  STOP_PRICE_NORMALIZED_TO_TICK,
+  SUPPORTED_CONTRACT_TYPES,
+  calculateDynamicLeveragePlan,
+  estimateIsolatedLiquidationPrice,
+} from "./binance-margin-engine";
+
 export type { RiskTemplate, RiskTemplateAmounts } from "./risk-template";
 export { calculateRiskTemplateAmounts } from "./risk-template";
 

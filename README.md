@@ -282,6 +282,22 @@ database, and is **not** wired into the alert pipeline. See
 | `BINANCE_API_KEY` | Binance API key. Required **only** when the connector is enabled. Use a key with *Enable Reading* permission only. | _(empty)_ |
 | `BINANCE_API_SECRET` | Binance API secret. Required only when the connector is enabled. | _(empty)_ |
 | `BINANCE_RECV_WINDOW_MS` | Signed-request validity window. Binance maximum is `60000`. | `5000` |
+| `BINANCE_TARGET_MARGIN_MULTIPLIER` | Preferred isolated margin = risk budget × this. Decimal string. | `2.5` |
+| `BINANCE_MAX_MARGIN_MULTIPLIER` | Hard isolated-margin ceiling = risk budget × this. Must be ≥ the target multiplier. | `3.333333` |
+| `BINANCE_LIQUIDATION_BUFFER_RATIO` | Liquidation must sit at least `stopDistance × ratio` beyond the stop loss. | `0.5` |
+| `BINANCE_MAX_AUTOMATION_LEVERAGE` | User-side automation leverage ceiling (integer, max 125). Usable leverage = min(Binance bracket maximum, this). Recommendation only — never applied to the account. | `25` |
+
+Phase 3 adds a **calculation-only** dynamic leverage / isolated margin planner.
+It reuses the same GET-only connector, recommends a leverage without ever
+applying it, and touches no order, leverage, margin type or position mode:
+
+```bash
+# <SYMBOL> <LONG|SHORT> <entry> <stopLoss> [riskBudgetUsd]
+pnpm --filter @trading-alert-dashboard/backend binance:margin-plan -- BTCUSDT LONG 64000 63500 1.50
+
+# Compare the liquidation estimator against Binance's reported values
+pnpm --filter @trading-alert-dashboard/backend binance:liquidation-check
+```
 
 Run the health check (optionally for one symbol):
 
@@ -514,6 +530,8 @@ Run from the repo root. Only scripts that actually exist are listed.
 | `pnpm test:binance` | Check Binance klines connectivity (`scripts/test-binance-candles.js`). |
 | `pnpm test:telegram` | Send a Telegram test message (`scripts/test-telegram.js`). |
 | `pnpm --filter @trading-alert-dashboard/backend binance:read-only-check [SYMBOL]` | Read-only Binance account/symbol health check (no orders, no account changes). |
+| `pnpm --filter @trading-alert-dashboard/backend binance:margin-plan -- <SYMBOL> <LONG\|SHORT> <entry> <stop> [risk]` | Calculation-only dynamic leverage / isolated margin plan (recommends, never applies). |
+| `pnpm --filter @trading-alert-dashboard/backend binance:liquidation-check` | Validates the liquidation estimator against Binance-reported values for ISOLATED positions. |
 | `pnpm --filter @trading-alert-dashboard/backend playwright:install` | Install the Chromium build used for screenshots. |
 
 ## Troubleshooting
