@@ -66,10 +66,19 @@ describe("pure lifecycle purity", () => {
 });
 
 describe("mutation surface", () => {
-  it("declares exactly four mutation endpoints", () => {
+  it("declares only the approved mutation endpoints", () => {
     const endpoints = readCode(ENDPOINTS);
     const paths = [...endpoints.matchAll(/path:\s*"([^"]+)"/g)].map((match) => match[1]);
-    expect(paths.sort()).toEqual(["/fapi/v1/leverage", "/fapi/v1/marginType", "/fapi/v1/order", "/fapi/v1/order"]);
+    // Phase 6 entry paths plus the three risk-reducing Phase 7 paths.
+    expect(paths.sort()).toEqual([
+      "/fapi/v1/algoOrder",
+      "/fapi/v1/algoOrder",
+      "/fapi/v1/leverage",
+      "/fapi/v1/marginType",
+      "/fapi/v1/order",
+      "/fapi/v1/order",
+      "/fapi/v1/positionMargin",
+    ]);
   });
 
   it("declares only POST and DELETE", () => {
@@ -83,7 +92,6 @@ describe("mutation surface", () => {
       for (const forbidden of [
         "/fapi/v1/positionSide/dual\"",
         "/fapi/v1/multiAssetsMargin\"",
-        "/fapi/v1/positionMargin",
         "/fapi/v1/batchOrders",
         "/fapi/v1/allOpenOrders",
         "/fapi/v1/countdownCancelAll",
@@ -97,9 +105,16 @@ describe("mutation surface", () => {
 
   it("submits no MARKET entry and no protection order", () => {
     const client = readCode(CLIENT);
-    // The only order type expressible is the allowlisted LIMIT constant.
+    // The only ENTRY order type expressible is the allowlisted LIMIT constant.
+    // (Phase 7 added a single branded emergency MARKET close, which is
+    // risk-reducing and cannot be reached through the entry path.)
     expect(client).toContain("ALLOWED_ENTRY_ORDER_TYPE");
-    for (const forbidden of ['"MARKET"', '"STOP"', '"STOP_MARKET"', '"TAKE_PROFIT"', '"TAKE_PROFIT_MARKET"', '"TRAILING_STOP_MARKET"']) {
+    expect((client.match(/"MARKET"/g) ?? []).length).toBe(1);
+    expect(client).toContain("submitEmergencyMarketClose");
+    // Protection types belong to the Phase 7 methods and are pinned there by
+    // the allowlist; what must never exist here is a trailing or limit
+    // conditional type.
+    for (const forbidden of ['"TRAILING_STOP_MARKET"', '"STOP_LIMIT"', '"TAKE_PROFIT_LIMIT"']) {
       expect(client).not.toContain(forbidden);
     }
   });

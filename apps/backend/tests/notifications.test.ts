@@ -1,7 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import path from "node:path";
 import type { Alert } from "@prisma/client";
+
+/**
+ * Screenshot bytes are served from memory: `null` means "no such file", which
+ * is exactly how the real readFile failure is handled. This keeps the Telegram
+ * tests free of filesystem latency.
+ */
+let mockedScreenshot: Buffer | null = null;
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    readFile: vi.fn(async (...args: Parameters<typeof actual.readFile>) => {
+      const target = String(args[0]);
+      if (target.endsWith(".png")) {
+        if (mockedScreenshot === null) throw new Error("ENOENT: no such file");
+        return mockedScreenshot;
+      }
+      return actual.readFile(...args);
+    }),
+  };
+});
 
 /**
  * Telegram behavior is driven by env vars that config/env.ts reads once at
@@ -181,17 +201,19 @@ describe("notifyAnalyzedAlert", () => {
 });
 
 describe("notifyAnalyzedAlert with screenshot", () => {
-  const screenshotDir = path.join(process.cwd(), "src", "storage", "screenshots");
   const alertId = "tg_photo_test";
-  const screenshotPath = path.join(screenshotDir, `${alertId}.png`);
 
-  beforeEach(async () => {
-    await mkdir(screenshotDir, { recursive: true });
-    await writeFile(screenshotPath, Buffer.from("fake-png"));
+  // The screenshot is served from an in-memory mock rather than real disk.
+  // Creating and deleting a file per test made these cases depend on
+  // filesystem latency, which is what made them exceed the default timeout
+  // under parallel suite load. The behaviour under test — "a readable
+  // screenshot produces a sendPhoto call" — is unchanged.
+  beforeEach(() => {
+    mockedScreenshot = Buffer.from("fake-png");
   });
 
-  afterEach(async () => {
-    await rm(screenshotPath, { force: true });
+  afterEach(() => {
+    mockedScreenshot = null;
   });
 
   it("sends a photo when a screenshot exists", async () => {

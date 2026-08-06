@@ -2,12 +2,16 @@ import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import { BinanceReadOnlyClient, buildCanonicalQuery, signQuery, type QueryParams } from "./binance.client";
 import {
+  ALLOWED_ALGO_TYPE,
   ALLOWED_ENTRY_ORDER_TYPE,
   ALLOWED_ENTRY_TIME_IN_FORCE,
   BINANCE_MUTATION_ENDPOINTS,
   FORBIDDEN_ENTRY_PARAMS,
+  FORBIDDEN_PROTECTION_PARAMS,
+  MARGIN_ADD_TYPE,
   isAllowedMutation,
   type BinanceMutationEndpointName,
+  type ProtectionOrderType,
 } from "./binance-execution.endpoints";
 import { BinanceError, classifyBinanceFailure, registerBinanceRedactions, sanitizeBinanceText } from "./binance.errors";
 // Pure helper (no Prisma, no I/O): lets the cancellation context prove that a
@@ -107,6 +111,11 @@ export interface LeverageChangeDto {
  */
 const AUTHORIZATION_BRAND = Symbol("binance-mutation-authorization");
 
+/** Plain positive decimal literal — no float parsing, no exponent form. */
+function isPositiveDecimal(value: string): boolean {
+  return /^\d+(\.\d+)?$/.test(String(value).trim()) && /[1-9]/.test(String(value));
+}
+
 /** Proof that both live-entry gates were open. Required for every POST. */
 export interface LiveEntryAuthorization {
   readonly [AUTHORIZATION_BRAND]: "LIVE_ENTRY";
@@ -136,6 +145,84 @@ export interface AuthorizeEntryCancellationInput {
   role: string;
   generation: number;
   reason: EntryCancellationReason;
+}
+
+/**
+ * Phase 7 authorization contexts.
+ *
+ * Protection, margin top-up, protection cleanup and emergency close are all
+ * RISK_REDUCING: they are NOT gated on the live-entry switches, because
+ * gating them would leave live exposure unprotected or unclosable exactly
+ * when the operator has decided to stop opening new trades. Their narrowing
+ * is structural — every value comes from a persisted, verified local intent.
+ */
+export interface ProtectionSubmissionContext {
+  readonly [AUTHORIZATION_BRAND]: "PROTECTION_SUBMISSION";
+  readonly symbol: string;
+  readonly clientAlgoId: string;
+  readonly orderType: ProtectionOrderType;
+  readonly side: "BUY" | "SELL";
+  readonly positionSide: "LONG" | "SHORT";
+  readonly quantity: string;
+  readonly triggerPrice: string;
+  readonly workingType: WorkingTypeName;
+  readonly priceProtect: boolean;
+}
+
+export interface ProtectionCancellationContext {
+  readonly [AUTHORIZATION_BRAND]: "PROTECTION_CANCELLATION";
+  readonly symbol: string;
+  readonly clientAlgoId: string;
+}
+
+export interface MarginAdditionContext {
+  readonly [AUTHORIZATION_BRAND]: "MARGIN_ADDITION";
+  readonly symbol: string;
+  readonly positionSide: "LONG" | "SHORT";
+  readonly amount: string;
+}
+
+export interface EmergencyCloseContext {
+  readonly [AUTHORIZATION_BRAND]: "EMERGENCY_CLOSE";
+  readonly symbol: string;
+  readonly side: "BUY" | "SELL";
+  readonly positionSide: "LONG" | "SHORT";
+  readonly quantity: string;
+  readonly clientOrderId: string;
+}
+
+export type WorkingTypeName = "MARK_PRICE" | "CONTRACT_PRICE";
+
+export interface AuthorizeProtectionInput {
+  executionId: string;
+  symbol: string;
+  role: "STOP_LOSS" | "TAKE_PROFIT";
+  generation: number;
+  /** Must equal the deterministic id for (executionId, role, generation). */
+  clientAlgoId: string;
+  side: "BUY" | "SELL";
+  positionSide: "LONG" | "SHORT";
+  quantity: string;
+  triggerPrice: string;
+  workingType: WorkingTypeName;
+  priceProtect: boolean;
+}
+
+export interface AuthorizeEmergencyCloseInput {
+  executionId: string;
+  symbol: string;
+  side: "BUY" | "SELL";
+  positionSide: "LONG" | "SHORT";
+  quantity: string;
+  /** Must equal the deterministic id for (executionId, EMERGENCY_CLOSE, 1). */
+  clientOrderId: string;
+}
+
+export interface AlgoOrderAckDto {
+  algoId: string | null;
+  clientAlgoId: string | null;
+  symbol: string | null;
+  algoStatus: string | null;
 }
 
 export interface SubmitLimitEntryInput {
@@ -345,6 +432,216 @@ export class BinanceUsdMExecutionClient {
     const payload = await this.mutate<Record<string, unknown>>("cancelOrder", {
       symbol: context.symbol,
       origClientOrderId: context.clientOrderId,
+    });
+    return {
+      orderId: payload?.orderId === undefined || payload?.orderId === null ? null : String(payload.orderId),
+      clientOrderId: typeof payload?.clientOrderId === "string" ? payload.clientOrderId : null,
+      symbol: typeof payload?.symbol === "string" ? payload.symbol : null,
+      status: typeof payload?.status === "string" ? payload.status : null,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 7 — protection, margin and emergency close (all risk-reducing)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Issues permission to submit ONE protection order for a persisted tranche.
+   *
+   * Narrowed structurally: only STOP_MARKET / TAKE_PROFIT_MARKET, only a
+   * hedge-mode positionSide matching the closing side, and only the exact
+   * deterministic client algo id derived from (execution, role, generation).
+   * A caller cannot invent the symbol, quantity, trigger or id.
+   */
+  authorizeProtectionSubmission(input: AuthorizeProtectionInput): ProtectionSubmissionContext {
+    const orderType: ProtectionOrderType = input.role === "STOP_LOSS" ? "STOP_MARKET" : "TAKE_PROFIT_MARKET";
+    if (input.role !== "STOP_LOSS" && input.role !== "TAKE_PROFIT") {
+      throw new BinanceMutationViolationError("Only STOP_LOSS and TAKE_PROFIT protection roles exist in Phase 7.");
+    }
+    if (!Number.isSafeInteger(input.generation) || input.generation < 1) {
+      throw new BinanceMutationViolationError("Protection generation must be a positive integer.");
+    }
+    if (buildClientOrderId(input.executionId, input.role, input.generation) !== input.clientAlgoId) {
+      throw new BinanceMutationViolationError(
+        "The client algo id does not match this execution's reserved protection tranche."
+      );
+    }
+    // Hedge mode: the closing side must oppose the position side.
+    const expectedSide = input.positionSide === "LONG" ? "SELL" : "BUY";
+    if (input.side !== expectedSide) {
+      throw new BinanceMutationViolationError("Protection side must close the position, not increase it.");
+    }
+    if (!isPositiveDecimal(input.quantity) || !isPositiveDecimal(input.triggerPrice)) {
+      throw new BinanceMutationViolationError("Protection quantity and trigger price must be positive decimals.");
+    }
+
+    return {
+      [AUTHORIZATION_BRAND]: "PROTECTION_SUBMISSION",
+      symbol: input.symbol.trim().toUpperCase(),
+      clientAlgoId: input.clientAlgoId,
+      orderType,
+      side: input.side,
+      positionSide: input.positionSide,
+      quantity: input.quantity,
+      triggerPrice: input.triggerPrice,
+      workingType: input.workingType,
+      priceProtect: input.priceProtect,
+    };
+  }
+
+  /** Permission to cancel ONE persisted protection order by its own algo id. */
+  authorizeProtectionCancellation(input: {
+    executionId: string;
+    symbol: string;
+    role: "STOP_LOSS" | "TAKE_PROFIT";
+    generation: number;
+    clientAlgoId: string;
+  }): ProtectionCancellationContext {
+    if (input.role !== "STOP_LOSS" && input.role !== "TAKE_PROFIT") {
+      throw new BinanceMutationViolationError("Only local protection roles may be cancelled.");
+    }
+    if (buildClientOrderId(input.executionId, input.role, input.generation) !== input.clientAlgoId) {
+      throw new BinanceMutationViolationError(
+        "The client algo id does not belong to this execution's protection tranche."
+      );
+    }
+    return {
+      [AUTHORIZATION_BRAND]: "PROTECTION_CANCELLATION",
+      symbol: input.symbol.trim().toUpperCase(),
+      clientAlgoId: input.clientAlgoId,
+    };
+  }
+
+  /** Permission to ADD a bounded amount of isolated margin. */
+  authorizeMarginAddition(input: {
+    symbol: string;
+    positionSide: "LONG" | "SHORT";
+    amount: string;
+  }): MarginAdditionContext {
+    if (!isPositiveDecimal(input.amount)) {
+      throw new BinanceMutationViolationError("Margin addition requires a positive decimal amount.");
+    }
+    return {
+      [AUTHORIZATION_BRAND]: "MARGIN_ADDITION",
+      symbol: input.symbol.trim().toUpperCase(),
+      positionSide: input.positionSide,
+      amount: input.amount,
+    };
+  }
+
+  /**
+   * Permission for the single branded emergency MARKET close. This is the only
+   * non-entry MARKET order in the codebase, and the values come from the
+   * persisted, verified emergency intent.
+   */
+  authorizeEmergencyClose(input: AuthorizeEmergencyCloseInput): EmergencyCloseContext {
+    if (buildClientOrderId(input.executionId, "EMERGENCY_CLOSE", 1) !== input.clientOrderId) {
+      throw new BinanceMutationViolationError(
+        "The client order id does not match this execution's emergency-close reservation."
+      );
+    }
+    const expectedSide = input.positionSide === "LONG" ? "SELL" : "BUY";
+    if (input.side !== expectedSide) {
+      throw new BinanceMutationViolationError("An emergency close must reduce exposure, not increase it.");
+    }
+    if (!isPositiveDecimal(input.quantity)) {
+      throw new BinanceMutationViolationError("Emergency close requires a positive decimal quantity.");
+    }
+    return {
+      [AUTHORIZATION_BRAND]: "EMERGENCY_CLOSE",
+      symbol: input.symbol.trim().toUpperCase(),
+      side: input.side,
+      positionSide: input.positionSide,
+      quantity: input.quantity,
+      clientOrderId: input.clientOrderId,
+    };
+  }
+
+  /** POST /fapi/v1/algoOrder — one CONDITIONAL protection order, ACK. */
+  async submitProtectionOrder(context: ProtectionSubmissionContext): Promise<AlgoOrderAckDto> {
+    if (context?.[AUTHORIZATION_BRAND] !== "PROTECTION_SUBMISSION") {
+      throw new BinanceMutationViolationError("Protection submission requires a service-issued context.");
+    }
+    const params: QueryParams = {
+      algoType: ALLOWED_ALGO_TYPE,
+      symbol: context.symbol,
+      side: context.side,
+      positionSide: context.positionSide,
+      type: context.orderType,
+      // Quantity-based, never closePosition=true: the strategy tracks filled
+      // quantity explicitly and protects it in tranches.
+      quantity: context.quantity,
+      stopPrice: context.triggerPrice,
+      workingType: context.workingType,
+      priceProtect: context.priceProtect ? "true" : "false",
+      closePosition: "false",
+      clientAlgoId: context.clientAlgoId,
+      newOrderRespType: "ACK",
+    };
+
+    // reduceOnly is invalid in hedge mode, and none of the trailing/limit
+    // parameters belong on a conditional market protection order.
+    for (const forbidden of FORBIDDEN_PROTECTION_PARAMS) {
+      if (forbidden in params) {
+        throw new BinanceMutationViolationError(`Parameter "${forbidden}" is not permitted on protection.`);
+      }
+    }
+
+    const payload = await this.mutate<Record<string, unknown>>("newAlgoOrder", params);
+    return {
+      algoId: payload?.algoId === undefined || payload?.algoId === null ? null : String(payload.algoId),
+      clientAlgoId: typeof payload?.clientAlgoId === "string" ? payload.clientAlgoId : null,
+      symbol: typeof payload?.symbol === "string" ? payload.symbol : null,
+      algoStatus: typeof payload?.algoStatus === "string" ? payload.algoStatus : null,
+    };
+  }
+
+  /** DELETE /fapi/v1/algoOrder — cancels one persisted protection order. */
+  async cancelProtectionOrder(context: ProtectionCancellationContext): Promise<AlgoOrderAckDto> {
+    if (context?.[AUTHORIZATION_BRAND] !== "PROTECTION_CANCELLATION") {
+      throw new BinanceMutationViolationError("Protection cancellation requires a service-issued context.");
+    }
+    const payload = await this.mutate<Record<string, unknown>>("cancelAlgoOrder", {
+      symbol: context.symbol,
+      clientAlgoId: context.clientAlgoId,
+    });
+    return {
+      algoId: payload?.algoId === undefined || payload?.algoId === null ? null : String(payload.algoId),
+      clientAlgoId: typeof payload?.clientAlgoId === "string" ? payload.clientAlgoId : null,
+      symbol: typeof payload?.symbol === "string" ? payload.symbol : null,
+      algoStatus: typeof payload?.algoStatus === "string" ? payload.algoStatus : null,
+    };
+  }
+
+  /** POST /fapi/v1/positionMargin — type 1 (ADD) only. */
+  async addIsolatedMargin(context: MarginAdditionContext): Promise<{ code: number | null; msg: string | null }> {
+    if (context?.[AUTHORIZATION_BRAND] !== "MARGIN_ADDITION") {
+      throw new BinanceMutationViolationError("Margin addition requires a service-issued context.");
+    }
+    // type is hardcoded: removal (2) cannot be expressed through this client.
+    return this.mutate("addPositionMargin", {
+      symbol: context.symbol,
+      positionSide: context.positionSide,
+      amount: context.amount,
+      type: MARGIN_ADD_TYPE,
+    });
+  }
+
+  /** POST /fapi/v1/order — the ONLY non-entry MARKET order, ACK. */
+  async submitEmergencyMarketClose(context: EmergencyCloseContext): Promise<AcknowledgedOrderDto> {
+    if (context?.[AUTHORIZATION_BRAND] !== "EMERGENCY_CLOSE") {
+      throw new BinanceMutationViolationError("Emergency close requires a service-issued context.");
+    }
+    const payload = await this.mutate<Record<string, unknown>>("newOrder", {
+      symbol: context.symbol,
+      side: context.side,
+      positionSide: context.positionSide,
+      type: "MARKET",
+      quantity: context.quantity,
+      newClientOrderId: context.clientOrderId,
+      newOrderRespType: "ACK",
+      // Deliberately absent: reduceOnly, closePosition, price, stopPrice,
+      // timeInForce and every protection field.
     });
     return {
       orderId: payload?.orderId === undefined || payload?.orderId === null ? null : String(payload.orderId),

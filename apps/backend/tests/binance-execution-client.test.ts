@@ -127,12 +127,16 @@ function paramsOf(url: string): URLSearchParams {
 // ---------------------------------------------------------------------------
 
 describe("mutation endpoint allowlist", () => {
-  it("contains exactly the four approved (method, path) pairs", () => {
+  it("contains exactly the approved (method, path) pairs", () => {
+    // Four from Phase 6 (entry) plus three risk-reducing pairs from Phase 7.
     expect(allowedMutationPairs()).toEqual([
+      "DELETE /fapi/v1/algoOrder",
       "DELETE /fapi/v1/order",
+      "POST /fapi/v1/algoOrder",
       "POST /fapi/v1/leverage",
       "POST /fapi/v1/marginType",
       "POST /fapi/v1/order",
+      "POST /fapi/v1/positionMargin",
     ]);
   });
 
@@ -140,7 +144,6 @@ describe("mutation endpoint allowlist", () => {
     for (const path of [
       "/fapi/v1/positionSide/dual",
       "/fapi/v1/multiAssetsMargin",
-      "/fapi/v1/positionMargin",
       "/fapi/v1/batchOrders",
       "/fapi/v1/allOpenOrders",
       "/fapi/v1/countdownCancelAll",
@@ -184,7 +187,6 @@ describe("mutation endpoint allowlist", () => {
     for (const forbidden of [
       "/fapi/v1/positionSide/dual",
       "/fapi/v1/multiAssetsMargin",
-      "/fapi/v1/positionMargin",
       "/fapi/v1/batchOrders",
       "/fapi/v1/allOpenOrders",
       "/sapi/v1/futures/transfer",

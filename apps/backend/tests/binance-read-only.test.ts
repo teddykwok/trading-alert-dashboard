@@ -277,14 +277,14 @@ describe("read-only safety boundary", () => {
   it("allowlists only documented read-only endpoints", () => {
     expect(allowedReadOnlyPaths()).toEqual([
       "/fapi/v1/accountConfig",
+      "/fapi/v1/algoOrder",
       "/fapi/v1/exchangeInfo",
       "/fapi/v1/leverageBracket",
       "/fapi/v1/multiAssetsMargin",
       "/fapi/v1/openOrders",
-      // Query Order — GET only. The connector hardcodes GET, so allowlisting
-      // this path cannot make it mutable here.
       "/fapi/v1/order",
       "/fapi/v1/ping",
+      "/fapi/v1/positionMargin/history",
       "/fapi/v1/positionSide/dual",
       "/fapi/v1/symbolConfig",
       "/fapi/v1/time",

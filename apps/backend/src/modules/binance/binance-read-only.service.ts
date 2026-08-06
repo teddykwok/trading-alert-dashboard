@@ -10,6 +10,8 @@ import {
   normalizeOpenOrders,
   normalizePositionMode,
   normalizePositions,
+  normalizeAlgoOrder,
+  normalizeMarginHistory,
   normalizeQueriedOrder,
   normalizeSymbolConfig,
   normalizeSymbolFilters,
@@ -171,6 +173,46 @@ export class BinanceReadOnlyService {
   async getOpenOrders(symbol?: string) {
     const params = symbol ? { symbol: symbol.trim().toUpperCase() } : {};
     return normalizeOpenOrders(await this.client.request<unknown>("openOrders", params));
+  }
+
+  /**
+   * GET /fapi/v1/algoOrder by clientAlgoId. Resolving an ambiguous protection
+   * submission or cancellation always asks about the SAME deterministic id
+   * rather than creating another order.
+   */
+  async queryAlgoOrderByClientAlgoId(symbol: string, clientAlgoId: string) {
+    const payload = await this.client.request<unknown>("algoOrder", {
+      symbol: symbol.trim().toUpperCase(),
+      clientAlgoId,
+    });
+    return normalizeAlgoOrder(payload);
+  }
+
+  /** GET /fapi/v1/positionMargin/history — reconciliation of an ADD only. */
+  async getPositionMarginHistory(symbol: string, positionSide?: string) {
+    const payload = await this.client.request<unknown>("positionMarginHistory", {
+      symbol: symbol.trim().toUpperCase(),
+      // 1 = ADD. History is never read for removals.
+      type: 1,
+      ...(positionSide ? { positionSide: positionSide.toUpperCase() } : {}),
+    });
+    return normalizeMarginHistory(payload);
+  }
+
+  /**
+   * GET /fapi/v3/positionRisk narrowed to ONE symbol and positionSide. Returns
+   * only that row so no unrelated position or account-wide data is carried
+   * into the protection lifecycle.
+   */
+  async getPositionForSide(symbol: string, positionSide: string): Promise<BinancePositionDto | null> {
+    const wanted = positionSide.trim().toUpperCase();
+    const rows = normalizePositions(
+      await this.client.request<unknown>("positionRisk", { symbol: symbol.trim().toUpperCase() })
+    );
+    const matching = rows.filter((row) => (row.positionSide ?? "").toUpperCase() === wanted);
+    // More than one row for the same side is contradictory, never merged.
+    if (matching.length !== 1) return null;
+    return matching[0];
   }
 
   /** GET /fapi/v3/positionRisk, non-zero positions only. */

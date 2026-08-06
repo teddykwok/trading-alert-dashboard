@@ -50,6 +50,10 @@ export const CAPACITY_FREE_STATUSES: readonly TradeExecutionStatusName[] = [
   "ENTRY_EXPIRED",
   "CLOSED_TP",
   "CLOSED_SL",
+  // Phase 7: reached only after the position, the entry remainder and every
+  // protection sibling are all verified terminated, so its risk and margin
+  // reservations are safe to release.
+  "CLOSED_EMERGENCY",
   "CANCELED",
   "SKIPPED",
   "FAILED",

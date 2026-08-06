@@ -945,13 +945,14 @@ describe("engine purity and safety", () => {
     const { allowedReadOnlyPaths } = await import("../src/modules/binance/binance.endpoints");
     expect(allowedReadOnlyPaths()).toEqual([
       "/fapi/v1/accountConfig",
+      "/fapi/v1/algoOrder",
       "/fapi/v1/exchangeInfo",
       "/fapi/v1/leverageBracket",
       "/fapi/v1/multiAssetsMargin",
       "/fapi/v1/openOrders",
-      // Query Order, added GET-only in Phase 6.
       "/fapi/v1/order",
       "/fapi/v1/ping",
+      "/fapi/v1/positionMargin/history",
       "/fapi/v1/positionSide/dual",
       "/fapi/v1/symbolConfig",
       "/fapi/v1/time",
