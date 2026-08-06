@@ -142,6 +142,7 @@ model Alert {
   tradeReview     TradeReview?
   tradeJournal    TradeJournal?
   extremeRRPlan   ExtremeRRPlan?
+  tradeExecutions TradeExecution[]
 
   @@index([status])
   @@index([symbol])
@@ -288,7 +289,291 @@ model ExtremeRRPlan {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  tradeExecutions TradeExecution[]
+
   @@index([status])
+}
+
+// ===========================================================================
+// Phase 4 — Execution database and lifecycle foundation.
+//
+// DATABASE AND LIFECYCLE ONLY. Nothing in this phase submits, cancels or
+// modifies anything on Binance: BinanceOrder rows are LOCAL reservations, and
+// no model stores an API key, secret, signature, signed URL or raw exchange
+// payload. Phase 2 stays GET-only; Phase 3 stays calculation-only.
+// ===========================================================================
+
+enum ExecutionExchange {
+  BINANCE
+}
+
+enum ExecutionProduct {
+  USD_M_FUTURES
+}
+
+enum ExecutionEnvironment {
+  MAINNET
+  TESTNET
+}
+
+enum ExecutionPositionMode {
+  HEDGE
+  ONE_WAY
+}
+
+enum ExecutionMarginType {
+  ISOLATED
+  CROSS
+}
+
+enum ExecutionOrderType {
+  LIMIT
+  MARKET
+  STOP_MARKET
+  TAKE_PROFIT_MARKET
+}
+
+enum ExecutionDirection {
+  LONG
+  SHORT
+}
+
+enum ExecutionPositionSide {
+  LONG
+  SHORT
+  BOTH
+}
+
+enum ExecutionOrderSide {
+  BUY
+  SELL
+}
+
+ // Lifecycle of one planned execution. FAILED means no unresolved live
+ // exposure is known; whenever exposure may exist and protection is uncertain
+ // the correct state is MANUAL_INTERVENTION. CANCELED is only for an execution
+ // canceled before any live exposure.
+enum TradeExecutionStatus {
+  PLAN_READY
+  PREFLIGHT
+  ENTRY_SUBMITTING
+  ENTRY_PENDING
+  PARTIALLY_FILLED
+  ENTRY_FILLED
+  PLACING_PROTECTION
+  PROTECTED
+  ENTRY_EXPIRED
+  CLOSED_TP
+  CLOSED_SL
+  CANCELED
+  SKIPPED
+  FAILED
+  MANUAL_INTERVENTION
+}
+
+enum ExecutionOrderRole {
+  ENTRY
+  STOP_LOSS
+  TAKE_PROFIT
+  EMERGENCY_CLOSE
+}
+
+enum ExecutionOrderStatus {
+  PLANNED
+  SUBMITTING
+  NEW
+  PARTIALLY_FILLED
+  FILLED
+  CANCELED
+  EXPIRED
+  REJECTED
+  UNKNOWN
+}
+
+enum ExecutionEventType {
+  EXECUTION_CREATED
+  STATUS_CHANGED
+  ORDER_RESERVED
+  ORDER_UPDATED
+  PLAN_SNAPSHOT_RECORDED
+  ACTUALS_UPDATED
+  DECISION_RECORDED
+  FAILURE_RECORDED
+  MANUAL_INTERVENTION_REQUIRED
+}
+
+ // Non-secret execution/account configuration. `accountIdentifier` is an opaque
+ // user-chosen alias (e.g. "primary-futures"); it is NEVER an API key, secret
+ // or any credential, and no credential column exists on this model. Profiles
+ // default to disabled so nothing can be treated as live by accident.
+model ExecutionProfile {
+  id                   String                @id @default(cuid())
+  name                 String
+  accountIdentifier    String
+  exchange             ExecutionExchange     @default(BINANCE)
+  product              ExecutionProduct      @default(USD_M_FUTURES)
+  environment          ExecutionEnvironment  @default(TESTNET)
+  isEnabled            Boolean               @default(false)
+  expectedPositionMode ExecutionPositionMode @default(HEDGE)
+  expectedMarginType   ExecutionMarginType   @default(ISOLATED)
+  entryOrderType       ExecutionOrderType    @default(LIMIT)
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+
+  executions TradeExecution[]
+
+  @@unique([exchange, environment, accountIdentifier])
+  @@index([isEnabled])
+}
+
+ // One planned execution derived from one frozen Extreme RR + margin plan.
+ //
+ // The planned block is IMMUTABLE once created — lifecycle services never
+ // rewrite it; only the nullable actual/result fields are updated by later
+ // reconciliation phases. `version` drives optimistic locking and also
+ // supplies the strictly increasing ExecutionEvent sequence.
+ //
+ // Deletion policy (financial/audit data):
+ //  - alert / extremeRRPlan use SET NULL so bounded retention can delete old
+ //    alerts WITHOUT destroying execution history (the row stays self-contained
+ //    via denormalized symbol/direction and the frozen snapshots);
+ //  - executionProfile uses RESTRICT so a profile with history cannot be
+ //    removed;
+ //  - orders and events use RESTRICT so an execution with either cannot be
+ //    deleted implicitly.
+model TradeExecution {
+  id                 String                @id @default(cuid())
+  executionProfileId String
+  executionProfile   ExecutionProfile      @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)
+  alertId            String?
+  alert              Alert?                @relation(fields: [alertId], references: [id], onDelete: SetNull)
+  extremeRRPlanId    String?
+  extremeRRPlan      ExtremeRRPlan?        @relation(fields: [extremeRRPlanId], references: [id], onDelete: SetNull)
+
+  symbol           String
+  direction        ExecutionDirection
+  positionSide     ExecutionPositionSide
+  selectedLookback Int
+  status           TradeExecutionStatus  @default(PLAN_READY)
+  version          Int                   @default(1)
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+
+  // --- Frozen planned values (immutable after creation) --------------------
+  plannedEntryPrice          Decimal  @db.Decimal(30, 12)
+  calculatedStopLoss         Decimal  @db.Decimal(30, 12)
+  executableStopLoss         Decimal  @db.Decimal(30, 12)
+  takeProfit                 Decimal? @db.Decimal(30, 12)
+  riskBudgetUsd              Decimal  @db.Decimal(30, 12)
+  quantityRaw                Decimal  @db.Decimal(40, 18)
+  plannedQuantity            Decimal  @db.Decimal(40, 18)
+  quantityStepSize           Decimal  @db.Decimal(40, 18)
+  actualPlannedLoss          Decimal  @db.Decimal(30, 12)
+  unusedRiskBudget           Decimal  @db.Decimal(30, 12)
+  positionNotional           Decimal  @db.Decimal(30, 12)
+  targetIsolatedMargin       Decimal  @db.Decimal(30, 12)
+  maximumIsolatedMargin      Decimal  @db.Decimal(30, 12)
+  selectedLeverage           Int
+  estimatedInitialMargin     Decimal  @db.Decimal(30, 12)
+  estimatedLiquidationPrice  Decimal? @db.Decimal(30, 12)
+  requiredLiquidationBoundary Decimal? @db.Decimal(30, 12)
+  liquidationBufferRatio     Decimal  @db.Decimal(10, 4)
+  estimatedRewardRatio       Decimal? @db.Decimal(10, 4)
+  entryExpiresAt             DateTime?
+
+  // --- Frozen sanitized snapshots (exact decimal strings, no raw payloads) --
+  extremeRRCandidateSnapshot Json?
+  marginPlanSnapshot         Json?
+  riskTemplateSnapshot       Json?
+  exchangeFiltersSnapshot    Json?
+
+  // --- Actual/result values (null until later execution phases) ------------
+  submittedEntryPrice      Decimal? @db.Decimal(30, 12)
+  averageFillPrice         Decimal? @db.Decimal(30, 12)
+  filledQuantity           Decimal? @db.Decimal(40, 18)
+  actualLeverage           Int?
+  actualIsolatedMargin     Decimal? @db.Decimal(30, 12)
+  reportedLiquidationPrice Decimal? @db.Decimal(30, 12)
+  actualExitPrice          Decimal? @db.Decimal(30, 12)
+  realizedPnl              Decimal? @db.Decimal(30, 12)
+  exitReason               String?
+  entrySubmittedAt         DateTime?
+  firstFillAt              DateTime?
+  entryFilledAt            DateTime?
+  protectionPlacedAt       DateTime?
+  closedAt                 DateTime?
+
+  // --- Failure / decision (sanitized text only, never stack traces) --------
+  decisionReasonCode        String?
+  sanitizedMessage          String?
+  requiresManualIntervention Boolean  @default(false)
+  lastReconciledAt          DateTime?
+
+  orders BinanceOrder[]
+  events ExecutionEvent[]
+
+  @@unique([alertId, executionProfileId])
+  @@index([status])
+  @@index([executionProfileId])
+  @@index([symbol])
+}
+
+ // LOCAL representation of an order this project may later submit. Creating a
+ // row here sends nothing to Binance — Phase 4 has no submission path at all.
+ // `generation` allows replacement orders (e.g. a re-placed stop) to coexist
+ // as distinct historical rows.
+model BinanceOrder {
+  id               String               @id @default(cuid())
+  tradeExecutionId String
+  tradeExecution   TradeExecution       @relation(fields: [tradeExecutionId], references: [id], onDelete: Restrict)
+  role             ExecutionOrderRole
+  generation       Int                  @default(1)
+  /// Deterministic, non-identifying local id (Binance: ^[\.A-Z\:/a-z0-9_-]{1,36}$).
+  clientOrderId    String               @unique
+  exchangeOrderId  String?
+  side             ExecutionOrderSide
+  positionSide     ExecutionPositionSide
+  orderType        ExecutionOrderType
+  timeInForce      String?
+  price            Decimal?             @db.Decimal(30, 12)
+  stopPrice        Decimal?             @db.Decimal(30, 12)
+  originalQuantity Decimal              @db.Decimal(40, 18)
+  executedQuantity Decimal              @default(0) @db.Decimal(40, 18)
+  averageFillPrice Decimal?             @db.Decimal(30, 12)
+  status           ExecutionOrderStatus @default(PLANNED)
+  reduceOnly       Boolean?
+  closePosition    Boolean?
+  submittedAt      DateTime?
+  lastExchangeUpdateAt DateTime?
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  @@unique([tradeExecutionId, role, generation])
+  @@index([tradeExecutionId])
+  @@index([status])
+}
+
+ // Append-only lifecycle history. The service never updates or deletes an
+ // event. `sequenceNumber` is strictly increasing per execution and is written
+ // in the same transaction as the status change it describes. `metadata` is
+ // sanitized before storage — credential-like keys are rejected/redacted and
+ // raw Binance payloads are never stored.
+model ExecutionEvent {
+  id               String             @id @default(cuid())
+  tradeExecutionId String
+  tradeExecution   TradeExecution     @relation(fields: [tradeExecutionId], references: [id], onDelete: Restrict)
+  sequenceNumber   Int
+  eventType        ExecutionEventType
+  fromStatus       TradeExecutionStatus?
+  toStatus         TradeExecutionStatus?
+  reasonCode       String?
+  message          String?
+  metadata         Json?
+  createdAt        DateTime           @default(now())
+
+  @@unique([tradeExecutionId, sequenceNumber])
+  @@index([tradeExecutionId, sequenceNumber])
+  @@index([eventType])
 }
 
 model Setting {
