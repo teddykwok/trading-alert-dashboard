@@ -266,7 +266,33 @@ the root `.env.example` (identical to `apps/backend/.env.example`); the frontend
 | `MARKET_DATA_PROVIDER` | Crypto market-data provider. Only `binance` is implemented today. | `binance` |
 | `MARKET_DATA_FALLBACK_TO_MOCK` | If the real Binance fetch fails: `true` logs a warning and falls back to mock candles; `false` fails the job (alert → `FAILED`). | `false` |
 | `BINANCE_REST_BASE_URL` | Binance public Spot REST base URL (no API key needed). | `https://api.binance.com` |
-| `BINANCE_FUTURES_REST_BASE_URL` | Binance USD‑M Futures REST base URL, used for `.P` perpetual symbols. | `https://fapi.binance.com` |
+| `BINANCE_FUTURES_REST_BASE_URL` | Binance USD‑M Futures REST base URL, used for `.P` perpetual symbols and by the read-only connector below. | `https://fapi.binance.com` |
+
+### Backend — Binance read-only connector (Phase 2)
+
+Strictly read-only account inspection. It can only issue `GET` requests to an
+allowlisted set of documented USDⓈ-M endpoints — it cannot place or cancel
+orders, change leverage, margin type or position mode, writes nothing to the
+database, and is **not** wired into the alert pipeline. See
+[docs/binance-execution-policy.md](docs/binance-execution-policy.md).
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `BINANCE_READ_ONLY_ENABLED` | Enables the connector. While `false`, the backend starts with no Binance credentials at all. | `false` |
+| `BINANCE_API_KEY` | Binance API key. Required **only** when the connector is enabled. Use a key with *Enable Reading* permission only. | _(empty)_ |
+| `BINANCE_API_SECRET` | Binance API secret. Required only when the connector is enabled. | _(empty)_ |
+| `BINANCE_RECV_WINDOW_MS` | Signed-request validity window. Binance maximum is `60000`. | `5000` |
+
+Run the health check (optionally for one symbol):
+
+```bash
+pnpm --filter @trading-alert-dashboard/backend binance:read-only-check
+pnpm --filter @trading-alert-dashboard/backend binance:read-only-check BTCUSDT
+```
+
+It prints connection status, measured clock offset, position mode, USDT
+balance, open positions and orders, and — with a symbol — that symbol's
+filters and leverage brackets. Credentials are never printed.
 
 ### Backend — AI vision
 
@@ -487,6 +513,7 @@ Run from the repo root. Only scripts that actually exist are listed.
 | `pnpm test:webhook:batch` | Fire a batch of local webhooks (`scripts/test-webhook-batch.js`). |
 | `pnpm test:binance` | Check Binance klines connectivity (`scripts/test-binance-candles.js`). |
 | `pnpm test:telegram` | Send a Telegram test message (`scripts/test-telegram.js`). |
+| `pnpm --filter @trading-alert-dashboard/backend binance:read-only-check [SYMBOL]` | Read-only Binance account/symbol health check (no orders, no account changes). |
 | `pnpm --filter @trading-alert-dashboard/backend playwright:install` | Install the Chromium build used for screenshots. |
 
 ## Troubleshooting

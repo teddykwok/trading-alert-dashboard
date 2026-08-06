@@ -63,6 +63,20 @@ const envSchema = z.object({
   // USD-M futures REST host, used for TradingView ".P" perpetual symbols
   // (GET /fapi/v1/klines). Spot keeps using BINANCE_REST_BASE_URL.
   BINANCE_FUTURES_REST_BASE_URL: z.string().min(1).default("https://fapi.binance.com"),
+  // --- Binance READ-ONLY connector (Phase 2 of the automation roadmap) ---
+  // Strictly read-only: the client can only issue GET requests to an
+  // allowlisted set of USDⓈ-M endpoints (see modules/binance). It is not
+  // wired into the alert pipeline and cannot trade. Keys are optional while
+  // disabled so startup never demands credentials for the default setup.
+  BINANCE_READ_ONLY_ENABLED: z
+    .string()
+    .optional()
+    .default("false")
+    .transform((value) => value === "true"),
+  BINANCE_API_KEY: z.string().optional().default(""),
+  BINANCE_API_SECRET: z.string().optional().default(""),
+  // Binance rejects recvWindow above 60000 ms; 5000 is the documented default.
+  BINANCE_RECV_WINDOW_MS: z.coerce.number().int().positive().max(60_000).default(5000),
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value
   // fall back to mock candles, same as STOCK alerts.
@@ -105,6 +119,26 @@ const envSchema = z.object({
       path: ["OPENAI_API_KEY"],
       message: "OPENAI_API_KEY is required when AI_VISION_PROVIDER=openai",
     });
+  }
+
+  // Credentials are only required once the read-only connector is switched
+  // on. With BINANCE_READ_ONLY_ENABLED=false (the default) the backend starts
+  // with no Binance keys at all.
+  if (value.BINANCE_READ_ONLY_ENABLED) {
+    if (!value.BINANCE_API_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["BINANCE_API_KEY"],
+        message: "BINANCE_API_KEY is required when BINANCE_READ_ONLY_ENABLED=true",
+      });
+    }
+    if (!value.BINANCE_API_SECRET) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["BINANCE_API_SECRET"],
+        message: "BINANCE_API_SECRET is required when BINANCE_READ_ONLY_ENABLED=true",
+      });
+    }
   }
 });
 
