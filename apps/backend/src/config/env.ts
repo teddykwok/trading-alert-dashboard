@@ -125,6 +125,26 @@ const envSchema = z.object({
   // leverage Binance currently publishes in USDⓈ-M brackets — so a typo like
   // 250 cannot silently promise an unusable leverage.
   BINANCE_MAX_AUTOMATION_LEVERAGE: z.coerce.number().int().positive().max(125).default(25),
+  // --- Phase 5 safety & capacity (fail-closed canary limits) ---------------
+  // TRUE means the global kill switch is ACTIVE and every NEW admission is
+  // rejected. It never cancels orders, closes positions or changes existing
+  // execution status — it only blocks new admissions.
+  // Fails closed: unset means ACTIVE, and only the exact string "false" can
+  // release it — a typo can never accidentally enable admissions.
+  EXECUTION_GLOBAL_KILL_SWITCH: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+  EXECUTION_MAX_OPEN_POSITIONS: z.coerce.number().int().positive().default(1),
+  EXECUTION_MAX_PENDING_ENTRIES: z.coerce.number().int().positive().default(1),
+  EXECUTION_MAX_TOTAL_ACTIVE_TRADES: z.coerce.number().int().positive().default(1),
+  // Monetary limits stay decimal STRINGS — never parsed through a JS float.
+  EXECUTION_MAX_TOTAL_PLANNED_RISK_USD: positiveDecimalString.default("1.50"),
+  EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD: positiveDecimalString.default("5.00"),
+  EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE: z.coerce.number().int().positive().default(1),
+  EXECUTION_MAX_ALERT_AGE_SECONDS: z.coerce.number().int().positive().default(300),
+  // Tolerance for a signal timestamp slightly ahead of local time (clock skew).
+  EXECUTION_SIGNAL_FUTURE_TOLERANCE_SECONDS: z.coerce.number().int().nonnegative().default(5),
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value
   // fall back to mock candles, same as STOCK alerts.
@@ -177,6 +197,23 @@ const envSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ["BINANCE_MAX_MARGIN_MULTIPLIER"],
       message: "BINANCE_MAX_MARGIN_MULTIPLIER must be greater than or equal to BINANCE_TARGET_MARGIN_MULTIPLIER",
+    });
+  }
+
+  // A total-active cap below either individual cap would be silently
+  // unreachable, which hides a misconfiguration — reject it outright.
+  if (value.EXECUTION_MAX_TOTAL_ACTIVE_TRADES < value.EXECUTION_MAX_OPEN_POSITIONS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["EXECUTION_MAX_TOTAL_ACTIVE_TRADES"],
+      message: "EXECUTION_MAX_TOTAL_ACTIVE_TRADES must be >= EXECUTION_MAX_OPEN_POSITIONS",
+    });
+  }
+  if (value.EXECUTION_MAX_TOTAL_ACTIVE_TRADES < value.EXECUTION_MAX_PENDING_ENTRIES) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["EXECUTION_MAX_TOTAL_ACTIVE_TRADES"],
+      message: "EXECUTION_MAX_TOTAL_ACTIVE_TRADES must be >= EXECUTION_MAX_PENDING_ENTRIES",
     });
   }
 

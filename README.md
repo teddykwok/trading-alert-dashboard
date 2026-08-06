@@ -310,6 +310,41 @@ It prints connection status, measured clock offset, position mode, USDT
 balance, open positions and orders, and — with a symbol — that symbol's
 filters and leverage brackets. Credentials are never printed.
 
+### Backend — execution safety and capacity limits (Phase 5)
+
+Admission control for planned executions: it decides whether a plan may
+proceed and reserves its capacity **locally**. It reads Binance only through
+the GET-only connector above and submits nothing.
+
+**The kill switch blocks NEW admissions only.** It never cancels an order,
+closes a position, changes the status of an existing execution or deletes a
+capacity record — engaging it mid-flight leaves everything already running
+exactly as it is. The effective switch is active when **either** the global
+variable or the per-profile `ExecutionSafetyPolicy.killSwitchActive` is active,
+and every other limit resolves to the **stricter** of the two.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `EXECUTION_GLOBAL_KILL_SWITCH` | `true` = kill switch **ACTIVE**, every admission rejected. Only the exact string `false` releases it. | `true` |
+| `EXECUTION_MAX_OPEN_POSITIONS` | Concurrent open positions per profile. | `1` |
+| `EXECUTION_MAX_PENDING_ENTRIES` | Concurrent pending entries per profile. | `1` |
+| `EXECUTION_MAX_TOTAL_ACTIVE_TRADES` | Union of open + pending. Must be ≥ both limits above or startup fails. | `1` |
+| `EXECUTION_MAX_TOTAL_PLANNED_RISK_USD` | Ceiling on summed reserved risk budgets. Decimal string. | `1.50` |
+| `EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD` | Ceiling on summed reserved **maximum** isolated margins. Decimal string. | `5.00` |
+| `EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE` | Active executions per symbol **and** side. | `1` |
+| `EXECUTION_MAX_ALERT_AGE_SECONDS` | Freshness ceiling, measured from the original signal time. | `300` |
+| `EXECUTION_SIGNAL_FUTURE_TOLERANCE_SECONDS` | Tolerance for a signal timestamp slightly ahead of local time (clock skew). | `5` |
+
+Reaching a limit skips **only the requesting execution** — existing
+executions, positions and orders are never touched. A `SKIP` is terminal
+(`SKIPPED`), but an `UNAVAILABLE` — a connector failure, a rate limit, an
+un-inspectable symbol — is **not**: the execution stays `PLAN_READY` and can be
+retried with the incremented version. Permanently missing frozen data (no
+signal time, no plan snapshot) is a terminal `SKIP` instead, so it is never
+retried forever. Full rules, the capacity classification table, the
+decision lifecycle and the atomicity model are in
+[docs/binance-execution-policy.md](docs/binance-execution-policy.md).
+
 ### Backend — AI vision
 
 | Variable | Description | Default |

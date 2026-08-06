@@ -228,6 +228,21 @@ export class ExecutionService {
     };
     planned.selectedLookback = 0;
 
+    // The ORIGINAL signal time is frozen onto the execution at creation.
+    // Admission freshness must never be measured from createdAt (which only
+    // says when we got around to planning), and retention may later null
+    // alertId — so the value has to live on the execution itself.
+    const alert = await this.prisma.alert.findUnique({
+      where: { id: input.alertId },
+      select: { triggeredAt: true },
+    });
+    if (!alert) throw new NotFoundError(`Alert ${input.alertId} not found.`);
+    if (!(alert.triggeredAt instanceof Date) || Number.isNaN(alert.triggeredAt.getTime())) {
+      throw new ValidationError(
+        `Alert ${input.alertId} has no usable triggeredAt; refusing to create an execution with unknown signal time.`
+      );
+    }
+
     const existing = await this.prisma.tradeExecution.findUnique({
       where: { alertId_executionProfileId: { alertId: input.alertId, executionProfileId: profile.id } },
     });
@@ -246,6 +261,7 @@ export class ExecutionService {
           direction: planned.direction,
           positionSide: planned.positionSide,
           selectedLookback,
+          signalTriggeredAt: alert.triggeredAt,
           status: "PLAN_READY",
           version: 1,
           plannedEntryPrice: planned.plannedEntryPrice,
