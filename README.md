@@ -386,6 +386,38 @@ There is no worker, queue, webhook wiring, Telegram message, frontend control or
 HTTP route in this phase; the orchestration methods are internal and a future
 worker will call them.
 
+### Backend — SL/TP protection and emergency close (Phase 7)
+
+Protects confirmed exposure with conditional Algo Orders, revalidates
+liquidation safety, optionally tops up isolated margin, and cleans up after a
+closure. **Live entry and protection remain disabled** — `EXECUTION_LIVE_ENTRY_ENABLED`
+and `EXECUTION_PROTECTION_READY` stay `false` until a reviewed live-canary step.
+
+Every Phase 7 mutation is **risk-reducing**, so unlike the Phase 6 entry
+mutations it is deliberately not gated on those switches: refusing to protect
+or close an existing position because new entries were disabled would be the
+opposite of safe.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `EXECUTION_AUTO_ADD_MARGIN_ENABLED` | Allow adding isolated margin (type 1 only, never removal). Total verified margin can never exceed the frozen `maximumIsolatedMargin`. | `false` |
+| `EXECUTION_EMERGENCY_CLOSE_MODE` | `DISABLED` (park for a human) or `ON_UNVERIFIED_STOP` (last-resort MARKET close). | `DISABLED` |
+| `EXECUTION_PROTECTION_RECONCILE_MAX_ATTEMPTS` | Bounded budget for resolving an ambiguous protection result. | `5` |
+| `EXECUTION_PROTECTION_RECONCILE_DELAY_MS` | Delay between bounded reconciliation attempts. | `1000` |
+| `EXECUTION_SL_WORKING_TYPE` | Stop trigger reference. | `MARK_PRICE` |
+| `EXECUTION_TP_WORKING_TYPE` | Take-profit trigger reference. | `CONTRACT_PRICE` |
+| `EXECUTION_PROTECTION_PRICE_PROTECT` | Binance price-protection flag on protection orders. | `false` |
+
+Protection starts on the **first** confirmed non-zero fill and grows in
+non-overlapping paired tranches, so a verified stop is never cancelled because
+the entry filled further. The stop is always verified before the take profit is
+submitted. A filled protection order is not proof of closure — only a confirmed
+zero position is. Full rules are in
+[docs/binance-execution-policy.md](docs/binance-execution-policy.md).
+
+No worker, queue, webhook wiring, user-data stream, HTTP route or frontend
+control is added; the orchestration methods are internal.
+
 ### Backend — AI vision
 
 | Variable | Description | Default |

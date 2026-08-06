@@ -369,6 +369,8 @@ enum TradeExecutionStatus {
   SKIPPED
   FAILED
   MANUAL_INTERVENTION
+  /// Phase 7: exposure was closed by the last-resort emergency MARKET close.
+  CLOSED_EMERGENCY
 }
 
 enum ExecutionOrderRole {
@@ -405,6 +407,15 @@ enum ExecutionEventType {
   ENTRY_SUBMITTED
   ENTRY_RECONCILED
   ENTRY_CANCEL_REQUESTED
+  // --- Phase 7 protection lifecycle ---
+  PROTECTION_RESERVED
+  PROTECTION_SUBMITTED
+  PROTECTION_VERIFIED
+  PROTECTION_RECONCILED
+  MARGIN_ADJUSTED
+  EMERGENCY_CLOSE_SUBMITTED
+  PROTECTION_CLEANUP
+  CRITICAL_ALERT_RAISED
 }
 
  // Non-secret execution/account configuration. `accountIdentifier` is an opaque
@@ -594,9 +605,12 @@ model TradeExecution {
   requiresManualIntervention Boolean  @default(false)
   lastReconciledAt          DateTime?
 
-  orders           BinanceOrder[]
-  events           ExecutionEvent[]
-  safetyAdmissions SafetyAdmission[]
+  orders            BinanceOrder[]
+  events            ExecutionEvent[]
+  safetyAdmissions  SafetyAdmission[]
+  protectionState   ExecutionProtectionState?
+  marginAdjustments MarginAdjustmentIntent[]
+  criticalAlerts    CriticalAlert[]
 
   @@unique([alertId, executionProfileId])
   @@index([status])
@@ -650,6 +664,21 @@ model BinanceOrder {
   /// audit when it does not map 1:1 onto ExecutionOrderStatus.
   exchangeStatusRaw    String?
 
+  // --- Phase 7 conditional (Algo) protection identity ----------------------
+  /// Deterministic id for POST/GET/DELETE /fapi/v1/algoOrder. Unique, so a
+  /// retry can never create a second protection order.
+  clientAlgoId         String?              @unique
+  /// Binance algoId, persisted only once it has actually been observed.
+  exchangeAlgoId       String?
+  /// Binance algoStatus verbatim — normalized separately from order status.
+  algoStatus           String?
+  /// The standard order id created when the conditional order triggers.
+  actualOrderId        String?
+  triggerPrice         Decimal?             @db.Decimal(30, 12)
+  workingType          String?
+  priceProtect         Boolean?
+  triggeredAt          DateTime?
+
   createdAt        DateTime             @default(now())
   updatedAt        DateTime             @updatedAt
 
@@ -687,4 +716,131 @@ model Setting {
   value     Json
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+// ===========================================================================
+// Phase 7 — SL/TP protection, liquidation safety, margin top-up, emergency close
+// ===========================================================================
+
+/// Protection lifecycle, tracked SEPARATELY from TradeExecution.status.
+/// The entry can still be PARTIALLY_FILLED (and must keep consuming its
+/// pending-entry capacity) while the already-filled quantity is fully
+/// protected — overloading TradeExecution.PROTECTED would hide that.
+enum ProtectionState {
+  UNPROTECTED
+  MARGIN_CHECK
+  MARGIN_ADJUSTING
+  PLACING_STOP
+  STOP_VERIFIED
+  PLACING_TAKE_PROFIT
+  PROTECTED
+  PROTECTION_INCOMPLETE
+  EMERGENCY_CLOSING
+  CLOSURE_CLEANUP
+  CLOSED
+  MANUAL_INTERVENTION
+}
+
+model ExecutionProtectionState {
+  id               String          @id @default(cuid())
+  tradeExecutionId String          @unique
+  tradeExecution   TradeExecution  @relation(fields: [tradeExecutionId], references: [id], onDelete: Restrict)
+  state            ProtectionState @default(UNPROTECTED)
+
+  /// Absolute open position quantity confirmed from positionRisk.
+  confirmedOpenQuantity       Decimal @default(0) @db.Decimal(40, 18)
+  /// Aggregate VERIFIED active coverage across every generation.
+  protectedStopQuantity       Decimal @default(0) @db.Decimal(40, 18)
+  protectedTakeProfitQuantity Decimal @default(0) @db.Decimal(40, 18)
+  /// Highest protection tranche reserved so far (0 = none).
+  currentGeneration           Int     @default(0)
+
+  /// Result of revalidating the ACTUAL liquidation price against the frozen
+  /// boundary. Null means "not yet established" and never means "safe".
+  liquidationSafe Boolean?
+  verifiedAt      DateTime?
+
+  reasonCode       String?
+  sanitizedMessage String?
+
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([state])
+}
+
+enum MarginAdjustmentStatus {
+  PENDING
+  SUBMITTING
+  RESULT_UNKNOWN
+  CONFIRMED
+  REJECTED
+}
+
+/// One durable ADD-margin intent. Written BEFORE the POST so an ambiguous
+/// result can be reconciled against a known baseline instead of being retried
+/// blind. Only type=1 (ADD) is representable.
+model MarginAdjustmentIntent {
+  id               String         @id @default(cuid())
+  tradeExecutionId String
+  tradeExecution   TradeExecution @relation(fields: [tradeExecutionId], references: [id], onDelete: Restrict)
+  /// Deterministic per execution: attempt N is unique, so a retry cannot
+  /// silently become a second ADD.
+  attempt          Int
+  symbol           String
+  positionSide     ExecutionPositionSide
+  /// Always 1 (ADD). Margin removal has no representation anywhere.
+  adjustType       Int            @default(1)
+  amount           Decimal        @db.Decimal(30, 12)
+
+  /// Pre-adjustment snapshot used to prove whether the ADD landed.
+  baselineIsolatedMargin   Decimal? @db.Decimal(30, 12)
+  baselinePositionAmt      Decimal? @db.Decimal(40, 18)
+  baselineLiquidationPrice Decimal? @db.Decimal(30, 12)
+
+  status                 MarginAdjustmentStatus @default(PENDING)
+  verifiedIsolatedMargin Decimal?               @db.Decimal(30, 12)
+  reasonCode             String?
+  requestedAt            DateTime?
+  resolvedAt             DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tradeExecutionId, attempt])
+  @@index([tradeExecutionId])
+  @@index([status])
+}
+
+enum CriticalAlertStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+/// Durable outbox for critical protection alerts. Safety actions never wait
+/// for delivery, and a delivery failure stays visible and retryable. Content
+/// is sanitized: no credentials, signed URLs, balances, unrelated positions or
+/// raw Binance payloads.
+model CriticalAlert {
+  id               String         @id @default(cuid())
+  tradeExecutionId String
+  tradeExecution   TradeExecution @relation(fields: [tradeExecutionId], references: [id], onDelete: Restrict)
+  alertType        String
+  reasonCode       String
+  /// Stable per (execution, type, reason, state) so repeated reconciliation
+  /// cannot spam identical alerts.
+  dedupeKey        String              @unique
+  message          String
+  details          Json?
+  status           CriticalAlertStatus @default(PENDING)
+  attempts         Int                 @default(0)
+  lastError        String?
+  sentAt           DateTime?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  @@index([tradeExecutionId])
+  @@index([status])
 }

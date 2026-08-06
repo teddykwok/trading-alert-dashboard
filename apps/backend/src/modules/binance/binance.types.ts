@@ -146,3 +146,41 @@ export interface BinanceQueriedOrderDto {
   closePosition: boolean | null;
   updateTimeMs: number | null;
 }
+
+/**
+ * One conditional (Algo) protection order from GET /fapi/v1/algoOrder. Algo
+ * semantics differ from standard orders: it stays "working" until it triggers
+ * and only then creates an actual order, so both identities are normalized.
+ */
+export interface BinanceAlgoOrderDto {
+  algoId: string | null;
+  clientAlgoId: string | null;
+  symbol: string | null;
+  algoStatus: string | null;
+  algoType: string | null;
+  side: string | null;
+  positionSide: BinancePositionSide | null;
+  orderType: string | null;
+  quantity: string | null;
+  triggerPrice: string | null;
+  workingType: string | null;
+  priceProtect: boolean | null;
+  closePosition: boolean | null;
+  reduceOnly: boolean | null;
+  /** The standard order created once the conditional order triggered. */
+  actualOrderId: string | null;
+  executedQuantity: string | null;
+  averagePrice: string | null;
+  triggerTimeMs: number | null;
+  updateTimeMs: number | null;
+}
+
+/** One ADD entry from GET /fapi/v1/positionMargin/history. */
+export interface BinanceMarginHistoryEntryDto {
+  symbol: string | null;
+  positionSide: BinancePositionSide | null;
+  amount: string | null;
+  /** 1 = ADD, 2 = REMOVE. Only ADD is ever requested. */
+  type: number | null;
+  timeMs: number | null;
+}

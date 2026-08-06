@@ -29,6 +29,7 @@ export const TRADE_EXECUTION_STATUSES = [
   "SKIPPED",
   "FAILED",
   "MANUAL_INTERVENTION",
+  "CLOSED_EMERGENCY",
 ] as const;
 
 export type TradeExecutionStatusName = (typeof TRADE_EXECUTION_STATUSES)[number];
@@ -41,6 +42,9 @@ export const TERMINAL_STATUSES: readonly TradeExecutionStatusName[] = [
   "CANCELED",
   "SKIPPED",
   "FAILED",
+  // Phase 7: the position was closed at market as a last resort. Like every
+  // other closed state it asserts there is nothing left to unwind.
+  "CLOSED_EMERGENCY",
 ];
 
 /**
@@ -70,19 +74,31 @@ const TRANSITIONS: Record<TradeExecutionStatusName, readonly TradeExecutionStatu
     "FAILED",
     "MANUAL_INTERVENTION",
   ],
-  PARTIALLY_FILLED: ["ENTRY_FILLED", "PLACING_PROTECTION", "ENTRY_EXPIRED", "MANUAL_INTERVENTION"],
-  ENTRY_FILLED: ["PLACING_PROTECTION", "MANUAL_INTERVENTION"],
-  PLACING_PROTECTION: ["PROTECTED", "MANUAL_INTERVENTION"],
-  PROTECTED: ["CLOSED_TP", "CLOSED_SL", "MANUAL_INTERVENTION"],
+  // Phase 7 protects the filled quantity while the entry may still be open, so
+  // a protection exit can close directly from these states.
+  PARTIALLY_FILLED: [
+    "ENTRY_FILLED",
+    "PLACING_PROTECTION",
+    "ENTRY_EXPIRED",
+    "CLOSED_TP",
+    "CLOSED_SL",
+    "CLOSED_EMERGENCY",
+    "MANUAL_INTERVENTION",
+  ],
+  ENTRY_FILLED: ["PLACING_PROTECTION", "CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"],
+  PLACING_PROTECTION: ["PROTECTED", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"],
+  PROTECTED: ["CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"],
   // Terminal.
   ENTRY_EXPIRED: [],
   CLOSED_TP: [],
   CLOSED_SL: [],
+  CLOSED_EMERGENCY: [],
   CANCELED: [],
   SKIPPED: [],
   FAILED: [],
-  // Stays put while further events are recorded (see allowsSelfEvent).
-  MANUAL_INTERVENTION: [],
+  // Parked for a human. A verified emergency close is the one way out: the
+  // exposure it was parked for has been provably removed.
+  MANUAL_INTERVENTION: ["CLOSED_EMERGENCY"],
 };
 
 export function isTerminalStatus(status: TradeExecutionStatusName): boolean {

@@ -6,6 +6,8 @@ import type {
   BinanceOpenOrderDto,
   BinancePositionDto,
   BinancePositionMode,
+  BinanceAlgoOrderDto,
+  BinanceMarginHistoryEntryDto,
   BinancePositionSide,
   BinanceQueriedOrderDto,
   BinanceSymbolFiltersDto,
@@ -310,4 +312,54 @@ export function normalizeQueriedOrder(payload: unknown): BinanceQueriedOrderDto 
     closePosition: bool(row.closePosition),
     updateTimeMs: Number.isFinite(updateTime) ? updateTime : null,
   };
+}
+
+/**
+ * Normalizes one Algo Order response. Decimals stay exact strings and the
+ * algoStatus token is passed through verbatim — the pure protection module,
+ * not this normalizer, decides what an unrecognised value means.
+ */
+export function normalizeAlgoOrder(payload: unknown): BinanceAlgoOrderDto {
+  // Binance may answer with the row itself or with a single-entry list.
+  const rows = Array.isArray(payload) ? asRows(payload) : [asRow(payload)];
+  const row = (rows[0] ?? {}) as Row;
+  const triggerTime = Number(row.triggerTime ?? row.bookTime);
+  const updateTime = Number(row.updateTime ?? row.time);
+
+  return {
+    algoId: row.algoId === undefined || row.algoId === null ? null : String(row.algoId),
+    clientAlgoId: text(row.clientAlgoId),
+    symbol: text(row.symbol),
+    algoStatus: text(row.algoStatus ?? row.status),
+    algoType: text(row.algoType),
+    side: text(row.side),
+    positionSide: row.positionSide === undefined ? null : normalizePositionSide(row.positionSide),
+    orderType: text(row.type ?? row.orderType ?? row.origType),
+    quantity: decimalString(row.quantity ?? row.origQty),
+    triggerPrice: decimalString(row.stopPrice ?? row.triggerPrice),
+    workingType: text(row.workingType),
+    priceProtect: bool(row.priceProtect),
+    closePosition: bool(row.closePosition),
+    reduceOnly: bool(row.reduceOnly),
+    actualOrderId: row.orderId === undefined || row.orderId === null ? null : String(row.orderId),
+    executedQuantity: decimalString(row.executedQty),
+    averagePrice: decimalString(row.avgPrice),
+    triggerTimeMs: Number.isFinite(triggerTime) ? triggerTime : null,
+    updateTimeMs: Number.isFinite(updateTime) ? updateTime : null,
+  };
+}
+
+/** Normalizes position-margin change history rows (ADD reconciliation only). */
+export function normalizeMarginHistory(payload: unknown): BinanceMarginHistoryEntryDto[] {
+  return asRows(payload).map((row) => {
+    const time = Number(row.time);
+    const type = Number(row.type);
+    return {
+      symbol: text(row.symbol),
+      positionSide: row.positionSide === undefined ? null : normalizePositionSide(row.positionSide),
+      amount: decimalString(row.amount ?? row.deltaAmount),
+      type: Number.isFinite(type) ? type : null,
+      timeMs: Number.isFinite(time) ? time : null,
+    };
+  });
 }

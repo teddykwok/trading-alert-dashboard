@@ -561,3 +561,140 @@ while different profiles stay unblocked. Every local mutation keeps the Phase 4
 guarantees: conditional update on `(id, expectedVersion)`, exactly one version
 increment per committed event, the new version as the event `sequenceNumber`,
 and full rollback if the event insert fails.
+
+## Phase 7 scope — SL/TP protection, liquidation safety, margin top-up, emergency close
+
+Phase 7 protects confirmed exposure. **Live entry and protection remain
+disabled**: `EXECUTION_LIVE_ENTRY_ENABLED=false` and
+`EXECUTION_PROTECTION_READY=false` stay false until a reviewed live-canary step
+after this phase is merged.
+
+### Algo Order API
+
+Current USDⓈ-M protection uses the **Algo Order** API, not a legacy
+standard-order workflow:
+
+```
+POST   /fapi/v1/algoOrder    algoType=CONDITIONAL
+GET    /fapi/v1/algoOrder    by clientAlgoId
+DELETE /fapi/v1/algoOrder    by clientAlgoId
+```
+
+`algoId` is persisted only after it has been observed; `clientAlgoId` is the
+deterministic idempotency key.
+
+### Mutation allowlist after Phase 7
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| POST | `/fapi/v1/marginType` | Phase 6 — ISOLATED only |
+| POST | `/fapi/v1/leverage` | Phase 6 — exact frozen leverage |
+| POST | `/fapi/v1/order` | Phase 6 LIMIT entry **and** the one branded emergency MARKET close |
+| DELETE | `/fapi/v1/order` | Phase 6 — reserved ENTRY cancellation |
+| POST | `/fapi/v1/algoOrder` | Phase 7 — STOP_MARKET / TAKE_PROFIT_MARKET protection |
+| DELETE | `/fapi/v1/algoOrder` | Phase 7 — persisted protection cleanup |
+| POST | `/fapi/v1/positionMargin` | Phase 7 — ADD (type 1) only |
+
+Every Phase 7 operation is **RISK-REDUCING** and therefore deliberately **not**
+gated on the exposure-increasing live-entry switches: refusing to protect or
+close an existing position because new entries were disabled would be the
+opposite of safe. Emergency close additionally survives an active kill switch.
+Authorization is carried by module-private branded contexts; there is no
+`bypassSafety` flag and no generic MARKET-order method.
+
+### Protection state is tracked separately
+
+`ExecutionProtectionState` is a one-to-one companion to `TradeExecution`.
+`TradeExecution.status` continues to describe the **entry** lifecycle, so a
+still-open `PARTIALLY_FILLED` entry keeps consuming its pending-entry capacity
+while its filled quantity is fully protected. Phase 5 capacity classification is
+unchanged, with a test proving no slot is released early.
+
+States: `UNPROTECTED`, `MARGIN_CHECK`, `MARGIN_ADJUSTING`, `PLACING_STOP`,
+`STOP_VERIFIED`, `PLACING_TAKE_PROFIT`, `PROTECTED`, `PROTECTION_INCOMPLETE`,
+`EMERGENCY_CLOSING`, `CLOSURE_CLEANUP`, `CLOSED`, `MANUAL_INTERVENTION`.
+
+### First fill, not full fill
+
+Protection starts on the **first confirmed non-zero fill** — it never waits for
+`ENTRY_FILLED`. Phase 6 persists the fill; the internal
+`ensureProtectionForExposure` then continues from that durable state. No
+mutation is ever sent inside a Phase 6 transaction.
+
+### Incremental tranches
+
+A verified stop is never cancelled merely because the entry filled further.
+Coverage grows in non-overlapping paired generations:
+
+```
+fill 0.10  -> generation 1: STOP 0.10 + TP 0.10
+fill 0.25  -> generation 2: STOP 0.15 + TP 0.15   (aggregate 0.25)
+```
+
+Aggregate active STOP coverage **and** aggregate active TP coverage must each
+equal the confirmed open quantity exactly before a position is declared
+protected. Over-protection is escalated, never silently accepted.
+
+### Protection parameters
+
+| | LONG exposure | SHORT exposure |
+| --- | --- | --- |
+| SL | `STOP_MARKET`, side `SELL`, positionSide `LONG` | `STOP_MARKET`, side `BUY`, positionSide `SHORT` |
+| TP | `TAKE_PROFIT_MARKET`, side `SELL`, positionSide `LONG` | `TAKE_PROFIT_MARKET`, side `BUY`, positionSide `SHORT` |
+
+Always `algoType=CONDITIONAL`, the exact frozen trigger, the exact coverage
+quantity, `newOrderRespType=ACK`, the configured working type and
+`priceProtect`, and `closePosition=false`. **Never** `reduceOnly` (invalid in
+hedge mode), `closePosition=true` (the strategy tracks filled quantity
+explicitly), `price`, `priceMatch`, `activationPrice`, `callbackRate` or any
+trailing parameter. The working-type and price-protect policy is frozen into
+the local intent, so a retry cannot silently change it.
+
+### Stop first
+
+Within a tranche the STOP is submitted, queried by its own `clientAlgoId` and
+verified active **before** the TP is submitted. If the STOP is unverified the
+position is never claimed protected and the TP is never used as a substitute.
+If the STOP is verified but the TP fails, the STOP is retained — never
+cancelled — and the state becomes `PROTECTION_INCOMPLETE`.
+
+### Liquidation safety and margin top-up
+
+The **actual** reported liquidation price is revalidated against the frozen
+boundary (LONG safe when `actual <= boundary`, SHORT when `actual >= boundary`;
+exact equality accepted). Missing, zero or malformed data fails closed.
+
+Margin top-up only ever ADDs (type 1). The allowance is recomputed on every
+attempt as `maximumIsolatedMargin - verifiedCurrentIsolatedMargin`, so retries
+after an ambiguous result can never accumulate past the frozen cap. A durable
+`MarginAdjustmentIntent` with a pre-adjustment baseline is written **before**
+the POST; an ambiguous result is proven by re-reading the position, never by
+sending another ADD.
+
+### Emergency close
+
+Eligible only when confirmed exposure exists, the stop cannot be verified after
+the bounded budget, no verified stop covers the position, the identity is known
+and `EXECUTION_EMERGENCY_CLOSE_MODE=ON_UNVERIFIED_STOP`. In `DISABLED` mode no
+MARKET order is sent at all: the execution parks in `MANUAL_INTERVENTION` with
+a critical alert and all evidence preserved. Success requires a confirmed zero
+position, not just an acknowledgement; the terminal status is
+`CLOSED_EMERGENCY`.
+
+### Critical alerts are durable
+
+`CriticalAlert` is an outbox: the row is persisted first and delivered
+separately, so a safety action never waits for Telegram and a delivery failure
+stays visible and retryable. Alerts are deduplicated per
+(execution, type, reason, state), so repeated reconciliation cannot spam. No
+credentials, signed URLs, balances, unrelated positions or raw payloads.
+
+### Closure and sibling cleanup
+
+A filled protection order is **not** proof of closure — only a confirmed zero
+position quantity is. A protection fill alongside remaining exposure is a
+`PARTIAL_PROTECTION_EXIT`: critical, never `CLOSED_TP`/`CLOSED_SL`. Once flat,
+every sibling across every generation is cancelled by its own `clientAlgoId`,
+queried again afterwards, and only then is the terminal status recorded. While
+the position is open no protection is cancelled at all. An unreadable sibling
+leaves cleanup incomplete rather than being assumed gone.

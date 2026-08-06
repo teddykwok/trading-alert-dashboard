@@ -51,6 +51,15 @@ async function loadFormatter() {
   return import("../src/modules/notifications/extreme-rr-telegram");
 }
 
+/**
+ * Every test re-resolves the notification module (vi.resetModules + dynamic
+ * import) so config/env.ts re-reads the toggled Telegram variables. That module
+ * setup is the entire cost here — the tests themselves are deterministic, with
+ * no filesystem, timer or network dependence — but under parallel suite load it
+ * can exceed the 5s default. The allowance is for setup only.
+ */
+vi.setConfig({ testTimeout: 20_000 });
+
 async function loadService() {
   vi.resetModules();
   return import("../src/modules/notifications/notification.service");

@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { TradeExecutionStatus } from "@prisma/client";
 import { describe, expect, it } from "vitest";
 import {
   BINANCE_CLIENT_ORDER_ID_MAX_LENGTH,
@@ -19,6 +20,14 @@ import {
   mayHaveExposure,
   type TradeExecutionStatusName,
 } from "../src/modules/execution/execution-status";
+import {
+  CAPACITY_FREE_STATUSES,
+  TOTAL_ACTIVE_STATUSES,
+  consumesNoCapacity,
+  consumesOpenPosition,
+  consumesPendingEntry,
+  consumesTotalActive,
+} from "../src/modules/execution/capacity-status";
 
 /** Pure Phase 4 tests — no database, no network, entirely synthetic. */
 
@@ -32,10 +41,26 @@ describe("execution state machine", () => {
     ["PREFLIGHT", ["ENTRY_SUBMITTING", "SKIPPED", "CANCELED", "FAILED"]],
     ["ENTRY_SUBMITTING", ["ENTRY_PENDING", "PARTIALLY_FILLED", "ENTRY_FILLED", "FAILED", "MANUAL_INTERVENTION"]],
     ["ENTRY_PENDING", ["PARTIALLY_FILLED", "ENTRY_FILLED", "ENTRY_EXPIRED", "CANCELED", "FAILED", "MANUAL_INTERVENTION"]],
-    ["PARTIALLY_FILLED", ["ENTRY_FILLED", "PLACING_PROTECTION", "ENTRY_EXPIRED", "MANUAL_INTERVENTION"]],
-    ["ENTRY_FILLED", ["PLACING_PROTECTION", "MANUAL_INTERVENTION"]],
-    ["PLACING_PROTECTION", ["PROTECTED", "MANUAL_INTERVENTION"]],
-    ["PROTECTED", ["CLOSED_TP", "CLOSED_SL", "MANUAL_INTERVENTION"]],
+    // Phase 7 protects the FILLED quantity while the entry may still be open,
+    // so a protection exit can close directly from an exposure state.
+    [
+      "PARTIALLY_FILLED",
+      [
+        "ENTRY_FILLED",
+        "PLACING_PROTECTION",
+        "ENTRY_EXPIRED",
+        "CLOSED_TP",
+        "CLOSED_SL",
+        "CLOSED_EMERGENCY",
+        "MANUAL_INTERVENTION",
+      ],
+    ],
+    ["ENTRY_FILLED", ["PLACING_PROTECTION", "CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"]],
+    ["PLACING_PROTECTION", ["PROTECTED", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"]],
+    ["PROTECTED", ["CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"]],
+    // A verified emergency close is the one documented way out of a parked
+    // execution: the exposure it was parked for has provably been removed.
+    ["MANUAL_INTERVENTION", ["CLOSED_EMERGENCY"]],
   ];
 
   it("permits exactly the documented transitions", () => {
@@ -297,6 +322,80 @@ describe("phase 4 safety boundary", () => {
     const all = sources.map((s) => s.code).join("\n") + schema.slice(schema.indexOf("model ExecutionProfile"));
     for (const forbidden of ["kenneth", "EDENUSDT", "EULUSDT", "LUMIAUSDT", "ZROUSDT", "HYPEUSDT"]) {
       expect(all).not.toContain(forbidden);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Enum completeness — driven by the GENERATED Prisma enum, not a hardcoded list
+// ---------------------------------------------------------------------------
+
+describe("status classification completeness", () => {
+  // Reading the generated enum means a newly added status cannot stay
+  // unclassified just because a test's literal list was never updated.
+  const generated = Object.values(TradeExecutionStatus) as TradeExecutionStatusName[];
+
+  it("classifies every generated status in the pure status list", () => {
+    expect([...TRADE_EXECUTION_STATUSES].sort()).toEqual([...generated].sort());
+  });
+
+  it("gives every generated status defined transition semantics", () => {
+    for (const status of generated) {
+      // A terminal status has no out-edges; everything else must have some.
+      const targets = allowedTransitionsFrom(status);
+      if (isTerminalStatus(status)) expect(targets, status).toHaveLength(0);
+      else expect(targets.length, status).toBeGreaterThan(0);
+    }
+  });
+
+  it("classifies every generated status exactly once as active or capacity-free", () => {
+    for (const status of generated) {
+      const active = consumesTotalActive(status);
+      const free = consumesNoCapacity(status);
+      expect(active, status).toBe(!free);
+    }
+    expect(TOTAL_ACTIVE_STATUSES.length + CAPACITY_FREE_STATUSES.length).toBe(generated.length);
+  });
+
+  it("gives every generated status consistent pending/open semantics", () => {
+    for (const status of generated) {
+      const pending = consumesPendingEntry(status);
+      const open = consumesOpenPosition(status);
+      // Anything that consumes a pending or open slot must be counted active.
+      if (pending || open) expect(consumesTotalActive(status), status).toBe(true);
+      else expect(consumesTotalActive(status), status).toBe(false);
+    }
+  });
+
+  it("treats CLOSED_EMERGENCY as terminal and capacity-free", () => {
+    expect(generated).toContain("CLOSED_EMERGENCY");
+    expect(isTerminalStatus("CLOSED_EMERGENCY")).toBe(true);
+    expect(allowedTransitionsFrom("CLOSED_EMERGENCY")).toHaveLength(0);
+    expect(consumesPendingEntry("CLOSED_EMERGENCY")).toBe(false);
+    expect(consumesOpenPosition("CLOSED_EMERGENCY")).toBe(false);
+    expect(consumesTotalActive("CLOSED_EMERGENCY")).toBe(false);
+    expect(consumesNoCapacity("CLOSED_EMERGENCY")).toBe(true);
+  });
+
+  it("permits no transition out of any closed status", () => {
+    for (const closed of ["CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY"] as const) {
+      expect(isTerminalStatus(closed)).toBe(true);
+      for (const target of generated) {
+        expect(canTransition(closed, target).allowed, `${closed} -> ${target}`).toBe(false);
+      }
+    }
+  });
+
+  it("reaches every closed status only from a state that can hold exposure", () => {
+    for (const closed of ["CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY"] as const) {
+      const sources = generated.filter((from) => canTransition(from, closed).allowed);
+      expect(sources.length, closed).toBeGreaterThan(0);
+      for (const from of sources) {
+        expect(
+          mayHaveExposure(from) || from === "MANUAL_INTERVENTION",
+          `${from} -> ${closed} must come from a state that can hold exposure`
+        ).toBe(true);
+      }
     }
   });
 });

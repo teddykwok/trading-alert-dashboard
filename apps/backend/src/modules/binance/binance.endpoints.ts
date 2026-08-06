@@ -42,6 +42,11 @@ export const BINANCE_READ_ONLY_ENDPOINTS = {
   // issue anything but GET.
   order: { path: "/fapi/v1/order", signed: true, weight: 1 },
   leverageBracket: { path: "/fapi/v1/leverageBracket", signed: true, weight: 1 },
+  // Query Algo Order (Phase 7 protection). GET only — the mutation client
+  // owns POST/DELETE on this path from a separate module.
+  algoOrder: { path: "/fapi/v1/algoOrder", signed: true, weight: 1 },
+  // Position margin change history, used only to reconcile an ambiguous ADD.
+  positionMarginHistory: { path: "/fapi/v1/positionMargin/history", signed: true, weight: 1 },
 } as const satisfies Record<string, BinanceEndpointDefinition>;
 
 export type BinanceEndpointName = keyof typeof BINANCE_READ_ONLY_ENDPOINTS;

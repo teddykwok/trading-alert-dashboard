@@ -161,6 +161,26 @@ const envSchema = z.object({
   EXECUTION_ENTRY_TTL_SECONDS: z.coerce.number().int().positive().default(300),
   EXECUTION_ENTRY_RECONCILE_MAX_ATTEMPTS: z.coerce.number().int().positive().max(20).default(5),
   EXECUTION_ENTRY_RECONCILE_DELAY_MS: z.coerce.number().int().positive().max(60_000).default(1000),
+  // --- Phase 7 protection, margin top-up and emergency close ---------------
+  // Every default is fail-closed. Adding isolated margin is a real balance
+  // movement, so it stays off until deliberately enabled.
+  EXECUTION_AUTO_ADD_MARGIN_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  // DISABLED: never send a MARKET close — park for a human instead.
+  // ON_UNVERIFIED_STOP: last-resort close when the stop cannot be verified.
+  EXECUTION_EMERGENCY_CLOSE_MODE: z.enum(["DISABLED", "ON_UNVERIFIED_STOP"]).default("DISABLED"),
+  EXECUTION_PROTECTION_RECONCILE_MAX_ATTEMPTS: z.coerce.number().int().positive().max(20).default(5),
+  EXECUTION_PROTECTION_RECONCILE_DELAY_MS: z.coerce.number().int().positive().max(60_000).default(1000),
+  // Stops trigger on MARK_PRICE so a thin-book wick cannot fire them; take
+  // profits trigger on the traded CONTRACT_PRICE.
+  EXECUTION_SL_WORKING_TYPE: z.enum(["MARK_PRICE", "CONTRACT_PRICE"]).default("MARK_PRICE"),
+  EXECUTION_TP_WORKING_TYPE: z.enum(["MARK_PRICE", "CONTRACT_PRICE"]).default("CONTRACT_PRICE"),
+  EXECUTION_PROTECTION_PRICE_PROTECT: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value
   // fall back to mock candles, same as STOCK alerts.
