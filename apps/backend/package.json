@@ -14,6 +14,7 @@
     "prisma:seed": "tsx prisma/seed.ts",
     "retention:dry-run": "tsx src/modules/retention/run-retention.ts",
     "retention:apply": "tsx src/modules/retention/run-retention.ts --apply",
+    "binance:read-only-check": "tsx src/modules/binance/run-read-only-check.ts",
     "test": "vitest run",
     "playwright:install": "playwright install chromium"
   },

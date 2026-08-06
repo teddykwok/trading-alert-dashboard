@@ -1,0 +1,119 @@
+/**
+ * Narrow internal DTOs. Raw Binance payloads never leave the module: every
+ * service return value is one of these shapes, so added upstream fields are
+ * ignored rather than leaking or breaking parsing.
+ *
+ * All exchange numerics are DECIMAL STRINGS. Values Binance sends as JSON
+ * strings ("0.00100000") are preserved byte-for-byte; the few it sends as
+ * JSON numbers are stringified without any arithmetic.
+ */
+
+export type BinancePositionMode = "HEDGE" | "ONE_WAY";
+export type BinancePositionSide = "LONG" | "SHORT" | "BOTH";
+export type BinanceMarginType = "ISOLATED" | "CROSS";
+export type BinanceAssetMode = "MULTI_ASSET" | "SINGLE_ASSET";
+
+export interface BinanceConnectionInfo {
+  ok: boolean;
+  /** Host only, never credentials, e.g. "fapi.binance.com". */
+  host: string;
+  serverTimeMs: number | null;
+  serverTimeIso: string | null;
+  clockOffsetMs: number | null;
+  roundTripMs: number | null;
+}
+
+export interface BinanceBalanceDto {
+  asset: string;
+  walletBalance: string | null;
+  availableBalance: string | null;
+  crossUnPnl: string | null;
+}
+
+export interface BinancePositionDto {
+  symbol: string;
+  positionSide: BinancePositionSide;
+  positionAmt: string | null;
+  entryPrice: string | null;
+  markPrice: string | null;
+  liquidationPrice: string | null;
+  unrealizedProfit: string | null;
+  notional: string | null;
+  /** From positionRisk when present, else enriched from symbolConfig. */
+  marginType: BinanceMarginType | null;
+  leverage: string | null;
+  isolatedMargin: string | null;
+  isolatedWallet: string | null;
+}
+
+export interface BinanceOpenOrderDto {
+  orderId: string | null;
+  symbol: string;
+  side: string | null;
+  positionSide: BinancePositionSide | null;
+  type: string | null;
+  timeInForce: string | null;
+  price: string | null;
+  stopPrice: string | null;
+  origQty: string | null;
+  reduceOnly: boolean | null;
+  closePosition: boolean | null;
+}
+
+export interface BinanceSymbolFiltersDto {
+  symbol: string;
+  status: string | null;
+  contractType: string | null;
+  /** PRICE_FILTER */
+  tickSize: string | null;
+  minPrice: string | null;
+  maxPrice: string | null;
+  /** LOT_SIZE */
+  stepSize: string | null;
+  minQty: string | null;
+  maxQty: string | null;
+  /** MARKET_LOT_SIZE */
+  marketStepSize: string | null;
+  marketMinQty: string | null;
+  marketMaxQty: string | null;
+  /** MIN_NOTIONAL, when supplied. */
+  minNotional: string | null;
+  orderTypes: string[];
+  timeInForce: string[];
+}
+
+export interface BinanceLeverageBracketDto {
+  bracket: number | null;
+  initialLeverage: number | null;
+  notionalCap: string | null;
+  notionalFloor: string | null;
+  maintMarginRatio: string | null;
+  cum: string | null;
+}
+
+export interface BinanceSymbolInspectionDto {
+  filters: BinanceSymbolFiltersDto;
+  brackets: BinanceLeverageBracketDto[];
+  /** Highest documented initialLeverage across the symbol's brackets. */
+  maxInitialLeverage: number | null;
+  /** Account-specific configuration for this symbol, when available. */
+  accountSymbolConfig: {
+    marginType: BinanceMarginType | null;
+    leverage: string | null;
+    maxNotionalValue: string | null;
+    isAutoAddMargin: boolean | null;
+  } | null;
+}
+
+export interface BinanceAccountSummaryDto {
+  connection: BinanceConnectionInfo;
+  positionMode: BinancePositionMode | null;
+  assetMode: BinanceAssetMode | null;
+  usdtWalletBalance: string | null;
+  usdtAvailableBalance: string | null;
+  nonZeroPositionCount: number;
+  openOrderCount: number;
+  positions: BinancePositionDto[];
+  /** Sanitized, human-readable notes (e.g. the ONE_WAY mode warning). */
+  warnings: string[];
+}
