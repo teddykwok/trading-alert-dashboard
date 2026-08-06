@@ -345,6 +345,47 @@ retried forever. Full rules, the capacity classification table, the
 decision lifecycle and the atomicity model are in
 [docs/binance-execution-policy.md](docs/binance-execution-policy.md).
 
+### Backend — LIMIT entry lifecycle (Phase 6)
+
+The first phase able to mutate Binance state — and **real entry submission is
+off by default and stays off until Phase 7 protection exists.**
+
+`EXECUTION_LIVE_ENTRY_ENABLED` and `EXECUTION_PROTECTION_READY` must **both** be
+the exact string `true` before any exposure-increasing POST is dispatched
+(`POST /fapi/v1/marginType`, `POST /fapi/v1/leverage`, `POST /fapi/v1/order`).
+With either gate closed and the execution still `PREFLIGHT`, the lifecycle makes
+zero mutation calls, reserves no order and changes no execution status.
+
+`DELETE /fapi/v1/order` is deliberately **not** gated, narrowed instead to this
+execution's own already-reserved ENTRY order: gating it would trap a resting
+order, since turning the gates off after an entry was accepted would leave the
+system unable to cancel the unfilled remainder at TTL. Disabling live entry
+stops new exposure; it must not prevent risk reduction. GET reconciliation is
+always available too.
+
+Exactly four mutation endpoints exist anywhere in the codebase, in a client
+separate from the GET-only Phase 2 connector. There is no `bypassSafety`
+boolean — authorization is carried by branded contexts that only that module
+can mint.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `EXECUTION_LIVE_ENTRY_ENABLED` | Master gate for real entry mutations. Only the exact string `true` opens it. | `false` |
+| `EXECUTION_PROTECTION_READY` | Second gate: no real entry until stop-loss/take-profit protection exists (Phase 7). | `false` |
+| `EXECUTION_ENTRY_TTL_SECONDS` | Local deadline after which an unfilled LIMIT entry's **remainder** is cancelled. The order itself is sent GTC. | `300` |
+| `EXECUTION_ENTRY_RECONCILE_MAX_ATTEMPTS` | Bounded query budget for an ambiguous submit/cancel result. | `5` |
+| `EXECUTION_ENTRY_RECONCILE_DELAY_MS` | Delay between bounded reconciliation attempts. | `1000` |
+
+A timeout is never treated as proof that nothing happened: the same
+deterministic client order id is queried rather than a new order being created.
+A partial fill whose remainder is cancelled becomes `MANUAL_INTERVENTION`, never
+the terminal `ENTRY_EXPIRED` — a live position still exists. Full rules are in
+[docs/binance-execution-policy.md](docs/binance-execution-policy.md).
+
+There is no worker, queue, webhook wiring, Telegram message, frontend control or
+HTTP route in this phase; the orchestration methods are internal and a future
+worker will call them.
+
 ### Backend — AI vision
 
 | Variable | Description | Default |

@@ -37,6 +37,10 @@ export const BINANCE_READ_ONLY_ENDPOINTS = {
   accountConfig: { path: "/fapi/v1/accountConfig", signed: true, weight: 5 },
   symbolConfig: { path: "/fapi/v1/symbolConfig", signed: true, weight: 5 },
   openOrders: { path: "/fapi/v1/openOrders", signed: true, weight: 40 },
+  // Query Order. GET only — the Phase 6 mutation client owns POST/DELETE on
+  // this path and lives in a separate module; this connector still cannot
+  // issue anything but GET.
+  order: { path: "/fapi/v1/order", signed: true, weight: 1 },
   leverageBracket: { path: "/fapi/v1/leverageBracket", signed: true, weight: 1 },
 } as const satisfies Record<string, BinanceEndpointDefinition>;
 
