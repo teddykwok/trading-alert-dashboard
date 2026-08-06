@@ -254,7 +254,9 @@ describe("read-only safety boundary", () => {
   });
 
   it("rejects paths outside the allowlist even with GET", () => {
-    for (const path of ["/fapi/v1/order", "/fapi/v1/leverage", "/fapi/v1/marginType", "/fapi/v1/positionSide/dual/set"]) {
+    // /fapi/v1/order is allowlisted for GET (Query Order) from Phase 6 on; the
+    // write paths below still have no representation here at all.
+    for (const path of ["/fapi/v1/leverage", "/fapi/v1/marginType", "/fapi/v1/batchOrders", "/fapi/v1/positionMargin"]) {
       expect(() => assertReadOnlyRequest(path, "GET")).toThrow(BinanceReadOnlyViolationError);
     }
     expect(() => assertReadOnlyRequest("/fapi/v3/balance", "GET")).not.toThrow();
@@ -279,6 +281,9 @@ describe("read-only safety boundary", () => {
       "/fapi/v1/leverageBracket",
       "/fapi/v1/multiAssetsMargin",
       "/fapi/v1/openOrders",
+      // Query Order — GET only. The connector hardcodes GET, so allowlisting
+      // this path cannot make it mutable here.
+      "/fapi/v1/order",
       "/fapi/v1/ping",
       "/fapi/v1/positionSide/dual",
       "/fapi/v1/symbolConfig",
@@ -287,7 +292,8 @@ describe("read-only safety boundary", () => {
       "/fapi/v3/balance",
       "/fapi/v3/positionRisk",
     ]);
-    expect(isAllowedReadOnlyPath("/fapi/v1/order")).toBe(false);
+    expect(isAllowedReadOnlyPath("/fapi/v1/leverage")).toBe(false);
+    expect(isAllowedReadOnlyPath("/fapi/v1/marginType")).toBe(false);
   });
 
   it("exposes no trading or account-mutating method anywhere in the module", () => {
@@ -324,7 +330,14 @@ describe("read-only safety boundary", () => {
       // Strip comments so documentation of the ban doesn't trip the check.
       const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|\s)\/\/.*$/gm, "");
       for (const method of forbiddenMethods) expect(code).not.toContain(method);
-      expect(code).not.toMatch(/["'`]\/fapi\/v1\/order["'`]/);
+      // No WRITE path has any representation in this module. /fapi/v1/order is
+      // present as a GET query endpoint; the line below proves no non-GET verb
+      // can be attached to it here.
+      // Quoted forms: "/fapi/v1/leverage" must not match the legitimate
+      // "/fapi/v1/leverageBracket" read endpoint.
+      for (const writePath of ['"/fapi/v1/leverage"', '"/fapi/v1/marginType"', '"/fapi/v1/batchOrders"']) {
+        expect(code).not.toContain(writePath);
+      }
       expect(code).not.toMatch(/method:\s*["'](POST|PUT|PATCH|DELETE)["']/);
     }
   });

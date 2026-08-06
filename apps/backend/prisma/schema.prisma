@@ -400,6 +400,11 @@ enum ExecutionEventType {
   DECISION_RECORDED
   FAILURE_RECORDED
   MANUAL_INTERVENTION_REQUIRED
+  // --- Phase 6 entry lifecycle ---
+  EXCHANGE_CONFIG_VERIFIED
+  ENTRY_SUBMITTED
+  ENTRY_RECONCILED
+  ENTRY_CANCEL_REQUESTED
 }
 
  // Non-secret execution/account configuration. `accountIdentifier` is an opaque
@@ -626,6 +631,25 @@ model BinanceOrder {
   closePosition    Boolean?
   submittedAt      DateTime?
   lastExchangeUpdateAt DateTime?
+
+  // --- Phase 6 entry lifecycle --------------------------------------------
+  // Durable TTL deadline for THIS order. Deliberately NOT TradeExecution
+  // .entryExpiresAt, which sits in the frozen planned block and means "the
+  // plan's entry opportunity expires" — a different thing, decided before any
+  // order exists. Derived once from the committed submission intent and then
+  // stable across every retry.
+  entryOrderExpiresAt  DateTime?
+  /// Set when a submission returned an ambiguous result (timeout / 5xx).
+  submissionUnknownAt  DateTime?
+  cancelRequestedAt    DateTime?
+  cancelConfirmedAt    DateTime?
+  /// Bounded reconciliation accounting — never a raw Binance payload.
+  reconcileAttempts    Int                 @default(0)
+  lastReconcileAt      DateTime?
+  /// Binance's own status string (e.g. "EXPIRED_IN_MATCH") kept verbatim for
+  /// audit when it does not map 1:1 onto ExecutionOrderStatus.
+  exchangeStatusRaw    String?
+
   createdAt        DateTime             @default(now())
   updatedAt        DateTime             @updatedAt
 

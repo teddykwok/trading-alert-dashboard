@@ -145,6 +145,22 @@ const envSchema = z.object({
   EXECUTION_MAX_ALERT_AGE_SECONDS: z.coerce.number().int().positive().default(300),
   // Tolerance for a signal timestamp slightly ahead of local time (clock skew).
   EXECUTION_SIGNAL_FUTURE_TOLERANCE_SECONDS: z.coerce.number().int().nonnegative().default(5),
+  // --- Phase 6 live entry gates (BOTH must be true to mutate) ---------------
+  // Same strict enum as the kill switch: unset or malformed is a hard failure
+  // or a closed gate, never an accidental "on".
+  EXECUTION_LIVE_ENTRY_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  // Phase 7 protection does not exist yet, so this stays false and no real
+  // entry can be placed even if live entry is switched on.
+  EXECUTION_PROTECTION_READY: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  EXECUTION_ENTRY_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+  EXECUTION_ENTRY_RECONCILE_MAX_ATTEMPTS: z.coerce.number().int().positive().max(20).default(5),
+  EXECUTION_ENTRY_RECONCILE_DELAY_MS: z.coerce.number().int().positive().max(60_000).default(1000),
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value
   // fall back to mock candles, same as STOCK alerts.

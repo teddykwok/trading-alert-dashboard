@@ -10,6 +10,7 @@ import {
   normalizeOpenOrders,
   normalizePositionMode,
   normalizePositions,
+  normalizeQueriedOrder,
   normalizeSymbolConfig,
   normalizeSymbolFilters,
 } from "./binance.normalize";
@@ -17,6 +18,7 @@ import type {
   BinanceAccountSummaryDto,
   BinanceConnectionInfo,
   BinancePositionDto,
+  BinanceQueriedOrderDto,
   BinanceSymbolInspectionDto,
 } from "./binance.types";
 
@@ -140,6 +142,41 @@ export class BinanceReadOnlyService {
       maxInitialLeverage: maxInitialLeverage(brackets),
       accountSymbolConfig,
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 6 query accessors — still GET-only, still side-effect free.
+  // -------------------------------------------------------------------------
+
+  /**
+   * GET /fapi/v1/order by origClientOrderId. This is how an ambiguous
+   * submission or cancellation is resolved: the same deterministic id is asked
+   * about rather than a new order being created.
+   */
+  async queryOrderByClientOrderId(symbol: string, origClientOrderId: string): Promise<BinanceQueriedOrderDto> {
+    const payload = await this.client.request<unknown>("order", {
+      symbol: symbol.trim().toUpperCase(),
+      origClientOrderId,
+    });
+    return normalizeQueriedOrder(payload);
+  }
+
+  /** GET /fapi/v1/symbolConfig for one symbol (margin type, leverage, caps). */
+  async getSymbolConfiguration(symbol: string) {
+    const payload = await this.client.request<unknown>("symbolConfig", { symbol: symbol.trim().toUpperCase() });
+    return normalizeSymbolConfig(payload, symbol);
+  }
+
+  /** GET /fapi/v1/openOrders, optionally narrowed to one symbol. */
+  async getOpenOrders(symbol?: string) {
+    const params = symbol ? { symbol: symbol.trim().toUpperCase() } : {};
+    return normalizeOpenOrders(await this.client.request<unknown>("openOrders", params));
+  }
+
+  /** GET /fapi/v3/positionRisk, non-zero positions only. */
+  async getPositionRisk(symbol?: string): Promise<BinancePositionDto[]> {
+    const params = symbol ? { symbol: symbol.trim().toUpperCase() } : {};
+    return normalizePositions(await this.client.request<unknown>("positionRisk", params)).filter(isNonZeroPosition);
   }
 
   /**

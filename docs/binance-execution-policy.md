@@ -377,3 +377,187 @@ position/account detail.
 only, with optimistic locking on `version`. There is deliberately **no HTTP
 route**: loosening a limit or releasing a kill switch is a deliberate operator
 action, never something an unauthenticated request can reach.
+
+## Phase 6 scope — LIMIT entry lifecycle (first mutation phase)
+
+Phase 6 is the first phase able to change Binance state. **Real entry
+submission is disabled by default and stays disabled until Phase 7.**
+
+### Two fail-closed gates, applied per operation class
+
+`EXECUTION_LIVE_ENTRY_ENABLED` and `EXECUTION_PROTECTION_READY` both default to
+`false`; unset stays closed and any other value fails startup validation. Phase
+7 protection does not exist, so `EXECUTION_PROTECTION_READY` remains `false` and
+no real entry can be placed.
+
+The four approved mutations do **not** carry the same risk, so they are gated
+differently:
+
+| Class | Operations | Gate |
+| --- | --- | --- |
+| `EXPOSURE_OR_CONFIGURATION` | `POST /fapi/v1/marginType`, `POST /fapi/v1/leverage`, `POST /fapi/v1/order` | Both gates must be `true` |
+| `RISK_REDUCING_RECOVERY` | `DELETE /fapi/v1/order`, narrowed to this execution's own reserved ENTRY order | Not gated |
+
+Cancellation is deliberately ungated. Gating it would **trap a resting order**:
+turning the gates off after an entry had been accepted would leave the system
+unable to cancel the unfilled remainder at TTL. Disabling live entry must stop
+NEW exposure, not prevent reducing exposure that already exists.
+
+GET reconciliation is likewise always available.
+
+With either gate closed and the execution still `PREFLIGHT`, the lifecycle
+returns `LIVE_ENTRY_DISABLED` / `PROTECTION_NOT_READY` and dispatches zero
+POST/DELETE requests, creates no `BinanceOrder`, changes no execution status
+and appends no entry-intent event. The exception applies only once a durable
+local ENTRY intent already exists and the lifecycle is reconciling or expiring
+that exact order.
+
+### Authorization model
+
+There is no `bypassSafety` boolean anywhere. Authorization is carried by
+branded context objects that only the mutation-client module can mint:
+
+- `authorizeLiveEntry()` — throws when either gate is closed, so an
+  exposure-increasing POST cannot be expressed without it. The gates are
+  re-checked at **call** time as well, not only when the token was minted.
+- `authorizeEntryCancellation({ executionId, symbol, clientOrderId, role,
+  generation, reason })` — accepted only for role `ENTRY`, generation `1`, an
+  explicit recovery reason (`TTL_DUE` or `OPERATOR_RECOVERY`), and a
+  `clientOrderId` that **equals the deterministic id derived from that
+  execution**. `cancelReservedEntryOrder(context)` then takes the symbol and
+  client order id from the context, never from the call site — so an arbitrary
+  symbol, client order id, exchange order id, role, generation or external
+  order cannot be addressed. There is no generic ungated cancel method.
+
+The service additionally refuses recovery cancellation unless a persisted
+execution and a persisted ENTRY generation 1 reservation exist, the execution
+is in a state where an entry order may exist (`ENTRY_SUBMITTING`,
+`ENTRY_PENDING`, `PARTIALLY_FILLED`, `MANUAL_INTERVENTION`), the order was
+queried first, and TTL is due (or an explicit recovery reason was given).
+
+### Kill-switch recheck immediately before the entry POST
+
+Margin-type and leverage configuration take several network round trips, so
+everything is re-validated immediately before `POST /fapi/v1/order`: both live
+gates; the profile and its safety policy re-read from the database; the
+execution still `ENTRY_SUBMITTING` at the same version; the same reserved
+order; and no conflicting local or Binance exposure. No database transaction is
+held across any Binance call.
+
+If a gate or kill switch became active in that window, the entry is **not**
+submitted, no second reservation is created, margin type and leverage are
+**not** rolled back, and a sanitized operator-visible result is persisted —
+the system never claims an entry was submitted.
+
+### Mutation allowlist
+
+Exactly four `(method, path)` pairs exist anywhere in the codebase:
+
+```
+POST   /fapi/v1/marginType
+POST   /fapi/v1/leverage
+POST   /fapi/v1/order
+DELETE /fapi/v1/order
+```
+
+They live in a **separate** `BinanceUsdMExecutionClient`; the Phase 2 connector
+stays structurally GET-only. There is no public generic signed-request method,
+so an arbitrary mutation cannot be expressed. Position-mode changes,
+multi-assets-mode changes, position-margin top-ups, batch orders, order
+modification, cancel-all and every transfer endpoint have no representation at
+all. Because a protection or MARKET order would travel the same
+`POST /fapi/v1/order` path, the order **type** is allowlisted separately —
+`LIMIT` + `GTC` only.
+
+A mutation is never blind-retried: an ambiguous result is reconciled by client
+order id instead.
+
+### Local intent before external mutation
+
+Before changing margin type, leverage or submitting anything, one transaction
+verifies `(id, expectedVersion, status = PREFLIGHT)`, reserves exactly one
+`BinanceOrder` (role `ENTRY`, generation 1, deterministic client order id,
+status `SUBMITTING`, no exchange id, zero executed), transitions
+`PREFLIGHT → ENTRY_SUBMITTING`, increments the version once and appends one
+event. A crash after this commit resumes from the durable reservation.
+
+Generation 2 is **never** created automatically, and a timeout never mints a new
+client order id.
+
+### Configuration verification
+
+ISOLATED margin and the exact frozen `selectedLeverage` are each read first (no
+POST when already correct), changed only when the symbol carries no position and
+no open order, and then **verified by a second GET** — a success message is
+never taken as proof. An unresolved ambiguity stops the lifecycle; neither
+setting is ever automatically reverted, because reverting could collide with the
+user's own activity.
+
+Leverage is sent exactly as frozen: no clamp, no fallback, no recalculation, and
+the verified `maxNotionalValue` must still cover the frozen `positionNotional`.
+
+### Result classification
+
+`CONFIRMED_ACCEPTED`, `CONFIRMED_REJECTED`, `RESULT_UNKNOWN`, `QUERY_RETRYABLE`,
+`NOT_FOUND_CONFIRMED`, `CONFLICT`, `MANUAL_REVIEW_REQUIRED`.
+
+A timeout, connection reset or 5xx is `RESULT_UNKNOWN` — **never** proof that
+nothing happened. The response is always followed by a query on the same
+`origClientOrderId`. A duplicate-client-id conflict proves the order exists, so
+it triggers a query rather than a new id.
+
+### Status mapping
+
+| Exchange | Local order | Execution |
+| --- | --- | --- |
+| `NEW` | `NEW` | `ENTRY_PENDING` |
+| `PARTIALLY_FILLED` | `PARTIALLY_FILLED` | `PARTIALLY_FILLED` |
+| `FILLED` | `FILLED` | `ENTRY_FILLED` |
+| `CANCELED`, zero fill, TTL | `CANCELED` | `ENTRY_EXPIRED` |
+| `CANCELED`, zero fill, operator | `CANCELED` | `CANCELED` |
+| `EXPIRED` / `EXPIRED_IN_MATCH`, zero fill | `EXPIRED` | `ENTRY_EXPIRED` |
+| `REJECTED`, zero fill | `REJECTED` | `FAILED` |
+| **any close-out with a non-zero fill** | preserved | **`MANUAL_INTERVENTION`** |
+| unknown / contradictory | `UNKNOWN` | `MANUAL_INTERVENTION` |
+
+Fills are monotonic: an exchange read reporting less filled than already
+observed is ignored, an average fill price is never cleared, and a known
+`exchangeOrderId` is never overwritten. A contradictory order identity (symbol,
+side, positionSide, type, price, quantity or client id) produces
+`MANUAL_INTERVENTION` instead of rewriting local intent.
+
+### TTL and the partial-fill rule
+
+The order is sent `GTC` with a **local** TTL (`EXECUTION_ENTRY_TTL_SECONDS`,
+default 300). The deadline is stored on `BinanceOrder.entryOrderExpiresAt` —
+deliberately not `TradeExecution.entryExpiresAt`, which is a frozen planned
+field meaning "the plan's entry opportunity expires". It is derived once from
+the committed submission intent and stays stable across retries.
+
+TTL cancellation cancels **only the unfilled remainder**. It never closes the
+filled position, never submits an opposite order, never zeroes
+`filledQuantity`, and never releases open-position capacity as though no fill
+happened. Until Phase 7 can protect a partial position:
+
+> **partial fill + cancelled remainder → `MANUAL_INTERVENTION`**, never the
+> terminal `ENTRY_EXPIRED`.
+
+A cancel timeout is likewise an unknown result: the order is queried again, a
+`FILLED` order never receives another cancel, and an ambiguous cancellation
+while a fill is possible parks the execution for a human. No compensating trade
+is ever submitted.
+
+### Kill switches
+
+The Phase 5 kill switch is re-checked before a new submission and blocks it. It
+does **not** cancel an entry order that has already been submitted —
+active-order emergency behaviour belongs to a later phase.
+
+### Concurrency
+
+Reservation and configuration hold a per-`(profile, symbol)` advisory lock, so
+two local executions never configure or submit the same symbol simultaneously
+while different profiles stay unblocked. Every local mutation keeps the Phase 4
+guarantees: conditional update on `(id, expectedVersion)`, exactly one version
+increment per committed event, the new version as the event `sequenceNumber`,
+and full rollback if the event insert fails.

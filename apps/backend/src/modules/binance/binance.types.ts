@@ -123,3 +123,26 @@ export interface BinanceAccountSummaryDto {
   /** Sanitized, human-readable notes (e.g. the ONE_WAY mode warning). */
   warnings: string[];
 }
+
+/**
+ * One order as returned by GET /fapi/v1/order. Only the fields the entry
+ * lifecycle needs are normalized — no raw payload is ever carried forward.
+ */
+export interface BinanceQueriedOrderDto {
+  orderId: string | null;
+  clientOrderId: string | null;
+  symbol: string | null;
+  status: string | null;
+  side: string | null;
+  positionSide: BinancePositionSide | null;
+  type: string | null;
+  timeInForce: string | null;
+  price: string | null;
+  origQty: string | null;
+  executedQty: string | null;
+  /** Weighted average fill price ("avgPrice"). */
+  averagePrice: string | null;
+  reduceOnly: boolean | null;
+  closePosition: boolean | null;
+  updateTimeMs: number | null;
+}

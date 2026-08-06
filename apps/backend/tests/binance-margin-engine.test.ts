@@ -949,6 +949,8 @@ describe("engine purity and safety", () => {
       "/fapi/v1/leverageBracket",
       "/fapi/v1/multiAssetsMargin",
       "/fapi/v1/openOrders",
+      // Query Order, added GET-only in Phase 6.
+      "/fapi/v1/order",
       "/fapi/v1/ping",
       "/fapi/v1/positionSide/dual",
       "/fapi/v1/symbolConfig",

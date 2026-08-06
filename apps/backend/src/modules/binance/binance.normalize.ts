@@ -7,6 +7,7 @@ import type {
   BinancePositionDto,
   BinancePositionMode,
   BinancePositionSide,
+  BinanceQueriedOrderDto,
   BinanceSymbolFiltersDto,
 } from "./binance.types";
 
@@ -280,5 +281,33 @@ export function normalizeSymbolConfig(payload: unknown, symbol: string) {
     leverage: decimalString(entry.leverage),
     maxNotionalValue: decimalString(entry.maxNotionalValue),
     isAutoAddMargin: bool(entry.isAutoAddMargin),
+  };
+}
+
+/**
+ * Normalizes one GET /fapi/v1/order response. Decimal fields stay exact
+ * strings; the status token is passed through verbatim so the pure lifecycle
+ * module — not this normalizer — decides what an unrecognised value means.
+ */
+export function normalizeQueriedOrder(payload: unknown): BinanceQueriedOrderDto {
+  const row = asRow(payload);
+  const updateTime = Number(row.updateTime ?? row.time);
+
+  return {
+    orderId: row.orderId === undefined || row.orderId === null ? null : String(row.orderId),
+    clientOrderId: text(row.clientOrderId),
+    symbol: text(row.symbol),
+    status: text(row.status),
+    side: text(row.side),
+    positionSide: row.positionSide === undefined ? null : normalizePositionSide(row.positionSide),
+    type: text(row.type ?? row.origType),
+    timeInForce: text(row.timeInForce),
+    price: decimalString(row.price),
+    origQty: decimalString(row.origQty),
+    executedQty: decimalString(row.executedQty),
+    averagePrice: decimalString(row.avgPrice),
+    reduceOnly: bool(row.reduceOnly),
+    closePosition: bool(row.closePosition),
+    updateTimeMs: Number.isFinite(updateTime) ? updateTime : null,
   };
 }
