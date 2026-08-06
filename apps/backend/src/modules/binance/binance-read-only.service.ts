@@ -101,6 +101,7 @@ export class BinanceReadOnlyService {
       usdtAvailableBalance: usdt?.availableBalance ?? null,
       nonZeroPositionCount: positions.length,
       openOrderCount: openOrders.length,
+      openOrderSymbols: [...new Set(openOrders.map((order) => order.symbol.trim().toUpperCase()))].sort(),
       positions,
       warnings,
     };

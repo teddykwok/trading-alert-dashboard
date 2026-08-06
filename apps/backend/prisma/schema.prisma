@@ -420,10 +420,84 @@ model ExecutionProfile {
   createdAt            DateTime              @default(now())
   updatedAt            DateTime              @updatedAt
 
-  executions TradeExecution[]
+  executions   TradeExecution[]
+  safetyPolicy ExecutionSafetyPolicy?
 
   @@unique([exchange, environment, accountIdentifier])
   @@index([isEnabled])
+}
+
+// Phase 5 — per-profile safety and capacity limits.
+//
+// Fails closed by design: killSwitchActive defaults TRUE and every limit
+// defaults to the canary value, so a freshly created policy admits nothing
+// until it is deliberately relaxed. Stores no credential of any kind.
+//
+// The kill switch blocks NEW admissions only. It never cancels an order,
+// closes a position, changes an existing execution status or deletes capacity
+// records — see docs/binance-execution-policy.md.
+model ExecutionSafetyPolicy {
+  id                 String           @id @default(cuid())
+  executionProfileId String           @unique
+  executionProfile   ExecutionProfile @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)
+
+  killSwitchActive Boolean @default(true)
+
+  maxOpenPositions      Int @default(1)
+  maxPendingEntries     Int @default(1)
+  maxTotalActiveTrades  Int @default(1)
+  maxActivePerSymbolSide Int @default(1)
+  maxAlertAgeSeconds    Int @default(300)
+
+  maxTotalPlannedRiskUsd    Decimal @default("1.50") @db.Decimal(30, 12)
+  maxTotalIsolatedMarginUsd Decimal @default("5.00") @db.Decimal(30, 12)
+
+  // Empty array = no additional user restriction; non-empty = allowlist only.
+  allowedSymbols String[] @default([])
+
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum SafetyDecision {
+  PASS
+  SKIP
+  RETRY_CONFLICT
+  UNAVAILABLE
+}
+
+// Sanitized audit record of one admission evaluation. Holds decision inputs
+// and projected totals only — never credentials, signed URLs, auth headers or
+// raw Binance payloads, and no unrelated position/account detail.
+//
+// RESTRICT on the execution: this is financial/audit history and must not be
+// removed implicitly.
+model SafetyAdmission {
+  id               String         @id @default(cuid())
+  tradeExecutionId String
+  tradeExecution   TradeExecution @relation(fields: [tradeExecutionId], references: [id], onDelete: Restrict)
+  // One decision per evaluated version, so idempotent retries cannot duplicate history.
+  evaluatedVersion Int
+  evaluatedAt      DateTime
+  decision         SafetyDecision
+  reasonCode       String?
+  message          String?
+  signalAgeSeconds Int?
+
+  effectiveLimits  Json?
+  capacityBefore   Json?
+  capacityProjected Json?
+  reservedRiskUsd    Decimal? @db.Decimal(30, 12)
+  reservedMarginUsd  Decimal? @db.Decimal(30, 12)
+  symbolStateSummary Json?
+  binanceSnapshotAt  DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@unique([tradeExecutionId, evaluatedVersion])
+  @@index([tradeExecutionId])
+  @@index([decision])
 }
 
  // One planned execution derived from one frozen Extreme RR + margin plan.
@@ -454,6 +528,12 @@ model TradeExecution {
   direction        ExecutionDirection
   positionSide     ExecutionPositionSide
   selectedLookback Int
+  // Frozen copy of Alert.triggeredAt — the ORIGINAL signal time, used for
+  // freshness admission. Kept on the execution so it survives retention
+  // nulling alertId. Nullable only because rows created before Phase 5 have
+  // no trustworthy value; those fail closed with SIGNAL_TIME_UNAVAILABLE
+  // rather than being backfilled with a fabricated timestamp.
+  signalTriggeredAt DateTime?
   status           TradeExecutionStatus  @default(PLAN_READY)
   version          Int                   @default(1)
   createdAt        DateTime              @default(now())
@@ -509,8 +589,9 @@ model TradeExecution {
   requiresManualIntervention Boolean  @default(false)
   lastReconciledAt          DateTime?
 
-  orders BinanceOrder[]
-  events ExecutionEvent[]
+  orders           BinanceOrder[]
+  events           ExecutionEvent[]
+  safetyAdmissions SafetyAdmission[]
 
   @@unique([alertId, executionProfileId])
   @@index([status])

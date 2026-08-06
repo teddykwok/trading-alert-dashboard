@@ -113,6 +113,12 @@ export interface BinanceAccountSummaryDto {
   usdtAvailableBalance: string | null;
   nonZeroPositionCount: number;
   openOrderCount: number;
+  /**
+   * Distinct uppercase symbols with at least one open order. Symbols only —
+   * no order ids, prices or quantities — so safety admission can block a
+   * symbol that already has working orders without handling order detail.
+   */
+  openOrderSymbols: string[];
   positions: BinancePositionDto[];
   /** Sanitized, human-readable notes (e.g. the ONE_WAY mode warning). */
   warnings: string[];
