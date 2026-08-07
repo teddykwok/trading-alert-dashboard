@@ -527,6 +527,8 @@ afterAll(async () => {
       await prisma.executionEvent.deleteMany({ where: { tradeExecutionId: { in: ids } } });
       // Phase 9 verification history is Restrict-linked audit data: it must go
       // before the execution it belongs to.
+      // Phase 9 notifications are Restrict-linked; they must go first.
+      await prisma.executionNotification.deleteMany({ where: { tradeExecutionId: { in: ids } } });
       await prisma.executionProtectionVerification.deleteMany({ where: { tradeExecutionId: { in: ids } } });
       await prisma.binanceOrder.deleteMany({ where: { tradeExecutionId: { in: ids } } });
       await prisma.tradeExecution.deleteMany({ where: { id: { in: ids } } });

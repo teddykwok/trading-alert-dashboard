@@ -220,10 +220,21 @@ export async function detectExecutionOrchestration(): Promise<boolean> {
     const worker = readFileSync(WORKER_ENTRYPOINT, "utf8");
     const app = readFileSync(path.join(process.cwd(), "src", "app.ts"), "utf8");
     const combined = `${worker}\n${app}`;
+    // The worker must actually START the orchestration scheduler, and that
+    // scheduler must construct all three lifecycle services and run startup
+    // recovery. Checking registration AND construction keeps this honest: a
+    // module that is merely imported, or a scheduler that reconciles without
+    // recovering, would not satisfy it.
+    const scheduler = readFileSync(
+      path.join(process.cwd(), "src", "modules", "jobs", "execution-orchestration.scheduler.ts"),
+      "utf8"
+    );
     return (
-      /new\s+SafetyAdmissionService/.test(combined) &&
-      /new\s+EntryLifecycleService/.test(combined) &&
-      /new\s+ProtectionLifecycleService/.test(combined)
+      /startExecutionOrchestrationScheduler\(\)/.test(combined) &&
+      /new\s+SafetyAdmissionService/.test(scheduler) &&
+      /new\s+EntryLifecycleService/.test(scheduler) &&
+      /new\s+ProtectionLifecycleService/.test(scheduler) &&
+      /runStartupRecovery\(/.test(scheduler)
     );
   } catch {
     return false;

@@ -20,6 +20,13 @@ import { bullConnection, type ExtremeRRJobData, type VisionAnalysisJobData } fro
 import { startCleanupScheduler } from "./cleanup.worker";
 import { setupRetentionSchedule } from "./retention.worker";
 import { startExecutionNotificationScheduler } from "./execution-notification.scheduler";
+import {
+  createExecutionOrchestrator,
+  startExecutionOrchestrationScheduler,
+} from "./execution-orchestration.scheduler";
+import { BinanceMarginPlanService } from "../binance/binance-margin-plan.service";
+import { ExecutionService } from "../execution/execution.service";
+import { SelectedPlanExecutor } from "../execution/selected-plan-executor";
 
 const alertsService = new AlertsService(prisma);
 
@@ -143,9 +150,30 @@ async function processExtremeRRJob(job: Job<ExtremeRRJobData>): Promise<void> {
   await notifyExtremeRRPlanOutcome(prisma, plan, alert);
 
   logger.info({ alertId, status: plan.status }, "Extreme RR plan generated");
+
+  // Phase 11A.1: the selected plan becomes a PLAN_READY TradeExecution and is
+  // handed to safety admission. Idempotent through the unique
+  // (alertId, executionProfileId) constraint, so a redelivered job adopts the
+  // existing row instead of creating a second one. Wrapped so an execution
+  // problem can never fail the plan job — the persisted PLAN_READY row is
+  // recovered by the reconciliation scheduler regardless.
+  try {
+    const outcome = await selectedPlanExecutor.handleSelectedPlan(plan, alert.symbol);
+    logger.info({ alertId, outcome: outcome.handled ? outcome.reasonCode : outcome.reasonCode }, "Selected plan execution handling completed");
+  } catch (executionError) {
+    logger.error({ alertId, error: executionError }, "Selected plan execution handling failed (non-fatal)");
+  }
 }
 
 const extremeRRService = new ExtremeRRService(prisma);
+
+// Phase 11A.1 production signal -> execution link.
+const selectedPlanExecutor = new SelectedPlanExecutor({
+  prisma,
+  marginPlanner: new BinanceMarginPlanService(),
+  executions: new ExecutionService(prisma),
+  orchestrator: createExecutionOrchestrator(),
+});
 
 const worker = new Worker<VisionAnalysisJobData>(VISION_ANALYSIS_QUEUE_NAME, processVisionAnalysisJob, {
   connection: bullConnection,
@@ -176,6 +204,11 @@ const cleanupTimer = startCleanupScheduler();
 // a Telegram outage cannot affect any job this worker runs.
 const notificationTimer = startExecutionNotificationScheduler();
 
+// Phase 11A.1: startup execution recovery, then bounded periodic reconciliation.
+// Every mutation still travels through the Phase 6/7 gates, so with the live
+// gates closed this registers work that dispatches nothing.
+const orchestrationTimer = startExecutionOrchestrationScheduler();
+
 // Daily bounded-data-retention cleanup (03:00 Asia/Singapore by default).
 // Failure to schedule must never take down the vision worker.
 let retentionWorker: Awaited<ReturnType<typeof setupRetentionSchedule>> = null;
@@ -192,6 +225,7 @@ logger.info("vision-analysis worker started, waiting for jobs...");
 process.on("SIGTERM", async () => {
   clearInterval(cleanupTimer);
   clearInterval(notificationTimer);
+  clearInterval(orchestrationTimer);
   await worker.close();
   await extremeRRWorker.close();
   await retentionWorker?.close();

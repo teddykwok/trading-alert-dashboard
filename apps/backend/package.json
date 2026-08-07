@@ -21,6 +21,7 @@
     "binance:set-hedge-mode": "tsx src/modules/binance/run-set-hedge-mode.ts",
     "binance:test-order": "tsx src/modules/binance/run-test-order.ts",
     "execution:canary-preflight": "tsx src/modules/execution/run-canary-preflight.ts",
+    "execution:ensure-profile": "tsx src/modules/execution/run-ensure-profile.ts",
     "test": "vitest run",
     "playwright:install": "playwright install chromium"
   },
