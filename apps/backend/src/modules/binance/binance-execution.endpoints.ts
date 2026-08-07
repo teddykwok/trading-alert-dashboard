@@ -2,13 +2,17 @@
  * The COMPLETE set of Binance USDⓈ-M MUTATION endpoints this repository may
  * ever call — Phase 6, LIMIT entry lifecycle only.
  *
- * Four entries. Nothing else has a representation anywhere in the codebase, so
- * the following are structurally impossible rather than merely discouraged:
- * position-mode changes (/fapi/v1/positionSide/dual), multi-assets-mode
- * changes (/fapi/v1/multiAssetsMargin), position margin top-ups
- * (/fapi/v1/positionMargin), batch orders (/fapi/v1/batchOrders), order
- * modification (/fapi/v1/order PUT), cancel-all
- * (/fapi/v1/allOpenOrders), countdown cancel, and every transfer endpoint.
+ * Nothing outside this table is reachable from the EXECUTION client, so the
+ * following are structurally impossible here rather than merely discouraged:
+ * position-mode changes, multi-assets-mode changes
+ * (/fapi/v1/multiAssetsMargin), batch orders (/fapi/v1/batchOrders), order
+ * modification (/fapi/v1/order PUT), cancel-all (/fapi/v1/allOpenOrders),
+ * countdown cancel, test orders, and every transfer endpoint.
+ *
+ * Position mode and test orders ARE representable elsewhere in the repository —
+ * Phase 10 owns them in binance-account-setup.endpoints.ts, a separate table
+ * with its own operator gates and its own authorization contexts. They are
+ * deliberately not reachable from an execution code path.
  *
  * Protection orders (STOP_MARKET / TAKE_PROFIT_MARKET) and MARKET entries are
  * Phase 7+ concerns: they would use POST /fapi/v1/order, which IS listed here,

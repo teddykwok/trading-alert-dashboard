@@ -2,10 +2,16 @@
  * The COMPLETE set of Binance USDⓈ-M endpoints this connector may ever call.
  *
  * Phase 2 is strictly read-only, so every entry here is a documented GET
- * endpoint. There is deliberately no table of write endpoints anywhere in the
- * codebase: order placement, leverage changes, margin-type changes and
- * position-mode changes simply have no representation, so they cannot be
- * called even by mistake.
+ * endpoint. This connector has no write capability of any kind: order
+ * placement, leverage changes, margin-type changes and position-mode changes
+ * have no representation here, so they cannot be called from it even by
+ * mistake.
+ *
+ * Writes live in two separate, narrowly scoped modules with their own
+ * allowlists and authorization contexts — binance-execution.endpoints.ts
+ * (Phase 6/7 trading) and binance-account-setup.endpoints.ts (Phase 10
+ * operator maintenance). Keeping them apart is what lets this file stay
+ * provably GET-only.
  *
  * Paths follow the current official documentation (v3 account/balance/
  * positionRisk supersede the v1/v2 variants; symbolConfig and accountConfig

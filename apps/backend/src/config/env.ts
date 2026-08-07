@@ -112,6 +112,28 @@ const envSchema = z.object({
   BINANCE_API_SECRET: z.string().optional().default(""),
   // Binance rejects recvWindow above 60000 ms; 5000 is the documented default.
   BINANCE_RECV_WINDOW_MS: z.coerce.number().int().positive().max(60_000).default(5000),
+  // --- Phase 10 operator maintenance gates (fail-closed) ---------------------
+  // Strict enum, not `=== "true"`: a typo like "TRUE" or "1" fails startup
+  // rather than silently reading as false, which is the behaviour you want from
+  // a switch that authorizes a POST against a real account.
+  //
+  // Each gate authorizes EXACTLY the one operation it names and nothing else.
+  // Neither has any influence on live entry: turning both on still leaves
+  // EXECUTION_LIVE_ENTRY_ENABLED and EXECUTION_PROTECTION_READY closed, so no
+  // real trade can be placed.
+  //
+  // Authorizes POST /fapi/v1/positionSide/dual (HEDGE only), and only after the
+  // account-wide zero-position / zero-open-order preflight passes.
+  BINANCE_ACCOUNT_SETUP_MUTATIONS_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  // Authorizes POST /fapi/v1/order/test — Binance's NON-MATCHING validation
+  // endpoint. It never reaches the order book and never creates an order.
+  BINANCE_TEST_ORDER_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   // --- Phase 3 dynamic leverage / isolated margin policy (calculation only) ---
   // Kept as decimal STRINGS: they feed decimal.js directly and must never be
   // round-tripped through a JS float. Target is the preferred isolated margin
