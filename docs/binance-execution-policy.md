@@ -975,3 +975,121 @@ When `TELEGRAM_NOTIFICATIONS_ENABLED` is false (or no bot token is configured):
 
 Switching Telegram back on finds every intent still `PENDING` with
 `attemptCount = 0`, and the next tick delivers them in causal order.
+
+## Phase 10 — account connection, mode verification and test orders
+
+Phase 10 prepares a REAL Binance account for the later live canary. It does not
+start the canary, and it does not enable any trading. Every live gate stays
+false throughout and afterwards.
+
+### Three separate mutation surfaces
+
+A path being allowlisted has never meant any caller may use it. After Phase 10
+there are three tables, in three files, with three sets of authorization
+contexts:
+
+| Surface | File | Endpoints |
+| --- | --- | --- |
+| Phase 2 read | `binance.endpoints.ts` | GET only |
+| Phase 6/7 execution | `binance-execution.endpoints.ts` | marginType, leverage, order POST/DELETE, algoOrder POST/DELETE, positionMargin |
+| Phase 10 maintenance | `binance-account-setup.endpoints.ts` | `POST /fapi/v1/positionSide/dual`, `POST /fapi/v1/order/test` |
+
+Phase 10 adds exactly those two POSTs and no DELETE. The maintenance client
+cannot reach `POST /fapi/v1/order`: the path appears nowhere in it, and no
+branch, fallback or retry leads there.
+
+### Gates
+
+Two new fail-closed environment gates, both strict enums so a typo fails
+startup:
+
+- `BINANCE_ACCOUNT_SETUP_MUTATIONS_ENABLED` — authorizes the position-mode POST.
+- `BINANCE_TEST_ORDER_ENABLED` — authorizes the test-order POST.
+
+Each authorizes exactly the operation it names. Enabling both leaves
+`EXECUTION_LIVE_ENTRY_ENABLED`, `EXECUTION_PROTECTION_READY`,
+`EXECUTION_AUTO_ADD_MARGIN_ENABLED` and `EXECUTION_EMERGENCY_CLOSE_MODE`
+untouched, so no real trade becomes possible.
+
+Both mutating CLIs additionally require an explicit confirmation flag. Without
+it they are dry runs.
+
+### Account-wide hedge mode
+
+USDⓈ-M position mode is an ACCOUNT setting, not a per-symbol one, so the
+preflight inspects the whole account rather than the symbol the bot cares
+about. A position or a resting order on any unrelated symbol blocks the change,
+because the change would affect that symbol too.
+
+Order of operations:
+
+1. read the current mode — already `HEDGE` means zero POST, `ALREADY_HEDGE`;
+2. check the gate;
+3. read account-wide non-zero positions and open orders (an unknown count is
+   never treated as zero);
+4. **re-read both immediately before the POST** — a fill or a manual order can
+   land between preflight and mutation, and switching position mode underneath
+   live exposure is exactly what must never happen. Any change aborts with
+   `ACCOUNT_STATE_CHANGED` and zero requests;
+5. mint the authorization context, which itself re-asserts ONE_WAY and both
+   zero counts;
+6. one POST — never a blind retry;
+7. verify with a fresh GET.
+
+A success response is never trusted on its own, and a timeout is never treated
+as failure: the verification GET decides. Timeout then `HEDGE` observed is
+success; timeout then `ONE_WAY` is `HEDGE_MODE_NOT_VERIFIED` and the procedure
+stops. There is no automatic rollback and no path that requests One-way.
+
+Nothing here cancels an order, closes or reduces a position, transfers funds, or
+changes asset mode, leverage or margin type.
+
+### Test orders
+
+`POST /fapi/v1/order/test` is Binance's non-matching validation endpoint. Phase
+10 sends LIMIT + GTC only, with the hedge-mode `positionSide` mandatory and
+every forbidden parameter simply absent — no MARKET, no conditional type, no
+`reduceOnly`, no `closePosition`, no batch.
+
+Before anything is sent: the symbol must be `TRADING` and (when known)
+`PERPETUAL`, the account must be `HEDGE` + `SINGLE_ASSET`, and price and
+quantity are validated against the symbol's own tick size, step size, ranges and
+minimum notional. Violations are **rejected locally, never rounded** — silently
+snapping an operator's price would validate a request they did not make.
+
+The client id uses a `tadtest-*` namespace derived from the request itself,
+distinct from the live `tad-<role>-*` execution ids, so a validation request can
+never borrow or collide with a real reserved entry. No `TradeExecution` and no
+`BinanceOrder` row is created: this is connection validation, not execution.
+
+That the endpoint creates no order is verified rather than assumed. The
+account-wide open-order count is read before and after; any change is reported
+as `CRITICAL_TEST_INVARIANT_VIOLATION` and the procedure stops without
+cancelling anything.
+
+An ambiguous transport result is retried within a bounded budget of two attempts
+and then reported as `TEST_ORDER_RESULT_UNKNOWN`. A definitive rejection is not
+retried. Neither ever falls back to the real order endpoint.
+
+### What a successful test order proves
+
+Authentication, request signing, clock synchronization and the parameters are
+accepted, and the key carries the permission the endpoint requires.
+
+It does **not** prove that a real order would fill, that future balance will be
+sufficient, that the symbol state will stay unchanged, that SL/TP placement
+works, or that the executor is enabled.
+
+### Readiness
+
+The connection ladder tops out at `TEST_ORDER_VALIDATED`. The Phase 10 terminal
+state is `LIVE_CANARY_NOT_ENABLED`: a validated test order is evidence that the
+plumbing works, never authority to trade, and it enables nothing.
+
+### Credentials
+
+Environment-only, exactly as before. Never persisted to Prisma, never returned
+from an API, never sent to the frontend, never logged, and never included in a
+sanitized error. Phase 10 adds no database model — a health result is ephemeral
+and read-only. See `docs/binance-api-key-setup.md` for the manual operator
+checklist and for what can and cannot be verified programmatically.

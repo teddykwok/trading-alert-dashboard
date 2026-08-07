@@ -17,6 +17,9 @@
     "binance:read-only-check": "tsx src/modules/binance/run-read-only-check.ts",
     "binance:margin-plan": "tsx src/modules/binance/run-margin-plan.ts",
     "binance:liquidation-check": "tsx src/modules/binance/run-liquidation-validation.ts",
+    "binance:account-health": "tsx src/modules/binance/run-account-health.ts",
+    "binance:set-hedge-mode": "tsx src/modules/binance/run-set-hedge-mode.ts",
+    "binance:test-order": "tsx src/modules/binance/run-test-order.ts",
     "test": "vitest run",
     "playwright:install": "playwright install chromium"
   },

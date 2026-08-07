@@ -714,7 +714,51 @@ Run from the repo root. Only scripts that actually exist are listed.
 | `pnpm --filter @trading-alert-dashboard/backend binance:read-only-check [SYMBOL]` | Read-only Binance account/symbol health check (no orders, no account changes). |
 | `pnpm --filter @trading-alert-dashboard/backend binance:margin-plan -- <SYMBOL> <LONG\|SHORT> <entry> <stop> [risk]` | Calculation-only dynamic leverage / isolated margin plan (recommends, never applies). |
 | `pnpm --filter @trading-alert-dashboard/backend binance:liquidation-check` | Validates the liquidation estimator against Binance-reported values for ISOLATED positions. |
+| `pnpm --filter @trading-alert-dashboard/backend binance:account-health [SYMBOL]` | Phase 10 read-only account connection / mode / readiness check (sanitized counts only). |
+| `pnpm --filter @trading-alert-dashboard/backend binance:set-hedge-mode [--confirm-set-hedge-mode]` | Operator-only HEDGE mode setup. Dry run without the flag; refuses unless the whole account is empty. |
+| `pnpm --filter @trading-alert-dashboard/backend binance:test-order --symbol=… --side=LONG|SHORT --quantity=… --price=… [--confirm-test-order]` | Operator-only `POST /fapi/v1/order/test` validation. Non-matching: creates no order. |
 | `pnpm --filter @trading-alert-dashboard/backend playwright:install` | Install the Chromium build used for screenshots. |
+
+## Binance account connection (Phase 10)
+
+Phase 10 prepares a real Binance account for a later live canary. It does not
+start the canary and enables no trading — every live gate stays false.
+
+Start with the read-only check, which is always safe:
+
+```bash
+pnpm --filter @trading-alert-dashboard/backend binance:account-health
+```
+
+It verifies connectivity, request signing, clock sync, position mode, asset
+mode, symbol filters and leverage brackets, and prints **sanitized counts** —
+never a balance, position symbol, quantity, order id or credential. A
+`ONE_WAY` or `MULTI_ASSET` account is reported, never corrected.
+
+Two operator commands can change or probe the account. Both need their own
+fail-closed environment gate **and** an explicit confirmation flag; without the
+flag they are dry runs:
+
+| Gate | Authorizes |
+| --- | --- |
+| `BINANCE_ACCOUNT_SETUP_MUTATIONS_ENABLED` | `POST /fapi/v1/positionSide/dual` — HEDGE only |
+| `BINANCE_TEST_ORDER_ENABLED` | `POST /fapi/v1/order/test` — Binance’s non-matching validator |
+
+Position mode is **account-wide**, so hedge-mode setup refuses to run unless the
+entire USDⓈ-M account has zero positions and zero open orders; state is re-read
+immediately before the request, and the result is verified with a fresh read
+rather than trusted from the response. If your account holds exposure, setup is
+blocked and you decide what to do with it — nothing here cancels or closes
+anything.
+
+`/order/test` never reaches the order book. That is verified, not assumed: the
+open-order count is compared before and after, and a change is reported as
+`CRITICAL_TEST_INVARIANT_VIOLATION`. A successful test proves authentication,
+signing and parameters are accepted — not that a real order would fill.
+
+Creating the API key is a **manual** step and is never automated here. See
+[docs/binance-api-key-setup.md](docs/binance-api-key-setup.md) for the checklist
+and for what can and cannot be verified programmatically.
 
 ## Troubleshooting
 
