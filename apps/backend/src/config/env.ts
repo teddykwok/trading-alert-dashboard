@@ -214,6 +214,11 @@ const envSchema = z.object({
   // Skip the Telegram notification when aiConfidence is below this (0..1).
   // 0 (default) means always notify regardless of confidence.
   TELEGRAM_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0),
+  // Phase 9. OPTIONAL separate destination for execution milestone messages so
+  // trade-execution noise can be kept out of the signal chat. Empty (the
+  // default) falls back to TELEGRAM_CHAT_ID. There is deliberately no second
+  // bot token: the same TELEGRAM_BOT_TOKEN sends to both chats.
+  TELEGRAM_EXECUTION_CHAT_ID: z.string().optional().default(""),
 }).superRefine((value, ctx) => {
   // Fail fast at startup rather than silently at the first alert: a real
   // OpenAI vision provider is useless without an API key.
@@ -222,6 +227,19 @@ const envSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ["OPENAI_API_KEY"],
       message: "OPENAI_API_KEY is required when AI_VISION_PROVIDER=openai",
+    });
+  }
+
+  // A Telegram chat id is either a numeric id (negative for groups/channels)
+  // or an @public_name. Rejecting anything else at startup — the same
+  // fail-fast convention used above — turns a typo into an immediate, obvious
+  // error instead of a silently undelivered execution notification. The value
+  // itself is never echoed back in the message.
+  if (value.TELEGRAM_EXECUTION_CHAT_ID !== "" && !/^(-?\d{1,32}|@[A-Za-z][A-Za-z0-9_]{4,31})$/.test(value.TELEGRAM_EXECUTION_CHAT_ID)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["TELEGRAM_EXECUTION_CHAT_ID"],
+      message: "TELEGRAM_EXECUTION_CHAT_ID must be a numeric chat id or an @channel name",
     });
   }
 

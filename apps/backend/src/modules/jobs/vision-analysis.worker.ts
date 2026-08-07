@@ -19,6 +19,7 @@ import { ExtremeRRService } from "../extreme-rr/extreme-rr.service";
 import { bullConnection, type ExtremeRRJobData, type VisionAnalysisJobData } from "./queue";
 import { startCleanupScheduler } from "./cleanup.worker";
 import { setupRetentionSchedule } from "./retention.worker";
+import { startExecutionNotificationScheduler } from "./execution-notification.scheduler";
 
 const alertsService = new AlertsService(prisma);
 
@@ -170,6 +171,11 @@ worker.on("failed", (job, error) => {
 
 const cleanupTimer = startCleanupScheduler();
 
+// Phase 9: the production invocation path for execution Telegram notifications.
+// Bounded, read-only with respect to the trading lifecycle, and self-contained —
+// a Telegram outage cannot affect any job this worker runs.
+const notificationTimer = startExecutionNotificationScheduler();
+
 // Daily bounded-data-retention cleanup (03:00 Asia/Singapore by default).
 // Failure to schedule must never take down the vision worker.
 let retentionWorker: Awaited<ReturnType<typeof setupRetentionSchedule>> = null;
@@ -185,6 +191,7 @@ logger.info("vision-analysis worker started, waiting for jobs...");
 
 process.on("SIGTERM", async () => {
   clearInterval(cleanupTimer);
+  clearInterval(notificationTimer);
   await worker.close();
   await extremeRRWorker.close();
   await retentionWorker?.close();

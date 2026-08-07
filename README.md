@@ -442,6 +442,55 @@ unknown.
 Decimals travel as exact strings, timestamps as ISO-8601, and no credential,
 balance, account identifier or raw Binance/Telegram payload is ever returned.
 
+### Telegram execution notifications (Phase 9)
+
+Durable, idempotent Telegram messages for meaningful execution milestones:
+`LIMIT_PLACED`, `PARTIAL_FILL`, `POSITION_FILLED`, `POSITION_PROTECTED`,
+`ENTRY_EXPIRED`, `CLOSED_TP`, `CLOSED_SL`, `CLOSED_EMERGENCY`,
+`TRADE_SKIPPED` and `CRITICAL_PROTECTION_FAILURE`.
+
+**Observability only.** Nothing here submits or cancels an order, changes
+leverage or margin, closes a position, or alters any Phase 5–7 decision.
+Telegram can be down indefinitely without affecting trading safety or lifecycle
+progress — an undelivered message stays durable, visible and retryable.
+
+A milestone is persisted first and delivered afterwards, so no Telegram call
+ever happens inside a lifecycle transaction. Milestones are derived from
+**durably confirmed** state: a bare submission ACK is not a placed order, and a
+`PROTECTED` status is not protection unless the persisted protection state
+proves full verified coverage of the confirmed exposure. Every notification has
+a deterministic dedupe key enforced by a database unique constraint;
+`PARTIAL_FILL` keys on the cumulative filled quantity and `POSITION_PROTECTED`
+on the verified protected quantity, so a repeated observation is silent while a
+genuine increase is a new message.
+
+Phase 7 `CriticalAlert` stays the one authoritative record for critical
+conditions — Phase 9 delivers it through the same pipeline rather than creating
+a second model, and critical alerts are always delivered before informational
+messages.
+
+Financial semantics are Phase 8’s: net PnL appears only when realized PnL,
+fees and funding are all known; otherwise the message reads "Not available".
+A null fee is never printed as `/usr/bin/bash.00`.
+
+A bounded tick (`runExecutionNotificationTick()`) runs on a 60-second interval,
+started once from the existing worker entrypoint alongside the cleanup and
+retention schedulers and cleared by the same shutdown handler. One pass
+discovers unmaterialized lifecycle history, materializes what it earns,
+delivers critical alerts, delivers informational messages, and returns — no
+loop, no second daemon, no queue, no HTTP route, no Binance polling, and no
+Telegram reply is ever interpreted as a command.
+
+Milestones are recovered from durable history, so a runner that was offline
+across `0.10 → 0.15 → 0.25 FILLED` still sends both partial fills rather than
+only the final fill. Discovery is a per-record checkpoint (never a timestamp
+watermark), and the checkpoint commits in the same transaction as the
+notifications it produced.
+
+With Telegram disabled, intents are still persisted but nothing is sent and no
+retry attempt is consumed, so switching it back on delivers the backlog in
+causal order.
+
 ### Backend — AI vision
 
 | Variable | Description | Default |
@@ -469,6 +518,7 @@ balance, account identifier or raw Binance/Telegram payload is ever returned.
 | `TELEGRAM_SEND_SCREENSHOT` | Send the chart screenshot as a photo (falls back to text on failure). | `true` |
 | `TELEGRAM_NOTIFY_ON_FAILED` | Also notify when an alert becomes `FAILED`. | `false` |
 | `TELEGRAM_MIN_CONFIDENCE` | Skip notifications below this AI confidence (0..1). `0` = always. | `0` |
+| `TELEGRAM_EXECUTION_CHAT_ID` | **Optional** separate chat for execution milestone messages. Empty = use `TELEGRAM_CHAT_ID`. Same bot token either way. | *(empty)* |
 
 ### Backend — screenshot / Playwright
 
