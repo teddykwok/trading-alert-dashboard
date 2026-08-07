@@ -2,11 +2,13 @@ import { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { CanaryPreflightService } from "./canary-preflight.service";
 import {
+  CanaryAuthorizationAlreadyActiveError,
   CanaryAuthorizationService,
   DEFAULT_AUTHORIZATION_TTL_MINUTES,
   MINIMUM_REMAINING_LIFETIME_MS,
-  describeAuthorization,
+  describeAuthorizationWindow,
 } from "./canary-authorization.service";
+import { validateCanarySymbol } from "./canary-symbol-validation";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
 /**
@@ -124,26 +126,56 @@ export async function prepareCanary(): Promise<void> {
       return;
     }
 
-    // --- Defence in depth: narrow the profile to one symbol ---------------
-    // [] means ALLOW ALL in SafetyAdmissionService, so leaving it empty would
-    // be the opposite of what a canary wants.
-    await prisma.executionSafetyPolicy.update({
-      where: { executionProfileId: profile.id },
-      data: { allowedSymbols: [symbol] },
-    });
+    // --- The symbol must be real, BEFORE anything is written --------------
+    // Read-only exchange metadata, the same GETs the Phase 3 planner uses.
+    // Nothing below this point can leave a half-applied state, because the
+    // allowlist change and the authorization share one transaction.
+    const validation = await validateCanarySymbol(symbol);
+    if (!validation.ok) {
+      console.log(`BLOCKED — ${validation.reasonCode}: ${validation.message}`);
+      console.log("Neither allowedSymbols nor any authorization was changed.");
+      process.exitCode = 1;
+      return;
+    }
 
-    const { authorization, token } = await new CanaryAuthorizationService(prisma).prepare({
-      executionProfileId: profile.id,
-      symbol,
-      direction: direction as "LONG" | "SHORT",
-      ttlMinutes,
-    });
+    let prepared: { authorization: { allowedSymbol: string; allowedDirection: string; expiresAt: Date }; token: string };
+    try {
+      prepared = await new CanaryAuthorizationService(prisma).prepare(
+        {
+          executionProfileId: profile.id,
+          symbol: validation.symbol,
+          direction: direction as "LONG" | "SHORT",
+          ttlMinutes,
+        },
+        // Defence in depth, in the SAME transaction: [] means ALLOW ALL in
+        // SafetyAdmissionService, so leaving it empty would be the opposite of
+        // what a canary wants.
+        async (tx) => {
+          await tx.executionSafetyPolicy.update({
+            where: { executionProfileId: profile.id },
+            data: { allowedSymbols: [validation.symbol] },
+          });
+        }
+      );
+    } catch (error) {
+      if (error instanceof CanaryAuthorizationAlreadyActiveError) {
+        console.log(`BLOCKED — ${error.reasonCode}: ${error.message}`);
+        console.log("Nothing was changed. Explicit disarm is required before a new window opens.");
+        process.exitCode = 1;
+        return;
+      }
+      throw error;
+    }
+
+    const { authorization, token } = prepared;
 
     console.log("PREPARED.");
     line("symbol", authorization.allowedSymbol);
     line("direction", authorization.allowedDirection);
     line("expiresAt", authorization.expiresAt.toISOString());
-    line("allowedSymbols", `[${symbol}]`);
+    // The VALIDATED symbol, which is what was actually written — not the raw
+    // argument, which may have been a prefixed or suffixed ticker.
+    line("allowedSymbols", `[${validation.symbol}]`);
     line("profile isEnabled", profile.isEnabled);
     line("profile killSwitch", true);
     console.log("");
@@ -182,9 +214,16 @@ export async function armCanary(): Promise<void> {
     const profile = resolution.profile;
     const authorizations = new CanaryAuthorizationService(prisma);
     const active = await authorizations.findActive(profile.id);
+    const activeCount = await authorizations.countActive(profile.id);
 
     const blockers: string[] = [];
     if (!active) blockers.push("no active unexpired authorization is prepared");
+    // Prepare now refuses to create a second window, but arming re-checks it
+    // independently: this is the last gate before real money, and it should not
+    // depend on another command having behaved.
+    if (activeCount > 1) {
+      blockers.push(`${activeCount} authorizations are active; exactly one is required — run execution:disarm-canary`);
+    }
     if (active && active.expiresAt.getTime() - Date.now() < MINIMUM_REMAINING_LIFETIME_MS) {
       // Arming, a final preflight and sending the alert all take time.
       blockers.push("the authorization is too close to expiry; prepare a fresh one");
@@ -205,6 +244,7 @@ export async function armCanary(): Promise<void> {
     console.log("Preconditions");
     line("profile", `${profile.accountIdentifier} (${profile.environment})`);
     line("authorization", active ? `${active.allowedSymbol} ${active.allowedDirection}` : "none");
+    line("active authorization count", activeCount);
     line("expiresAt", active ? active.expiresAt.toISOString() : null);
     line("env gates armed", environmentIsArmed());
     line("Binance positions", preflight.gathered.binance.nonZeroPositionCount);
@@ -306,10 +346,14 @@ export async function closeCanaryWindow(): Promise<void> {
     console.log("CLOSED — profile kill switch is engaged. No new admission is possible.");
     line("active executions", active);
     line("recovery required", recovery);
-    const latest = authorization[0] ?? null;
-    const status = describeAuthorization(latest);
-    line("authorization", status.prepared ? `${status.symbol} ${status.direction}` : "none");
+    const status = describeAuthorizationWindow(authorization);
+    line("authorization active", status.prepared);
+    line("authorization symbol", status.symbol);
+    line("authorization direction", status.direction);
     line("consumed", status.consumed);
+    line("revoked", status.revoked);
+    line("active authorization count", status.activeCount);
+    line("authorizations on record", status.onRecord);
     console.log("");
     if (active > 0 || recovery > 0) {
       console.log("A live execution still exists. It was NOT cancelled and NOT closed.");
