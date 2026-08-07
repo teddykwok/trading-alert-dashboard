@@ -311,7 +311,20 @@ describe("locked Phase 7 configuration", () => {
       "EXECUTION_AUTO_ADD_MARGIN_ENABLED",
       "EXECUTION_EMERGENCY_CLOSE_MODE",
     ]) {
-      expect(real).not.toContain(name);
+      const value = realEnvGateValue(real, name);
+      const safe = name === "EXECUTION_EMERGENCY_CLOSE_MODE" ? "DISABLED" : "false";
+      expect(value === null || value === safe, `${name} must be absent or ${safe}`).toBe(true);
     }
   });
 });
+
+/**
+ * The real .env may now name a gate EXPLICITLY — making the safe posture
+ * visible in the file is better than relying on an invisible code default.
+ * What must never happen is a gate being ENABLED there, so the assertion is
+ * on the VALUE, not on the mere presence of the name.
+ */
+function realEnvGateValue(source: string, name: string): string | null {
+  const match = new RegExp(`^s*${name}s*=s*(.*)$`, "m").exec(source);
+  return match ? match[1].trim() : null;
+}

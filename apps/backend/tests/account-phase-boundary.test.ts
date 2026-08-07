@@ -294,10 +294,15 @@ describe("credential protection", () => {
     } catch {
       return;
     }
-    expect(real).not.toContain("BINANCE_ACCOUNT_SETUP_MUTATIONS_ENABLED");
-    expect(real).not.toContain("BINANCE_TEST_ORDER_ENABLED");
-    expect(real).not.toContain("EXECUTION_LIVE_ENTRY_ENABLED");
-    expect(real).not.toContain("EXECUTION_PROTECTION_READY");
+    for (const gate of [
+      "BINANCE_ACCOUNT_SETUP_MUTATIONS_ENABLED",
+      "BINANCE_TEST_ORDER_ENABLED",
+      "EXECUTION_LIVE_ENTRY_ENABLED",
+      "EXECUTION_PROTECTION_READY",
+    ]) {
+      const value = realEnvGateValue(real, gate);
+      expect(value === null || value === "false", `${gate} must be absent or false`).toBe(true);
+    }
   });
 
   it("never prints a credential from a CLI", () => {
@@ -468,3 +473,14 @@ describe("operator documentation", () => {
     expect(doc).not.toMatch(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
   });
 });
+
+/**
+ * The real .env may now name a gate EXPLICITLY — making the safe posture
+ * visible in the file is better than relying on an invisible code default.
+ * What must never happen is a gate being ENABLED there, so the assertion is
+ * on the VALUE, not on the mere presence of the name.
+ */
+function realEnvGateValue(source: string, name: string): string | null {
+  const match = new RegExp(`^s*${name}s*=s*(.*)$`, "m").exec(source);
+  return match ? match[1].trim() : null;
+}
