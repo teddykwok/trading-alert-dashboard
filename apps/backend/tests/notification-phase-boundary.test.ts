@@ -389,8 +389,10 @@ describe("execution chat configuration", () => {
     }
     // Phase 9 adds nothing to the real environment.
     expect(real).not.toContain("TELEGRAM_EXECUTION_CHAT_ID");
-    expect(real).not.toContain("EXECUTION_LIVE_ENTRY_ENABLED");
-    expect(real).not.toContain("EXECUTION_PROTECTION_READY");
+    for (const gate of ["EXECUTION_LIVE_ENTRY_ENABLED", "EXECUTION_PROTECTION_READY"]) {
+      const value = realEnvGateValue(real, gate);
+      expect(value === null || value === "false", `${gate} must be absent or false`).toBe(true);
+    }
   });
 });
 
@@ -424,3 +426,12 @@ describe("existing Telegram behaviour", () => {
     expect(readCode(FORMAT)).not.toContain("parse_mode");
   });
 });
+
+/**
+ * The real .env may name a gate EXPLICITLY; what must never happen is one
+ * being ENABLED there, so the assertion is on the VALUE not the name.
+ */
+function realEnvGateValue(source: string, name: string): string | null {
+  const match = new RegExp(`^s*${name}s*=s*(.*)$`, "m").exec(source);
+  return match ? match[1].trim() : null;
+}

@@ -267,7 +267,20 @@ describe("locked configuration", () => {
     } catch {
       return; // No local .env — nothing to protect.
     }
-    expect(real).not.toContain("EXECUTION_LIVE_ENTRY_ENABLED");
-    expect(real).not.toContain("EXECUTION_PROTECTION_READY");
+    for (const gate of ["EXECUTION_LIVE_ENTRY_ENABLED", "EXECUTION_PROTECTION_READY"]) {
+      const value = realEnvGateValue(real, gate);
+      expect(value === null || value === "false", `${gate} must be absent or false`).toBe(true);
+    }
   });
 });
+
+/**
+ * The real .env may now name a gate EXPLICITLY — making the safe posture
+ * visible in the file is better than relying on an invisible code default.
+ * What must never happen is a gate being ENABLED there, so the assertion is
+ * on the VALUE, not on the mere presence of the name.
+ */
+function realEnvGateValue(source: string, name: string): string | null {
+  const match = new RegExp(`^s*${name}s*=s*(.*)$`, "m").exec(source);
+  return match ? match[1].trim() : null;
+}
