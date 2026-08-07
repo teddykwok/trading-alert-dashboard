@@ -1,7 +1,6 @@
-import { readFileSync } from "node:fs";
-import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
+import { connectTestDatabase } from "./helpers/test-database";
 import type { DynamicLeveragePlan } from "@trading-alert-dashboard/shared";
 
 /**
@@ -29,36 +28,11 @@ process.env.EXECUTION_SL_WORKING_TYPE = "MARK_PRICE";
 process.env.EXECUTION_TP_WORKING_TYPE = "CONTRACT_PRICE";
 process.env.BINANCE_FUTURES_REST_BASE_URL = "https://testnet.binancefuture.example";
 
-function resolveDatabaseUrl(): string | null {
-  for (const candidate of [path.join(process.cwd(), ".env"), path.join(process.cwd(), "apps", "backend", ".env")]) {
-    try {
-      const match = /^DATABASE_URL\s*=\s*"?([^"\r\n]+)"?\s*$/m.exec(readFileSync(candidate, "utf8"));
-      if (match) return match[1].trim();
-    } catch {
-      // Try the next candidate path.
-    }
-  }
-  return process.env.DATABASE_URL ?? null;
-}
-
-const databaseUrl = resolveDatabaseUrl();
-const prisma = databaseUrl ? new PrismaClient({ datasources: { db: { url: databaseUrl } } }) : null;
-
-let available = false;
-if (prisma) {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    available = true;
-  } catch (error) {
-    console.warn(
-      `[phase7] Skipping protection integration tests — no database reachable: ${
-        error instanceof Error ? error.message.split("\n")[0] : String(error)
-      }`
-    );
-  }
-} else {
-  console.warn("[phase7] Skipping protection integration tests — no DATABASE_URL could be resolved.");
-}
+// Integration state lives in the DEDICATED test database. The helper refuses
+// to fall back to the runtime/canary database, so a misconfiguration fails the
+// suite instead of quietly writing synthetic executions into runtime state.
+const { prisma: testDatabase, available } = await connectTestDatabase();
+const prisma: PrismaClient | null = testDatabase;
 
 const { ExecutionService } = await import("../src/modules/execution/execution.service");
 const { ProtectionLifecycleService } = await import("../src/modules/execution/protection-lifecycle.service");

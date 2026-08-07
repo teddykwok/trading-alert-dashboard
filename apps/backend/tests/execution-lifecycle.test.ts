@@ -269,9 +269,29 @@ describe("phase 4 safety boundary", () => {
 
   it("stores no credential field anywhere in the schema", () => {
     const phase4 = schema.slice(schema.indexOf("model ExecutionProfile"));
+
+    // Scoped to STORED COLUMNS. A model may legitimately be NAMED for a
+    // concept (Phase 11B.0's ExecutionCanaryAuthorization), and a relation
+    // field back to it stores nothing; what must never exist is a column that
+    // could hold a credential.
+    const modelNames = new Set([...schema.matchAll(/^model (\w+)/gm)].map((match) => match[1]));
+    const fieldNames = [...phase4.matchAll(/^ {2}(\w+)\s+(\w+)/gm)]
+      .filter((match) => !modelNames.has(match[2]))
+      .map((match) => match[1]);
+
+    // The single deliberate exception, and why it is not a credential: it is a
+    // SHA-256 digest of a one-shot, minutes-long canary authorization. The raw
+    // value is shown to the operator once and never written anywhere.
+    const allowed = new Set(["tokenHash"]);
+
     for (const forbidden of ["apiKey", "apiSecret", "secret", "signature", "authorization", "token", "password"]) {
-      expect(phase4.toLowerCase()).not.toContain(forbidden.toLowerCase() + " ");
+      const offenders = fieldNames.filter(
+        (name) => !allowed.has(name) && name.toLowerCase().includes(forbidden.toLowerCase())
+      );
+      expect(`${forbidden}:${offenders.join(",")}`).toBe(`${forbidden}:`);
     }
+    // And no raw-value column beside the digest.
+    expect(fieldNames).not.toContain("token");
     // The profile keeps only an opaque alias.
     expect(phase4).toContain("accountIdentifier");
   });

@@ -438,6 +438,7 @@ model ExecutionProfile {
 
   executions   TradeExecution[]
   safetyPolicy ExecutionSafetyPolicy?
+  canaryAuthorizations ExecutionCanaryAuthorization[]
 
   @@unique([exchange, environment, accountIdentifier])
   @@index([isEnabled])
@@ -1008,4 +1009,57 @@ model ExecutionNotification {
 
   @@index([tradeExecutionId])
   @@index([deliveryStatus, createdAt])
+}
+
+// ===========================================================================
+// Phase 11B.0 — one-shot live-canary authorization
+// ===========================================================================
+
+enum CanaryDirection {
+  LONG
+  SHORT
+}
+
+/// Durable proof that ONE specific signal is the intended live canary.
+///
+/// Capacity limits protect the account from over-trading; they do not identify
+/// WHICH trade was meant. `allowedSymbols` narrows the symbol but still admits
+/// either direction and any number of signals on it. This row is the missing
+/// identity: one profile, one symbol, one direction, one use, short-lived.
+///
+/// It is an ADDITIONAL guard. It never bypasses the global kill switch, the
+/// profile kill switch, `isEnabled`, SafetyAdmission, capacity, the risk
+/// ceiling or the live-entry/protection gates — a match means "this is the
+/// intended canary", never "skip the normal checks".
+///
+/// Restrict on the profile: this is operator-authorization history and must not
+/// vanish implicitly.
+model ExecutionCanaryAuthorization {
+  id                 String           @id @default(cuid())
+  executionProfileId String
+  executionProfile   ExecutionProfile @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)
+
+  /// Normalized uppercase symbol this authorization admits.
+  allowedSymbol   String
+  allowedDirection CanaryDirection
+
+  /// SHA-256 of the one-time operator token. The raw token is shown once at
+  /// prepare time and never persisted, logged or returned anywhere.
+  tokenHash String @unique
+
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  /// Set the instant the authorization is bound to a signal. Binding is what
+  /// makes it one-shot; it is deliberately distinct from the execution having
+  /// SUCCEEDED, so a crash after binding leaves the SAME execution recoverable
+  /// while never letting a different one reuse the authorization.
+  consumedAt        DateTime?
+  consumedAlertId   String?
+  consumedExecutionId String?
+
+  revokedAt DateTime?
+
+  @@index([executionProfileId])
+  @@index([expiresAt])
 }

@@ -3,6 +3,8 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { PrismaClient } from "@prisma/client";
 
+import { connectTestDatabase } from "./helpers/test-database";
+
 /**
  * FINAL Phase 11A validation — REAL services, FAKE network only.
  *
@@ -41,30 +43,11 @@ process.env.BINANCE_FUTURES_REST_BASE_URL = "https://testnet.binancefuture.com";
 process.env.EXECUTION_LIVE_ENTRY_ENABLED = "true";
 process.env.EXECUTION_PROTECTION_READY = "true";
 
-function resolveDatabaseUrl(): string | null {
-  for (const candidate of [path.join(process.cwd(), ".env"), path.join(process.cwd(), "apps", "backend", ".env")]) {
-    try {
-      const match = /^DATABASE_URL\s*=\s*"?([^"\r\n]+)"?\s*$/m.exec(readFileSync(candidate, "utf8"));
-      if (match) return match[1].trim();
-    } catch {
-      // Try the next candidate path.
-    }
-  }
-  return process.env.DATABASE_URL ?? null;
-}
-
-const databaseUrl = resolveDatabaseUrl();
-const prisma = databaseUrl ? new PrismaClient({ datasources: { db: { url: databaseUrl } } }) : null;
-
-let available = false;
-if (prisma) {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    available = true;
-  } catch {
-    console.warn("[phase11-real] Skipping — no database reachable.");
-  }
-}
+// Integration state lives in the DEDICATED test database. The helper refuses
+// to fall back to the runtime/canary database, so a misconfiguration fails the
+// suite instead of quietly writing synthetic executions into runtime state.
+const { prisma: testDatabase, available } = await connectTestDatabase();
+const prisma: PrismaClient | null = testDatabase;
 
 const { ExecutionService } = await import("../src/modules/execution/execution.service");
 const { SafetyAdmissionService } = await import("../src/modules/execution/safety-admission.service");
@@ -525,7 +508,188 @@ beforeAll(() => {
 });
 
 /**
- * Ownership-based teardown for every profile this suite created.
+ * The suite's ownership namespace.
+ *
+ * Cleanup is keyed on this PREFIX in the database, not on an in-memory list of
+ * ids. That distinction is the fix for the leak that started this work: the
+ * previous teardown could only delete profiles it had personally pushed into an
+ * array during the current process, so a worker that died between creating a
+ * profile and running its hooks orphaned the whole graph permanently — nothing
+ * in any later run would ever look for it again. A namespace query reclaims
+ * those orphans on the next run.
+ *
+ * Ownership stays narrow: the prefix AND the TESTNET environment must both
+ * match. No production row, and no row belonging to another suite, is reachable
+ * from here, and nothing is ever truncated.
+ */
+const TEST_PROFILE_PREFIX = `${TAG}-`;
+
+/** Every profile in this suite's namespace, including orphans from earlier runs. */
+async function ownedProfileIds(): Promise<string[]> {
+  if (!prisma || !available) return [];
+  const rows = await prisma.executionProfile.findMany({
+    where: { accountIdentifier: { startsWith: TEST_PROFILE_PREFIX }, environment: "TESTNET" },
+    select: { id: true },
+  });
+  return rows.map((row) => row.id);
+}
+
+/** Counts of everything the namespace owns. All zero means no residue. */
+interface OwnedRowCounts {
+  profiles: number;
+  executions: number;
+  admissions: number;
+  orders: number;
+  events: number;
+  protectionStates: number;
+  protectionVerifications: number;
+  marginIntents: number;
+  criticalAlerts: number;
+  notifications: number;
+  checkpoints: number;
+  canaryAuthorizations: number;
+  alerts: number;
+}
+
+async function countOwnedRows(): Promise<OwnedRowCounts> {
+  const profileIds = await ownedProfileIds();
+  const executionIds = (
+    await prisma!.tradeExecution.findMany({
+      where: { executionProfileId: { in: profileIds } },
+      select: { id: true },
+    })
+  ).map((row) => row.id);
+  const eventIds = (
+    await prisma!.executionEvent.findMany({ where: { tradeExecutionId: { in: executionIds } }, select: { id: true } })
+  ).map((row) => row.id);
+  const verificationIds = (
+    await prisma!.executionProtectionVerification.findMany({
+      where: { tradeExecutionId: { in: executionIds } },
+      select: { id: true },
+    })
+  ).map((row) => row.id);
+
+  const owned = { tradeExecutionId: { in: executionIds } };
+  return {
+    profiles: profileIds.length,
+    executions: executionIds.length,
+    admissions: await prisma!.safetyAdmission.count({ where: owned }),
+    orders: await prisma!.binanceOrder.count({ where: owned }),
+    events: eventIds.length,
+    protectionStates: await prisma!.executionProtectionState.count({ where: owned }),
+    protectionVerifications: verificationIds.length,
+    marginIntents: await prisma!.marginAdjustmentIntent.count({ where: owned }),
+    criticalAlerts: await prisma!.criticalAlert.count({ where: owned }),
+    notifications: await prisma!.executionNotification.count({ where: owned }),
+    checkpoints: await prisma!.executionNotificationCheckpoint.count({
+      where: { OR: [{ executionEventId: { in: eventIds } }, { protectionVerificationId: { in: verificationIds } }] },
+    }),
+    canaryAuthorizations: await prisma!.executionCanaryAuthorization.count({
+      where: { executionProfileId: { in: profileIds } },
+    }),
+    alerts: await prisma!.alert.count({ where: { indicatorName: { startsWith: TAG } } }),
+  };
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Waits until the owned graph stops changing.
+ *
+ * A scenario that times out, or a reconciliation whose last write lands after
+ * the assertion already returned, keeps inserting rows into a graph teardown is
+ * walking. Deleting underneath that produces exactly the failure this replaces:
+ * `ExecutionNotification_tradeExecutionId_fkey` violated by a notification
+ * written between the child delete and the execution delete.
+ *
+ * Two identical consecutive samples is the signal. It is a bounded wait rather
+ * than a guarantee, which is why the delete below also retries.
+ */
+async function waitForOwnedWorkToStop(): Promise<void> {
+  let previous: string | null = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const current = JSON.stringify(await countOwnedRows());
+    if (current === previous) return;
+    previous = current;
+    await sleep(25);
+  }
+}
+
+/**
+ * Deletes the namespace's entire object graph in FK order.
+ *
+ * Every child of TradeExecution is `onDelete: Restrict`, so a missed row makes
+ * the parent delete fail loudly instead of cascading silently — the right
+ * schema choice for financial history, and the reason this must be exhaustive.
+ * Ids are re-queried on every attempt so a row created during the previous
+ * attempt is picked up rather than skipped.
+ */
+async function deleteOwnedGraph(): Promise<void> {
+  const lastAttempt = 5;
+  for (let attempt = 1; attempt <= lastAttempt; attempt += 1) {
+    try {
+      const profileIds = await ownedProfileIds();
+      if (profileIds.length === 0) return;
+
+      const executionIds = (
+        await prisma!.tradeExecution.findMany({
+          where: { executionProfileId: { in: profileIds } },
+          select: { id: true },
+        })
+      ).map((row) => row.id);
+
+      if (executionIds.length > 0) {
+        const owned = { tradeExecutionId: { in: executionIds } };
+        // Checkpoints first: they point at events and verifications, and both
+        // of those are about to go.
+        await prisma!.executionNotificationCheckpoint.deleteMany({
+          where: {
+            OR: [
+              { executionEvent: { tradeExecutionId: { in: executionIds } } },
+              { protectionVerification: { tradeExecutionId: { in: executionIds } } },
+            ],
+          },
+        });
+        await prisma!.executionNotification.deleteMany({ where: owned });
+        await prisma!.criticalAlert.deleteMany({ where: owned });
+        await prisma!.executionProtectionVerification.deleteMany({ where: owned });
+        await prisma!.marginAdjustmentIntent.deleteMany({ where: owned });
+        await prisma!.safetyAdmission.deleteMany({ where: owned });
+        await prisma!.binanceOrder.deleteMany({ where: owned });
+        await prisma!.executionProtectionState.deleteMany({ where: owned });
+        await prisma!.executionEvent.deleteMany({ where: owned });
+        await prisma!.tradeExecution.deleteMany({ where: { id: { in: executionIds } } });
+      }
+
+      await prisma!.alert.deleteMany({ where: { indicatorName: { startsWith: TAG } } });
+      await prisma!.executionCanaryAuthorization.deleteMany({
+        where: { executionProfileId: { in: profileIds } },
+      });
+      await prisma!.executionSafetyPolicy.deleteMany({ where: { executionProfileId: { in: profileIds } } });
+
+      // Final ownership-scoped re-query: a profile is only deleted once it owns
+      // nothing, so a late execution can never be orphaned by removing its
+      // parent out from under it.
+      const stillOwning = (
+        await prisma!.tradeExecution.findMany({
+          where: { executionProfileId: { in: profileIds } },
+          select: { executionProfileId: true },
+        })
+      ).map((row) => row.executionProfileId);
+      const deletable = profileIds.filter((id) => !stillOwning.includes(id));
+      await prisma!.executionProfile.deleteMany({ where: { id: { in: deletable } } });
+
+      if (deletable.length === profileIds.length) return;
+      throw new Error("a late execution appeared during teardown");
+    } catch (error) {
+      if (attempt === lastAttempt) throw error;
+      await sleep(100);
+    }
+  }
+}
+
+/**
+ * Ownership-based teardown for every profile in this suite's namespace.
  *
  * A unique profile per scenario is NOT sufficient on its own:
  * `countRecoveryRequired()` deliberately counts across the whole database
@@ -534,62 +698,11 @@ beforeAll(() => {
  * earlier scenario blocks a later one even under a different profile, and the
  * only correct fix is to remove each scenario's object graph rather than to
  * relax the production rule.
- *
- * Deletes only rows owned by this suite's profiles, in FK order.
  */
 async function cleanupOwnedGraphs(): Promise<void> {
-  if (!prisma || !available || createdProfileIds.length === 0) return;
-
-  const ids = (
-    await prisma.tradeExecution.findMany({
-      where: { executionProfileId: { in: createdProfileIds } },
-      select: { id: true },
-    })
-  ).map((e) => e.id);
-
-  if (ids.length > 0) {
-    const eventIds = (
-      await prisma.executionEvent.findMany({ where: { tradeExecutionId: { in: ids } }, select: { id: true } })
-    ).map((e) => e.id);
-    const verificationIds = (
-      await prisma.executionProtectionVerification.findMany({
-        where: { tradeExecutionId: { in: ids } },
-        select: { id: true },
-      })
-    ).map((e) => e.id);
-
-    await prisma.executionNotificationCheckpoint.deleteMany({
-      where: {
-        OR: [{ executionEventId: { in: eventIds } }, { protectionVerificationId: { in: verificationIds } }],
-      },
-    });
-    for (const model of [
-      "executionNotification",
-      "criticalAlert",
-      "executionProtectionVerification",
-      "marginAdjustmentIntent",
-      "safetyAdmission",
-      "binanceOrder",
-      "executionProtectionState",
-      "executionEvent",
-    ] as const) {
-      await (prisma as never as Record<string, { deleteMany: (a: unknown) => Promise<unknown> }>)[model].deleteMany({
-        where: { tradeExecutionId: { in: ids } },
-      });
-    }
-    // Re-read and clear any event written after the first snapshot (a
-    // reconciliation inside the test can append one), so the Restrict FK on
-    // TradeExecution cannot block the delete.
-    await prisma.executionNotificationCheckpoint.deleteMany({
-      where: { executionEvent: { tradeExecutionId: { in: ids } } },
-    });
-    await prisma.executionEvent.deleteMany({ where: { tradeExecutionId: { in: ids } } });
-    await prisma.tradeExecution.deleteMany({ where: { id: { in: ids } } });
-  }
-
-  await prisma.alert.deleteMany({ where: { indicatorName: { startsWith: TAG } } });
-  await prisma.executionSafetyPolicy.deleteMany({ where: { executionProfileId: { in: createdProfileIds } } });
-  await prisma.executionProfile.deleteMany({ where: { id: { in: createdProfileIds } } });
+  if (!prisma || !available) return;
+  await waitForOwnedWorkToStop();
+  await deleteOwnedGraph();
   createdProfileIds.length = 0;
 }
 
@@ -598,18 +711,27 @@ afterEach(cleanupOwnedGraphs);
 afterAll(async () => {
   vi.unstubAllGlobals();
   if (!prisma) return;
-  if (available && createdProfileIds.length > 0) {
-    const ids = (await prisma.tradeExecution.findMany({ where: { executionProfileId: { in: createdProfileIds } }, select: { id: true } })).map((e) => e.id);
-    const evIds = (await prisma.executionEvent.findMany({ where: { tradeExecutionId: { in: ids } }, select: { id: true } })).map((e) => e.id);
-    const vfIds = (await prisma.executionProtectionVerification.findMany({ where: { tradeExecutionId: { in: ids } }, select: { id: true } })).map((e) => e.id);
-    await prisma.executionNotificationCheckpoint.deleteMany({ where: { OR: [{ executionEventId: { in: evIds } }, { protectionVerificationId: { in: vfIds } }] } });
-    for (const model of ["executionNotification", "criticalAlert", "executionProtectionVerification", "marginAdjustmentIntent", "safetyAdmission", "binanceOrder", "executionProtectionState", "executionEvent"] as const) {
-      await (prisma as never as Record<string, { deleteMany: (a: unknown) => Promise<unknown> }>)[model].deleteMany({ where: { tradeExecutionId: { in: ids } } });
-    }
-    await prisma.tradeExecution.deleteMany({ where: { id: { in: ids } } });
-    await prisma.alert.deleteMany({ where: { indicatorName: { startsWith: TAG } } });
-    await prisma.executionSafetyPolicy.deleteMany({ where: { executionProfileId: { in: createdProfileIds } } });
-    await prisma.executionProfile.deleteMany({ where: { id: { in: createdProfileIds } } });
+  if (available) {
+    await cleanupOwnedGraphs();
+
+    // No-residue assertion, scoped strictly to this suite's namespace. It never
+    // claims the database is empty — only that nothing this suite owns is left.
+    const remaining = await countOwnedRows();
+    expect(remaining).toEqual({
+      profiles: 0,
+      executions: 0,
+      admissions: 0,
+      orders: 0,
+      events: 0,
+      protectionStates: 0,
+      protectionVerifications: 0,
+      marginIntents: 0,
+      criticalAlerts: 0,
+      notifications: 0,
+      checkpoints: 0,
+      canaryAuthorizations: 0,
+      alerts: 0,
+    });
   }
   await prisma.$disconnect();
 });

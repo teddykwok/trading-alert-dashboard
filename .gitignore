@@ -27,3 +27,7 @@ apps/backend/playwright-report/
 .env
 apps/backend/.env
 apps/frontend/.env
+
+# Test-only database configuration (local credentials, never runtime).
+.env.test
+apps/backend/.env.test

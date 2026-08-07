@@ -42,9 +42,16 @@ function harness(options: {
   createThrowsP2002?: boolean;
   existingExecutionId?: string;
   profileFound?: boolean;
+  /** Phase 11B.0: how many authorizations exist (>0 puts the profile in canary mode). */
+  canaryCount?: number;
+  /** The authorization bound to THIS alert, if any. */
+  canaryBound?: Record<string, unknown> | null;
+  /** The execution the bound authorization already produced, if any. */
+  canaryOwnerAlertId?: string;
 } = {}) {
   const creates: unknown[] = [];
   const admissions: string[] = [];
+  const canaryBindings: unknown[] = [];
   let createCalls = 0;
 
   const executor = new SelectedPlanExecutor({
@@ -55,6 +62,16 @@ function harness(options: {
       },
       tradeExecution: {
         findFirst: async () => (options.existingExecutionId ? { id: options.existingExecutionId } : null),
+        findUnique: async () =>
+          options.canaryOwnerAlertId ? { alertId: options.canaryOwnerAlertId } : null,
+      },
+      executionCanaryAuthorization: {
+        count: async () => options.canaryCount ?? 0,
+        findFirst: async () => options.canaryBound ?? null,
+        updateMany: async (args: unknown) => {
+          canaryBindings.push(args);
+          return { count: 1 };
+        },
       },
     } as never,
     marginPlanner: {
@@ -91,8 +108,93 @@ function harness(options: {
     profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
   });
 
-  return { executor, creates, admissions, createCalls: () => createCalls };
+  return { executor, creates, admissions, canaryBindings, createCalls: () => createCalls };
 }
+
+// ---------------------------------------------------------------------------
+// Phase 11B.0 — canary authorization
+// ---------------------------------------------------------------------------
+
+describe("canary authorization gate", () => {
+  const BOUND = { id: "auth-1", allowedSymbol: "FRAXUSDT", allowedDirection: "LONG", consumedExecutionId: null };
+
+  it("is inert when no authorization has ever been prepared", async () => {
+    const { executor, creates, canaryBindings } = harness({ canaryCount: 0 });
+    const result = await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect(result.handled).toBe(true);
+    expect(creates).toHaveLength(1);
+    // Nothing to bind, so nothing was written.
+    expect(canaryBindings).toHaveLength(0);
+  });
+
+  it("blocks an unauthorized signal once the profile is in canary mode", async () => {
+    const { executor, creates, admissions } = harness({ canaryCount: 1, canaryBound: null });
+    const result = await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect(result.handled).toBe(false);
+    expect((result as { reasonCode: string }).reasonCode).toBe("CANARY_AUTHORIZATION_REQUIRED");
+    expect(creates).toHaveLength(0);
+    expect(admissions).toHaveLength(0);
+  });
+
+  it("admits the authorized signal and records which execution it produced", async () => {
+    const { executor, creates, admissions, canaryBindings } = harness({ canaryCount: 1, canaryBound: BOUND });
+    const result = await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect(result.handled).toBe(true);
+    expect(creates).toHaveLength(1);
+    // Still goes through normal admission — the authorization grants nothing.
+    expect(admissions).toEqual(["exec-1"]);
+    expect(canaryBindings).toHaveLength(1);
+  });
+
+  it("blocks the right symbol in the wrong direction", async () => {
+    const { executor, creates } = harness({
+      canaryCount: 1,
+      canaryBound: { ...BOUND, allowedDirection: "SHORT" },
+    });
+    const result = await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect((result as { reasonCode: string }).reasonCode).toBe("CANARY_AUTHORIZATION_WRONG_DIRECTION");
+    expect(creates).toHaveLength(0);
+  });
+
+  it("blocks a different symbol", async () => {
+    const { executor, creates } = harness({ canaryCount: 1, canaryBound: { ...BOUND, allowedSymbol: "BTCUSDT" } });
+    const result = await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect((result as { reasonCode: string }).reasonCode).toBe("CANARY_AUTHORIZATION_WRONG_SYMBOL");
+    expect(creates).toHaveLength(0);
+  });
+
+  it("refuses to let a second execution adopt an authorization already bound to another", async () => {
+    const { executor, creates } = harness({
+      canaryCount: 1,
+      canaryBound: { ...BOUND, consumedExecutionId: "exec-earlier" },
+      canaryOwnerAlertId: "alert-somebody-else",
+    });
+    const result = await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect((result as { reasonCode: string }).reasonCode).toBe("CANARY_AUTHORIZATION_ALREADY_CONSUMED");
+    expect(creates).toHaveLength(0);
+  });
+
+  it("lets the ORIGINAL execution recover after a crash", async () => {
+    // Bound, already tied to an execution — but that execution is this alert's.
+    const { executor, creates, admissions } = harness({
+      canaryCount: 1,
+      canaryBound: { ...BOUND, consumedExecutionId: "exec-1" },
+      canaryOwnerAlertId: "alert-1",
+      existingExecutionId: "exec-1",
+    });
+    const result = await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect(result.handled).toBe(true);
+    expect(admissions).toEqual(["exec-1"]);
+    expect(creates).toHaveLength(1);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Eligibility

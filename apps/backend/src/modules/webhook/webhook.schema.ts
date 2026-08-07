@@ -18,6 +18,10 @@ export const tradingViewWebhookSchema = z.object({
   triggeredAt: z.string().min(1, "triggeredAt is required"),
   exchange: z.string().optional(),
   note: z.string().optional(),
+  // Phase 11B.0. Present ONLY on a deliberately created canary alert. It is not
+  // a Binance credential, but it authorizes a real-money trade, so it is never
+  // logged, never returned by an API and never persisted in this raw form.
+  canaryAuthorization: z.string().optional(),
 });
 
 export type TradingViewWebhookInput = z.infer<typeof tradingViewWebhookSchema>;

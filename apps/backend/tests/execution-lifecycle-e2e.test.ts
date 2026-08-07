@@ -70,6 +70,13 @@ function buildRuntime(scenario: Scenario, rows: Row[]) {
       count: async () => 0,
     },
     executionProfile: { findMany: async () => [{ id: "profile-1", safetyPolicy: { id: "policy-1" } }] },
+    // Phase 11B.0: no authorization prepared, so the profile is not in canary
+    // mode and this lifecycle is unaffected by it.
+    executionCanaryAuthorization: {
+      count: async () => 0,
+      findFirst: async () => null,
+      updateMany: async () => ({ count: 0 }),
+    },
   } as never;
 
   const entry = {

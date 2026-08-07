@@ -22,7 +22,12 @@
     "binance:test-order": "tsx src/modules/binance/run-test-order.ts",
     "execution:canary-preflight": "tsx src/modules/execution/run-canary-preflight.ts",
     "execution:ensure-profile": "tsx src/modules/execution/run-ensure-profile.ts",
+    "execution:prepare-canary": "tsx src/modules/execution/run-prepare-canary.ts",
+    "execution:arm-canary": "tsx src/modules/execution/run-arm-canary.ts",
+    "execution:close-canary-window": "tsx src/modules/execution/run-close-canary-window.ts",
+    "execution:disarm-canary": "tsx src/modules/execution/run-disarm-canary.ts",
     "test": "vitest run",
+    "test:db:setup": "tsx scripts/setup-test-db.ts",
     "playwright:install": "playwright install chromium"
   },
   "dependencies": {
