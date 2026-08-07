@@ -147,8 +147,12 @@ describe("phase boundary", () => {
       expect(source).not.toMatch(/fastify|FastifyInstance|\.get\(\s*"\/|\.post\(\s*"\//);
     }
     const app = read(path.join(BACKEND, "src", "app.ts")).toLowerCase();
-    expect(app).not.toContain("entry");
-    expect(app).not.toContain("execution");
+    // Phase 8 registers a READ-ONLY journal route, so the word "execution"
+    // legitimately appears here. What must never appear is a route for the
+    // entry LIFECYCLE.
+    expect(app).not.toContain("entrylifecycle");
+    expect(app).not.toContain("entry.routes");
+    expect(app).not.toContain("entryroutes");
   });
 
   it("has no polling daemon or automatic caller of the lifecycle methods", () => {

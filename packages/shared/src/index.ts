@@ -151,3 +151,5 @@ export {
   calculateExtremeMoney,
   extremeOfDecimalStrings,
 } from "./extreme-rr";
+
+export { subtractDecimalStrings, isNegativeDecimalString } from "./decimal-compare";

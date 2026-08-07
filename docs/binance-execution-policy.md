@@ -698,3 +698,88 @@ every sibling across every generation is cancelled by its own `clientAlgoId`,
 queried again afterwards, and only then is the terminal status recorded. While
 the position is open no protection is cancelled at all. An unreadable sibling
 leaves cleanup incomplete rather than being assumed gone.
+
+## Phase 8 scope — execution journal and dashboard (read-only)
+
+Phase 8 adds observability only. It reads persisted database state and changes
+nothing: no Binance call of any kind (GET or mutation) happens on a dashboard
+request, no execution record is created or updated by viewing a page, and no
+worker, queue, webhook or Telegram sender is involved. All live execution gates
+remain `false`.
+
+### Financial fields
+
+`tradingFeesUsd` (non-negative) and `fundingPnlUsd` (signed: positive = funding
+received, negative = paid) are both **nullable**, and null means *unknown / not
+yet collected* — never zero. Nothing estimates them and Phase 8 adds no
+historical Binance fetch, so they stay null until a future phase records real
+values.
+
+```
+netPnlUsd = realizedPnl - tradingFeesUsd + fundingPnlUsd
+```
+
+If **any** component is null, `netPnlUsd` is null and the UI shows "—" plus the
+names of the missing components. A partial sum is never presented as a net
+result. The same rule governs the aggregate: the summary sums only KNOWN
+realized PnL and states how many closed executions are unknown, so it is never
+labelled complete net profit.
+
+### Read-only API
+
+```
+GET /api/executions                          paginated summaries + metrics
+GET /api/executions/:executionId             full detail
+GET /api/executions/:executionId/timeline    ordered event history
+GET /api/alerts/:alertId/execution           null when none exists
+```
+
+GET only — there is deliberately no POST/PUT/PATCH/DELETE journal route, and a
+test asserts every write verb 404s. The list returns summaries only; timelines
+load exclusively when a detail view is opened. Page size is bounded
+(`MAX_PAGE_SIZE = 100`) and sorting is stable (`updatedAt desc, id desc`).
+
+### DTO rules
+
+Prisma rows are never returned directly. Every monetary, price, quantity,
+margin and PnL value leaves as an **exact decimal string or null** (never a JS
+float); timestamps are ISO-8601 or null. Metadata is re-sanitized at the DTO
+boundary, and unlike the write-time sanitizer — which redacts a credential-like
+*value* but keeps the key — the boundary **drops the key entirely**, so no
+response carries even the shape of a credential. `accountIdentifier` is never
+copied into a DTO; only the profile name and environment are.
+
+### Timeline ordering
+
+`sequenceNumber` is authoritative. Two events can share a `createdAt`, so
+sorting by time alone would present them in the wrong order; the UI shows the
+sequence number explicitly and same-status events remain visible.
+
+### Protection presentation
+
+An execution is labelled protected only from the persisted verified protection
+state, never from local intent rows. `TradeExecution.status` continues to
+describe the entry lifecycle, so a `PARTIALLY_FILLED` entry with fully verified
+protection still reads as partially filled — and still consumes its capacity.
+
+### Unknown statuses
+
+Every backend enum has a central frontend mapping. An unrecognised future value
+is never styled as a success: it falls through to a warning tone and its raw
+sanitized value stays visible. Completeness tests fail if a backend enum gains a
+value the frontend has not learned about.
+
+### Exit reason
+
+The persisted `exitReason` wins. A lifecycle status is used as a fallback label
+only where it unambiguously describes a position exit (`CLOSED_TP`,
+`CLOSED_SL`, `CLOSED_EMERGENCY`). `FAILED`, `SKIPPED`, `CANCELED`,
+`ENTRY_EXPIRED` and `MANUAL_INTERVENTION` are lifecycle outcomes, so no exit
+reason is invented for them.
+
+### Journal versus manual review
+
+The Execution Journal is the authoritative automated lifecycle. The existing
+`TradeReview` / `TradeJournal` records remain the user's own manual outcome and
+retrospective notes; they are separate models, shown in separate labelled
+sections, and Phase 8 neither merges nor overwrites them.

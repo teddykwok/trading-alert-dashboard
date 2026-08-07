@@ -418,6 +418,30 @@ zero position is. Full rules are in
 No worker, queue, webhook wiring, user-data stream, HTTP route or frontend
 control is added; the orchestration methods are internal.
 
+### Execution journal (Phase 8)
+
+A read-only **Executions** page (sidebar), an **Execution Detail** view and an
+**Execution** tab inside Alert Detail. Everything renders persisted database
+state: viewing a page performs no Binance call of any kind and changes no
+execution record, and there is no write endpoint.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/executions` | Paginated summaries + truthful summary metrics |
+| `GET /api/executions/:id` | Planned vs actual, orders, protection, margin, safety, alerts |
+| `GET /api/executions/:id/timeline` | Ordered event history (by `sequenceNumber`) |
+| `GET /api/alerts/:alertId/execution` | `null` when the alert has no execution |
+
+Two nullable fields were added to `TradeExecution`: `tradingFeesUsd` and
+`fundingPnlUsd`. **Null means unknown, never zero.** Net PnL
+(`realizedPnl - fees + funding`) is shown only when all three are known;
+otherwise the UI shows "—" and names the missing components. The aggregate
+realized PnL sums only known values and states how many closed executions are
+unknown.
+
+Decimals travel as exact strings, timestamps as ISO-8601, and no credential,
+balance, account identifier or raw Binance/Telegram payload is ever returned.
+
 ### Backend — AI vision
 
 | Variable | Description | Default |

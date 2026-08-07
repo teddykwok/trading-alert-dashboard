@@ -6,6 +6,7 @@ import { classNames } from "../../utils/classNames";
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", end: true },
   { to: "/risk-templates", label: "Risk Templates" },
+  { to: "/executions", label: "Executions" },
   { to: "/settings", label: "Settings" },
 ];
 
