@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import type { ExecutionCanaryAuthorization, PrismaClient } from "@prisma/client";
+import { profileLockKey } from "./safety-admission.service";
 
 /**
  * Phase 11B.0 — one-shot live-canary authorization.
@@ -28,6 +29,25 @@ export const DEFAULT_AUTHORIZATION_TTL_MINUTES = 10;
  * close is worse than no window, because it invites a rushed retry.
  */
 export const MINIMUM_REMAINING_LIFETIME_MS = 2 * 60 * 1000;
+
+/**
+ * Advisory-lock namespace for canary preparation, distinct from the entry,
+ * protection and admission namespaces already in use.
+ */
+const CANARY_PREPARE_LOCK_NAMESPACE = 0x11b0;
+
+/** Raised when a profile already holds an authorization that is still usable. */
+export class CanaryAuthorizationAlreadyActiveError extends Error {
+  readonly reasonCode = "CANARY_AUTHORIZATION_ALREADY_ACTIVE";
+
+  constructor(readonly existing: ExecutionCanaryAuthorization) {
+    super(
+      `An active canary authorization already exists for ${existing.allowedSymbol} ${existing.allowedDirection} ` +
+        `(expires ${existing.expiresAt.toISOString()}). Run execution:disarm-canary first.`
+    );
+    this.name = "CanaryAuthorizationAlreadyActiveError";
+  }
+}
 
 export const AUTHORIZATION_FAILURES = [
   "CANARY_AUTHORIZATION_MISSING",
@@ -76,8 +96,27 @@ export class CanaryAuthorizationService {
   /**
    * Creates one unconsumed, short-lived authorization and returns its raw token
    * once. Only the hash reaches the database.
+   *
+   * At most ONE authorization may be active per profile. Two windows open at
+   * the same time means two signals could each look legitimate, and the
+   * operator can no longer say which one the canary is — so a second prepare
+   * fails rather than replacing the first. Replacement is deliberately not
+   * offered: silently revoking a window the operator may have already pasted
+   * into an alert is worse than making them run `execution:disarm-canary`.
+   *
+   * Exclusivity is enforced with a transactional advisory lock keyed on the
+   * profile, the same mechanism Phase 5 admission uses. A partial unique index
+   * cannot express it: "active" depends on `expiresAt > now`, and an expired
+   * row must not block a fresh preparation.
+   *
+   * `alsoInTransaction` runs inside the same transaction, so a caller can
+   * narrow `allowedSymbols` and create the authorization atomically — either
+   * both land or neither does.
    */
-  async prepare(input: PrepareInput): Promise<PrepareResult> {
+  async prepare(
+    input: PrepareInput,
+    alsoInTransaction?: (tx: Prisma.TransactionClient) => Promise<void>
+  ): Promise<PrepareResult> {
     const now = input.now ?? new Date();
     const symbol = input.symbol.trim().toUpperCase();
     if (!symbol) throw new Error("A canary authorization requires a symbol.");
@@ -86,17 +125,46 @@ export class CanaryAuthorizationService {
     }
 
     const token = generateCanaryToken();
-    const authorization = await this.prisma.executionCanaryAuthorization.create({
-      data: {
-        executionProfileId: input.executionProfileId,
-        allowedSymbol: symbol,
-        allowedDirection: input.direction,
-        tokenHash: hashCanaryToken(token),
-        expiresAt: new Date(now.getTime() + (input.ttlMinutes ?? DEFAULT_AUTHORIZATION_TTL_MINUTES) * 60_000),
-      },
+    const authorization = await this.prisma.$transaction(async (tx) => {
+      // Serialize preparation per profile: two concurrent commands must not
+      // both observe "no active authorization" and both insert one.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CANARY_PREPARE_LOCK_NAMESPACE}::int, ${profileLockKey(
+        input.executionProfileId
+      )}::int)`;
+
+      const active = await tx.executionCanaryAuthorization.findFirst({
+        where: {
+          executionProfileId: input.executionProfileId,
+          consumedAt: null,
+          revokedAt: null,
+          expiresAt: { gt: now },
+        },
+        orderBy: { createdAt: "desc" },
+      });
+      if (active) throw new CanaryAuthorizationAlreadyActiveError(active);
+
+      const created = await tx.executionCanaryAuthorization.create({
+        data: {
+          executionProfileId: input.executionProfileId,
+          allowedSymbol: symbol,
+          allowedDirection: input.direction,
+          tokenHash: hashCanaryToken(token),
+          expiresAt: new Date(now.getTime() + (input.ttlMinutes ?? DEFAULT_AUTHORIZATION_TTL_MINUTES) * 60_000),
+        },
+      });
+
+      if (alsoInTransaction) await alsoInTransaction(tx);
+      return created;
     });
 
     return { authorization, token };
+  }
+
+  /** How many authorizations are active right now. Should never exceed one. */
+  async countActive(executionProfileId: string, now = new Date()): Promise<number> {
+    return this.prisma.executionCanaryAuthorization.count({
+      where: { executionProfileId, consumedAt: null, revokedAt: null, expiresAt: { gt: now } },
+    });
   }
 
   /** The single active (unconsumed, unrevoked, unexpired) authorization, if any. */
@@ -255,33 +323,93 @@ export class CanaryAuthorizationService {
   }
 }
 
-/** Sanitized view for operator output — never the token or its hash. */
+/**
+ * The single definition of "active", used by every reader.
+ *
+ * All three must hold. Any one of them failing means the authorization can
+ * never admit a signal again, whatever else is true of the row.
+ */
+export function isAuthorizationActive(authorization: ExecutionCanaryAuthorization, now = new Date()): boolean {
+  return authorization.consumedAt === null && authorization.revokedAt === null && authorization.expiresAt > now;
+}
+
+/**
+ * Sanitized view for operator output — never the token or its hash.
+ *
+ * `prepared` means "an authorization is ACTIVE", not "a row exists". The
+ * earlier version conflated the two and could print `prepared = true` beside
+ * `revoked = true`, which reads as an open window that is also shut. An
+ * operator glancing at that line has to reason about a contradiction at
+ * exactly the moment they should not have to.
+ */
 export interface CanaryAuthorizationStatus {
+  /** True only when an ACTIVE authorization exists. */
   prepared: boolean;
+  /** Fields of the active authorization, or of the latest record for context. */
   symbol: string | null;
   direction: string | null;
   expiresAt: string | null;
   expired: boolean;
   consumed: boolean;
   revoked: boolean;
+  /** Never above 1. Shown so an operator can see the invariant holding. */
+  activeCount: number;
+  /** Historical rows are never deleted; this is how many exist. */
+  onRecord: number;
+  /** True when nothing is active but history exists — the "shut window" case. */
+  latestIsHistoricalOnly: boolean;
 }
 
+const EMPTY_STATUS: CanaryAuthorizationStatus = {
+  prepared: false,
+  symbol: null,
+  direction: null,
+  expiresAt: null,
+  expired: false,
+  consumed: false,
+  revoked: false,
+  activeCount: 0,
+  onRecord: 0,
+  latestIsHistoricalOnly: false,
+};
+
+/**
+ * Describes the whole authorization window from every record on file.
+ *
+ * When nothing is active the latest historical row is still shown — an
+ * operator wants to know what the last window was for — but `prepared` is
+ * false and `activeCount` is zero, so the state cannot be misread.
+ */
+export function describeAuthorizationWindow(
+  authorizations: ExecutionCanaryAuthorization[],
+  now = new Date()
+): CanaryAuthorizationStatus {
+  if (authorizations.length === 0) return EMPTY_STATUS;
+
+  const byNewest = [...authorizations].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  const active = byNewest.filter((entry) => isAuthorizationActive(entry, now));
+  const shown = active[0] ?? byNewest[0];
+
+  return {
+    prepared: active.length > 0,
+    symbol: shown.allowedSymbol,
+    direction: shown.allowedDirection,
+    expiresAt: shown.expiresAt.toISOString(),
+    expired: shown.expiresAt <= now,
+    consumed: shown.consumedAt !== null,
+    revoked: shown.revokedAt !== null,
+    activeCount: active.length,
+    onRecord: authorizations.length,
+    latestIsHistoricalOnly: active.length === 0,
+  };
+}
+
+/** Single-row convenience wrapper. `prepared` still means ACTIVE. */
 export function describeAuthorization(
   authorization: ExecutionCanaryAuthorization | null,
   now = new Date()
 ): CanaryAuthorizationStatus {
-  if (!authorization) {
-    return { prepared: false, symbol: null, direction: null, expiresAt: null, expired: false, consumed: false, revoked: false };
-  }
-  return {
-    prepared: true,
-    symbol: authorization.allowedSymbol,
-    direction: authorization.allowedDirection,
-    expiresAt: authorization.expiresAt.toISOString(),
-    expired: authorization.expiresAt <= now,
-    consumed: authorization.consumedAt !== null,
-    revoked: authorization.revokedAt !== null,
-  };
+  return describeAuthorizationWindow(authorization ? [authorization] : [], now);
 }
 
 /** Never let a Prisma unique collision surface as an opaque crash. */

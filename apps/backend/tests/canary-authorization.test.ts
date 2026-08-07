@@ -21,9 +21,14 @@ const TAG = "phase11b-auth";
 const { prisma: testDatabase, available } = await connectTestDatabase();
 const prisma: PrismaClient | null = testDatabase;
 
-const { CanaryAuthorizationService, hashCanaryToken, describeAuthorization } = await import(
-  "../src/modules/execution/canary-authorization.service"
-);
+const {
+  CanaryAuthorizationAlreadyActiveError,
+  CanaryAuthorizationService,
+  hashCanaryToken,
+  describeAuthorization,
+  describeAuthorizationWindow,
+  isAuthorizationActive,
+} = await import("../src/modules/execution/canary-authorization.service");
 
 const profileIds: string[] = [];
 const alertIds: string[] = [];
@@ -116,6 +121,229 @@ describeDb("prepare", () => {
     const serialized = JSON.stringify(status);
     expect(serialized).not.toContain(authorization.tokenHash);
     expect(status).toMatchObject({ prepared: true, symbol: "BTCUSDT", direction: "LONG", consumed: false });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Active vs historical
+// ---------------------------------------------------------------------------
+
+describeDb("active/prepared semantics", () => {
+  it("reports prepared=false for a REVOKED authorization, while keeping the record", async () => {
+    const profileId = await newProfile();
+    await service().prepare({ executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG" });
+    await service().revokeUnused(profileId);
+
+    const rows = await service().listForProfile(profileId);
+    const status = describeAuthorizationWindow(rows);
+
+    // The contradiction this replaces: prepared=true beside revoked=true.
+    expect(status.prepared).toBe(false);
+    expect(status.revoked).toBe(true);
+    expect(status.activeCount).toBe(0);
+    // History is never deleted.
+    expect(status.onRecord).toBe(1);
+    expect(rows).toHaveLength(1);
+  });
+
+  it("reports prepared=false for an EXPIRED authorization", async () => {
+    const profileId = await newProfile();
+    const { authorization } = await service().prepare({
+      executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG",
+    });
+    await prisma!.executionCanaryAuthorization.update({
+      where: { id: authorization.id },
+      data: { expiresAt: new Date(Date.now() - 1000) },
+    });
+
+    const status = describeAuthorizationWindow(await service().listForProfile(profileId));
+    expect(status.prepared).toBe(false);
+    expect(status.expired).toBe(true);
+    expect(status.revoked).toBe(false);
+    expect(status.activeCount).toBe(0);
+    expect(status.onRecord).toBe(1);
+  });
+
+  it("reports prepared=false for a CONSUMED authorization", async () => {
+    const profileId = await newProfile();
+    const { token } = await service().prepare({
+      executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG",
+    });
+    await service().consume({
+      token, executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG", alertId: await newAlert(),
+    });
+
+    const status = describeAuthorizationWindow(await service().listForProfile(profileId));
+    expect(status.prepared).toBe(false);
+    expect(status.consumed).toBe(true);
+    expect(status.activeCount).toBe(0);
+    expect(status.onRecord).toBe(1);
+  });
+
+  it("reports prepared=true for exactly one valid active authorization", async () => {
+    const profileId = await newProfile();
+    await service().prepare({ executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG" });
+
+    const status = describeAuthorizationWindow(await service().listForProfile(profileId));
+    expect(status.prepared).toBe(true);
+    expect(status.activeCount).toBe(1);
+    expect(status.consumed).toBe(false);
+    expect(status.revoked).toBe(false);
+    expect(status.expired).toBe(false);
+    expect(status.symbol).toBe("BTCUSDT");
+  });
+
+  it("keeps every historical record visible and shows the latest for context", async () => {
+    const profileId = await newProfile();
+    await service().prepare({ executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG" });
+    await service().revokeUnused(profileId);
+    await service().prepare({ executionProfileId: profileId, symbol: "ETHUSDT", direction: "SHORT" });
+    await service().revokeUnused(profileId);
+
+    const status = describeAuthorizationWindow(await service().listForProfile(profileId));
+    expect(status.onRecord).toBe(2);
+    expect(status.activeCount).toBe(0);
+    expect(status.prepared).toBe(false);
+    expect(status.latestIsHistoricalOnly).toBe(true);
+    // The newest record is the one described.
+    expect(status.symbol).toBe("ETHUSDT");
+  });
+
+  it("prefers the ACTIVE record over a newer inactive one when describing", async () => {
+    const profileId = await newProfile();
+    const { authorization: older } = await service().prepare({
+      executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG",
+    });
+    // A newer row that is already revoked must not shadow the live one.
+    await prisma!.executionCanaryAuthorization.create({
+      data: {
+        executionProfileId: profileId,
+        allowedSymbol: "ETHUSDT",
+        allowedDirection: "SHORT",
+        tokenHash: `synthetic-${Date.now()}`,
+        expiresAt: new Date(Date.now() + 600_000),
+        revokedAt: new Date(),
+        createdAt: new Date(older.createdAt.getTime() + 1000),
+      },
+    });
+
+    const status = describeAuthorizationWindow(await service().listForProfile(profileId));
+    expect(status.prepared).toBe(true);
+    expect(status.symbol).toBe("BTCUSDT");
+    expect(status.activeCount).toBe(1);
+    expect(status.onRecord).toBe(2);
+  });
+
+  it("agrees with the single definition of active", async () => {
+    const profileId = await newProfile();
+    const { authorization } = await service().prepare({
+      executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG",
+    });
+    expect(isAuthorizationActive(authorization)).toBe(true);
+    expect(isAuthorizationActive({ ...authorization, revokedAt: new Date() })).toBe(false);
+    expect(isAuthorizationActive({ ...authorization, consumedAt: new Date() })).toBe(false);
+    expect(isAuthorizationActive({ ...authorization, expiresAt: new Date(Date.now() - 1) })).toBe(false);
+  });
+
+  it("describes an empty history as nothing prepared", () => {
+    const status = describeAuthorizationWindow([]);
+    expect(status).toMatchObject({ prepared: false, activeCount: 0, onRecord: 0, symbol: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One active authorization at a time
+// ---------------------------------------------------------------------------
+
+describeDb("exclusive preparation", () => {
+  it("refuses a second prepare while one is active", async () => {
+    const profileId = await newProfile();
+    await service().prepare({ executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG" });
+
+    await expect(
+      service().prepare({ executionProfileId: profileId, symbol: "ETHUSDT", direction: "LONG" })
+    ).rejects.toThrow(/already exists/);
+
+    // The first window is untouched — never silently replaced.
+    const rows = await service().listForProfile(profileId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].allowedSymbol).toBe("BTCUSDT");
+    expect(rows[0].revokedAt).toBeNull();
+  });
+
+  it("carries the operator reason code and points at disarm", async () => {
+    const profileId = await newProfile();
+    await service().prepare({ executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG" });
+
+    await service()
+      .prepare({ executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG" })
+      .then(() => expect.unreachable("a second prepare must not succeed"))
+      .catch((error) => {
+        expect(error).toBeInstanceOf(CanaryAuthorizationAlreadyActiveError);
+        expect(error.reasonCode).toBe("CANARY_AUTHORIZATION_ALREADY_ACTIVE");
+        expect(error.message).toContain("execution:disarm-canary");
+      });
+  });
+
+  it("allows a fresh prepare once the previous one is revoked", async () => {
+    const profileId = await newProfile();
+    await service().prepare({ executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG" });
+    await service().revokeUnused(profileId);
+
+    const second = await service().prepare({ executionProfileId: profileId, symbol: "ETHUSDT", direction: "SHORT" });
+    expect(second.authorization.allowedSymbol).toBe("ETHUSDT");
+    expect(await service().countActive(profileId)).toBe(1);
+    // Both records survive.
+    expect(await service().listForProfile(profileId)).toHaveLength(2);
+  });
+
+  it("allows a fresh prepare once the previous one has expired", async () => {
+    const profileId = await newProfile();
+    const { authorization } = await service().prepare({
+      executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG",
+    });
+    await prisma!.executionCanaryAuthorization.update({
+      where: { id: authorization.id },
+      data: { expiresAt: new Date(Date.now() - 1000) },
+    });
+
+    // Expiry is time-based, which is why a partial unique index cannot express
+    // this rule and the advisory lock does.
+    await expect(
+      service().prepare({ executionProfileId: profileId, symbol: "BTCUSDT", direction: "LONG" })
+    ).resolves.toBeTruthy();
+    expect(await service().countActive(profileId)).toBe(1);
+  });
+
+  it("never produces two active authorizations under concurrent prepares", async () => {
+    const profileId = await newProfile();
+    const attempts = await Promise.allSettled(
+      Array.from({ length: 5 }, (_, index) =>
+        service().prepare({
+          executionProfileId: profileId,
+          symbol: index % 2 === 0 ? "BTCUSDT" : "ETHUSDT",
+          direction: "LONG",
+        })
+      )
+    );
+
+    const fulfilled = attempts.filter((entry) => entry.status === "fulfilled");
+    expect(fulfilled).toHaveLength(1);
+    expect(await service().countActive(profileId)).toBe(1);
+    expect(await service().listForProfile(profileId)).toHaveLength(1);
+  });
+
+  it("keeps profiles independent", async () => {
+    const first = await newProfile();
+    const second = await newProfile();
+    await service().prepare({ executionProfileId: first, symbol: "BTCUSDT", direction: "LONG" });
+
+    // A window on one profile must not block a different profile.
+    await expect(
+      service().prepare({ executionProfileId: second, symbol: "BTCUSDT", direction: "LONG" })
+    ).resolves.toBeTruthy();
+    expect(await service().countActive(first)).toBe(1);
+    expect(await service().countActive(second)).toBe(1);
   });
 });
 

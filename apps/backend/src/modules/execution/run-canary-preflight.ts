@@ -2,7 +2,7 @@ import { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { CanaryPreflightService } from "./canary-preflight.service";
 import { CANARY_POLICY } from "./canary-readiness";
-import { CanaryAuthorizationService, describeAuthorization } from "./canary-authorization.service";
+import { CanaryAuthorizationService, describeAuthorizationWindow } from "./canary-authorization.service";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
 /**
@@ -89,8 +89,9 @@ async function main(): Promise<void> {
     } else {
       const profile = resolution.profile;
       const authorizations = await new CanaryAuthorizationService(prisma).listForProfile(profile.id);
-      // Newest first, so [0] is the one an operator just prepared.
-      const status = describeAuthorization(authorizations[0] ?? null);
+      // "prepared" means ACTIVE — unconsumed, unrevoked and unexpired. A row
+      // merely existing is history, and history never opens a window.
+      const status = describeAuthorizationWindow(authorizations);
 
       // Environment only — the account identifier is deliberately not printed.
       line("profile", `resolved (${profile.environment})`);
@@ -100,13 +101,18 @@ async function main(): Promise<void> {
       const allowed = profile.safetyPolicy?.allowedSymbols ?? [];
       line("allowedSymbols", allowed.length === 0 ? "[] (ALLOW ALL)" : `[${allowed.join(", ")}]`);
       line("authorization prepared", status.prepared);
-      line("authorization symbol", status.symbol);
-      line("authorization direction", status.direction);
-      line("authorization expiresAt", status.expiresAt);
-      line("authorization expired", status.expired);
-      line("authorization consumed", status.consumed);
-      line("authorization revoked", status.revoked);
-      line("authorizations on record", authorizations.length);
+      line("active authorization count", status.activeCount);
+      line("authorizations on record", status.onRecord);
+      if (status.onRecord > 0) {
+        // Whose fields the lines below belong to, so they are never ambiguous.
+        line("shown record", status.prepared ? "the ACTIVE authorization" : "latest HISTORICAL (none active)");
+        line("authorization symbol", status.symbol);
+        line("authorization direction", status.direction);
+        line("authorization expiresAt", status.expiresAt);
+        line("authorization expired", status.expired);
+        line("authorization consumed", status.consumed);
+        line("authorization revoked", status.revoked);
+      }
     }
 
     section(result.ready ? "CANARY READY" : "CANARY BLOCKED");

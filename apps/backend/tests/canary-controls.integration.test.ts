@@ -64,6 +64,18 @@ let preflightBlockers: Array<{ code: string; detail: string }> = [];
 let preflightCounts = { positions: 0, orders: 0, active: 0, recovery: 0 };
 
 /**
+ * Symbol validation is stubbed here so this suite reaches no network at all.
+ * The validator's own behaviour — including that it only ever sends GET — is
+ * proven against a real client with a faked transport in
+ * `canary-symbol-validation.test.ts`.
+ */
+let symbolValidation: { ok: boolean; symbol?: string; reasonCode?: string; message?: string } = {
+  ok: true,
+  symbol: "BTCUSDT",
+};
+let symbolValidationCalls: string[] = [];
+
+/**
  * Vitest reuses a worker across files, so every variable this suite overrides
  * is snapshotted and put back afterwards — a leaked profile identity would
  * silently retarget a later suite.
@@ -99,6 +111,19 @@ async function loadControls(gates: Record<string, string>) {
           },
         };
       }
+    },
+  }));
+
+  vi.doMock("../src/modules/execution/canary-symbol-validation", () => ({
+    validateCanarySymbol: async (input: string) => {
+      symbolValidationCalls.push(input);
+      return symbolValidation.ok
+        ? { ok: true, symbol: symbolValidation.symbol ?? input, filters: { stepSize: "0.001" } }
+        : {
+            ok: false,
+            reasonCode: symbolValidation.reasonCode ?? "CANARY_SYMBOL_MALFORMED",
+            message: symbolValidation.message ?? "rejected",
+          };
     },
   }));
 
@@ -178,6 +203,8 @@ beforeEach(() => {
   captured = [];
   preflightBlockers = [];
   preflightCounts = { positions: 0, orders: 0, active: 0, recovery: 0 };
+  symbolValidation = { ok: true, symbol: "BTCUSDT" };
+  symbolValidationCalls = [];
   process.argv = ["node", "controls"];
   process.exitCode = undefined;
   logSpy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
@@ -189,6 +216,7 @@ afterEach(() => {
   logSpy?.mockRestore();
   process.exitCode = undefined;
   vi.doUnmock("../src/modules/execution/canary-preflight.service");
+  vi.doUnmock("../src/modules/execution/canary-symbol-validation");
 });
 
 afterAll(async () => {
@@ -327,6 +355,82 @@ describeDb("execution:prepare-canary", () => {
     expect(await prisma!.executionCanaryAuthorization.count({ where: { executionProfileId: profileId } })).toBe(0);
   });
 
+  it("validates the symbol before touching the database at all", async () => {
+    symbolValidation = { ok: false, reasonCode: "CANARY_SYMBOL_MALFORMED", message: "not a Binance symbol" };
+    process.argv = ["node", "controls", "--symbol=<SYMBOL>", "--direction=LONG"];
+    const { prepareCanary } = await loadControls(SAFE_GATES);
+    await prepareCanary();
+
+    const policy = await prisma!.executionSafetyPolicy.findUniqueOrThrow({ where: { executionProfileId: profileId } });
+    expect(output()).toContain("CANARY_SYMBOL_MALFORMED");
+    expect(process.exitCode).toBe(1);
+    // Neither the allowlist nor the authorization table moved.
+    expect(policy.allowedSymbols).toEqual([]);
+    expect(await prisma!.executionCanaryAuthorization.count({ where: { executionProfileId: profileId } })).toBe(0);
+  });
+
+  it("reports an unlisted symbol without changing anything", async () => {
+    symbolValidation = { ok: false, reasonCode: "CANARY_SYMBOL_NOT_LISTED", message: "FOOBAR is not listed" };
+    process.argv = ["node", "controls", "--symbol=FOOBAR", "--direction=LONG"];
+    const { prepareCanary } = await loadControls(SAFE_GATES);
+    await prepareCanary();
+
+    const policy = await prisma!.executionSafetyPolicy.findUniqueOrThrow({ where: { executionProfileId: profileId } });
+    expect(output()).toContain("CANARY_SYMBOL_NOT_LISTED");
+    expect(policy.allowedSymbols).toEqual([]);
+    expect(await prisma!.executionCanaryAuthorization.count({ where: { executionProfileId: profileId } })).toBe(0);
+  });
+
+  it("uses the validator's normalized symbol for both the allowlist and the authorization", async () => {
+    symbolValidation = { ok: true, symbol: "ETHUSDT" };
+    process.argv = ["node", "controls", "--symbol=BINANCE:ETHUSDT.P", "--direction=SHORT"];
+    const { prepareCanary } = await loadControls(SAFE_GATES);
+    await prepareCanary();
+
+    const policy = await prisma!.executionSafetyPolicy.findUniqueOrThrow({ where: { executionProfileId: profileId } });
+    const row = await prisma!.executionCanaryAuthorization.findFirstOrThrow({ where: { executionProfileId: profileId } });
+    expect(policy.allowedSymbols).toEqual(["ETHUSDT"]);
+    expect(row.allowedSymbol).toBe("ETHUSDT");
+    expect(symbolValidationCalls).toContain("BINANCE:ETHUSDT.P");
+  });
+
+  it("refuses a second preparation while one is active, and changes nothing", async () => {
+    process.argv = ["node", "controls", "--symbol=BTCUSDT", "--direction=LONG"];
+    const { prepareCanary } = await loadControls(SAFE_GATES);
+    await prepareCanary();
+
+    symbolValidation = { ok: true, symbol: "ETHUSDT" };
+    process.argv = ["node", "controls", "--symbol=ETHUSDT", "--direction=SHORT"];
+    await prepareCanary();
+
+    const policy = await prisma!.executionSafetyPolicy.findUniqueOrThrow({ where: { executionProfileId: profileId } });
+    const rows = await prisma!.executionCanaryAuthorization.findMany({ where: { executionProfileId: profileId } });
+
+    expect(output()).toContain("CANARY_AUTHORIZATION_ALREADY_ACTIVE");
+    expect(output()).toContain("execution:disarm-canary");
+    expect(process.exitCode).toBe(1);
+    // The first window survives untouched — never silently replaced.
+    expect(rows).toHaveLength(1);
+    expect(rows[0].allowedSymbol).toBe("BTCUSDT");
+    expect(rows[0].revokedAt).toBeNull();
+    expect(policy.allowedSymbols).toEqual(["BTCUSDT"]);
+  });
+
+  it("leaves the allowlist unchanged when the authorization insert is refused", async () => {
+    process.argv = ["node", "controls", "--symbol=BTCUSDT", "--direction=LONG"];
+    const { prepareCanary } = await loadControls(SAFE_GATES);
+    await prepareCanary();
+
+    // A second prepare for a different symbol must not half-apply: the
+    // allowlist update shares the authorization's transaction.
+    symbolValidation = { ok: true, symbol: "ETHUSDT" };
+    process.argv = ["node", "controls", "--symbol=ETHUSDT", "--direction=LONG"];
+    await prepareCanary();
+
+    const policy = await prisma!.executionSafetyPolicy.findUniqueOrThrow({ where: { executionProfileId: profileId } });
+    expect(policy.allowedSymbols).toEqual(["BTCUSDT"]);
+  });
+
   it("propagates preflight blockers instead of overriding them", async () => {
     preflightBlockers = [{ code: "BINANCE_OPEN_ORDERS_PRESENT", detail: "2 open orders" }];
     process.argv = ["node", "controls", "--symbol=BTCUSDT", "--direction=LONG"];
@@ -438,6 +542,58 @@ describeDb("execution:arm-canary", () => {
     const profile = await prisma!.executionProfile.findUniqueOrThrow({ where: { id: profileId } });
     expect(output()).toContain("the symbol allowlist does not match the authorization exactly");
     expect(profile.isEnabled).toBe(false);
+  });
+
+  it("refuses to arm with zero active authorizations, even when records exist", async () => {
+    await prepared();
+    // Revoked: a record on file, but no window.
+    await prisma!.executionCanaryAuthorization.updateMany({
+      where: { executionProfileId: profileId },
+      data: { revokedAt: new Date() },
+    });
+    process.argv = ["node", "controls", "--confirm-arm"];
+    const { armCanary } = await loadControls(ARMED_GATES);
+    await armCanary();
+
+    const profile = await prisma!.executionProfile.findUniqueOrThrow({
+      where: { id: profileId },
+      include: { safetyPolicy: true },
+    });
+    expect(output()).toContain("no active unexpired authorization is prepared");
+    expect(profile.isEnabled).toBe(false);
+    expect(profile.safetyPolicy?.killSwitchActive).toBe(true);
+  });
+
+  it("refuses to arm with more than one active authorization", async () => {
+    const { authorization } = await prepared();
+    // Bypass the exclusivity guard directly to prove arm re-checks it itself
+    // rather than trusting prepare to have behaved.
+    await prisma!.executionCanaryAuthorization.create({
+      data: {
+        executionProfileId: profileId,
+        allowedSymbol: authorization.allowedSymbol,
+        allowedDirection: authorization.allowedDirection,
+        tokenHash: `second-${Date.now()}`,
+        expiresAt: new Date(Date.now() + 10 * 60_000),
+      },
+    });
+
+    process.argv = ["node", "controls", "--confirm-arm"];
+    const { armCanary } = await loadControls(ARMED_GATES);
+    await armCanary();
+
+    const profile = await prisma!.executionProfile.findUniqueOrThrow({ where: { id: profileId } });
+    expect(output()).toContain("2 authorizations are active; exactly one is required");
+    expect(output()).toContain("BLOCKED — nothing was changed:");
+    expect(profile.isEnabled).toBe(false);
+  });
+
+  it("reports the active authorization count in its preconditions", async () => {
+    await prepared();
+    const { armCanary } = await loadControls(ARMED_GATES);
+    await armCanary();
+
+    expect(output()).toMatch(/active authorization count\s+1/);
   });
 
   it("refuses to arm on a preflight blocker, with no way to override it", async () => {
