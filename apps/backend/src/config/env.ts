@@ -112,6 +112,17 @@ const envSchema = z.object({
   BINANCE_API_SECRET: z.string().optional().default(""),
   // Binance rejects recvWindow above 60000 ms; 5000 is the documented default.
   BINANCE_RECV_WINDOW_MS: z.coerce.number().int().positive().max(60_000).default(5000),
+  // --- Phase 11A.1 execution profile identity --------------------------------
+  // Which ExecutionProfile the production orchestrator uses, together with
+  // BINANCE_FUTURES_REST_BASE_URL's environment. A NON-SECRET operator-chosen
+  // alias (e.g. "primary-futures") — never an API key, secret or account number.
+  // Empty (the default) means no profile is selected, and the orchestrator
+  // fails closed rather than picking an arbitrary database row.
+  EXECUTION_PROFILE_ACCOUNT_IDENTIFIER: z.string().optional().default(""),
+  EXECUTION_PROFILE_ENVIRONMENT: z.enum(["TESTNET", "MAINNET"]).default("TESTNET"),
+  // How many non-terminal executions one reconciliation tick may process.
+  EXECUTION_RECONCILE_BATCH_SIZE: z.coerce.number().int().positive().max(50).default(10),
+
   // --- Phase 10 operator maintenance gates (fail-closed) ---------------------
   // Strict enum, not `=== "true"`: a typo like "TRUE" or "1" fails startup
   // rather than silently reading as false, which is the behaviour you want from

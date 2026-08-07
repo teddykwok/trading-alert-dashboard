@@ -286,21 +286,30 @@ describe("runtime detection", () => {
     await expect(detectNotificationScheduler()).resolves.toBe(true);
   });
 
-  it("reports the execution orchestration as NOT wired in this repository", async () => {
-    // This is the Phase 11A headline finding, asserted rather than described:
-    // the lifecycle services are never constructed in a production entrypoint.
-    await expect(detectExecutionOrchestration()).resolves.toBe(false);
+  it("reports the execution orchestration as wired after Phase 11A.1", async () => {
+    // The Phase 11A blocker is closed: the worker starts the orchestration
+    // scheduler, which constructs all three lifecycle services and runs
+    // startup recovery.
+    await expect(detectExecutionOrchestration()).resolves.toBe(true);
   });
 
-  it("confirms no production file constructs a lifecycle service", () => {
-    const worker = readFileSync(path.join(BACKEND, "src", "modules", "jobs", "vision-analysis.worker.ts"), "utf8");
-    const app = readFileSync(path.join(BACKEND, "src", "app.ts"), "utf8");
-    for (const source of [worker, app]) {
-      expect(source).not.toContain("new SafetyAdmissionService");
-      expect(source).not.toContain("new EntryLifecycleService");
-      expect(source).not.toContain("new ProtectionLifecycleService");
-      expect(source).not.toContain("new BinanceUsdMExecutionClient");
+  it("constructs the lifecycle services in the scheduler, not in the HTTP app", () => {
+    const scheduler = readFileSync(
+      path.join(BACKEND, "src", "modules", "jobs", "execution-orchestration.scheduler.ts"),
+      "utf8"
+    );
+    for (const needed of [
+      "new SafetyAdmissionService",
+      "new EntryLifecycleService",
+      "new ProtectionLifecycleService",
+      "new BinanceUsdMExecutionClient",
+    ]) {
+      expect(scheduler).toContain(needed);
     }
+    // The HTTP app stays free of execution machinery.
+    const app = readFileSync(path.join(BACKEND, "src", "app.ts"), "utf8");
+    expect(app).not.toContain("new EntryLifecycleService");
+    expect(app).not.toContain("new ProtectionLifecycleService");
   });
 });
 
