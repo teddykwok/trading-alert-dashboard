@@ -11,6 +11,8 @@ import { parseOrNowDate } from "../../utils/date";
 import { normalizeTradingSymbol } from "../../utils/symbol";
 import { UnauthorizedError, ValidationError } from "../../utils/errors";
 import { env } from "../../config/env";
+import { CanaryAuthorizationService } from "../execution/canary-authorization.service";
+import { resolveExecutionProfile } from "../execution/execution-profile.service";
 
 function normalizeAssetType(value: string): AssetType {
   const upper = value.toUpperCase();
@@ -112,7 +114,12 @@ export async function handleTradingViewWebhook(
 
   // Never persist the shared secret — rawPayload is exposed verbatim on the
   // alert detail page (and keeps the original, un-normalized symbol).
-  const { secret: _secret, ...payloadWithoutSecret } = payload;
+  // The canary authorization is stripped alongside the secret: rawPayload is
+  // rendered verbatim on the alert detail page, and a reusable authorization
+  // must never sit there. It is not needed afterwards either — it is consumed
+  // and BOUND to this alert below, and that durable binding is what the
+  // execution path checks.
+  const { secret: _secret, canaryAuthorization: _canary, ...payloadWithoutSecret } = payload;
 
   // Level context is parsed once here and stored as structured columns for
   // filtering/analytics. The original note stays untouched inside rawPayload;
@@ -137,6 +144,37 @@ export async function handleTradingViewWebhook(
     sourceTimeframe: levelContext.sourceTimeframe,
     touchDirection: levelContext.touchDirection,
   });
+
+  // Phase 11B.0: bind a one-shot canary authorization to THIS alert, if one
+  // accompanied the signal. Doing it here means the raw token never has to be
+  // persisted — the durable (authorization -> alert) binding is what the
+  // execution path later checks. Strictly best-effort: a canary problem must
+  // never reject an otherwise valid alert, and an unbound alert simply cannot
+  // become the canary.
+  if (payload.canaryAuthorization) {
+    try {
+      const profile = await resolveExecutionProfile(prisma);
+      if (profile.ok) {
+        const outcome = await new CanaryAuthorizationService(prisma).consume({
+          token: payload.canaryAuthorization,
+          executionProfileId: profile.profile.id,
+          symbol: normalizedSymbol,
+          direction: signal,
+          alertId: alert.id,
+        });
+        // Reason code only — never the token, not even truncated.
+        logger.info(
+          { alertId: alert.id, canary: outcome.ok ? (outcome.replay ? "REPLAY" : "BOUND") : outcome.reasonCode },
+          "Canary authorization evaluated"
+        );
+      }
+    } catch (error) {
+      logger.warn(
+        { alertId: alert.id, error: error instanceof Error ? error.message : "unknown" },
+        "Canary authorization evaluation failed (alert kept)"
+      );
+    }
+  }
 
   await notifyNewAlert(alert);
   await enqueueVisionAnalysis(alert.id);

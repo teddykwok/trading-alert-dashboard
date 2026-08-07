@@ -2,6 +2,8 @@ import { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { CanaryPreflightService } from "./canary-preflight.service";
 import { CANARY_POLICY } from "./canary-readiness";
+import { CanaryAuthorizationService, describeAuthorization } from "./canary-authorization.service";
+import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
 /**
  * Live-canary READ-ONLY preflight (Phase 11A).
@@ -76,6 +78,36 @@ async function main(): Promise<void> {
     line("testOrderEnabled", gates.testOrderEnabled);
     line("autoAddMarginEnabled", gates.autoAddMarginEnabled);
     line("emergencyCloseMode", gates.emergencyCloseMode);
+
+    // --- Phase 11B.0: the authorization window ---------------------------
+    // Purely a mirror of durable state. It prints no raw authorization and no
+    // hash — only whether one exists and what it would admit.
+    section("Canary authorization window (Phase 11B.0)");
+    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
+    if (!resolution.ok) {
+      line("profile", `unavailable (${resolution.reasonCode})`);
+    } else {
+      const profile = resolution.profile;
+      const authorizations = await new CanaryAuthorizationService(prisma).listForProfile(profile.id);
+      // Newest first, so [0] is the one an operator just prepared.
+      const status = describeAuthorization(authorizations[0] ?? null);
+
+      // Environment only — the account identifier is deliberately not printed.
+      line("profile", `resolved (${profile.environment})`);
+      line("profile isEnabled", profile.isEnabled);
+      line("profile killSwitchActive", profile.safetyPolicy?.killSwitchActive ?? null);
+      // [] means ALLOW ALL — always worth seeing explicitly.
+      const allowed = profile.safetyPolicy?.allowedSymbols ?? [];
+      line("allowedSymbols", allowed.length === 0 ? "[] (ALLOW ALL)" : `[${allowed.join(", ")}]`);
+      line("authorization prepared", status.prepared);
+      line("authorization symbol", status.symbol);
+      line("authorization direction", status.direction);
+      line("authorization expiresAt", status.expiresAt);
+      line("authorization expired", status.expired);
+      line("authorization consumed", status.consumed);
+      line("authorization revoked", status.revoked);
+      line("authorizations on record", authorizations.length);
+    }
 
     section(result.ready ? "CANARY READY" : "CANARY BLOCKED");
     line("summary", result.summary);

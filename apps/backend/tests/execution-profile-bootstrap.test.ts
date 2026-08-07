@@ -3,6 +3,8 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
 
+import { connectTestDatabase } from "./helpers/test-database";
+
 /**
  * Phase 11A.1 profile bootstrap tests against a real Postgres.
  *
@@ -13,30 +15,11 @@ import { PrismaClient } from "@prisma/client";
 const TAG = "phase11-bootstrap";
 const BACKEND = process.cwd();
 
-function resolveDatabaseUrl(): string | null {
-  for (const candidate of [path.join(process.cwd(), ".env"), path.join(process.cwd(), "apps", "backend", ".env")]) {
-    try {
-      const match = /^DATABASE_URL\s*=\s*"?([^"\r\n]+)"?\s*$/m.exec(readFileSync(candidate, "utf8"));
-      if (match) return match[1].trim();
-    } catch {
-      // Try the next candidate path.
-    }
-  }
-  return process.env.DATABASE_URL ?? null;
-}
-
-const databaseUrl = resolveDatabaseUrl();
-const prisma = databaseUrl ? new PrismaClient({ datasources: { db: { url: databaseUrl } } }) : null;
-
-let available = false;
-if (prisma) {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    available = true;
-  } catch {
-    console.warn("[phase11] Skipping profile bootstrap tests — no database reachable.");
-  }
-}
+// Integration state lives in the DEDICATED test database. The helper refuses
+// to fall back to the runtime/canary database, so a misconfiguration fails the
+// suite instead of quietly writing synthetic executions into runtime state.
+const { prisma: testDatabase, available } = await connectTestDatabase();
+const prisma: PrismaClient | null = testDatabase;
 
 const { ensureExecutionProfile, resolveExecutionProfile } = await import(
   "../src/modules/execution/execution-profile.service"

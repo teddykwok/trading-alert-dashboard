@@ -1,8 +1,8 @@
-import { readFileSync } from "node:fs";
-import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import { PrismaClient } from "@prisma/client";
+
+import { connectTestDatabase } from "./helpers/test-database";
 
 /**
  * Phase 8 route-layer tests.
@@ -15,32 +15,11 @@ import { PrismaClient } from "@prisma/client";
 const TAG = "phase8-routes";
 const SYMBOL = "TESTRUSDT";
 
-function resolveDatabaseUrl(): string | null {
-  for (const candidate of [path.join(process.cwd(), ".env"), path.join(process.cwd(), "apps", "backend", ".env")]) {
-    try {
-      const match = /^DATABASE_URL\s*=\s*"?([^"\r\n]+)"?\s*$/m.exec(readFileSync(candidate, "utf8"));
-      if (match) return match[1].trim();
-    } catch {
-      // Try the next candidate path.
-    }
-  }
-  return process.env.DATABASE_URL ?? null;
-}
-
-const databaseUrl = resolveDatabaseUrl();
-const prisma = databaseUrl ? new PrismaClient({ datasources: { db: { url: databaseUrl } } }) : null;
-
-let available = false;
-if (prisma) {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    available = true;
-  } catch {
-    console.warn("[phase8] Skipping journal route tests - no database reachable.");
-  }
-} else {
-  console.warn("[phase8] Skipping journal route tests - no DATABASE_URL.");
-}
+// Integration state lives in the DEDICATED test database. The helper refuses
+// to fall back to the runtime/canary database, so a misconfiguration fails the
+// suite instead of quietly writing synthetic executions into runtime state.
+const { prisma: testDatabase, available } = await connectTestDatabase();
+const prisma: PrismaClient | null = testDatabase;
 
 const { executionsRoutes } = await import("../src/routes/executions.routes");
 const { AppError } = await import("../src/utils/errors");

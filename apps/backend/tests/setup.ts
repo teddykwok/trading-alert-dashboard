@@ -1,8 +1,28 @@
 import { vi } from "vitest";
+import { resolveTestDatabase } from "./helpers/test-database";
 
-// Minimal env so config/env.ts validation passes; tests never hit a real
-// Postgres/Redis instance because ioredis/bullmq/socket.io are mocked below.
-process.env.DATABASE_URL ??= "postgresql://postgres:postgres@localhost:5432/trading_alert_dashboard_test?schema=public";
+/**
+ * `DATABASE_URL` inside the test process points at the TEST database, always.
+ *
+ * Production code constructs its own `new PrismaClient()` with no datasource
+ * override — every operator CLI does, and so does the app — so whatever this
+ * variable holds is where that code writes. Left to `dotenv`, it would hold the
+ * runtime/canary connection string from `.env`, which is how synthetic
+ * executions ended up in the database the canary preflight counts.
+ *
+ * Overwriting (not `??=`) is the point: there must be no path by which a test
+ * process reaches the runtime database, including an inherited shell variable.
+ *
+ * When no test database is configured this deliberately becomes an unusable
+ * placeholder rather than a fallback. Pure unit tests, which never open a
+ * connection, keep working; any suite that actually wants a database goes
+ * through `connectTestDatabase()` and gets a hard failure explaining why.
+ */
+try {
+  process.env.DATABASE_URL = resolveTestDatabase().url;
+} catch {
+  process.env.DATABASE_URL = "postgresql://unconfigured:unconfigured@127.0.0.1:1/no_test_database_configured";
+}
 process.env.REDIS_URL ??= "redis://localhost:6379";
 process.env.BACKEND_PORT ??= "4000";
 process.env.FRONTEND_URL ??= "http://localhost:5173";

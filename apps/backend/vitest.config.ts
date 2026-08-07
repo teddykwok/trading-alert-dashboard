@@ -19,5 +19,18 @@ export default defineConfig({
      * money-moving code.
      */
     fileParallelism: false,
+    /**
+     * Child processes, not worker threads.
+     *
+     * The default thread pool intermittently dies with SIGSEGV on this suite —
+     * usually at teardown, occasionally mid-run. A signal death skips every
+     * `afterEach`/`afterAll`, which is precisely how a synthetic execution
+     * graph once survived teardown and ended up in the counts the live-canary
+     * preflight reads. Teardown is now written to reclaim such orphans on the
+     * next run, but a runner that does not crash is the better first line of
+     * defence. Forks are marginally slower and have been stable across full
+     * runs.
+     */
+    pool: "forks",
   },
 });

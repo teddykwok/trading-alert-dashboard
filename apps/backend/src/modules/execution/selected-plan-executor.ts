@@ -47,7 +47,11 @@ export type SelectedPlanSkipReason =
   | "NO_SELECTED_CANDIDATE"
   | "CANDIDATE_INCOMPLETE"
   | "MARGIN_PLAN_NOT_READY"
-  | "PROFILE_UNAVAILABLE";
+  | "PROFILE_UNAVAILABLE"
+  | "CANARY_AUTHORIZATION_REQUIRED"
+  | "CANARY_AUTHORIZATION_WRONG_SYMBOL"
+  | "CANARY_AUTHORIZATION_WRONG_DIRECTION"
+  | "CANARY_AUTHORIZATION_ALREADY_CONSUMED";
 
 export interface SelectedPlanExecutorDependencies {
   prisma: PrismaClient;
@@ -58,6 +62,9 @@ export interface SelectedPlanExecutorDependencies {
 }
 
 export class SelectedPlanExecutor {
+  /** Set when this signal matched a prepared canary authorization. */
+  private boundAuthorizationId: string | null = null;
+
   constructor(private readonly deps: SelectedPlanExecutorDependencies) {}
 
   /**
@@ -102,6 +109,67 @@ export class SelectedPlanExecutor {
     const profile = await resolveExecutionProfile(this.deps.prisma, this.deps.profileIdentity);
     if (!profile.ok) {
       return { handled: false, reasonCode: "PROFILE_UNAVAILABLE", message: profile.message };
+    }
+
+    // --- Canary authorization (fail closed) --------------------------------
+    // While ANY authorization has been prepared for this profile, the profile
+    // is in canary mode and only the one specifically authorized signal may
+    // proceed. That closes the activation-window race: an unrelated alert, or
+    // the right symbol in the wrong direction, cannot consume the slot simply
+    // because the gates happen to be open.
+    //
+    // The check is on the durable binding written at ingestion, never on a
+    // token — nothing reusable is persisted or passed around.
+    const canaryMode = await this.deps.prisma.executionCanaryAuthorization.count({
+      where: { executionProfileId: profile.profile.id },
+    });
+    if (canaryMode > 0) {
+      const bound = await this.deps.prisma.executionCanaryAuthorization.findFirst({
+        where: {
+          executionProfileId: profile.profile.id,
+          consumedAlertId: plan.alertId,
+          revokedAt: null,
+        },
+      });
+      if (!bound) {
+        return {
+          handled: false,
+          reasonCode: "CANARY_AUTHORIZATION_REQUIRED",
+          message: "This profile is in canary mode and this signal carries no valid authorization.",
+        };
+      }
+      // Identity is re-asserted here too: the binding proves WHICH alert, and
+      // these prove the alert still matches what was authorized.
+      if (bound.allowedSymbol !== symbol.trim().toUpperCase()) {
+        return {
+          handled: false,
+          reasonCode: "CANARY_AUTHORIZATION_WRONG_SYMBOL",
+          message: `The authorization admits ${bound.allowedSymbol}, not this symbol.`,
+        };
+      }
+      if (bound.allowedDirection !== plan.direction) {
+        return {
+          handled: false,
+          reasonCode: "CANARY_AUTHORIZATION_WRONG_DIRECTION",
+          message: `The authorization admits ${bound.allowedDirection}, not ${plan.direction}.`,
+        };
+      }
+      // Bound to a DIFFERENT execution already: that execution may still
+      // recover, but this one may never adopt the authorization.
+      if (bound.consumedExecutionId !== null) {
+        const owner = await this.deps.prisma.tradeExecution.findUnique({
+          where: { id: bound.consumedExecutionId },
+          select: { alertId: true },
+        });
+        if (owner && owner.alertId !== plan.alertId) {
+          return {
+            handled: false,
+            reasonCode: "CANARY_AUTHORIZATION_ALREADY_CONSUMED",
+            message: "The authorization is already bound to a different execution.",
+          };
+        }
+      }
+      this.boundAuthorizationId = bound.id;
     }
 
     // --- Phase 3 does the mathematics -------------------------------------
@@ -152,6 +220,15 @@ export class SelectedPlanExecutor {
       } else {
         throw error;
       }
+    }
+
+    // Record which execution this authorization produced, so a later signal
+    // can never adopt it while THIS execution stays recoverable.
+    if (this.boundAuthorizationId) {
+      await this.deps.prisma.executionCanaryAuthorization.updateMany({
+        where: { id: this.boundAuthorizationId, consumedExecutionId: null },
+        data: { consumedExecutionId: executionId },
+      });
     }
 
     // --- Admission (separable; recoverable if this never runs) -------------
