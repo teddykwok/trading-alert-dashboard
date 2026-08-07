@@ -74,6 +74,17 @@ export interface ProtectionLifecycleInput {
   evaluatedAt: Date;
 }
 
+/**
+ * The exact coverage that was proven at one verification moment. Decimal
+ * STRINGS only — nothing here is ever routed through a JS number.
+ */
+export interface VerifiedCoverageSnapshot {
+  confirmedOpenQuantity: string;
+  protectedStopQuantity: string;
+  protectedTakeProfitQuantity: string;
+  verifiedAt: Date;
+}
+
 export interface ProtectionOutcome {
   ok: boolean;
   reasonCode: ProtectionReasonCode;
@@ -509,7 +520,19 @@ export class ProtectionLifecycleService {
     }
 
     if (coverage.fullyCovered) {
-      await this.setProtectionState(protection.id, "PROTECTED", "PROTECTION_VERIFIED", "Aggregate coverage matches exposure.", input.evaluatedAt);
+      await this.setProtectionState(
+        protection.id,
+        "PROTECTED",
+        "PROTECTION_VERIFIED",
+        "Aggregate coverage matches exposure.",
+        input.evaluatedAt,
+        {
+          confirmedOpenQuantity: openQuantity,
+          protectedStopQuantity: coverageNow.stop,
+          protectedTakeProfitQuantity: coverageNow.takeProfit,
+          verifiedAt: input.evaluatedAt,
+        }
+      );
       return this.outcome(true, "PROTECTION_VERIFIED", "Position is fully protected.", execution, await this.loadProtection(execution.id));
     }
 
@@ -878,16 +901,31 @@ export class ProtectionLifecycleService {
     });
 
     const state: ProtectionState = coverage.fullyCovered && !coverage.overProtected ? "PROTECTED" : "PROTECTION_INCOMPLETE";
-    await this.prisma.executionProtectionState.update({
-      where: { id: protection.id },
-      data: {
-        confirmedOpenQuantity: new D(open),
-        protectedStopQuantity: new D(measured.stop),
-        protectedTakeProfitQuantity: new D(measured.takeProfit),
-        state,
-        reasonCode: state === "PROTECTED" ? "PROTECTION_VERIFIED" : "PROTECTION_COVERAGE_INCOMPLETE",
-        verifiedAt: state === "PROTECTED" ? input.evaluatedAt : null,
-      },
+    await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.executionProtectionState.update({
+        where: { id: protection.id },
+        data: {
+          confirmedOpenQuantity: new D(open),
+          protectedStopQuantity: new D(measured.stop),
+          protectedTakeProfitQuantity: new D(measured.takeProfit),
+          state,
+          reasonCode: state === "PROTECTED" ? "PROTECTION_VERIFIED" : "PROTECTION_COVERAGE_INCOMPLETE",
+          verifiedAt: state === "PROTECTED" ? input.evaluatedAt : null,
+          // A change counter, not an optimistic lock (nothing guards on it).
+          // Advancing it per state write is what gives each verification a
+          // distinct, collision-free identity in the history below.
+          version: { increment: 1 },
+        },
+      });
+      // History is appended only for a PROVEN verification, never for a gap.
+      if (state === "PROTECTED") {
+        await this.appendVerification(tx, updated, {
+          confirmedOpenQuantity: open,
+          protectedStopQuantity: measured.stop,
+          protectedTakeProfitQuantity: measured.takeProfit,
+          verifiedAt: input.evaluatedAt,
+        });
+      }
     });
 
     if (state !== "PROTECTED") {
@@ -1619,17 +1657,65 @@ export class ProtectionLifecycleService {
     state: ProtectionState,
     reasonCode: ProtectionReasonCode | null,
     message: string | null,
-    verifiedAt?: Date
+    verifiedAt?: Date,
+    coverage?: VerifiedCoverageSnapshot
   ): Promise<void> {
-    await this.prisma.executionProtectionState.update({
-      where: { id },
-      data: {
-        state,
-        reasonCode: reasonCode ?? undefined,
-        sanitizedMessage: message?.slice(0, 1000) ?? undefined,
-        verifiedAt: verifiedAt ?? undefined,
-        version: { increment: 1 },
+    await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.executionProtectionState.update({
+        where: { id },
+        data: {
+          state,
+          reasonCode: reasonCode ?? undefined,
+          sanitizedMessage: message?.slice(0, 1000) ?? undefined,
+          verifiedAt: verifiedAt ?? undefined,
+          version: { increment: 1 },
+        },
+      });
+      if (coverage) await this.appendVerification(tx, updated, coverage);
+    });
+  }
+
+  /**
+   * Appends the durable proof that coverage was verified complete at this
+   * protection version.
+   *
+   * The protection row itself is mutable and only ever shows the LATEST
+   * coverage, so an observer that was offline across "protected 0.10" then
+   * "protected 0.25" could never learn the first happened. This append-only row
+   * is that history.
+   *
+   * Written inside the caller's transaction — it is history, not a side effect,
+   * and it involves no network call, no Telegram and no notification table.
+   * `upsert` rather than `create` so this bookkeeping can never be the thing
+   * that fails a protection transaction.
+   */
+  private async appendVerification(
+    tx: Prisma.TransactionClient,
+    protection: ExecutionProtectionState,
+    coverage: VerifiedCoverageSnapshot
+  ): Promise<void> {
+    const row = {
+      state: protection.state,
+      confirmedOpenQuantity: new D(coverage.confirmedOpenQuantity),
+      protectedStopQuantity: new D(coverage.protectedStopQuantity),
+      protectedTakeProfitQuantity: new D(coverage.protectedTakeProfitQuantity),
+      liquidationSafe: protection.liquidationSafe,
+      generation: protection.currentGeneration,
+      verifiedAt: coverage.verifiedAt,
+    };
+    await tx.executionProtectionVerification.upsert({
+      where: {
+        tradeExecutionId_protectionVersion: {
+          tradeExecutionId: protection.tradeExecutionId,
+          protectionVersion: protection.version,
+        },
       },
+      create: {
+        tradeExecutionId: protection.tradeExecutionId,
+        protectionVersion: protection.version,
+        ...row,
+      },
+      update: row,
     });
   }
 

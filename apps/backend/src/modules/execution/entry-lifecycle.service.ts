@@ -1049,6 +1049,16 @@ export class EntryLifecycleService {
             exchangeStatus: observed.status,
             cancelCause,
             regressionIgnored: progress.regressionIgnored,
+            // Exact decimal STRINGS (never JS numbers) of the fill as it stood
+            // at THIS reconciliation. The mutable order row only ever shows the
+            // latest quantity, so without this an observer that was offline
+            // across 0.10 -> 0.15 -> 0.25 could never learn the intermediate
+            // fills happened. Reading them is nobody's business here: this is
+            // simply the durable history the event already describes.
+            cumulativeFilledQuantity: progress.executedQuantity,
+            plannedQuantity: execution.plannedQuantity.toFixed(),
+            originalQuantity: order.originalQuantity.toFixed(),
+            averageFillPrice: progress.averageFillPrice,
           } as Prisma.InputJsonValue,
         },
       });

@@ -619,6 +619,8 @@ model TradeExecution {
   protectionState   ExecutionProtectionState?
   marginAdjustments MarginAdjustmentIntent[]
   criticalAlerts    CriticalAlert[]
+  notifications     ExecutionNotification[]
+  protectionVerifications ExecutionProtectionVerification[]
 
   @@unique([alertId, executionProfileId])
   @@index([status])
@@ -715,6 +717,8 @@ model ExecutionEvent {
   message          String?
   metadata         Json?
   createdAt        DateTime           @default(now())
+  /// Phase 9 materialization ledger entry (derived, never authoritative).
+  notificationCheckpoint ExecutionNotificationCheckpoint?
 
   @@unique([tradeExecutionId, sequenceNumber])
   @@index([tradeExecutionId, sequenceNumber])
@@ -849,9 +853,159 @@ model CriticalAlert {
   attempts         Int                 @default(0)
   lastError        String?
   sentAt           DateTime?
+  /// Phase 9 delivery lease. Two dispatcher runs cannot both send the same
+  /// alert: one wins the atomic claim, the other skips it. A crash leaves a
+  /// stale lease that is reclaimable after the configured timeout, so a
+  /// half-delivered alert is never lost — only, at worst, sent twice.
+  claimedAt        DateTime?
+  claimOwner       String?
   createdAt        DateTime            @default(now())
   updatedAt        DateTime            @updatedAt
 
   @@index([tradeExecutionId])
   @@index([status])
+}
+
+// ===========================================================================
+// Phase 9 — durable execution notification outbox (Telegram)
+// ===========================================================================
+
+/// Informational execution milestones. CRITICAL_PROTECTION_FAILURE is
+/// deliberately absent: Phase 7 CriticalAlert stays the single authoritative
+/// durable record for critical conditions and is delivered through the same
+/// dispatcher, so no second competing critical model exists.
+enum ExecutionNotificationType {
+  LIMIT_PLACED
+  PARTIAL_FILL
+  POSITION_FILLED
+  POSITION_PROTECTED
+  ENTRY_EXPIRED
+  CLOSED_TP
+  CLOSED_SL
+  CLOSED_EMERGENCY
+  TRADE_SKIPPED
+}
+
+enum ExecutionNotificationSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum ExecutionNotificationStatus {
+  PENDING
+  DELIVERED
+  RETRYABLE_FAILURE
+  PERMANENT_FAILURE
+}
+
+/// Append-only proof that protection coverage was VERIFIED complete at a
+/// point in time.
+///
+/// Phase 7 tracks protection on ExecutionProtectionState, which is mutable and
+/// only ever shows the LATEST coverage — so a notification runner that was
+/// offline across "protected 0.10" then "protected 0.25" could never learn that
+/// 0.10 happened. This row is the durable history that makes the earlier
+/// milestone recoverable.
+///
+/// Deliberately NOT an ExecutionEvent: that table's sequenceNumber is
+/// TradeExecution.version, so inserting into its sequence space would collide
+/// with the next lifecycle write and roll back a TRADING transaction. Protection
+/// verification therefore carries the protection row's own version instead,
+/// which already increments per state change and cannot collide.
+///
+/// Written only when the lifecycle actually proved full STOP + TP coverage of
+/// the confirmed exposure. Never updated, never deleted.
+model ExecutionProtectionVerification {
+  id               String         @id @default(cuid())
+  tradeExecutionId String
+  tradeExecution   TradeExecution @relation(fields: [tradeExecutionId], references: [id], onDelete: Restrict)
+  /// ExecutionProtectionState.version at the moment of verification.
+  protectionVersion Int
+  state             ProtectionState
+  /// Exact decimal quantities frozen at verification time.
+  confirmedOpenQuantity       Decimal @db.Decimal(40, 18)
+  protectedStopQuantity       Decimal @db.Decimal(40, 18)
+  protectedTakeProfitQuantity Decimal @db.Decimal(40, 18)
+  /// Null is never "safe" — a milestone requires an explicit true.
+  liquidationSafe   Boolean?
+  generation        Int
+  verifiedAt        DateTime
+  createdAt         DateTime @default(now())
+  notificationCheckpoint ExecutionNotificationCheckpoint?
+
+  @@unique([tradeExecutionId, protectionVersion])
+  @@index([tradeExecutionId])
+}
+
+/// Per-record materialization ledger.
+///
+/// The runner discovers work by asking each durable history table for rows with
+/// NO checkpoint — an index-backed anti-join over a real relation, so a bounded
+/// batch stays bounded no matter how large the history grows. Deliberately not
+/// a timestamp watermark: two events can share a createdAt to the millisecond
+/// and a watermark would silently skip one of them.
+///
+/// The checkpoint and the notification rows it produced commit in ONE
+/// transaction: a crash before commit leaves the source rediscoverable, and a
+/// crash after commit leaves both present. The unique dedupe key on
+/// ExecutionNotification remains the final backstop.
+///
+/// Exactly one of the two source columns is set. Both are UNIQUE, which is what
+/// makes "at most one checkpoint per source" a database guarantee rather than a
+/// convention, and Cascade so this derived bookkeeping can never restrict the
+/// deletion of the lifecycle history it points at.
+model ExecutionNotificationCheckpoint {
+  id                       String                           @id @default(cuid())
+  executionEventId         String?                          @unique
+  executionEvent           ExecutionEvent?                  @relation(fields: [executionEventId], references: [id], onDelete: Cascade)
+  protectionVerificationId String?                          @unique
+  protectionVerification   ExecutionProtectionVerification? @relation(fields: [protectionVerificationId], references: [id], onDelete: Cascade)
+  processedAt              DateTime
+  createdAt                DateTime                         @default(now())
+}
+
+/// Durable outbox for execution Telegram notifications.
+///
+/// The row is written from DURABLY CONFIRMED persisted state only, outside any
+/// lifecycle transaction, and delivery happens separately. Telegram can be down
+/// for a week without touching a single trading decision.
+///
+/// Content is sanitized: no bot token, no chat id, no API key or secret, no raw
+/// Telegram or Binance payload, no account balance, no account identifier.
+model ExecutionNotification {
+  id               String         @id @default(cuid())
+  tradeExecutionId String
+  // Restrict: financial/audit history is never removed implicitly.
+  tradeExecution   TradeExecution @relation(fields: [tradeExecutionId], references: [id], onDelete: Restrict)
+
+  notificationType ExecutionNotificationType
+  /// Deterministic per (execution, type, milestone discriminator). UNIQUE, so
+  /// concurrent materializers cannot create two rows for the same milestone —
+  /// the guarantee is the database constraint, never an in-memory check.
+  dedupeKey        String                        @unique
+  severity         ExecutionNotificationSeverity @default(INFO)
+  /// Causal delivery order within one materialization batch. Guarantees a
+  /// restart never sends CLOSED_TP before POSITION_FILLED.
+  milestoneSequence Int
+  /// Sanitized exact-decimal-string snapshot frozen at materialization; the
+  /// message is rendered from this, so late state changes cannot rewrite an
+  /// already-earned milestone.
+  payloadSnapshot  Json
+
+  deliveryStatus   ExecutionNotificationStatus @default(PENDING)
+  attemptCount     Int                         @default(0)
+  lastAttemptAt    DateTime?
+  deliveredAt      DateTime?
+  lastErrorCode    String?
+  sanitizedLastError String?
+  /// Delivery lease — see CriticalAlert.claimedAt.
+  claimedAt        DateTime?
+  claimOwner       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tradeExecutionId])
+  @@index([deliveryStatus, createdAt])
 }

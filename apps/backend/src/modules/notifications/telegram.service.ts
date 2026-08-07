@@ -71,6 +71,151 @@ export async function sendTelegramMessage(text: string): Promise<boolean> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 9 — execution notification transport
+// ---------------------------------------------------------------------------
+
+/** Stable delivery-level codes. These are TRANSPORT outcomes and never replace
+ *  a trading reason code — an execution's own decisionReasonCode is a different
+ *  concept and is never overwritten by any value here. */
+export const TELEGRAM_DELIVERY_CODES = [
+  "TELEGRAM_EXECUTION_DISABLED",
+  "TELEGRAM_DESTINATION_UNAVAILABLE",
+  "TELEGRAM_FORMATTING_FAILED",
+  "TELEGRAM_DELIVERY_RETRYABLE",
+  "TELEGRAM_DELIVERY_PERMANENT_FAILURE",
+  "TELEGRAM_DELIVERY_CLAIM_CONFLICT",
+  "TELEGRAM_NOTIFICATION_PAYLOAD_INVALID",
+] as const;
+
+export type TelegramDeliveryCode = (typeof TELEGRAM_DELIVERY_CODES)[number];
+
+export interface TelegramSendResult {
+  delivered: boolean;
+  /** False means "do not try this payload again" (e.g. bad chat id). */
+  retryable: boolean;
+  errorCode: TelegramDeliveryCode | null;
+  /** One short line, no token, no chat id, no raw response body. */
+  sanitizedError: string | null;
+}
+
+/**
+ * The transport the notification dispatcher depends on. Injected, so tests use
+ * a fake and never reach api.telegram.org.
+ */
+export type ExecutionTelegramSender = (chatId: string, text: string) => Promise<TelegramSendResult>;
+
+/**
+ * Where normal execution milestones go: the optional dedicated execution chat,
+ * or the existing configured chat when it is empty. Returns null when nothing
+ * is configured at all — the caller then leaves the notification retryable
+ * rather than marking it delivered.
+ */
+export function resolveExecutionChatId(): string | null {
+  const dedicated = env.TELEGRAM_EXECUTION_CHAT_ID.trim();
+  if (dedicated !== "") return dedicated;
+  const fallback = env.TELEGRAM_CHAT_ID.trim();
+  return fallback === "" ? null : fallback;
+}
+
+/**
+ * Where critical protection failures go: the EXISTING critical destination.
+ * Deliberately not duplicated into the execution chat — one critical message
+ * reaches one place, so nothing is acknowledged twice.
+ */
+/**
+ * The Telegram master switch, as the notification runner sees it. False means
+ * "do not attempt delivery at all" — the runner then skips claiming entirely so
+ * no attempt budget is consumed while notifications are switched off.
+ */
+export function telegramDeliveryEnabled(): boolean {
+  return env.TELEGRAM_NOTIFICATIONS_ENABLED && env.TELEGRAM_BOT_TOKEN !== "";
+}
+
+export function resolveCriticalChatId(): string | null {
+  const configured = env.TELEGRAM_CHAT_ID.trim();
+  return configured === "" ? null : configured;
+}
+
+/**
+ * Telegram error codes that will never succeed on retry: the payload or the
+ * destination is wrong, so re-sending burns attempts forever. Everything else
+ * (network, 5xx, 429 rate limit) stays retryable.
+ */
+function classifyStatus(status: number): { retryable: boolean } {
+  if (status === 429) return { retryable: true };
+  if (status >= 500) return { retryable: true };
+  // 400 Bad Request / 401 Unauthorized / 403 Forbidden / 404 chat not found.
+  if (status >= 400) return { retryable: false };
+  return { retryable: true };
+}
+
+/**
+ * Sends one execution notification to an explicit chat. Never throws.
+ *
+ * Plain text, no parse_mode — the repository-wide Telegram convention (see the
+ * comment on sendTelegramMessage). Nothing dynamic can break the parser, so no
+ * escaping scheme has to be kept correct for arbitrary symbols and reason
+ * codes.
+ *
+ * The returned error never contains the bot token, the chat id or the raw
+ * response body.
+ */
+export async function sendExecutionTelegramMessage(
+  chatId: string,
+  text: string
+): Promise<TelegramSendResult> {
+  if (!env.TELEGRAM_NOTIFICATIONS_ENABLED) {
+    return {
+      delivered: false,
+      retryable: true,
+      errorCode: "TELEGRAM_EXECUTION_DISABLED",
+      sanitizedError: "Telegram notifications are disabled.",
+    };
+  }
+  if (!env.TELEGRAM_BOT_TOKEN || chatId.trim() === "") {
+    return {
+      delivered: false,
+      retryable: true,
+      errorCode: "TELEGRAM_DESTINATION_UNAVAILABLE",
+      sanitizedError: "No Telegram bot token or destination is configured.",
+    };
+  }
+
+  try {
+    const response = await fetch(apiUrl("sendMessage"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+    });
+
+    if (response.ok) {
+      return { delivered: true, retryable: false, errorCode: null, sanitizedError: null };
+    }
+
+    const { retryable } = classifyStatus(response.status);
+    // The status code only — a Telegram error body can echo the request back.
+    logger.warn({ status: response.status, retryable }, "Execution Telegram delivery failed");
+    return {
+      delivered: false,
+      retryable,
+      errorCode: retryable ? "TELEGRAM_DELIVERY_RETRYABLE" : "TELEGRAM_DELIVERY_PERMANENT_FAILURE",
+      sanitizedError: `Telegram responded with HTTP ${response.status}.`,
+    };
+  } catch {
+    // Network-level failure: no status, always worth retrying. The thrown
+    // error is not echoed — a fetch error message can contain the full URL,
+    // which contains the bot token.
+    logger.warn("Execution Telegram delivery threw a transport error");
+    return {
+      delivered: false,
+      retryable: true,
+      errorCode: "TELEGRAM_DELIVERY_RETRYABLE",
+      sanitizedError: "Telegram could not be reached.",
+    };
+  }
+}
+
 /**
  * Sends a photo (the chart screenshot) with a caption via multipart form data.
  * Returns true on success, false if skipped or failed. Callers that need a

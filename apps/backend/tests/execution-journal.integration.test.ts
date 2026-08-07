@@ -570,10 +570,13 @@ describe("execution for alert", () => {
         signal: "LONG", indicatorName: `${TAG}-orphan`, rawPayload: { note: TAG }, triggeredAt: new Date(),
       },
     });
-    const before = await prisma!.tradeExecution.count();
+    // Scoped to this suite's synthetic symbol: other suites share the database
+    // and run in parallel, so a global count would measure their rows too.
+    const scope = { where: { OR: [{ symbol: SYMBOL }, { alertId: alert.id }] } };
+    const before = await prisma!.tradeExecution.count(scope);
     expect(await journal.getExecutionForAlert(alert.id)).toBeNull();
     // Opening the tab must never materialise an execution.
-    expect(await prisma!.tradeExecution.count()).toBe(before);
+    expect(await prisma!.tradeExecution.count(scope)).toBe(before);
   });
 });
 

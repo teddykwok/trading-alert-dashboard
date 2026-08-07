@@ -310,12 +310,19 @@ describe("phase 4 safety boundary", () => {
   });
 
   it("uses non-destructive deletion policies for financial rows", () => {
-    const phase4 = schema.slice(schema.indexOf("model TradeExecution"));
+    const financial = schema
+      .slice(schema.indexOf("model TradeExecution"))
+      // The Phase 9 materialization ledger is derived bookkeeping, not
+      // financial history: it points AT lifecycle rows and must never be able
+      // to restrict their deletion, so it alone uses Cascade. Everything that
+      // records money or a decision is checked below.
+      .replace(/model ExecutionNotificationCheckpoint \{[\s\S]*?\n\}/, "");
+
     // Alert/plan links degrade to null so retention cannot destroy history.
-    expect(phase4).toContain("onDelete: SetNull");
+    expect(financial).toContain("onDelete: SetNull");
     // Profile, orders and events are restricted.
-    expect(phase4).toContain("onDelete: Restrict");
-    expect(phase4).not.toContain("onDelete: Cascade");
+    expect(financial).toContain("onDelete: Restrict");
+    expect(financial).not.toContain("onDelete: Cascade");
   });
 
   it("seeds no real account, symbol or balance anywhere in Phase 4 sources", () => {

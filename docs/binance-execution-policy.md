@@ -783,3 +783,195 @@ The Execution Journal is the authoritative automated lifecycle. The existing
 `TradeReview` / `TradeJournal` records remain the user's own manual outcome and
 retrospective notes; they are separate models, shown in separate labelled
 sections, and Phase 8 neither merges nor overwrites them.
+
+## Phase 9 — Telegram execution notifications
+
+Phase 9 is **observability only**. It reads persisted execution state and sends
+Telegram messages. It never submits or cancels an order, never changes leverage,
+margin type or isolated margin, never closes a position, and never alters a
+Phase 5 capacity decision, a Phase 6 entry reconciliation or a Phase 7
+protection decision. Telegram availability has no influence whatsoever on
+trading safety or lifecycle progress: the worst case is an undelivered row that
+stays durable, visible and retryable.
+
+### Durable outbox
+
+A milestone is persisted first and delivered afterwards. No Telegram call ever
+happens inside a lifecycle transaction, and no database transaction is held open
+across an HTTP request. A Telegram failure therefore cannot roll back entry
+reconciliation, fill persistence, SL or TP placement, margin handling, emergency
+close or closure cleanup.
+
+Two explicitly separated stages:
+
+| Stage | Reads | Writes |
+| --- | --- | --- |
+| `materializeExecutionNotifications` | `TradeExecution`, `BinanceOrder`, `ExecutionProtectionState` | `ExecutionNotification` only |
+| `dispatchPendingNotifications` | `ExecutionNotification`, `CriticalAlert` | delivery fields only |
+
+Neither stage is wired to a worker, a queue, a scheduler or a poller. There is
+no background daemon: a caller decides when to run each stage, so nothing in the
+execution path can be delayed by Telegram.
+
+### Relationship with the Phase 7 CriticalAlert
+
+`CriticalAlert` remains the single authoritative durable record for every
+critical condition (`STOP_NOT_VERIFIED`, `STOP_SUBMISSION_UNKNOWN`,
+`LIQUIDATION_BUFFER_UNSAFE`, `MARGIN_TOP_UP_FAILED`,
+`MARGIN_TOP_UP_RESULT_UNKNOWN`, `PROTECTION_COVERAGE_INCOMPLETE`,
+`EMERGENCY_CLOSE_STARTED`, `EMERGENCY_CLOSE_FAILED`,
+`POSITION_IDENTITY_CONFLICT`, `SIBLING_CANCELLATION_FAILED`,
+`ORPHAN_PROTECTION_ORDER`, and the entry-cleanup reason codes that map onto
+them). Phase 9 creates **no** competing critical model and no
+`ExecutionNotification` row for a critical condition — it delivers the existing
+record through the shared pipeline, preserving the Phase 7 dedupe identity.
+Phase 9 writes only that row's delivery fields (`status`, `sentAt`, `attempts`,
+`lastError`, `claimedAt`, `claimToken`).
+
+### Milestones require durably confirmed state
+
+| Notification | Earned only when |
+| --- | --- |
+| `LIMIT_PLACED` | the generation-1 ENTRY order has been read back by reconciliation and is `NEW`/`PARTIALLY_FILLED`/`FILLED` — never from a bare submission ACK, and never from `status == ENTRY_PENDING` alone |
+| `PARTIAL_FILL` | `0 < confirmed filled < planned` |
+| `POSITION_FILLED` | the ENTRY order itself is `FILLED` |
+| `POSITION_PROTECTED` | the persisted protection state is `PROTECTED`, liquidation safety is verified true, and stop **and** take-profit coverage each equal the confirmed open quantity |
+| `ENTRY_EXPIRED` | terminal `ENTRY_EXPIRED` **and** zero exposure proven by the persisted protection state |
+| `CLOSED_TP` / `CLOSED_SL` / `CLOSED_EMERGENCY` | the corresponding terminal status has committed (Phase 7 has already proven position zero, entry remainder neutralized, sibling cleanup complete) |
+| `TRADE_SKIPPED` | terminal `SKIPPED` — a retryable `UNAVAILABLE` or capacity conflict never reaches this status and is never called a skip |
+
+### Dedupe
+
+Every notification carries a deterministic key,
+`sha256(executionId | type | discriminator)`, enforced by a **database unique
+constraint** rather than an in-memory check, so concurrent materializers create
+one row. The discriminator is empty for once-per-execution milestones,
+the canonical cumulative filled quantity for `PARTIAL_FILL`, and the canonical
+verified protected quantity for `POSITION_PROTECTED`. `0.10`, `0.1` and `0.100`
+are the same milestone. Critical alerts reuse the Phase 7 dedupe key unchanged.
+
+### Delivery, ordering and priority
+
+Delivery is claim-based: an atomic conditional update leases a row, the lease is
+released after the send, and a lease older than one minute is reclaimable so a
+crashed process cannot strand a message. Batches are bounded and no invocation
+loops. Critical alerts are claimed and delivered **before** any informational
+message and are counted against a separate budget, so an informational flood
+cannot starve a protection failure. Informational rows are ordered
+`createdAt, milestoneSequence, id`, which guarantees a restart never delivers
+`CLOSED_TP` before `POSITION_FILLED`.
+
+Telegram provides no exactly-once guarantee. A crash between a successful send
+and the local delivered mark re-sends the message. This is deliberate: durable
+at-least-once delivery is safer than silently losing a critical notification,
+and every message carries a stable `Ref:` line so a duplicate is recognisable as
+the same milestone rather than a second fill or a second closure. Trading
+correctness is never traded away for Telegram exactly-once.
+
+### Financial semantics
+
+Reused from Phase 8 unchanged. `netPnlUsd = realizedPnl - tradingFeesUsd +
+fundingPnlUsd`, and only when all three are known; otherwise the message reads
+`Not available`. Null is never rendered as `$0.00`, a zero fee is rendered as
+zero, and negative realized PnL and paid funding stay negative. Nothing is
+recomputed from exchange prices and no Binance income history is fetched.
+
+### Routing
+
+`TELEGRAM_EXECUTION_CHAT_ID` is optional. When set, execution milestones go
+there; when empty they fall back to `TELEGRAM_CHAT_ID`. Critical alerts always
+use the existing destination and are never duplicated into a second chat. The
+same `TELEGRAM_BOT_TOKEN` serves both — there is no second bot. The token stays
+environment-only, and no chat id is ever persisted, logged or written into a
+notification payload.
+
+### Message format
+
+Plain text, matching the repository-wide convention: no `parse_mode` is ever
+sent, so Markdown or HTML characters in a symbol, a reason code or an operator
+message cannot break a parser and cause a silent delivery failure. Dynamic
+fields are still flattened to a single line and length-bounded so nothing can
+forge extra message structure. Decimals are shown exactly (trailing zeros
+dropped — a lossless rewrite, never a rounding). Messages never contain a bot
+token, API key or secret, authorization header, signed URL, raw Telegram or
+Binance payload, wallet or available balance, account identifier, client order
+id or stack trace.
+
+### Phase 9 runtime — how notifications actually run
+
+`runExecutionNotificationTick()` is the production entry point. One bounded pass
+discovers unmaterialized history, materializes the intents it earns, delivers
+critical alerts, delivers informational notifications, and returns. There is no
+loop inside it and it never throws.
+
+It is scheduled by `execution-notification.scheduler.ts` on a 60-second
+interval, started once from the existing worker entrypoint
+(`vision-analysis.worker.ts`) next to the cleanup and retention schedulers and
+cleared by the same SIGTERM handler. An overlap guard skips a tick while the
+previous one is still running. No second daemon, no queue, no HTTP trigger, no
+Binance polling.
+
+#### Durable source per notification
+
+| Notification | Authoritative durable source |
+| --- | --- |
+| `LIMIT_PLACED` | `ExecutionEvent(ENTRY_RECONCILED).metadata.localOrderStatus` in an accepted state |
+| `PARTIAL_FILL` | `ExecutionEvent(ENTRY_RECONCILED).metadata.cumulativeFilledQuantity` — the quantity **at that event** |
+| `POSITION_FILLED` | the same event with `localOrderStatus = FILLED` |
+| `POSITION_PROTECTED` | `ExecutionProtectionVerification` — one immutable row per proven full-coverage verification |
+| `ENTRY_EXPIRED` / `CLOSED_TP` / `CLOSED_SL` / `CLOSED_EMERGENCY` / `TRADE_SKIPPED` | `ExecutionEvent.toStatus` — the status the event committed |
+| `CRITICAL_PROTECTION_FAILURE` | Phase 7 `CriticalAlert` |
+
+Quantity-sensitive milestones read the quantity that belonged to the historical
+event, never today's latest value. That is what lets a runner that was offline
+across `0.10 → 0.15 → 0.25` still emit both partial fills instead of only the
+final fill, and a runner offline across `protected 0.10 → protected 0.25` emit
+both protection milestones.
+
+The lifecycle writes this history inside the transaction it was already
+committing. No Telegram call, no notification-table write and no network
+activity was added to any trading transaction, and execution correctness never
+depends on an `ExecutionNotification` insert.
+
+#### Discovery and crash semantics
+
+`ExecutionNotificationCheckpoint` holds one row per processed source, linked by a
+UNIQUE foreign key to either the `ExecutionEvent` or the
+`ExecutionProtectionVerification` it covers. Discovery asks each history table
+for rows with no checkpoint — an index-backed anti-join, bounded per tick, never
+a timestamp watermark (two events can share a `createdAt` and a watermark would
+skip one).
+
+The notifications derived from a source and that source's checkpoint commit in
+one transaction:
+
+- crash before commit → no checkpoint, the source is rediscovered;
+- crash after commit → both exist, and the unique dedupe key stops a replay from
+  creating a second row;
+- two runners on the same source → the unique checkpoint lets exactly one win,
+  and the loser's `P2002` is treated as "already done".
+
+Sources that earn no milestone are still checkpointed, so ordinary lifecycle
+events are not rescanned forever.
+
+#### Ordering after downtime
+
+Informational rows carry `milestoneSequence` taken from the source's own causal
+position — `ExecutionEvent.sequenceNumber` for lifecycle events — and delivery
+orders by `createdAt, milestoneSequence, id`. A closure recovered together with
+the fill it closes is therefore delivered after that fill, never before it,
+regardless of what the execution's current status says. Critical alerts keep
+delivery priority over every informational message.
+
+#### Telegram disabled
+
+When `TELEGRAM_NOTIFICATIONS_ENABLED` is false (or no bot token is configured):
+
+- materialization still runs, so durable history is never lost;
+- dispatch returns before claiming anything — zero HTTP calls;
+- no attempt is consumed, so repeated scheduler ticks cannot exhaust the bounded
+  retry budget and there is no busy-loop;
+- nothing in any execution table changes.
+
+Switching Telegram back on finds every intent still `PENDING` with
+`attemptCount = 0`, and the next tick delivers them in causal order.
