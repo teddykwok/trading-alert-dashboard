@@ -157,8 +157,12 @@ describe("phase boundary", () => {
       expect(readCode(file)).not.toMatch(/fastify|FastifyInstance|\.get\(\s*"\/|\.post\(\s*"\//);
     }
     const app = read(path.join(BACKEND, "src", "app.ts")).toLowerCase();
-    expect(app).not.toContain("protection");
-    expect(app).not.toContain("execution");
+    // Phase 8 registers a READ-ONLY journal route, so the word "execution"
+    // legitimately appears here. What must never appear is a protection
+    // LIFECYCLE route.
+    expect(app).not.toContain("protectionlifecycle");
+    expect(app).not.toContain("protection.routes");
+    expect(app).not.toContain("protectionroutes");
   });
 
   it("has no automatic caller of the protection lifecycle", () => {

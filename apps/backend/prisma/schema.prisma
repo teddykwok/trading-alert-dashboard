@@ -592,6 +592,14 @@ model TradeExecution {
   reportedLiquidationPrice Decimal? @db.Decimal(30, 12)
   actualExitPrice          Decimal? @db.Decimal(30, 12)
   realizedPnl              Decimal? @db.Decimal(30, 12)
+  /// Phase 8 journal. Both are NULLABLE and null means "unknown / not yet
+  /// collected" — never zero. Nothing in this repository estimates them, and
+  /// no historical Binance fetch exists, so they stay null until a future
+  /// phase records real values.
+  /// Non-negative total trading fees paid.
+  tradingFeesUsd           Decimal? @db.Decimal(30, 12)
+  /// Signed funding PnL: positive = received, negative = paid.
+  fundingPnlUsd            Decimal? @db.Decimal(30, 12)
   exitReason               String?
   entrySubmittedAt         DateTime?
   firstFillAt              DateTime?
@@ -616,6 +624,9 @@ model TradeExecution {
   @@index([status])
   @@index([executionProfileId])
   @@index([symbol])
+  // Phase 8 journal lists default to "most recently updated first"; status,
+  // profile, symbol and (alertId, profile) are already covered above.
+  @@index([updatedAt])
 }
 
  // LOCAL representation of an order this project may later submit. Creating a

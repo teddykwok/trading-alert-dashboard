@@ -136,6 +136,9 @@ importers:
       vite:
         specifier: ^5.2.11
         version: 5.4.21(@types/node@20.19.43)
+      vitest:
+        specifier: 1.6.1
+        version: 1.6.1(@types/node@20.19.43)
 
   packages/shared:
     dependencies:

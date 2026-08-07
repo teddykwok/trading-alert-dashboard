@@ -3,6 +3,7 @@ import { Link, useLocation, useParams } from "react-router-dom";
 import { Card } from "../components/ui/Card";
 import { Disclosure } from "../components/ui/Disclosure";
 import { TabList, TabPanel, type TabDefinition } from "../components/ui/Tabs";
+import { AlertExecutionPanel } from "../features/executions/AlertExecutionPanel";
 import { SignalBadge } from "../components/alerts/SignalBadge";
 import { StatusBadge } from "../components/alerts/StatusBadge";
 import { MockAiBadge } from "../components/alerts/MockAiBadge";
@@ -33,6 +34,7 @@ const WORKFLOW_TABS: TabDefinition[] = [
   { id: "plan", label: "Trade Plan" },
   { id: "review", label: "Review & Journal" },
   { id: "ai", label: "AI Vision" },
+  { id: "execution", label: "Execution" },
 ];
 
 const STATUS_TIMELINE: AlertStatus[] = [
