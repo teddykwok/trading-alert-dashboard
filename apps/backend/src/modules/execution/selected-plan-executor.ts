@@ -173,7 +173,11 @@ export class SelectedPlanExecutor {
     }
 
     // --- Phase 3 does the mathematics -------------------------------------
-    const marginPlan = await this.deps.marginPlanner.planForSymbol({
+    // The snapshot-aware call returns the exact filters the calculation used,
+    // from the SAME symbol inspection. Phase 6 revalidation requires them to be
+    // frozen on the execution, and asking Binance a second time could freeze
+    // filters that describe a different calculation.
+    const { plan: marginPlan, exchangeFilters } = await this.deps.marginPlanner.planForSymbolWithSnapshot({
       symbol,
       direction: plan.direction,
       entryPrice: plan.entryPrice,
@@ -204,7 +208,7 @@ export class SelectedPlanExecutor {
         // an authorized window; planning ahead of that is safe because the
         // KILL SWITCH and the live gates still block every mutation.
         allowDisabledProfile: true,
-        snapshots: { extremeRRCandidate: candidate, marginPlan },
+        snapshots: { extremeRRCandidate: candidate, marginPlan, exchangeFilters },
       });
       executionId = execution.id;
       created = true;
@@ -234,8 +238,19 @@ export class SelectedPlanExecutor {
     // --- Admission (separable; recoverable if this never runs) -------------
     const admission = await this.deps.orchestrator.admitAndSubmit({ executionId });
 
+    // `admitted` means safety admission PASSED, not that an entry was reserved:
+    // a PREFLIGHT execution whose revalidation refuses still reports
+    // admitted=true with a failure reasonCode and no timeline event. Naming the
+    // reason code explicitly keeps that distinction readable in the log — the
+    // missing exchange-filters snapshot looked exactly like a success here.
     logger.info(
-      { executionId, created, admitted: admission.admitted, reasonCode: admission.reasonCode },
+      {
+        executionId,
+        created,
+        admitted: admission.admitted,
+        reasonCode: admission.reasonCode,
+        entryReserved: admission.admitted && admission.reasonCode === "ENTRY_SUBMITTED",
+      },
       "Selected Extreme RR plan handled"
     );
 

@@ -24,6 +24,23 @@ const CANDIDATE = {
   money: { quantityRaw: "294", plannedLossRaw: "1.5", plannedProfitRaw: "4.5", positionNotionalRaw: "79.58" },
 };
 
+/**
+ * Exactly the sanitized filter projection the Phase 3 planner returns — the
+ * object that must reach `exchangeFiltersSnapshot`, because Phase 6
+ * revalidation refuses to submit without it.
+ */
+const FILTERS = {
+  status: "TRADING",
+  contractType: "PERPETUAL",
+  tickSize: "0.0001",
+  minPrice: "0.0001",
+  maxPrice: "100000",
+  stepSize: "1",
+  minQty: "1",
+  maxQty: "1000000",
+  minNotional: "5",
+};
+
 const PLAN = {
   id: "plan-1",
   alertId: "alert-1",
@@ -53,6 +70,7 @@ function harness(options: {
   const admissions: string[] = [];
   const canaryBindings: unknown[] = [];
   let createCalls = 0;
+  let planningCalls = 0;
 
   const executor = new SelectedPlanExecutor({
     prisma: {
@@ -75,11 +93,17 @@ function harness(options: {
       },
     } as never,
     marginPlanner: {
-      planForSymbol: async () => ({
-        status: options.marginStatus ?? "READY",
-        selectedLeverage: options.marginStatus === "READY" || !options.marginStatus ? 21 : null,
-        reason: null,
-      }),
+      planForSymbolWithSnapshot: async () => {
+        planningCalls += 1;
+        return {
+          plan: {
+            status: options.marginStatus ?? "READY",
+            selectedLeverage: options.marginStatus === "READY" || !options.marginStatus ? 21 : null,
+            reason: null,
+          },
+          exchangeFilters: FILTERS,
+        };
+      },
     } as never,
     executions: {
       createExecutionFromReadyPlan: async (input: unknown) => {
@@ -108,7 +132,14 @@ function harness(options: {
     profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
   });
 
-  return { executor, creates, admissions, canaryBindings, createCalls: () => createCalls };
+  return {
+    executor,
+    creates,
+    admissions,
+    canaryBindings,
+    createCalls: () => createCalls,
+    planningCalls: () => planningCalls,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -410,5 +441,81 @@ describe("selected-plan boundary", () => {
     for (const forbidden of ["fetch(", "fapi/", "telegram", "sendMessage"]) {
       expect(`${forbidden}:${source.toLowerCase().includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Frozen exchange filters  the Phase 11B live-canary blocker
+// ---------------------------------------------------------------------------
+//
+// A real DOGSUSDT LONG canary reached PREFLIGHT/SAFETY_ADMITTED and stopped
+// dead, because the execution was created without an exchangeFiltersSnapshot
+// and Phase 6 revalidation refuses to submit without one. Nothing reached the
+// exchange, which is exactly what fail-closed is for  but the trade never
+// happened and the row held capacity.
+
+describe("frozen exchange filters", () => {
+  it("freezes the filters the margin calculation actually used", async () => {
+    const { executor, creates } = harness();
+    await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    const snapshots = (creates[0] as { snapshots: Record<string, unknown> }).snapshots;
+    expect(snapshots.exchangeFilters).toEqual(FILTERS);
+    // The other two snapshots are unchanged.
+    expect(snapshots.marginPlan).toBeDefined();
+    expect(snapshots.extremeRRCandidate).toEqual(CANDIDATE);
+  });
+
+  it("carries every field Phase 6 revalidation and the planner read", async () => {
+    const { executor, creates } = harness();
+    await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    const filters = (creates[0] as { snapshots: { exchangeFilters: Record<string, unknown> } }).snapshots
+      .exchangeFilters;
+    for (const field of [
+      "status",
+      "contractType",
+      "tickSize",
+      "minPrice",
+      "maxPrice",
+      "stepSize",
+      "minQty",
+      "maxQty",
+      "minNotional",
+    ]) {
+      expect(Object.keys(filters), field).toContain(field);
+    }
+  });
+
+  it("plans exactly once per signal, so the snapshot matches the calculation", async () => {
+    // A second inspection could observe a different tick size or minimum
+    // notional, and the frozen snapshot would then describe a calculation that
+    // never happened.
+    const { executor, planningCalls } = harness();
+    await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect(planningCalls()).toBe(1);
+  });
+
+  it("creates nothing when the margin plan is not READY, so no partial snapshot is stored", async () => {
+    const { executor, creates } = harness({ marginStatus: "INVALID" });
+    const result = await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect(result.handled).toBe(false);
+    expect(creates).toHaveLength(0);
+  });
+
+  it("asks the planner for the snapshot rather than re-inspecting the symbol", () => {
+    const source = readFileSync(
+      path.join(BACKEND, "src", "modules", "execution", "selected-plan-executor.ts"),
+      "utf8"
+    );
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+
+    expect(code).toContain("planForSymbolWithSnapshot");
+    // The executor must never talk to Binance itself.
+    expect(code).not.toContain("inspectSymbol");
+    expect(code).not.toContain("readOnly");
+    expect(code).toContain("exchangeFilters");
   });
 });

@@ -40,6 +40,8 @@ const { EntryLifecycleService } = await import("../src/modules/execution/entry-l
 const { BinanceUsdMExecutionClient } = await import("../src/modules/binance/binance-execution.client");
 const { BinanceError } = await import("../src/modules/binance/binance.errors");
 const { buildClientOrderId } = await import("../src/modules/execution/execution-safety");
+const { SelectedPlanExecutor } = await import("../src/modules/execution/selected-plan-executor");
+const { Prisma } = await import("@prisma/client");
 // Mutated per test to exercise the env-level gates, restored in afterEach.
 const { env: runtimeEnv } = await import("../src/config/env");
 const { PENDING_ENTRY_STATUSES, TOTAL_ACTIVE_STATUSES, consumesNoCapacity } = await import(
@@ -2548,5 +2550,245 @@ describe("PREFLIGHT expiry", () => {
     });
     expect(skips).toBe(1);
     expect(dispatched).toBe(0);
+  });
+});
+
+// ===========================================================================
+// Production path: SelectedPlanExecutor -> ExecutionService -> revalidation
+//
+// The Phase 11B canary blocker hid here. Every existing fixture in this file
+// hands `snapshots.exchangeFilters` straight to `createExecutionFromReadyPlan`,
+// so the suites stayed green while the PRODUCTION creation path passed no
+// filters at all and every real execution stalled at PREFLIGHT.
+//
+// These tests therefore build the execution through the REAL
+// SelectedPlanExecutor and the REAL ExecutionService against real Postgres,
+// with only the margin planner and the orchestrator stubbed. No Binance
+// transport is constructed.
+// ===========================================================================
+
+describe("production creation path freezes exchange filters", () => {
+  /** The sanitized projection the real planner returns from ONE inspection. */
+  const PLANNER_FILTERS = {
+    status: "TRADING",
+    contractType: "PERPETUAL",
+    tickSize: "0.01",
+    minPrice: "0.01",
+    maxPrice: "100000",
+    stepSize: "0.001",
+    minQty: "0.001",
+    maxQty: "1000",
+    minNotional: "5",
+  };
+
+  let planningCalls = 0;
+
+  /** The real executor, with only the exchange-facing planner stubbed. */
+  function productionExecutor() {
+    planningCalls = 0;
+    return new SelectedPlanExecutor({
+      prisma: prisma!,
+      marginPlanner: {
+        planForSymbolWithSnapshot: async () => {
+          planningCalls += 1;
+          return { plan: readyPlan("LONG"), exchangeFilters: PLANNER_FILTERS };
+        },
+      } as never,
+      executions,
+      // Admission is driven explicitly below so revalidation can be observed.
+      orchestrator: {
+        admitAndSubmit: async () => ({
+          admitted: false,
+          decision: null,
+          reasonCode: "TEST_NO_ADMISSION",
+          message: "Admission is driven by the test.",
+        }),
+      } as never,
+      profileIdentity: { accountIdentifier: `${SYNTHETIC_TAG}-account`, environment: "TESTNET" as const },
+    });
+  }
+
+  /** A READY Extreme RR plan for the synthetic alert, as the worker would pass it. */
+  async function selectedPlan() {
+    sequence += 1;
+    const alert = await prisma!.alert.create({
+      data: {
+        symbol: SYMBOL,
+        assetType: "CRYPTO",
+        exchange: "SYNTHETIC",
+        timeframe: "15m",
+        price: 100,
+        signal: "LONG",
+        indicatorName: `${SYNTHETIC_TAG}-${sequence}`,
+        rawPayload: { note: SYNTHETIC_TAG },
+        triggeredAt: new Date(),
+      },
+    });
+
+    // A real ExtremeRRPlan row: the executor passes plan.id as a foreign key.
+    const planRow = await prisma!.extremeRRPlan.create({
+      data: {
+        alertId: alert.id,
+        status: "READY",
+        direction: "LONG",
+        entryPrice: "100",
+        cutoffAt: new Date(),
+        timeframe: "15m",
+        selectedLookback: 200,
+      },
+    });
+
+    return {
+      id: planRow.id,
+      alertId: alert.id,
+      status: "READY",
+      direction: "LONG",
+      entryPrice: "100",
+      selectedLookback: 200,
+      template: { riskTemplateId: "t1", name: "canary", riskAmount: "1.50" },
+      candidates: [
+        {
+          requestedCandles: 200,
+          valid: true,
+          stopLoss: "96",
+          takeProfit: "112",
+          money: { quantityRaw: "0.375", plannedLossRaw: "1.5" },
+        },
+      ],
+    };
+  }
+
+  /** Admits an execution exactly as Phase 5 would, then returns it. */
+  async function admit(executionId: string) {
+    const execution = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
+    await prisma!.safetyAdmission.create({
+      data: {
+        tradeExecutionId: execution.id,
+        evaluatedVersion: execution.version,
+        evaluatedAt: new Date(),
+        decision: "PASS",
+        reasonCode: null,
+        reservedRiskUsd: "1.50",
+        reservedMarginUsd: "4.9999995",
+      },
+    });
+    return prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { status: "PREFLIGHT", version: { increment: 1 } },
+    });
+  }
+
+  maybe()("persists a non-null exchangeFiltersSnapshot", async () => {
+    const plan = await selectedPlan();
+    const outcome = await productionExecutor().handleSelectedPlan(plan as never, SYMBOL);
+
+    expect(outcome.handled).toBe(true);
+    const execution = await prisma!.tradeExecution.findUniqueOrThrow({
+      where: { id: (outcome as { executionId: string }).executionId },
+    });
+
+    // The exact defect: this was null for every real execution.
+    expect(execution.exchangeFiltersSnapshot).not.toBeNull();
+    expect(execution.exchangeFiltersSnapshot).toEqual(PLANNER_FILTERS);
+    expect(execution.marginPlanSnapshot).not.toBeNull();
+    // One inspection per signal  the snapshot describes THAT calculation.
+    expect(planningCalls).toBe(1);
+  });
+
+  maybe()("persists every filter Phase 6 revalidation compares against", async () => {
+    const plan = await selectedPlan();
+    const outcome = await productionExecutor().handleSelectedPlan(plan as never, SYMBOL);
+    const execution = await prisma!.tradeExecution.findUniqueOrThrow({
+      where: { id: (outcome as { executionId: string }).executionId },
+    });
+
+    const snapshot = execution.exchangeFiltersSnapshot as Record<string, unknown>;
+    expect(snapshot.status).toBe("TRADING");
+    expect(snapshot.contractType).toBe("PERPETUAL");
+    expect(snapshot.tickSize).toBe("0.01");
+    expect(snapshot.stepSize).toBe("0.001");
+    expect(snapshot.minQty).toBe("0.001");
+    expect(snapshot.maxQty).toBe("1000");
+    expect(snapshot.minPrice).toBe("0.01");
+    expect(snapshot.maxPrice).toBe("100000");
+    expect(snapshot.minNotional).toBe("5");
+    // Nothing beyond the sanitized projection.
+    expect(Object.keys(snapshot).sort()).toEqual([
+      "contractType", "maxPrice", "maxQty", "minNotional", "minPrice", "minQty", "status", "stepSize", "tickSize",
+    ]);
+  });
+
+  maybe()("reaches the ENTRY reservation instead of stalling at PREFLIGHT", async () => {
+    const plan = await selectedPlan();
+    const outcome = await productionExecutor().handleSelectedPlan(plan as never, SYMBOL);
+    const admitted = await admit((outcome as { executionId: string }).executionId);
+
+    const result = await entries.prepareEntrySubmission({
+      executionId: admitted.id,
+      expectedVersion: admitted.version,
+      evaluatedAt: at(),
+    });
+
+    // Previously: SAFETY_ADMISSION_NOT_READY, "The frozen plan or filters
+    // snapshot is missing", forever.
+    expect(result.reasonCode).not.toBe("SAFETY_ADMISSION_NOT_READY");
+    const after = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: admitted.id } });
+    expect(after.status).not.toBe("PREFLIGHT");
+
+    // The local reservation exists, with the one deterministic identity.
+    const orders = await prisma!.binanceOrder.findMany({ where: { tradeExecutionId: admitted.id } });
+    expect(orders).toHaveLength(1);
+    expect(orders[0].role).toBe("ENTRY");
+    expect(orders[0].generation).toBe(1);
+    expect(orders[0].clientOrderId).toBe(buildClientOrderId(admitted.id, "ENTRY", 1));
+  });
+
+  maybe()("still fails closed when the snapshot is missing", async () => {
+    const plan = await selectedPlan();
+    const outcome = await productionExecutor().handleSelectedPlan(plan as never, SYMBOL);
+    const executionId = (outcome as { executionId: string }).executionId;
+
+    // Deliberately remove what the production path now provides.
+    await prisma!.tradeExecution.update({
+      where: { id: executionId },
+      data: { exchangeFiltersSnapshot: Prisma.DbNull },
+    });
+    const admitted = await admit(executionId);
+
+    const result = await entries.prepareEntrySubmission({
+      executionId: admitted.id,
+      expectedVersion: admitted.version,
+      evaluatedAt: at(),
+    });
+
+    // The fail-closed invariant is intact and still worth having.
+    expect(result.ok).toBe(false);
+    expect(result.reasonCode).toBe("SAFETY_ADMISSION_NOT_READY");
+    expect(result.message).toContain("snapshot is missing");
+    expect((await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: admitted.id } })).status).toBe("PREFLIGHT");
+    expect(await prisma!.binanceOrder.count({ where: { tradeExecutionId: admitted.id } })).toBe(0);
+    expect(dispatched).toBe(0);
+  });
+
+  maybe()("still fails closed when the margin plan snapshot is missing", async () => {
+    const plan = await selectedPlan();
+    const outcome = await productionExecutor().handleSelectedPlan(plan as never, SYMBOL);
+    const executionId = (outcome as { executionId: string }).executionId;
+
+    await prisma!.tradeExecution.update({
+      where: { id: executionId },
+      data: { marginPlanSnapshot: Prisma.DbNull },
+    });
+    const admitted = await admit(executionId);
+
+    const result = await entries.prepareEntrySubmission({
+      executionId: admitted.id,
+      expectedVersion: admitted.version,
+      evaluatedAt: at(),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reasonCode).toBe("SAFETY_ADMISSION_NOT_READY");
+    expect(await prisma!.binanceOrder.count({ where: { tradeExecutionId: admitted.id } })).toBe(0);
   });
 });

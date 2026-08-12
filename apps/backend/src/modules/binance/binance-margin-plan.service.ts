@@ -32,6 +32,34 @@ export interface MarginPlanRequest {
   userMaximumAutomationLeverage?: number;
 }
 
+/**
+ * Exactly the sanitized symbol filters the Phase 3 calculator consumes —
+ * nothing more.
+ *
+ * Deliberately narrower than `BinanceSymbolFiltersDto`: no raw payload, no
+ * leverage brackets, no account configuration, no `symbol` (the execution row
+ * already carries it), and none of the MARKET_LOT_SIZE or order-type fields the
+ * calculation does not read. What is frozen onto an execution is precisely what
+ * decided its numbers.
+ */
+export interface MarginPlanExchangeFilters {
+  status: string | null;
+  contractType: string | null;
+  tickSize: string | null;
+  minPrice: string | null;
+  maxPrice: string | null;
+  stepSize: string | null;
+  minQty: string | null;
+  maxQty: string | null;
+  minNotional: string | null;
+}
+
+/** A plan plus the filter snapshot that produced it, from ONE inspection. */
+export interface MarginPlanWithSnapshot {
+  plan: DynamicLeveragePlan;
+  exchangeFilters: MarginPlanExchangeFilters;
+}
+
 export interface LiquidationCheck {
   symbol: string;
   positionSide: string;
@@ -50,11 +78,42 @@ export class BinanceMarginPlanService {
    * Builds a dynamic-leverage plan for one symbol using live read-only
    * exchange metadata. Two GETs only: exchangeInfo (filters) and
    * leverageBracket (account brackets), both via the Phase 2 allowlist.
+   *
+   * Unchanged for every caller that only wants the plan; it delegates to the
+   * snapshot-aware method below and drops the filters.
    */
   async planForSymbol(request: MarginPlanRequest): Promise<DynamicLeveragePlan> {
+    return (await this.planForSymbolWithSnapshot(request)).plan;
+  }
+
+  /**
+   * The same single planning operation, additionally returning the exact
+   * filters it used.
+   *
+   * The execution path must freeze the filters that produced its numbers, and
+   * asking the exchange a second time would not do: between two inspections a
+   * tick size or minimum notional can change, and the persisted snapshot would
+   * then describe a calculation that never happened. So there is ONE
+   * `inspectSymbol` call and ONE projection of its filters, handed both to the
+   * calculator and back to the caller — the same object, so the two can never
+   * disagree.
+   */
+  async planForSymbolWithSnapshot(request: MarginPlanRequest): Promise<MarginPlanWithSnapshot> {
     const inspection = await this.readOnly.inspectSymbol(request.symbol);
 
-    return calculateDynamicLeveragePlan({
+    const exchangeFilters: MarginPlanExchangeFilters = {
+      status: inspection.filters.status,
+      contractType: inspection.filters.contractType,
+      tickSize: inspection.filters.tickSize,
+      minPrice: inspection.filters.minPrice,
+      maxPrice: inspection.filters.maxPrice,
+      stepSize: inspection.filters.stepSize,
+      minQty: inspection.filters.minQty,
+      maxQty: inspection.filters.maxQty,
+      minNotional: inspection.filters.minNotional,
+    };
+
+    const plan = calculateDynamicLeveragePlan({
       symbol: request.symbol.trim().toUpperCase(),
       direction: request.direction,
       entryPrice: request.entryPrice,
@@ -65,19 +124,11 @@ export class BinanceMarginPlanService {
       liquidationBufferRatio: request.liquidationBufferRatio ?? env.BINANCE_LIQUIDATION_BUFFER_RATIO,
       userMaximumAutomationLeverage:
         request.userMaximumAutomationLeverage ?? env.BINANCE_MAX_AUTOMATION_LEVERAGE,
-      filters: {
-        status: inspection.filters.status,
-        contractType: inspection.filters.contractType,
-        tickSize: inspection.filters.tickSize,
-        minPrice: inspection.filters.minPrice,
-        maxPrice: inspection.filters.maxPrice,
-        stepSize: inspection.filters.stepSize,
-        minQty: inspection.filters.minQty,
-        maxQty: inspection.filters.maxQty,
-        minNotional: inspection.filters.minNotional,
-      },
+      filters: exchangeFilters,
       brackets: inspection.brackets satisfies MarginPlanLeverageBracket[],
     });
+
+    return { plan, exchangeFilters };
   }
 
   /**
