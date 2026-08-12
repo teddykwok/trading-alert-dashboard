@@ -180,12 +180,15 @@ async function runLifecycle(direction: Direction, closure: "TP" | "SL") {
   const executor = new SelectedPlanExecutor({
     prisma,
     marginPlanner: {
-      planForSymbol: async (request: { direction: string; riskBudgetUsd: string }) => ({
-        status: "READY",
-        selectedLeverage: 21,
-        reason: null,
-        direction: request.direction,
-        riskBudgetUsd: request.riskBudgetUsd,
+      planForSymbolWithSnapshot: async (request: { direction: string; riskBudgetUsd: string }) => ({
+        plan: {
+          status: "READY",
+          selectedLeverage: 21,
+          reason: null,
+          direction: request.direction,
+          riskBudgetUsd: request.riskBudgetUsd,
+        },
+        exchangeFilters: { status: "TRADING", contractType: "PERPETUAL", tickSize: "0.01", minPrice: "0.01", maxPrice: "100000", stepSize: "0.001", minQty: "0.001", maxQty: "1000", minNotional: "5" },
       }),
     } as never,
     executions: {

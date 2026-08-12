@@ -629,8 +629,12 @@ describe("canary control boundary", () => {
   it("keeps the authorization as an ADDITIONAL guard, never a bypass", () => {
     const source = readCode(path.join(BACKEND, "src", "modules", "execution", "selected-plan-executor.ts"));
 
-    // The canary check only ever refuses; it grants nothing.
-    const block = source.slice(source.indexOf("const canaryMode"), source.indexOf("const marginPlan"));
+    // The canary check only ever refuses; it grants nothing. The block ends
+    // where Phase 3 planning begins — anchored on the planner call, which is
+    // stable, rather than on a local variable name.
+    const blockEnd = source.indexOf("this.deps.marginPlanner");
+    expect(blockEnd).toBeGreaterThan(0);
+    const block = source.slice(source.indexOf("const canaryMode"), blockEnd);
     expect(block).toContain("handled: false");
     expect(block).not.toContain("handled: true");
     expect(block).not.toMatch(/allowDisabledProfile|killSwitch|bypass|skip/i);
