@@ -8,7 +8,7 @@ import { BinanceLiveEntryDisabledError, type BinanceUsdMExecutionClient } from "
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import type { BinanceQueriedOrderDto } from "../binance/binance.types";
 import { buildClientOrderId } from "./execution-safety";
-import type { TradeExecutionStatusName } from "./execution-status";
+import { canTransition, type TradeExecutionStatusName } from "./execution-status";
 import type { EntryCancellationReason } from "../binance/binance-execution.client";
 import {
   classifyMutationOutcome,
@@ -403,6 +403,235 @@ export class EntryLifecycleService {
   }
 
   // ==========================================================================
+  // 5. releaseUnrunnablePreflight  give back PRE-SUBMISSION work that cannot run
+  // ==========================================================================
+
+  /**
+   * Terminalizes a PREFLIGHT execution that can never be submitted, and only
+   * when that is provably harmless.
+   *
+   * PREFLIGHT consumes a pending-entry AND a total-active slot (see
+   * capacity-status.ts). With the canary limits at 1/1, an execution that can
+   * no longer advance holds both slots forever and nothing else can ever start.
+   * There are exactly two ways to reach that dead end, and this handles both:
+   *
+   *   - a NEW ENTRY IS BLOCKED (a gate, a kill switch, a disabled profile) 
+   *     the operator has said no, so the execution is CANCELED;
+   *   - the SIGNAL OR ENTRY DEADLINE HAS PASSED  the gates may be wide open,
+   *     but `revalidate` will refuse forever because the signal is too old, so
+   *     the execution is SKIPPED (deliberately not traded, matching what a
+   *     Phase 5 SKIP decision already does to a PLAN_READY row).
+   *
+   * Both triggers share ONE set of proofs, which is the point of keeping them
+   * in a single method: a second copy of this reasoning is exactly where a
+   * safety property would drift.
+   *
+   * It is safe ONLY because of what PREFLIGHT means: `reserveEntryIntent`
+   * writes the ENTRY reservation and the move to ENTRY_SUBMITTING in a single
+   * transaction, so a PREFLIGHT execution has no deterministic client order id
+   * and no order can bear its identity. Nothing is cancelled on the exchange
+   * because nothing was ever sent  this gives back local capacity and nothing
+   * else.
+   *
+   * Four conditions must ALL hold, and any doubt leaves the row untouched and
+   * retryable:
+   *
+   *   1. the execution is still PREFLIGHT;
+   *   2. it carries NO order reservation of any role or generation;
+   *   3. one of the two triggers above applies;
+   *   4. the exchange is proven FLAT for the symbol  `null` (unreadable) is
+   *      never read as "no".
+   *
+   * Dispatches zero Binance mutations on every path.
+   */
+  async releaseUnrunnablePreflight(input: EntryLifecycleInput): Promise<EntryLifecycleOutcome> {
+    const execution = await this.loadExecution(input.executionId);
+    const status = execution.status as TradeExecutionStatusName;
+
+    // 1. Only PREFLIGHT. Anything at or past ENTRY_SUBMITTING may own an
+    //    exchange order and belongs to the existing recovery semantics.
+    if (status !== "PREFLIGHT") {
+      return this.result(
+        false,
+        "EXECUTION_NOT_PREFLIGHT",
+        `Execution is ${status}; only a PREFLIGHT execution may be released pre-submission.`,
+        execution,
+        await this.loadEntryOrder(execution.id)
+      );
+    }
+
+    // 2. Any order row at all means an identity exists that an exchange order
+    //    could carry. PREFLIGHT plus a reservation is a state
+    //    `reserveEntryIntent` cannot produce, so it is anomalous rather than
+    //    merely inconvenient  park it for a human instead of guessing.
+    const reservations = await this.prisma.binanceOrder.count({ where: { tradeExecutionId: execution.id } });
+    if (reservations > 0) {
+      return this.escalate(
+        execution,
+        "MANUAL_REVIEW_REQUIRED",
+        "A PREFLIGHT execution carries an order reservation; exchange exposure cannot be ruled out.",
+        input
+      );
+    }
+
+    // 3. Is this execution actually unrunnable? If not, the normal submission
+    //    path owns it and nothing here may touch it.
+    const verdict = await this.preflightReleaseVerdict(execution, input.evaluatedAt);
+    if (!verdict) {
+      return this.result(
+        false,
+        "SAFETY_ADMISSION_NOT_READY",
+        "This execution can still run; the normal submission path owns it.",
+        execution,
+        null
+      );
+    }
+
+    // 4. Flatness must be PROVEN, not assumed.
+    const exposure = await this.symbolHasExposure(execution.symbol);
+    if (exposure === null) {
+      return this.result(
+        false,
+        "SYMBOL_EXPOSURE_CHANGED",
+        "Exchange state could not be read; nothing was terminalized and the next tick retries.",
+        execution,
+        null
+      );
+    }
+    if (exposure) {
+      return this.result(
+        false,
+        "SYMBOL_EXPOSURE_CHANGED",
+        "Exchange exposure exists on this symbol; nothing was terminalized.",
+        execution,
+        null
+      );
+    }
+
+    // The pure state machine has the final say on the transition itself.
+    const transition = canTransition("PREFLIGHT", verdict.toStatus);
+    if (!transition.allowed) {
+      return this.result(
+        false,
+        "CAPACITY_OR_VERSION_CONFLICT",
+        transition.reason ?? "The transition was refused.",
+        execution,
+        null
+      );
+    }
+
+    const committed = await this.prisma.$transaction(async (tx) => {
+      // Re-assert inside the transaction: a reservation appearing between the
+      // check above and this write would invalidate the whole argument.
+      const reservedNow = await tx.binanceOrder.count({ where: { tradeExecutionId: execution.id } });
+      if (reservedNow > 0) return null;
+
+      // Compare-and-swap on the version read a moment ago, so a concurrent
+      // tick or a second worker loses rather than double-terminalizing.
+      const updated = await tx.tradeExecution.updateMany({
+        where: { id: execution.id, version: execution.version, status: "PREFLIGHT" },
+        data: {
+          status: verdict.toStatus,
+          version: { increment: 1 },
+          decisionReasonCode: verdict.reasonCode,
+          sanitizedMessage: verdict.message.slice(0, 1000),
+        },
+      });
+      if (updated.count === 0) return null;
+
+      const next = await tx.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+      await tx.executionEvent.create({
+        data: {
+          tradeExecutionId: execution.id,
+          sequenceNumber: next.version,
+          eventType: "STATUS_CHANGED",
+          fromStatus: "PREFLIGHT",
+          toStatus: verdict.toStatus,
+          reasonCode: verdict.reasonCode,
+          message: verdict.message.slice(0, 1000),
+        },
+      });
+      return next;
+    });
+
+    if (!committed) {
+      const current = await this.loadExecution(execution.id);
+      return this.result(
+        false,
+        "CAPACITY_OR_VERSION_CONFLICT",
+        "The execution changed during release; nothing was terminalized.",
+        current,
+        await this.loadEntryOrder(execution.id)
+      );
+    }
+
+    return this.result(true, verdict.reasonCode, verdict.message, committed, null);
+  }
+
+  /**
+   * Decides WHETHER a PREFLIGHT execution is unrunnable, and into which
+   * terminal state it should be released. `null` means "it can still run".
+   *
+   * Blocked is checked first so an operator-closed window keeps producing
+   * CANCELED even when the signal has also gone stale  the operator's decision
+   * is the more informative reason to record.
+   */
+  private async preflightReleaseVerdict(
+    execution: TradeExecution,
+    evaluatedAt: Date
+  ): Promise<{ toStatus: TradeExecutionStatusName; reasonCode: EntryReasonCode; message: string } | null> {
+    const blocked = await this.newEntryBlockedReason(execution.executionProfileId);
+    if (blocked) {
+      return {
+        toStatus: "CANCELED",
+        reasonCode: "PREFLIGHT_ABANDONED_NEW_ENTRY_BLOCKED",
+        message:
+          `New entry is blocked (${blocked}) and no entry order was ever reserved; ` +
+          "the execution was released without contacting the exchange.",
+      };
+    }
+
+    const expiry = this.preflightDeadlinePassed(execution, evaluatedAt);
+    if (expiry) {
+      return {
+        toStatus: "SKIPPED",
+        reasonCode: "PREFLIGHT_SKIPPED_SIGNAL_EXPIRED",
+        message:
+          `This execution can never be submitted: ${expiry}. No entry order was ever reserved; ` +
+          "the execution was skipped without contacting the exchange.",
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * The subset of `revalidate`'s deadline rules that is MONOTONIC  once true
+   * it can never become false again, because both conditions only move further
+   * past their limit as time passes. That is what makes terminalizing on them
+   * safe: the submission path is not merely refusing right now, it will refuse
+   * forever.
+   *
+   * The comparisons deliberately mirror `revalidate` exactly, so an execution
+   * the submission path would still accept can never be skipped here.
+   *
+   * A missing `signalTriggeredAt` is NOT treated as expiry: it means the age is
+   * unknowable, and "unknown" is never proof. Such a row is left alone.
+   */
+  private preflightDeadlinePassed(execution: TradeExecution, evaluatedAt: Date): string | null {
+    if (execution.entryExpiresAt && evaluatedAt.getTime() > execution.entryExpiresAt.getTime()) {
+      return `the planned entry deadline passed at ${execution.entryExpiresAt.toISOString()}`;
+    }
+    if (!execution.signalTriggeredAt) return null;
+
+    const ageSeconds = Math.floor((evaluatedAt.getTime() - execution.signalTriggeredAt.getTime()) / 1000);
+    if (ageSeconds > env.EXECUTION_MAX_ALERT_AGE_SECONDS) {
+      return `the signal is ${ageSeconds}s old, beyond the ${env.EXECUTION_MAX_ALERT_AGE_SECONDS}s limit`;
+    }
+    return null;
+  }
+
+  // ==========================================================================
   // Internals
   // ==========================================================================
 
@@ -418,6 +647,32 @@ export class EntryLifecycleService {
   }
 
   /**
+   * Every condition that blocks a NEW entry submission, in ONE place: the two
+   * live gates, the mutation client's own block, the profile being disabled,
+   * the global kill switch and the profile kill switch.
+   *
+   * Both the pre-submission recheck and PREFLIGHT abandonment read it, so the
+   * two can never disagree about what "blocked" means — which matters, because
+   * abandonment is only safe precisely when submission is impossible.
+   *
+   * Returns `null` only when a new entry could legitimately be submitted.
+   */
+  private async newEntryBlockedReason(executionProfileId: string): Promise<EntryReasonCode | null> {
+    const gate = this.checkLiveGates();
+    if (gate) return gate;
+
+    const profile = await this.prisma.executionProfile.findUnique({
+      where: { id: executionProfileId },
+      include: { safetyPolicy: true },
+    });
+    if (!profile?.isEnabled) return "SAFETY_ADMISSION_NOT_READY";
+    if (env.EXECUTION_GLOBAL_KILL_SWITCH || profile.safetyPolicy?.killSwitchActive !== false) {
+      return "KILL_SWITCH_RECHECK_ACTIVE";
+    }
+    return null;
+  }
+
+  /**
    * Re-validated IMMEDIATELY before POST /fapi/v1/order. Margin-type and
    * leverage configuration involve several network round trips, so a kill
    * switch or gate may have been engaged in the meantime. No database
@@ -427,24 +682,19 @@ export class EntryLifecycleService {
     execution: TradeExecution,
     order: BinanceOrder
   ): Promise<{ reasonCode: EntryReasonCode; message: string } | null> {
-    // 1. Gates.
-    const gate = this.checkLiveGates();
-    if (gate) return { reasonCode: gate, message: "Live entry became disabled before submission." };
-
-    // 2. Profile and kill switches, re-read (not cached from revalidation).
-    const profile = await this.prisma.executionProfile.findUnique({
-      where: { id: execution.executionProfileId },
-      include: { safetyPolicy: true },
-    });
-    if (!profile?.isEnabled) {
-      return { reasonCode: "SAFETY_ADMISSION_NOT_READY", message: "Execution profile became disabled." };
+    // 1/2. Gates, profile and kill switches — re-read, never cached from
+    // revalidation. Same definition PREFLIGHT abandonment uses.
+    const blocked = await this.newEntryBlockedReason(execution.executionProfileId);
+    if (blocked === "SAFETY_ADMISSION_NOT_READY") {
+      return { reasonCode: blocked, message: "Execution profile became disabled." };
     }
-    if (env.EXECUTION_GLOBAL_KILL_SWITCH || profile.safetyPolicy?.killSwitchActive !== false) {
+    if (blocked === "KILL_SWITCH_RECHECK_ACTIVE") {
       return {
-        reasonCode: "KILL_SWITCH_RECHECK_ACTIVE",
+        reasonCode: blocked,
         message: "A kill switch became active after configuration; the entry was not submitted.",
       };
     }
+    if (blocked) return { reasonCode: blocked, message: "Live entry became disabled before submission." };
 
     // 3/4. Lifecycle ownership: still ours, still the same version and order.
     const current = await this.prisma.tradeExecution.findUnique({ where: { id: execution.id } });

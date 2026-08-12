@@ -40,6 +40,11 @@ const { EntryLifecycleService } = await import("../src/modules/execution/entry-l
 const { BinanceUsdMExecutionClient } = await import("../src/modules/binance/binance-execution.client");
 const { BinanceError } = await import("../src/modules/binance/binance.errors");
 const { buildClientOrderId } = await import("../src/modules/execution/execution-safety");
+// Mutated per test to exercise the env-level gates, restored in afterEach.
+const { env: runtimeEnv } = await import("../src/config/env");
+const { PENDING_ENTRY_STATUSES, TOTAL_ACTIVE_STATUSES, consumesNoCapacity } = await import(
+  "../src/modules/execution/capacity-status"
+);
 
 type ExecutionServiceType = InstanceType<typeof ExecutionService>;
 type EntryLifecycleServiceType = InstanceType<typeof EntryLifecycleService>;
@@ -478,6 +483,16 @@ afterEach(async () => {
   dispatched = 0;
   gates.liveEntryEnabled = true;
   gates.protectionReady = true;
+  runtimeEnv.EXECUTION_GLOBAL_KILL_SWITCH = false;
+  runtimeEnv.EXECUTION_LIVE_ENTRY_ENABLED = true;
+  runtimeEnv.EXECUTION_PROTECTION_READY = true;
+  if (prisma && available && profileId) {
+    await prisma.executionSafetyPolicy.updateMany({
+      where: { executionProfileId: profileId },
+      data: { killSwitchActive: false },
+    });
+    await prisma.executionProfile.updateMany({ where: { id: profileId }, data: { isEnabled: true } });
+  }
   if (!prisma || !available) return;
   // Every synthetic execution uses the same symbol, so leftovers from one test
   // would trip the next one's "another local execution is active" guard.
@@ -1932,5 +1947,606 @@ describe("gate semantics: exposure-increasing versus risk-reducing", () => {
     const finalOrder = await prisma!.binanceOrder.findFirstOrThrow({ where: { tradeExecutionId: execution.id } });
     expect(finalOrder.executedQuantity.toString()).toBe("0.12");
     expect(scenario.submittedParams).toHaveLength(1);
+  });
+});
+
+// ===========================================================================
+// PREFLIGHT recovery  the gap that stranded a real mainnet canary.
+//
+// An execution admitted moments before the operator closed the canary window
+// sat in PREFLIGHT forever: no reconciliation status included it, and PREFLIGHT
+// consumes a pending-entry AND a total-active slot, so with the canary limits
+// at 1/1 nothing else could ever start.
+//
+// PREFLIGHT is the one pre-submission state: `reserveEntryIntent` writes the
+// ENTRY reservation and the move to ENTRY_SUBMITTING in a single transaction,
+// so a PREFLIGHT execution owns no deterministic client order id and no
+// exchange order can carry its identity. That  and only that  is what makes
+// releasing it safe.
+// ===========================================================================
+
+describe("PREFLIGHT recovery", () => {
+  /** Runs abandonment against the execution's current persisted version. */
+  async function abandon(executionId: string) {
+    const current = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
+    return entries.releaseUnrunnablePreflight({
+      executionId,
+      expectedVersion: current.version,
+      evaluatedAt: at(),
+    });
+  }
+
+  const reload = (id: string) => prisma!.tradeExecution.findUniqueOrThrow({ where: { id } });
+  const orderCount = (id: string) => prisma!.binanceOrder.count({ where: { tradeExecutionId: id } });
+
+  // --- B. Gates open: the ordinary path, unchanged --------------------------
+
+  maybe()("resumes a PREFLIGHT execution through the normal submission path exactly once", async () => {
+    const execution = await admittedExecution();
+
+    const outcome = await entries.resumeEntrySubmission({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    // The existing prepareEntrySubmission path ran: one reservation, one
+    // submitted order, no second identity.
+    expect(outcome.ok).toBe(true);
+    const orders = await prisma!.binanceOrder.findMany({ where: { tradeExecutionId: execution.id } });
+    expect(orders).toHaveLength(1);
+    expect(orders[0].clientOrderId).toBe(buildClientOrderId(execution.id, "ENTRY", 1));
+    expect(scenario.submittedParams).toHaveLength(1);
+    expect((await reload(execution.id)).status).toBe("ENTRY_PENDING");
+  });
+
+  maybe()("never releases a PREFLIGHT execution while a new entry is possible", async () => {
+    const execution = await admittedExecution();
+
+    const outcome = await abandon(execution.id);
+
+    // Gates open means the submission path owns this execution; terminalizing
+    // it here would silently discard an admitted signal.
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("SAFETY_ADMISSION_NOT_READY");
+    expect((await reload(execution.id)).status).toBe("PREFLIGHT");
+    expect(dispatched).toBe(0);
+  });
+
+  // --- C/D/E/F. Blocked: release without touching the exchange -------------
+
+  const blockers: Array<[string, () => Promise<void> | void]> = [
+    [
+      "the profile kill switch is active",
+      async () => {
+        await prisma!.executionSafetyPolicy.updateMany({
+          where: { executionProfileId: profileId },
+          data: { killSwitchActive: true },
+        });
+      },
+    ],
+    ["the global kill switch is active", () => void (runtimeEnv.EXECUTION_GLOBAL_KILL_SWITCH = true)],
+    ["live entry is disabled", () => void (runtimeEnv.EXECUTION_LIVE_ENTRY_ENABLED = false)],
+    ["protection is not ready", () => void (runtimeEnv.EXECUTION_PROTECTION_READY = false)],
+    ["the mutation client itself is blocked", () => void (gates.liveEntryEnabled = false)],
+    [
+      "the execution profile is disabled",
+      async () => {
+        await prisma!.executionProfile.updateMany({ where: { id: profileId }, data: { isEnabled: false } });
+      },
+    ],
+  ];
+
+  for (const [label, block] of blockers) {
+    maybe()(`releases a PREFLIGHT execution with zero exchange mutations when ${label}`, async () => {
+      const execution = await admittedExecution();
+      await block();
+
+      // The ordinary recovery path runs first and must dispatch nothing.
+      const resumed = await entries.resumeEntrySubmission({
+        executionId: execution.id,
+        expectedVersion: execution.version,
+        evaluatedAt: at(),
+      });
+      expect(resumed.ok, label).toBe(false);
+      expect(await orderCount(execution.id), label).toBe(0);
+
+      const released = await abandon(execution.id);
+
+      expect(released.ok, label).toBe(true);
+      expect(released.reasonCode, label).toBe("PREFLIGHT_ABANDONED_NEW_ENTRY_BLOCKED");
+
+      const after = await reload(execution.id);
+      expect(after.status, label).toBe("CANCELED");
+      // Nothing was sent, nothing was reserved, no manual review demanded.
+      expect(dispatched, label).toBe(0);
+      expect(scenario.mutations, label).toEqual([]);
+      expect(scenario.submittedParams, label).toHaveLength(0);
+      expect(scenario.cancellationContexts, label).toEqual([]);
+      expect(await orderCount(execution.id), label).toBe(0);
+      expect(after.requiresManualIntervention, label).toBe(false);
+    });
+  }
+
+  maybe()("records the release as an auditable status change", async () => {
+    const execution = await admittedExecution();
+    runtimeEnv.EXECUTION_LIVE_ENTRY_ENABLED = false;
+
+    await abandon(execution.id);
+
+    const events = await prisma!.executionEvent.findMany({
+      where: { tradeExecutionId: execution.id },
+      orderBy: { sequenceNumber: "asc" },
+    });
+    const release = events[events.length - 1];
+    expect(release.fromStatus).toBe("PREFLIGHT");
+    expect(release.toStatus).toBe("CANCELED");
+    expect(release.reasonCode).toBe("PREFLIGHT_ABANDONED_NEW_ENTRY_BLOCKED");
+    expect(release.message).toContain("no entry order was ever reserved");
+  });
+
+  maybe()("frees the capacity the stuck execution was holding", async () => {
+    const execution = await admittedExecution();
+    runtimeEnv.EXECUTION_LIVE_ENTRY_ENABLED = false;
+
+    const before = await prisma!.tradeExecution.count({
+      where: { executionProfileId: profileId, status: { in: [...PENDING_ENTRY_STATUSES] } },
+    });
+    await abandon(execution.id);
+    const after = await prisma!.tradeExecution.count({
+      where: { executionProfileId: profileId, status: { in: [...PENDING_ENTRY_STATUSES] } },
+    });
+
+    expect(before).toBe(1);
+    expect(after).toBe(0);
+    expect(consumesNoCapacity("CANCELED")).toBe(true);
+  });
+
+  // --- G. Unprovable exchange state: fail closed ---------------------------
+
+  maybe()("does not release when exchange state cannot be read", async () => {
+    const execution = await admittedExecution();
+    runtimeEnv.EXECUTION_LIVE_ENTRY_ENABLED = false;
+    const original = readOnlyStub.getPositionRisk;
+    readOnlyStub.getPositionRisk = async () => {
+      throw timeoutError("positionRisk");
+    };
+
+    try {
+      const outcome = await abandon(execution.id);
+
+      // Unknown is never read as "flat".
+      expect(outcome.ok).toBe(false);
+      expect(outcome.reasonCode).toBe("SYMBOL_EXPOSURE_CHANGED");
+      expect((await reload(execution.id)).status).toBe("PREFLIGHT");
+    } finally {
+      readOnlyStub.getPositionRisk = original;
+    }
+  });
+
+  maybe()("does not release while the symbol carries an open order", async () => {
+    const execution = await admittedExecution();
+    runtimeEnv.EXECUTION_LIVE_ENTRY_ENABLED = false;
+    scenario.openOrderSymbols = [SYMBOL];
+
+    const outcome = await abandon(execution.id);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("SYMBOL_EXPOSURE_CHANGED");
+    expect((await reload(execution.id)).status).toBe("PREFLIGHT");
+  });
+
+  maybe()("does not release while the symbol carries a position", async () => {
+    const execution = await admittedExecution();
+    runtimeEnv.EXECUTION_LIVE_ENTRY_ENABLED = false;
+    scenario.positionSymbols = [SYMBOL];
+
+    const outcome = await abandon(execution.id);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("SYMBOL_EXPOSURE_CHANGED");
+    expect((await reload(execution.id)).status).toBe("PREFLIGHT");
+  });
+
+  // --- H. Concurrency -------------------------------------------------------
+
+  maybe()("releases once under concurrent reconciliation", async () => {
+    const execution = await admittedExecution();
+    runtimeEnv.EXECUTION_LIVE_ENTRY_ENABLED = false;
+    const current = await reload(execution.id);
+    const input = { executionId: execution.id, expectedVersion: current.version, evaluatedAt: at() };
+
+    const outcomes = await Promise.all([
+      entries.releaseUnrunnablePreflight(input),
+      entries.releaseUnrunnablePreflight(input),
+      entries.releaseUnrunnablePreflight(input),
+    ]);
+
+    // A compare-and-swap on the version, not an in-memory flag.
+    expect(outcomes.filter((outcome) => outcome.ok)).toHaveLength(1);
+    const after = await reload(execution.id);
+    expect(after.status).toBe("CANCELED");
+    expect(after.version).toBe(current.version + 1);
+    const releases = await prisma!.executionEvent.count({
+      where: { tradeExecutionId: execution.id, toStatus: "CANCELED" },
+    });
+    expect(releases).toBe(1);
+    expect(dispatched).toBe(0);
+  });
+
+  // --- I/J. Post-submission states keep their existing semantics ------------
+
+  maybe()("refuses to release anything at or past ENTRY_SUBMITTING", async () => {
+    for (const status of ["ENTRY_SUBMITTING", "ENTRY_PENDING", "PARTIALLY_FILLED", "ENTRY_FILLED"] as const) {
+      const execution = await admittedExecution();
+      runtimeEnv.EXECUTION_LIVE_ENTRY_ENABLED = false;
+      await prisma!.tradeExecution.update({
+        where: { id: execution.id },
+        data: { status, version: { increment: 1 } },
+      });
+
+      const outcome = await abandon(execution.id);
+
+      // An exchange order may exist from here on; only the existing recovery
+      // semantics may touch these.
+      expect(outcome.ok, status).toBe(false);
+      expect(outcome.reasonCode, status).toBe("EXECUTION_NOT_PREFLIGHT");
+      expect((await reload(execution.id)).status, status).toBe(status);
+      expect(dispatched, status).toBe(0);
+
+      await prisma!.tradeExecution.update({ where: { id: execution.id }, data: { status: "FAILED" } });
+    }
+  });
+
+  maybe()("parks a PREFLIGHT execution that somehow already holds a reservation", async () => {
+    const execution = await admittedExecution();
+    runtimeEnv.EXECUTION_LIVE_ENTRY_ENABLED = false;
+    // Not a state reserveEntryIntent can produce  it writes the order and the
+    // status together  so exposure cannot be ruled out and a human decides.
+    await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: execution.id,
+        role: "ENTRY",
+        generation: 1,
+        clientOrderId: buildClientOrderId(execution.id, "ENTRY", 1),
+        side: "BUY",
+        positionSide: "LONG",
+        orderType: "LIMIT",
+        timeInForce: "GTC",
+        price: "100",
+        originalQuantity: "0.375",
+        status: "SUBMITTING",
+        entryOrderExpiresAt: at(TTL_SECONDS),
+      },
+    });
+
+    const outcome = await abandon(execution.id);
+
+    expect(outcome.ok).toBe(false);
+    const after = await reload(execution.id);
+    expect(after.status).toBe("MANUAL_INTERVENTION");
+    expect(after.requiresManualIntervention).toBe(true);
+    expect(dispatched).toBe(0);
+  });
+
+  maybe()("leaves risk-reducing recovery available while a kill switch blocks new entry", async () => {
+    // The kill switch stops NEW submissions; it must never disable the
+    // reconciliation of an order that may already exist.
+    const execution = await admittedExecution();
+    const clientOrderId = buildClientOrderId(execution.id, "ENTRY", 1);
+    await prisma!.$transaction([
+      prisma!.tradeExecution.update({
+        where: { id: execution.id },
+        data: { status: "ENTRY_PENDING", version: { increment: 1 } },
+      }),
+      prisma!.binanceOrder.create({
+        data: {
+          tradeExecutionId: execution.id,
+          role: "ENTRY",
+          generation: 1,
+          clientOrderId,
+          side: "BUY",
+          positionSide: "LONG",
+          orderType: "LIMIT",
+          timeInForce: "GTC",
+          price: "100",
+          originalQuantity: "0.375",
+          status: "NEW",
+          entryOrderExpiresAt: at(-1),
+        },
+      }),
+    ]);
+    scenario.order = {
+      orderId: "9001",
+      clientOrderId,
+      symbol: SYMBOL,
+      status: "NEW",
+      side: "BUY",
+      positionSide: "LONG",
+      type: "LIMIT",
+      price: "100",
+      origQty: "0.375",
+      executedQty: "0",
+      avgPrice: "0",
+    };
+    await prisma!.executionSafetyPolicy.updateMany({
+      where: { executionProfileId: profileId },
+      data: { killSwitchActive: true },
+    });
+
+    const current = await reload(execution.id);
+    const outcome = await entries.expireEntryOrderIfDue({
+      executionId: execution.id,
+      expectedVersion: current.version,
+      evaluatedAt: at(),
+    });
+
+    // The TTL cancellation still runs: it reduces risk rather than creating it.
+    expect(scenario.cancellationContexts).toHaveLength(1);
+    expect(outcome.reasonCode).not.toBe("KILL_SWITCH_RECHECK_ACTIVE");
+  });
+});
+
+// ===========================================================================
+// Stale PREFLIGHT  the second permanent-stick case.
+//
+// Gates wide open, kill switches off, nothing reserved: `revalidate` still
+// refuses forever because the signal is older than
+// EXECUTION_MAX_ALERT_AGE_SECONDS. The blocked-release path does not apply
+// (nothing is blocked), so without this the row holds a pending-entry and a
+// total-active slot for good.
+//
+// SKIPPED rather than CANCELED: the signal was deliberately not traded, which
+// is exactly what a Phase 5 SKIP decision already records on a PLAN_READY row.
+// ===========================================================================
+
+describe("PREFLIGHT expiry", () => {
+  const reload = (id: string) => prisma!.tradeExecution.findUniqueOrThrow({ where: { id } });
+  const orderCount = (id: string) => prisma!.binanceOrder.count({ where: { tradeExecutionId: id } });
+
+  /** Ages the frozen signal past the freshness limit. Gates stay wide open. */
+  async function staleExecution() {
+    const execution = await admittedExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { signalTriggeredAt: at(-(runtimeEnv.EXECUTION_MAX_ALERT_AGE_SECONDS + 60)) },
+    });
+    return reload(execution.id);
+  }
+
+  async function release(executionId: string) {
+    const current = await reload(executionId);
+    return entries.releaseUnrunnablePreflight({
+      executionId,
+      expectedVersion: current.version,
+      evaluatedAt: at(),
+    });
+  }
+
+  maybe()("skips a stale PREFLIGHT execution with zero exchange mutations", async () => {
+    const execution = await staleExecution();
+
+    // The ordinary path is genuinely stuck: it refuses on the deadline and
+    // reserves nothing, however many times it runs.
+    const resumed = await entries.resumeEntrySubmission({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+    expect(resumed.ok).toBe(false);
+    expect(resumed.reasonCode).toBe("SIGNAL_OR_ENTRY_DEADLINE_EXPIRED");
+
+    const outcome = await release(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reasonCode).toBe("PREFLIGHT_SKIPPED_SIGNAL_EXPIRED");
+    const after = await reload(execution.id);
+    expect(after.status).toBe("SKIPPED");
+    expect(after.requiresManualIntervention).toBe(false);
+    // Nothing reserved, nothing sent, nothing cancelled.
+    expect(await orderCount(execution.id)).toBe(0);
+    expect(dispatched).toBe(0);
+    expect(scenario.mutations).toEqual([]);
+    expect(scenario.submittedParams).toHaveLength(0);
+    expect(scenario.cancellationContexts).toEqual([]);
+  });
+
+  maybe()("skips a PREFLIGHT execution whose planned entry deadline has passed", async () => {
+    const execution = await admittedExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { entryExpiresAt: at(-60) },
+    });
+
+    const outcome = await release(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reasonCode).toBe("PREFLIGHT_SKIPPED_SIGNAL_EXPIRED");
+    expect((await reload(execution.id)).status).toBe("SKIPPED");
+    expect(dispatched).toBe(0);
+  });
+
+  maybe()("records the skip as an auditable status change", async () => {
+    const execution = await staleExecution();
+
+    await release(execution.id);
+
+    const events = await prisma!.executionEvent.findMany({
+      where: { tradeExecutionId: execution.id },
+      orderBy: { sequenceNumber: "asc" },
+    });
+    const skip = events[events.length - 1];
+    expect(skip.fromStatus).toBe("PREFLIGHT");
+    expect(skip.toStatus).toBe("SKIPPED");
+    expect(skip.reasonCode).toBe("PREFLIGHT_SKIPPED_SIGNAL_EXPIRED");
+    expect(skip.message).toContain("can never be submitted");
+  });
+
+  maybe()("frees the capacity a stale execution was holding", async () => {
+    const execution = await staleExecution();
+
+    const before = await prisma!.tradeExecution.count({
+      where: { executionProfileId: profileId, status: { in: [...TOTAL_ACTIVE_STATUSES] } },
+    });
+    await release(execution.id);
+    const after = await prisma!.tradeExecution.count({
+      where: { executionProfileId: profileId, status: { in: [...TOTAL_ACTIVE_STATUSES] } },
+    });
+
+    expect(before).toBe(1);
+    expect(after).toBe(0);
+    expect(consumesNoCapacity("SKIPPED")).toBe(true);
+  });
+
+  maybe()("leaves a still-fresh PREFLIGHT execution alone", async () => {
+    // One second inside the limit: the submission path can still have it.
+    const execution = await admittedExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { signalTriggeredAt: at(-(runtimeEnv.EXECUTION_MAX_ALERT_AGE_SECONDS - 1)) },
+    });
+
+    const outcome = await release(execution.id);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("SAFETY_ADMISSION_NOT_READY");
+    expect((await reload(execution.id)).status).toBe("PREFLIGHT");
+  });
+
+  maybe()("never treats an unknown signal time as expiry", async () => {
+    const execution = await admittedExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { signalTriggeredAt: null },
+    });
+
+    const outcome = await release(execution.id);
+
+    // Age is unknowable, and unknown is never proof.
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("SAFETY_ADMISSION_NOT_READY");
+    expect((await reload(execution.id)).status).toBe("PREFLIGHT");
+  });
+
+  maybe()("prefers the blocked reason when the window is also shut", async () => {
+    const execution = await staleExecution();
+    runtimeEnv.EXECUTION_LIVE_ENTRY_ENABLED = false;
+
+    const outcome = await release(execution.id);
+
+    // The operator's decision is the more informative record.
+    expect(outcome.reasonCode).toBe("PREFLIGHT_ABANDONED_NEW_ENTRY_BLOCKED");
+    expect((await reload(execution.id)).status).toBe("CANCELED");
+  });
+
+  // --- The same proofs as the blocked path, re-asserted for this trigger ----
+
+  maybe()("does not skip when exchange state cannot be read", async () => {
+    const execution = await staleExecution();
+    const original = readOnlyStub.getOpenOrders;
+    readOnlyStub.getOpenOrders = async () => {
+      throw timeoutError("openOrders");
+    };
+
+    try {
+      const outcome = await release(execution.id);
+
+      expect(outcome.ok).toBe(false);
+      expect(outcome.reasonCode).toBe("SYMBOL_EXPOSURE_CHANGED");
+      expect((await reload(execution.id)).status).toBe("PREFLIGHT");
+    } finally {
+      readOnlyStub.getOpenOrders = original;
+    }
+  });
+
+  maybe()("does not skip while the symbol carries an open order", async () => {
+    const execution = await staleExecution();
+    scenario.openOrderSymbols = [SYMBOL];
+
+    const outcome = await release(execution.id);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("SYMBOL_EXPOSURE_CHANGED");
+    expect((await reload(execution.id)).status).toBe("PREFLIGHT");
+  });
+
+  maybe()("does not skip while the symbol carries a position", async () => {
+    const execution = await staleExecution();
+    scenario.positionSymbols = [SYMBOL];
+
+    const outcome = await release(execution.id);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("SYMBOL_EXPOSURE_CHANGED");
+    expect((await reload(execution.id)).status).toBe("PREFLIGHT");
+  });
+
+  maybe()("parks a stale PREFLIGHT execution that somehow holds a reservation", async () => {
+    const execution = await staleExecution();
+    await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: execution.id,
+        role: "ENTRY",
+        generation: 1,
+        clientOrderId: buildClientOrderId(execution.id, "ENTRY", 1),
+        side: "BUY",
+        positionSide: "LONG",
+        orderType: "LIMIT",
+        timeInForce: "GTC",
+        price: "100",
+        originalQuantity: "0.375",
+        status: "SUBMITTING",
+        entryOrderExpiresAt: at(TTL_SECONDS),
+      },
+    });
+
+    const outcome = await release(execution.id);
+
+    expect(outcome.ok).toBe(false);
+    const after = await reload(execution.id);
+    // Never SKIPPED: an order identity exists, so exposure is not ruled out.
+    expect(after.status).toBe("MANUAL_INTERVENTION");
+    expect(after.requiresManualIntervention).toBe(true);
+    expect(dispatched).toBe(0);
+  });
+
+  maybe()("refuses to skip anything at or past ENTRY_SUBMITTING", async () => {
+    for (const status of ["ENTRY_SUBMITTING", "ENTRY_PENDING", "PARTIALLY_FILLED", "ENTRY_FILLED"] as const) {
+      const execution = await staleExecution();
+      await prisma!.tradeExecution.update({
+        where: { id: execution.id },
+        data: { status, version: { increment: 1 } },
+      });
+
+      const outcome = await release(execution.id);
+
+      expect(outcome.ok, status).toBe(false);
+      expect(outcome.reasonCode, status).toBe("EXECUTION_NOT_PREFLIGHT");
+      expect((await reload(execution.id)).status, status).toBe(status);
+      expect(dispatched, status).toBe(0);
+
+      await prisma!.tradeExecution.update({ where: { id: execution.id }, data: { status: "FAILED" } });
+    }
+  });
+
+  maybe()("skips once under concurrent reconciliation", async () => {
+    const execution = await staleExecution();
+    const input = { executionId: execution.id, expectedVersion: execution.version, evaluatedAt: at() };
+
+    const outcomes = await Promise.all([
+      entries.releaseUnrunnablePreflight(input),
+      entries.releaseUnrunnablePreflight(input),
+      entries.releaseUnrunnablePreflight(input),
+    ]);
+
+    expect(outcomes.filter((outcome) => outcome.ok)).toHaveLength(1);
+    const after = await reload(execution.id);
+    expect(after.status).toBe("SKIPPED");
+    expect(after.version).toBe(execution.version + 1);
+    const skips = await prisma!.executionEvent.count({
+      where: { tradeExecutionId: execution.id, toStatus: "SKIPPED" },
+    });
+    expect(skips).toBe(1);
+    expect(dispatched).toBe(0);
   });
 });

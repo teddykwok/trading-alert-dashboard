@@ -93,6 +93,7 @@ function harness(options: {
       resumeEntrySubmission: record("entry", "resumeEntrySubmission"),
       reconcileEntryOrder: record("entry", "reconcileEntryOrder"),
       expireEntryOrderIfDue: record("entry", "expireEntryOrderIfDue"),
+      releaseUnrunnablePreflight: record("entry", "releaseUnrunnablePreflight"),
     } as never,
     protection: {
       ensureProtectionForExposure: record("protection", "ensureProtectionForExposure"),
@@ -231,6 +232,33 @@ describe("reconciliation routing", () => {
 
   it("observes a parked execution without auto-unwinding it", async () => {
     expect(await route("MANUAL_INTERVENTION")).toEqual(["protection.reconcileProtectionAndClosure"]);
+  });
+
+  it("discovers a PREFLIGHT execution and routes it through the existing entry recovery", async () => {
+    // The gap that stranded a real canary: PREFLIGHT was reconcilable in
+    // `resumeEntrySubmission` but no tick ever looked for it.
+    expect(RECONCILABLE_STATUSES).toContain("PREFLIGHT");
+    expect(await route("PREFLIGHT")).toEqual([
+      "entry.resumeEntrySubmission",
+      "entry.releaseUnrunnablePreflight",
+    ]);
+  });
+
+  it("gives PREFLIGHT no second order path of its own", () => {
+    const source = stripComments(
+      readFileSync(path.join(BACKEND, "src", "modules", "execution", "execution-orchestrator.ts"), "utf8")
+    );
+    const block = source.slice(source.indexOf('case "PREFLIGHT"'), source.indexOf('case "ENTRY_SUBMITTING"'));
+    // Coordination only: it calls the lifecycle service and decides nothing.
+    expect(block).toContain("this.deps.entry.resumeEntrySubmission(input)");
+    expect(block).toContain("this.deps.entry.releaseUnrunnablePreflight(input)");
+    expect(block).not.toMatch(/prisma|updateMany|CANCELED|killSwitch|env\./);
+  });
+
+  it("does not treat PREFLIGHT as unresolved exposure", () => {
+    // PREFLIGHT has provably reserved nothing, so it must not block new work
+    // the way a possibly-open order does.
+    expect(RECOVERY_REQUIRED_STATUSES).not.toContain("PREFLIGHT" as never);
   });
 
   it("touches no terminal execution", async () => {
