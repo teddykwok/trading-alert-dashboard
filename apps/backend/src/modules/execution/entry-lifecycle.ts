@@ -50,6 +50,15 @@ export const ENTRY_REASON_CODES = [
   "UNPROTECTED_PARTIAL_FILL",
   "CAPACITY_OR_VERSION_CONFLICT",
   "MANUAL_REVIEW_REQUIRED",
+  // A PREFLIGHT execution released BEFORE any reservation existed, because new
+  // entry is blocked and the exchange was proven flat. Distinct from every
+  // cancellation code above: nothing was ever sent, so there was nothing to
+  // cancel — only local capacity to give back.
+  "PREFLIGHT_ABANDONED_NEW_ENTRY_BLOCKED",
+  // The same pre-submission release, but because the signal or entry deadline
+  // has passed. The gates may be wide open: this execution is simply too old to
+  // trade, which is a SKIP (deliberately not traded) rather than a cancellation.
+  "PREFLIGHT_SKIPPED_SIGNAL_EXPIRED",
   "ENTRY_SUBMITTED",
   "ENTRY_RECONCILED",
 ] as const;

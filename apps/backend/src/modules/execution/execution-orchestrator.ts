@@ -46,6 +46,11 @@ export const RECONCILABLE_STATUSES = [
   // nobody to admit it. Discovering it here is what makes the original BullMQ
   // delivery unnecessary for the execution to survive.
   "PLAN_READY",
+  // Admitted but not yet reserved. Its recovery already existed
+  // (`resumeEntrySubmission` handles PREFLIGHT) but nothing ever discovered it,
+  // so an execution admitted just before the window closed held a pending-entry
+  // and a total-active slot indefinitely.
+  "PREFLIGHT",
   "ENTRY_SUBMITTING",
   "ENTRY_PENDING",
   "PARTIALLY_FILLED",
@@ -264,6 +269,24 @@ export class ExecutionOrchestrator {
         case "PLAN_READY": {
           const outcome = await this.admitAndSubmit({ executionId: execution.id, evaluatedAt });
           return outcome.admitted ? outcome.mutationsDispatched : 0;
+        }
+
+        // Admitted, nothing reserved. `resumeEntrySubmission` routes PREFLIGHT
+        // to the ordinary `prepareEntrySubmission` path, which re-checks every
+        // gate, kill switch and exchange precondition itself — so with the
+        // window shut this dispatches nothing.
+        //
+        // The second call then asks the lifecycle service whether the execution
+        // can still run at all — a closed window or a deadline that has already
+        // passed both leave it holding capacity forever otherwise. It is called
+        // unconditionally rather than on a failure flag: if the resume succeeded
+        // the status is no longer PREFLIGHT and it returns immediately, and what
+        // "unrunnable" and "safe to release" mean stays in Phase 6 rather than
+        // leaking into the orchestrator.
+        case "PREFLIGHT": {
+          const resumed = await this.deps.entry.resumeEntrySubmission(input);
+          const released = await this.deps.entry.releaseUnrunnablePreflight(input);
+          return resumed.mutationsDispatched + released.mutationsDispatched;
         }
 
         // An ambiguous submission: resume queries the SAME deterministic client
