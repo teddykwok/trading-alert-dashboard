@@ -400,6 +400,10 @@ export type NormalizedProtectionStatus =
   | "CANCELED"
   | "EXPIRED"
   | "REJECTED"
+  // Binance PROVED this exact deterministic id does not exist. A RESOLVED
+  // state: nothing to cancel, nothing to wait for. Never produced by
+  // `normalizeAlgoStatus` — only by a query that came back definitively empty.
+  | "ABSENT"
   | "UNKNOWN";
 
 /**

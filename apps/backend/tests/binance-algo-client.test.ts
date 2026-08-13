@@ -16,6 +16,7 @@ import {
 import { BinanceReadOnlyClient, signQuery } from "../src/modules/binance/binance.client";
 import { buildClientOrderId } from "../src/modules/execution/execution-safety";
 import { classifyMutationOutcome } from "../src/modules/execution/entry-lifecycle";
+import * as binanceEndpoints from "../src/modules/binance/binance-execution.endpoints";
 
 /**
  * Phase 7 Algo / margin / emergency mutation-client tests.
@@ -169,7 +170,14 @@ describe("protection submission", () => {
     expect(params.get("side")).toBe("SELL");
     expect(params.get("positionSide")).toBe("LONG");
     expect(params.get("quantity")).toBe("0.100");
-    expect(params.get("stopPrice")).toBe("96");
+    // POST /fapi/v1/algoOrder takes triggerPrice; stopPrice is the LEGACY
+    // standard-order field and must never appear here again.
+    expect(params.get("triggerPrice")).toBe("96");
+    expect(params.has("stopPrice")).toBe(false);
+    expect(params.get("priceProtect")).toBe("false");
+    expect(params.get("closePosition")).toBe("false");
+    expect(params.get("symbol")).toBe(SYMBOL);
+    expect(params.has("reduceOnly")).toBe(false);
     expect(params.get("workingType")).toBe("MARK_PRICE");
     expect(params.get("newOrderRespType")).toBe("ACK");
     expect(params.get("clientAlgoId")).toBe(buildClientOrderId(EXECUTION_ID, "STOP_LOSS", 1));
@@ -193,8 +201,29 @@ describe("protection submission", () => {
         priceProtect: false,
       })
     );
-    expect(paramsOf(calls[0].url).get("type")).toBe("TAKE_PROFIT_MARKET");
-    expect(paramsOf(calls[0].url).get("workingType")).toBe("CONTRACT_PRICE");
+    const tp = paramsOf(calls[0].url);
+    expect(tp.get("algoType")).toBe("CONDITIONAL");
+    expect(tp.get("type")).toBe("TAKE_PROFIT_MARKET");
+    expect(tp.get("side")).toBe("SELL");
+    expect(tp.get("positionSide")).toBe("LONG");
+    expect(tp.get("quantity")).toBe("0.100");
+    // The same trigger contract as STOP_MARKET.
+    expect(tp.get("triggerPrice")).toBe("108");
+    expect(tp.has("stopPrice")).toBe(false);
+    expect(tp.get("workingType")).toBe("CONTRACT_PRICE");
+    expect(tp.get("priceProtect")).toBe("false");
+    expect(tp.get("closePosition")).toBe("false");
+    expect(tp.get("newOrderRespType")).toBe("ACK");
+    expect(tp.get("clientAlgoId")).toBe(buildClientOrderId(EXECUTION_ID, "TAKE_PROFIT", 1));
+    expect(tp.has("reduceOnly")).toBe(false);
+  });
+
+  it("refuses structurally if a regression ever puts stopPrice back on the algo request", () => {
+    const { FORBIDDEN_PROTECTION_PARAMS } = binanceEndpoints;
+    // The guard is the endpoints allowlist, so the failure happens before any
+    // request is built rather than at the exchange.
+    expect(FORBIDDEN_PROTECTION_PARAMS).toContain("stopPrice");
+    expect(FORBIDDEN_PROTECTION_PARAMS).toContain("reduceOnly");
   });
 
   it("maps SHORT protection to BUY on positionSide SHORT", async () => {

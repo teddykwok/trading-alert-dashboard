@@ -571,7 +571,12 @@ export class BinanceUsdMExecutionClient {
       // Quantity-based, never closePosition=true: the strategy tracks filled
       // quantity explicitly and protects it in tranches.
       quantity: context.quantity,
-      stopPrice: context.triggerPrice,
+      // POST /fapi/v1/algoOrder takes `triggerPrice`. `stopPrice` is the
+      // LEGACY field of the standard /fapi/v1/order endpoint and is rejected
+      // here — which is exactly what stranded the first real canary: Binance
+      // refused the STOP with a parameter error, the rejection was misread as
+      // ambiguous, and the position was left unprotected.
+      triggerPrice: context.triggerPrice,
       workingType: context.workingType,
       priceProtect: context.priceProtect ? "true" : "false",
       closePosition: "false",

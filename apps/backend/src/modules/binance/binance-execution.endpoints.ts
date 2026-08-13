@@ -55,6 +55,10 @@ export const MARGIN_ADD_TYPE = 1 as const;
 /** Parameters that must never appear on a Phase 7 protection order. */
 export const FORBIDDEN_PROTECTION_PARAMS = [
   "reduceOnly",
+  // The Algo Order endpoint's trigger field is `triggerPrice`. `stopPrice`
+  // belongs to the legacy standard-order endpoint and is refused here, so a
+  // regression back to it fails structurally rather than at the exchange.
+  "stopPrice",
   "price",
   "priceMatch",
   "activationPrice",

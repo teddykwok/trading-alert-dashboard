@@ -43,6 +43,11 @@ describe("execution state machine", () => {
     ["ENTRY_PENDING", ["PARTIALLY_FILLED", "ENTRY_FILLED", "ENTRY_EXPIRED", "CANCELED", "FAILED", "MANUAL_INTERVENTION"]],
     // Phase 7 protects the FILLED quantity while the entry may still be open,
     // so a protection exit can close directly from an exposure state.
+    //
+    // CLOSED_EXTERNAL belongs to all three exposure states because the
+    // orchestrator routes each of them into ensureProtectionForExposure, which
+    // hands a flat position to reconcileProtectionAndClosure — so each can
+    // genuinely reach the proof path and observe an unattributable closure.
     [
       "PARTIALLY_FILLED",
       [
@@ -52,15 +57,20 @@ describe("execution state machine", () => {
         "CLOSED_TP",
         "CLOSED_SL",
         "CLOSED_EMERGENCY",
+        "CLOSED_EXTERNAL",
         "MANUAL_INTERVENTION",
       ],
     ],
-    ["ENTRY_FILLED", ["PLACING_PROTECTION", "CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"]],
-    ["PLACING_PROTECTION", ["PROTECTED", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"]],
-    ["PROTECTED", ["CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"]],
-    // A verified emergency close is the one documented way out of a parked
-    // execution: the exposure it was parked for has provably been removed.
-    ["MANUAL_INTERVENTION", ["CLOSED_EMERGENCY"]],
+    [
+      "ENTRY_FILLED",
+      ["PLACING_PROTECTION", "CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "MANUAL_INTERVENTION"],
+    ],
+    ["PLACING_PROTECTION", ["PROTECTED", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "MANUAL_INTERVENTION"]],
+    ["PROTECTED", ["CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "MANUAL_INTERVENTION"]],
+    // The two documented ways out of a parked execution, both requiring
+    // exchange proof: a verified emergency close, or a position proven flat
+    // whose closure cannot be attributed to one of our owned orders.
+    ["MANUAL_INTERVENTION", ["CLOSED_EMERGENCY", "CLOSED_EXTERNAL"]],
   ];
 
   it("permits exactly the documented transitions", () => {

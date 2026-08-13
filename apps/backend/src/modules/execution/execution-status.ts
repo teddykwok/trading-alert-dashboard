@@ -30,6 +30,10 @@ export const TRADE_EXECUTION_STATUSES = [
   "FAILED",
   "MANUAL_INTERVENTION",
   "CLOSED_EMERGENCY",
+  // Provably flat, but the closure cannot be attributed to one of OUR owned,
+  // verified orders. A manual operator close, another client, a liquidation or
+  // ADL all look identical from here, so the status claims only what is known.
+  "CLOSED_EXTERNAL",
 ] as const;
 
 export type TradeExecutionStatusName = (typeof TRADE_EXECUTION_STATUSES)[number];
@@ -45,6 +49,10 @@ export const TERMINAL_STATUSES: readonly TradeExecutionStatusName[] = [
   // Phase 7: the position was closed at market as a last resort. Like every
   // other closed state it asserts there is nothing left to unwind.
   "CLOSED_EMERGENCY",
+  // Reached only after the position is PROVEN flat, the entry can no longer
+  // refill and every owned protection sibling is absent, terminal or verifiably
+  // cancelled — so it asserts the same "nothing left to unwind" as the others.
+  "CLOSED_EXTERNAL",
 ];
 
 /**
@@ -58,6 +66,29 @@ export const EXPOSURE_POSSIBLE_STATUSES: readonly TradeExecutionStatusName[] = [
   "ENTRY_FILLED",
   "PLACING_PROTECTION",
   "PROTECTED",
+];
+
+/**
+ * The only statuses from which an unattributed external close may be recorded.
+ *
+ * Each one can reach reconcileProtectionAndClosure's proof path — position
+ * proven flat, entry remainder neutralized, position re-read with no refill,
+ * every owned protection sibling resolved and no owned fill to attribute — and
+ * each one has RECORDED LIVE EXPOSURE, so "something closed this position" is a
+ * statement about reality rather than a convenience.
+ *
+ * ENTRY_SUBMITTING is deliberately absent even though exposure MAY exist there:
+ * no confirmed fill is recorded yet, so ensureProtectionForExposure stops at
+ * EXECUTION_HAS_NO_CONFIRMED_FILL and the proof path is never reached. The
+ * pre-exposure states are absent for the stronger reason that there is nothing
+ * external to observe at all.
+ */
+export const EXTERNAL_CLOSURE_SOURCE_STATUSES: readonly TradeExecutionStatusName[] = [
+  "PARTIALLY_FILLED",
+  "ENTRY_FILLED",
+  "PLACING_PROTECTION",
+  "PROTECTED",
+  "MANUAL_INTERVENTION",
 ];
 
 const TRANSITIONS: Record<TradeExecutionStatusName, readonly TradeExecutionStatusName[]> = {
@@ -76,6 +107,12 @@ const TRANSITIONS: Record<TradeExecutionStatusName, readonly TradeExecutionStatu
   ],
   // Phase 7 protects the filled quantity while the entry may still be open, so
   // a protection exit can close directly from these states.
+  //
+  // CLOSED_EXTERNAL is reachable from all three because the orchestrator routes
+  // each of them into ensureProtectionForExposure, which hands a flat position
+  // straight to reconcileProtectionAndClosure. Exposure was recorded here, so a
+  // proven-flat position that no owned order explains is a real outcome — not a
+  // convenience. See EXTERNAL_CLOSURE_SOURCE_STATUSES.
   PARTIALLY_FILLED: [
     "ENTRY_FILLED",
     "PLACING_PROTECTION",
@@ -83,11 +120,19 @@ const TRANSITIONS: Record<TradeExecutionStatusName, readonly TradeExecutionStatu
     "CLOSED_TP",
     "CLOSED_SL",
     "CLOSED_EMERGENCY",
+    "CLOSED_EXTERNAL",
     "MANUAL_INTERVENTION",
   ],
-  ENTRY_FILLED: ["PLACING_PROTECTION", "CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"],
-  PLACING_PROTECTION: ["PROTECTED", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"],
-  PROTECTED: ["CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "MANUAL_INTERVENTION"],
+  ENTRY_FILLED: [
+    "PLACING_PROTECTION",
+    "CLOSED_TP",
+    "CLOSED_SL",
+    "CLOSED_EMERGENCY",
+    "CLOSED_EXTERNAL",
+    "MANUAL_INTERVENTION",
+  ],
+  PLACING_PROTECTION: ["PROTECTED", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "MANUAL_INTERVENTION"],
+  PROTECTED: ["CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "MANUAL_INTERVENTION"],
   // Terminal.
   ENTRY_EXPIRED: [],
   CLOSED_TP: [],
@@ -96,9 +141,12 @@ const TRANSITIONS: Record<TradeExecutionStatusName, readonly TradeExecutionStatu
   CANCELED: [],
   SKIPPED: [],
   FAILED: [],
+  CLOSED_EXTERNAL: [],
   // Parked for a human. A verified emergency close is the one way out: the
   // exposure it was parked for has been provably removed.
-  MANUAL_INTERVENTION: ["CLOSED_EMERGENCY"],
+  // A verified emergency close, or a proven-flat position whose closure we
+  // cannot attribute. Both require exchange proof before they may be taken.
+  MANUAL_INTERVENTION: ["CLOSED_EMERGENCY", "CLOSED_EXTERNAL"],
 };
 
 export function isTerminalStatus(status: TradeExecutionStatusName): boolean {

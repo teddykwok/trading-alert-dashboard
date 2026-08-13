@@ -24,6 +24,11 @@ export type BinanceErrorKind =
   | "TIMEOUT"
   | "MALFORMED_RESPONSE"
   | "UNSUPPORTED_SYMBOL"
+  // Binance validated the REQUEST and refused it before the matching engine:
+  // a malformed, missing or unknown parameter. Definitive proof that nothing
+  // was created — distinct from MALFORMED_RESPONSE, which means WE could not
+  // understand the reply and therefore know nothing.
+  | "REQUEST_INVALID"
   | "READ_ONLY_VIOLATION";
 
 /** Kinds that a bounded retry may help with. Auth/permission/validation never retry. */
@@ -131,6 +136,27 @@ export function classifyBinanceFailure(
         return "AUTH";
       case -1121:
         return "UNSUPPORTED_SYMBOL";
+      // Documented request-validation codes. Each one means Binance parsed the
+      // request, found it malformed and refused it — so no order can exist.
+      // Enumerated deliberately: an UNKNOWN 4xx still falls through to
+      // MALFORMED_RESPONSE below and stays ambiguous.
+      case -1100: // Illegal characters in a parameter
+      case -1101: // Too many parameters
+      case -1102: // Mandatory parameter missing, empty or malformed
+      case -1103: // Unknown parameter
+      case -1104: // Not all sent parameters were read
+      case -1105: // Parameter was empty
+      case -1106: // Parameter was sent when not required
+      case -1111: // Precision over the maximum for this asset
+      case -1116: // Invalid orderType
+      case -1117: // Invalid side
+      case -1118: // New client order id was empty
+      case -1130: // Invalid data sent for a parameter
+      // INVALID_CL_ORD_ID_LEN — "client order id length should not be more than
+      // 36 chars". A malformed id, NOT a duplicate: it proves the request was
+      // refused, never that an order exists.
+      case -4015:
+        return "REQUEST_INVALID";
       case -1000:
       case -1001:
         return "SERVER";

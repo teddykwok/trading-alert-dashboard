@@ -371,6 +371,11 @@ enum TradeExecutionStatus {
   MANUAL_INTERVENTION
   /// Phase 7: exposure was closed by the last-resort emergency MARKET close.
   CLOSED_EMERGENCY
+  /// The position is PROVEN flat but the closure cannot be attributed to one
+  /// of our owned, verified orders: a manual operator close, another client, a
+  /// liquidation or ADL are indistinguishable from here. Claims only what is
+  /// known rather than inventing a cause.
+  CLOSED_EXTERNAL
 }
 
 enum ExecutionOrderRole {
@@ -884,6 +889,8 @@ enum ExecutionNotificationType {
   CLOSED_TP
   CLOSED_SL
   CLOSED_EMERGENCY
+  /// Closure proven but unattributed — see TradeExecutionStatus.CLOSED_EXTERNAL.
+  CLOSED_EXTERNAL
   TRADE_SKIPPED
 }
 

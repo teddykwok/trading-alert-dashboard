@@ -8,6 +8,8 @@ import type {
   TradeExecution,
 } from "@prisma/client";
 import { env } from "../../config/env";
+import { logger } from "../../config/logger";
+import { canTransition, isTerminalStatus, type TradeExecutionStatusName } from "./execution-status";
 import { NotFoundError } from "../../utils/errors";
 import { BinanceError } from "../binance/binance.errors";
 import type { BinanceUsdMExecutionClient, WorkingTypeName } from "../binance/binance-execution.client";
@@ -224,7 +226,11 @@ export class ProtectionLifecycleService {
   async resumeProtectionLifecycle(input: ProtectionLifecycleInput): Promise<ProtectionOutcome> {
     const execution = await this.loadExecution(input.executionId);
 
-    if (["SKIPPED", "FAILED", "CANCELED", "ENTRY_EXPIRED", "CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY"].includes(execution.status)) {
+    // The shared state machine is the single source of truth. The literal list
+    // this replaced silently omitted every status added after it was written —
+    // CLOSED_EXTERNAL among them — which would have made a terminally closed
+    // execution look like a resumable protection lifecycle.
+    if (isTerminalStatus(execution.status as TradeExecutionStatusName)) {
       return this.outcome(false, "MANUAL_REVIEW_REQUIRED", `Execution is terminal (${execution.status}).`, execution);
     }
 
@@ -282,11 +288,20 @@ export class ProtectionLifecycleService {
     const orders = await this.loadProtectionOrders(execution.id);
     const observed: Array<{ order: BinanceOrder; status: NormalizedProtectionStatus; dto: BinanceAlgoOrderDto | null }> = [];
     for (const order of orders) {
-      const query = await this.queryProtection(execution.symbol, order.clientAlgoId!);
+      const query = await this.queryProtection(execution.symbol, order.clientAlgoId!, {
+        executionId: execution.id,
+        role: order.role,
+        generation: order.generation,
+      });
       if (query.outcome === "CONFIRMED_ACCEPTED" && query.order) {
         const status = normalizeAlgoStatus(query.order.algoStatus);
         await this.applyProtectionObservation(order, query.order, status, input.evaluatedAt);
         observed.push({ order, status, dto: query.order });
+      } else if (query.outcome === "NOT_FOUND_CONFIRMED") {
+        // Binance PROVED this exact id does not exist. There is nothing left
+        // for this sibling to cancel, which is a resolved state — collapsing it
+        // into UNKNOWN is what left the first real canary stuck forever.
+        observed.push({ order, status: "ABSENT", dto: null });
       } else {
         observed.push({ order, status: "UNKNOWN", dto: null });
       }
@@ -401,6 +416,8 @@ export class ProtectionLifecycleService {
 
     // An order whose state could not be read is NOT proof that there is
     // nothing left to cancel — cleanup stays incomplete until we can see it.
+    // A CONFIRMED-ABSENT sibling is different: Binance proved that exact id
+    // does not exist, so there is provably nothing to cancel.
     let cleanupComplete = !observed.some((entry) => entry.status === "UNKNOWN");
     for (const sibling of plan.cancel) {
       const cancelled = await this.cancelSibling(execution, sibling, input.evaluatedAt);
@@ -440,8 +457,79 @@ export class ProtectionLifecycleService {
             : null;
 
     if (!targetStatus) {
+      // The position is PROVEN flat, the entry can no longer refill and every
+      // owned sibling is absent, terminal or verifiably cancelled — but no
+      // owned order filled, so we cannot say what closed it. A manual operator
+      // close, another client, a liquidation and ADL are indistinguishable from
+      // here, so the execution is terminalized as an unattributed EXTERNAL
+      // close rather than mislabelled as one of ours.
+      //
+      // Without this the execution stayed MANUAL_INTERVENTION forever and kept
+      // recoveryRequiredCount at 1, blocking all new work — exactly what the
+      // first real canary left behind after the operator closed it by hand.
+      //
+      // ORDERING IS LOAD-BEARING, and mirrors the SL/TP/emergency path below:
+      // the TradeExecution is terminalized FIRST and the protection row is
+      // marked CLOSED only after that commit succeeds. Closing protection first
+      // can produce protection=CLOSED with a non-terminal execution, and
+      // resumeProtectionLifecycle then returns early on that CLOSED row forever
+      // — a half-terminal durable state that strands the execution for good.
+      const current = await this.loadExecution(execution.id);
+      const currentStatus = current.status as TradeExecutionStatusName;
+
+      if (isTerminalStatus(currentStatus)) {
+        // Another reconciliation winner already terminalized this execution.
+        // Its attribution is authoritative and is never overwritten; protection
+        // is safe to close because the execution is already final.
+        await this.setProtectionState(protection.id, "CLOSED", "PROTECTION_VERIFIED", "Position is flat.");
+        return this.outcome(true, "PROTECTION_VERIFIED", "Execution is already terminal.", current, await this.loadProtection(execution.id));
+      }
+
+      if (!canTransition(currentStatus, "CLOSED_EXTERNAL").allowed) {
+        // No terminal state may be recorded from here, so protection must stay
+        // open: marking it CLOSED would strand a non-terminal execution.
+        return this.outcome(
+          false,
+          "PROTECTION_COVERAGE_INCOMPLETE",
+          `Position is flat with no owned protection fill, but ${currentStatus} cannot record an external closure.`,
+          current,
+          await this.loadProtection(execution.id)
+        );
+      }
+
+      const externallyClosed = await this.commitExecutionChange(current, current.version, {
+        status: "CLOSED_EXTERNAL",
+        reasonCode: "PROTECTION_VERIFIED",
+        message:
+          "Position is provably flat and every owned protection identity is resolved, but no owned order " +
+          "filled; the closure is external and unattributed.",
+        eventType: "PROTECTION_CLEANUP",
+        actuals: {
+          // Deliberately NO actualExitPrice, realizedPnl or fees: none of them
+          // is known, and inventing them would corrupt the journal.
+          exitReason: "EXTERNAL",
+          closedAt: input.evaluatedAt,
+          lastReconciledAt: input.evaluatedAt,
+        },
+        clearManualIntervention: true,
+      });
+      if (!externallyClosed) {
+        // Lost the version race. Protection is deliberately LEFT OPEN so the
+        // next tick can retry the whole proof; closing it here would leave a
+        // non-terminal execution that resumeProtectionLifecycle skips forever.
+        return this.outcome(false, "CAPACITY_OR_VERSION_CONFLICT", "Version changed during external closure.", current, await this.loadProtection(execution.id));
+      }
+
+      // Terminal is durable; only now is protection safe to close.
       await this.setProtectionState(protection.id, "CLOSED", "PROTECTION_VERIFIED", "Position is flat.");
-      return this.outcome(true, "PROTECTION_VERIFIED", "Position is flat with no protection fill.", execution, await this.loadProtection(execution.id));
+
+      return this.outcome(
+        true,
+        "PROTECTION_VERIFIED",
+        "Position is flat with no owned protection fill; closed as external.",
+        externallyClosed,
+        await this.loadProtection(execution.id)
+      );
     }
 
     const exitOrder = closure.reason === "TAKE_PROFIT" ? takeProfitFilled : closure.reason === "STOP_LOSS" ? stopFilled : null;
@@ -811,7 +899,7 @@ export class ProtectionLifecycleService {
         });
         await this.mutations.submitProtectionOrder(context);
       } catch (error) {
-        outcome = classifyMutationOutcome(this.asFailureShape(error));
+        outcome = classifyMutationOutcome(this.asFailureShape(error), "SUBMIT_ALGO");
         if (outcome === "CONFIRMED_REJECTED") {
           await this.prisma.binanceOrder.update({ where: { id: order.id }, data: { status: "REJECTED" } });
           return {
@@ -1032,7 +1120,7 @@ export class ProtectionLifecycleService {
         this.mutations.authorizeMarginAddition({ symbol: execution.symbol, positionSide, amount: allowance.amount })
       );
     } catch (error) {
-      outcome = classifyMutationOutcome(this.asFailureShape(error));
+      outcome = classifyMutationOutcome(this.asFailureShape(error), "SUBMIT_CONFIG");
       if (outcome === "CONFIRMED_REJECTED") {
         await this.prisma.marginAdjustmentIntent.update({
           where: { id: intent.id },
@@ -1189,7 +1277,7 @@ export class ProtectionLifecycleService {
         })
       );
     } catch (error) {
-      const outcome = classifyMutationOutcome(this.asFailureShape(error));
+      const outcome = classifyMutationOutcome(this.asFailureShape(error), "SUBMIT_ORDER");
       if (outcome === "CONFIRMED_REJECTED") {
         await this.alerts.raise({
           tradeExecutionId: execution.id,
@@ -1356,7 +1444,7 @@ export class ProtectionLifecycleService {
       });
       await this.mutations.cancelReservedEntryOrder(context);
     } catch (error) {
-      const outcome = classifyMutationOutcome(this.asFailureShape(error));
+      const outcome = classifyMutationOutcome(this.asFailureShape(error), "CANCEL");
       if (outcome === "CONFIRMED_REJECTED") {
         return {
           action: "BLOCK_UNRESOLVED",
@@ -1429,7 +1517,7 @@ export class ProtectionLifecycleService {
       });
       await this.mutations.cancelProtectionOrder(context);
     } catch (error) {
-      const outcome = classifyMutationOutcome(this.asFailureShape(error));
+      const outcome = classifyMutationOutcome(this.asFailureShape(error), "CANCEL");
       if (outcome === "CONFIRMED_REJECTED") return false;
       // Unknown: the query below decides, never the DELETE response.
     }
@@ -1528,6 +1616,12 @@ export class ProtectionLifecycleService {
       message: string;
       eventType: "PROTECTION_RESERVED" | "PROTECTION_SUBMITTED" | "PROTECTION_VERIFIED" | "PROTECTION_RECONCILED" | "MARGIN_ADJUSTED" | "EMERGENCY_CLOSE_SUBMITTED" | "PROTECTION_CLEANUP" | "MANUAL_INTERVENTION_REQUIRED";
       requiresManualIntervention?: boolean;
+      /**
+       * Clears the manual-intervention flag. Only a terminal transition backed
+       * by exchange proof may set this — it is what releases the execution from
+       * the recovery-required count.
+       */
+      clearManualIntervention?: boolean;
       actuals?: Prisma.TradeExecutionUpdateManyMutationInput;
     }
   ): Promise<TradeExecution | null> {
@@ -1541,6 +1635,7 @@ export class ProtectionLifecycleService {
           decisionReasonCode: change.reasonCode,
           sanitizedMessage: change.message.slice(0, 1000),
           ...(change.requiresManualIntervention ? { requiresManualIntervention: true } : {}),
+          ...(change.clearManualIntervention ? { requiresManualIntervention: false } : {}),
         },
       });
       if (updated.count === 0) return null;
@@ -1620,15 +1715,45 @@ export class ProtectionLifecycleService {
     }
   }
 
+  /**
+   * Queries ONE protection order by its deterministic client algo id.
+   *
+   * Three outcomes matter to the caller and must never be conflated:
+   *
+   *   CONFIRMED_ACCEPTED  — the order exists; `order` carries its state;
+   *   NOT_FOUND_CONFIRMED — Binance proved this exact id does not exist;
+   *   anything else       — we do not know, and absence must not be inferred.
+   *
+   * For a QUERY, absence is proven by -2013 (NO_SUCH_ORDER) and by nothing
+   * else. -2011 is CANCEL_REJECTED, documented only in the cancel context, so
+   * it says nothing about a GET and stays RESULT_UNKNOWN here. A timeout, a
+   * 5xx, an auth failure, a rate limit or an unparseable reply likewise remain
+   * unknown, because none of them says anything about the order.
+   */
   private async queryProtection(
     symbol: string,
-    clientAlgoId: string
+    clientAlgoId: string,
+    context?: { executionId: string; role: string; generation: number }
   ): Promise<{ outcome: MutationOutcome; order: BinanceAlgoOrderDto | null }> {
     try {
       const order = await this.readOnly.queryAlgoOrderByClientAlgoId(symbol, clientAlgoId);
       return { outcome: "CONFIRMED_ACCEPTED", order };
     } catch (error) {
-      return { outcome: classifyMutationOutcome(this.asFailureShape(error)), order: null };
+      const failure = this.asFailureShape(error);
+      const outcome = classifyMutationOutcome(failure);
+      if (context) {
+        this.logProtectionFailure({
+          stage: "QUERY",
+          executionId: context.executionId,
+          role: context.role,
+          generation: context.generation,
+          clientAlgoId,
+          endpoint: "queryAlgoOrder",
+          outcome,
+          failure,
+        });
+      }
+      return { outcome, order: null };
     }
   }
 
@@ -1752,6 +1877,42 @@ export class ProtectionLifecycleService {
       return { kind: error.kind, httpStatus: error.httpStatus, binanceCode: error.binanceCode };
     }
     return { kind: "NETWORK", httpStatus: null, binanceCode: null };
+  }
+
+  /**
+   * Sanitized diagnostics for a protection exchange call.
+   *
+   * The first real canary failed with nothing but a reason code to go on. Every
+   * field here is safe: the Binance error KIND, the HTTP status, the numeric
+   * Binance code, the endpoint NAME, and identifiers we minted ourselves. Never
+   * the API key, secret, signature, signed URL or query string — the URL
+   * carries the signature, so it is never logged.
+   */
+  private logProtectionFailure(input: {
+    stage: "SUBMIT" | "QUERY" | "CANCEL";
+    executionId: string;
+    role: string;
+    generation: number;
+    clientAlgoId: string;
+    endpoint: string;
+    outcome: MutationOutcome;
+    failure: { kind: string; httpStatus?: number | null; binanceCode?: number | null };
+  }): void {
+    logger.warn(
+      {
+        stage: input.stage,
+        executionId: input.executionId,
+        role: input.role,
+        generation: input.generation,
+        clientAlgoId: input.clientAlgoId,
+        endpoint: input.endpoint,
+        outcome: input.outcome,
+        binanceKind: input.failure.kind,
+        httpStatus: input.failure.httpStatus ?? null,
+        binanceCode: input.failure.binanceCode ?? null,
+      },
+      "Protection exchange call failed"
+    );
   }
 
   private outcome(

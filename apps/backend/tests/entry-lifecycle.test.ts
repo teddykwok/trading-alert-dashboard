@@ -226,13 +226,38 @@ describe("mutation outcome classification", () => {
     }
   });
 
-  it("recognises a duplicate client order id as a conflict", () => {
-    expect(classifyMutationOutcome({ kind: "MALFORMED_RESPONSE", binanceCode: -4015 })).toBe("CONFLICT");
+  it("recognises a duplicate client order id as a conflict, on standard-order submission only", () => {
+    // -4116 is DUPLICATED_CLIENT_ORDER_ID, documented for clientOrderId.
+    expect(classifyMutationOutcome({ kind: "MALFORMED_RESPONSE", binanceCode: -4116 }, "SUBMIT_ORDER")).toBe(
+      "CONFLICT"
+    );
+    // The algo family has no established duplicate semantic for clientAlgoId,
+    // so it stays ambiguous and is resolved by querying the same id.
+    expect(classifyMutationOutcome({ kind: "MALFORMED_RESPONSE", binanceCode: -4116 }, "SUBMIT_ALGO")).toBe(
+      "RESULT_UNKNOWN"
+    );
+    // -4015 is INVALID_CL_ORD_ID_LEN — a malformed-id validation error that
+    // must never claim an order exists.
+    expect(classifyMutationOutcome({ kind: "REQUEST_INVALID", binanceCode: -4015 }, "SUBMIT_ORDER")).toBe(
+      "CONFIRMED_REJECTED"
+    );
   });
 
-  it("recognises the documented order-absent codes", () => {
-    expect(classifyMutationOutcome({ kind: "MALFORMED_RESPONSE", binanceCode: -2011 })).toBe("NOT_FOUND_CONFIRMED");
-    expect(classifyMutationOutcome({ kind: "MALFORMED_RESPONSE", binanceCode: -2013 })).toBe("NOT_FOUND_CONFIRMED");
+  it("recognises the documented order-absent codes per operation", () => {
+    // -2013 NO_SUCH_ORDER proves absence for both a query and a cancel.
+    expect(classifyMutationOutcome({ kind: "MALFORMED_RESPONSE", binanceCode: -2013 }, "QUERY")).toBe(
+      "NOT_FOUND_CONFIRMED"
+    );
+    expect(classifyMutationOutcome({ kind: "MALFORMED_RESPONSE", binanceCode: -2013 }, "CANCEL")).toBe(
+      "NOT_FOUND_CONFIRMED"
+    );
+    // -2011 CANCEL_REJECTED is documented in the cancel context only.
+    expect(classifyMutationOutcome({ kind: "MALFORMED_RESPONSE", binanceCode: -2011 }, "CANCEL")).toBe(
+      "NOT_FOUND_CONFIRMED"
+    );
+    expect(classifyMutationOutcome({ kind: "MALFORMED_RESPONSE", binanceCode: -2011 }, "QUERY")).not.toBe(
+      "NOT_FOUND_CONFIRMED"
+    );
   });
 
   it("treats no failure as accepted", () => {

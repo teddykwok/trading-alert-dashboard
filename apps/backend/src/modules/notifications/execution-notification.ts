@@ -33,6 +33,7 @@ export const EXECUTION_NOTIFICATION_TYPES = [
   "CLOSED_TP",
   "CLOSED_SL",
   "CLOSED_EMERGENCY",
+  "CLOSED_EXTERNAL",
   "TRADE_SKIPPED",
 ] as const;
 
@@ -65,6 +66,8 @@ const MILESTONE_ORDER: Record<ExecutionNotificationTypeName, number> = {
   CLOSED_TP: 700,
   CLOSED_SL: 700,
   CLOSED_EMERGENCY: 700,
+  // Same closure rank as the other terminal exits.
+  CLOSED_EXTERNAL: 700,
 };
 
 // ---------------------------------------------------------------------------
@@ -408,6 +411,9 @@ export function deriveEarnedMilestones(snapshot: ExecutionNotificationSnapshot):
   if (snapshot.status === "CLOSED_EMERGENCY") {
     push("CLOSED_EMERGENCY", closurePayload(snapshot, "CLOSED_EMERGENCY"), { severity: "WARNING" });
   }
+  if (snapshot.status === "CLOSED_EXTERNAL") {
+    push("CLOSED_EXTERNAL", closurePayload(snapshot, "CLOSED_EXTERNAL"), { severity: "WARNING" });
+  }
 
   return milestones.sort((a, b) => a.milestoneSequence - b.milestoneSequence);
 }
@@ -561,6 +567,9 @@ export function deriveMilestonesFromEvent(
       break;
     case "CLOSED_EMERGENCY":
       push("CLOSED_EMERGENCY", closure("CLOSED_EMERGENCY"), { severity: "WARNING" });
+      break;
+    case "CLOSED_EXTERNAL":
+      push("CLOSED_EXTERNAL", closure("CLOSED_EXTERNAL"), { severity: "WARNING" });
       break;
     case "SKIPPED":
       push(
