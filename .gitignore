@@ -31,3 +31,10 @@ apps/frontend/.env
 # Test-only database configuration (local credentials, never runtime).
 .env.test
 apps/backend/.env.test
+
+# TESTNET protection verifier crash-recovery state. Carries deterministic
+# order identities for an in-flight demo run — never credentials — and is
+# machine-local operational state, not source.
+.testnet-verifier-state.json
+apps/backend/.testnet-verifier-state.json
+*.testnet-verifier-state.json.tmp

@@ -33,6 +33,10 @@ export const BINANCE_READ_ONLY_ENDPOINTS = {
   ping: { path: "/fapi/v1/ping", signed: false, weight: 1 },
   serverTime: { path: "/fapi/v1/time", signed: false, weight: 1 },
   exchangeInfo: { path: "/fapi/v1/exchangeInfo", signed: false, weight: 1 },
+  // Mark price / funding rate. Public and unsigned, weight 1 with a symbol.
+  // The ONLY way to read a mark price before a position exists — positionRisk
+  // carries markPrice too, but only for a position that is already open.
+  premiumIndex: { path: "/fapi/v1/premiumIndex", signed: false, weight: 1 },
 
   // --- Signed USER_DATA (read-only) ---
   balance: { path: "/fapi/v3/balance", signed: true, weight: 5 },
@@ -51,6 +55,10 @@ export const BINANCE_READ_ONLY_ENDPOINTS = {
   // Query Algo Order (Phase 7 protection). GET only — the mutation client
   // owns POST/DELETE on this path from a separate module.
   algoOrder: { path: "/fapi/v1/algoOrder", signed: true, weight: 1 },
+  // Current open Algo (conditional) orders. Weight 1 with a symbol, 40
+  // without. Read-only: it is how a baseline proves the conditional book is
+  // empty WITHOUT ever reaching for a cancel-all endpoint.
+  openAlgoOrders: { path: "/fapi/v1/openAlgoOrders", signed: true, weight: 1 },
   // Position margin change history, used only to reconcile an ambiguous ADD.
   positionMarginHistory: { path: "/fapi/v1/positionMargin/history", signed: true, weight: 1 },
 } as const satisfies Record<string, BinanceEndpointDefinition>;

@@ -949,11 +949,15 @@ describe("engine purity and safety", () => {
       "/fapi/v1/exchangeInfo",
       "/fapi/v1/leverageBracket",
       "/fapi/v1/multiAssetsMargin",
+      "/fapi/v1/openAlgoOrders",
       "/fapi/v1/openOrders",
       "/fapi/v1/order",
       "/fapi/v1/ping",
       "/fapi/v1/positionMargin/history",
       "/fapi/v1/positionSide/dual",
+      // Phase 20B: mark price. Public, unsigned and GET-only, so the
+      // allowlist stays provably read-only.
+      "/fapi/v1/premiumIndex",
       "/fapi/v1/symbolConfig",
       "/fapi/v1/time",
       "/fapi/v3/account",

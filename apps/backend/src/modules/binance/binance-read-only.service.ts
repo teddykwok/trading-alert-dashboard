@@ -7,18 +7,22 @@ import {
   normalizeAssetMode,
   normalizeBalances,
   normalizeLeverageBrackets,
+  normalizeOpenAlgoOrders,
   normalizeOpenOrders,
   normalizePositionMode,
   normalizePositions,
   normalizeAlgoOrder,
   normalizeMarginHistory,
+  normalizeMarkPrice,
   normalizeQueriedOrder,
   normalizeSymbolConfig,
   normalizeSymbolFilters,
 } from "./binance.normalize";
 import type {
   BinanceAccountSummaryDto,
+  BinanceAlgoOrderDto,
   BinanceConnectionInfo,
+  BinanceMarkPriceDto,
   BinancePositionDto,
   BinanceQueriedOrderDto,
   BinanceSymbolInspectionDto,
@@ -163,6 +167,27 @@ export class BinanceReadOnlyService {
     return normalizeQueriedOrder(payload);
   }
 
+  /**
+   * GET /fapi/v1/premiumIndex — public, unsigned, weight 1 with a symbol.
+   *
+   * The only way to read a mark price BEFORE a position exists. Fails closed:
+   * an unreadable, zero or mismatched mark price throws rather than returning
+   * a value a trigger price could be derived from.
+   */
+  async getMarkPrice(symbol: string): Promise<BinanceMarkPriceDto> {
+    const wanted = symbol.trim().toUpperCase();
+    const payload = await this.client.request<unknown>("premiumIndex", { symbol: wanted });
+    const markPrice = normalizeMarkPrice(payload, wanted);
+    if (!markPrice) {
+      throw new BinanceError({
+        kind: "MALFORMED_RESPONSE",
+        message: `Binance returned no usable mark price for ${wanted}`,
+        endpoint: "premiumIndex",
+      });
+    }
+    return markPrice;
+  }
+
   /** GET /fapi/v1/symbolConfig for one symbol (margin type, leverage, caps). */
   async getSymbolConfiguration(symbol: string) {
     const payload = await this.client.request<unknown>("symbolConfig", { symbol: symbol.trim().toUpperCase() });
@@ -186,6 +211,45 @@ export class BinanceReadOnlyService {
       clientAlgoId,
     });
     return normalizeAlgoOrder(payload);
+  }
+
+  /**
+   * GET /fapi/v1/openAlgoOrders for ONE symbol — current open conditional
+   * orders.
+   *
+   * Read-only. It is how a baseline proves the conditional book is empty
+   * without ever reaching for a cancel-all endpoint.
+   *
+   * The symbol is REQUIRED, for two reasons. Binance charges weight 1 for the
+   * per-symbol form and weight 40 for the all-symbols form, and the endpoint
+   * table here declares 1 — so an accidental all-symbols call would silently
+   * consume 40× its declared budget. And `buildCanonicalQuery` DROPS empty
+   * values, so an empty string would not fail loudly, it would quietly become
+   * that all-symbols request. An explicit guard closes both.
+   *
+   * Throws MALFORMED_RESPONSE when the reply cannot be fully read, so a caller
+   * can always tell "no open orders" from "we could not see the book".
+   */
+  async getOpenAlgoOrders(symbol: string): Promise<BinanceAlgoOrderDto[]> {
+    const wanted = symbol.trim().toUpperCase();
+    if (wanted === "") {
+      throw new BinanceError({
+        kind: "MALFORMED_RESPONSE",
+        message: "getOpenAlgoOrders requires an explicit symbol; the all-symbols form is not exposed here",
+        endpoint: "openAlgoOrders",
+      });
+    }
+
+    const payload = await this.client.request<unknown>("openAlgoOrders", { symbol: wanted });
+    const orders = normalizeOpenAlgoOrders(payload, wanted);
+    if (orders === null) {
+      throw new BinanceError({
+        kind: "MALFORMED_RESPONSE",
+        message: `Binance returned an unreadable open Algo order list for ${wanted}`,
+        endpoint: "openAlgoOrders",
+      });
+    }
+    return orders;
   }
 
   /** GET /fapi/v1/positionMargin/history — reconciliation of an ADD only. */
