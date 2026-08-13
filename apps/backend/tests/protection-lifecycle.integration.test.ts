@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
 import { connectTestDatabase } from "./helpers/test-database";
 import type { DynamicLeveragePlan } from "@trading-alert-dashboard/shared";
+import type { TradeExecutionStatusName } from "../src/modules/execution/execution-status";
 
 /**
  * Phase 7 integration tests against a real Postgres, with FAKE transports.
@@ -1446,5 +1447,326 @@ describe("entry remainder cleanup before terminal closure", () => {
     expect(entries[0].generation).toBe(1);
     // The only POSTs in the whole flow were the two protection submissions.
     expect(scenario.mutations.filter((call) => call.startsWith("POST"))).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// External / unattributed flat recovery  the real canary's stuck state.
+//
+// The operator closed a real DOGSUSDT LONG by hand after protection failed.
+// Binance went flat, but no OWNED order filled, so the reconciler had nothing
+// to attribute the closure to and left the execution MANUAL_INTERVENTION with
+// requiresManualIntervention=true forever.
+// ===========================================================================
+
+describe("external flat recovery", () => {
+  async function parkedFlatExecution() {
+    const seed = await filledExecution();
+    await protect(seed);
+    const execution = await reload(seed.id);
+    // Position closed by something that is not one of our orders.
+    scenario.positionAmt = "0";
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { status: "MANUAL_INTERVENTION", requiresManualIntervention: true, version: { increment: 1 } },
+    });
+    scenario.mutations = [];
+    return reload(execution.id);
+  }
+
+  const reconcile = async (id: string) => {
+    const current = await reload(id);
+    return protectionService.reconcileProtectionAndClosure({
+      executionId: id,
+      expectedVersion: current.version,
+      evaluatedAt: at(),
+    });
+  };
+
+  maybe()("terminalizes as CLOSED_EXTERNAL when every owned sibling is confirmed absent", async () => {
+    const execution = await parkedFlatExecution();
+    // Binance proves both deterministic ids are gone (-2013).
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+
+    const outcome = await reconcile(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    const after = await reload(execution.id);
+    expect(after.status).toBe("CLOSED_EXTERNAL");
+    // The whole point: recovery is no longer blocked.
+    expect(after.requiresManualIntervention).toBe(false);
+    expect(after.closedAt).not.toBeNull();
+    expect(after.lastReconciledAt).not.toBeNull();
+    expect(after.exitReason).toBe("EXTERNAL");
+    // Nothing is invented about a closure we did not perform.
+    expect(after.actualExitPrice).toBeNull();
+    expect(after.realizedPnl).toBeNull();
+    // Absence needs no cancellation.
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  maybe()("stays parked when ANY owned sibling is unknown", async () => {
+    const execution = await parkedFlatExecution();
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+    // The stop cannot be read at all  absence is not proven.
+    scenario.queryFailures.add(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+
+    const outcome = await reconcile(execution.id);
+
+    expect(outcome.ok).toBe(false);
+    const after = await reload(execution.id);
+    expect(after.status).toBe("MANUAL_INTERVENTION");
+    expect(after.requiresManualIntervention).toBe(true);
+    expect(after.status).not.toBe("CLOSED_EXTERNAL");
+  });
+
+  maybe()("cancels an ACTIVE owned sibling first, then terminalizes", async () => {
+    const execution = await parkedFlatExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+    scenario.algoOrders.get(stopId)!.algoStatus = "NEW";
+
+    const outcome = await reconcile(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    // Cancelled by its own persisted deterministic identity.
+    expect(scenario.mutations).toContain("DELETE /fapi/v1/algoOrder");
+    // Cancelled by its own persisted identity, and now off the book.
+    expect(scenario.algoOrders.get(stopId)!.algoStatus).toBe("CANCELED");
+    const after = await reload(execution.id);
+    expect(after.status).toBe("CLOSED_EXTERNAL");
+    expect(after.requiresManualIntervention).toBe(false);
+  });
+
+  maybe()("is idempotent  a repeated tick mutates nothing further", async () => {
+    const execution = await parkedFlatExecution();
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+
+    await reconcile(execution.id);
+    const first = await reload(execution.id);
+    scenario.mutations = [];
+
+    await reconcile(execution.id);
+    const second = await reload(execution.id);
+
+    expect(second.status).toBe("CLOSED_EXTERNAL");
+    // No second transition, no second event, no exchange call.
+    expect(second.version).toBe(first.version);
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  maybe()("never terminalizes while the position is still open", async () => {
+    const execution = await parkedFlatExecution();
+    scenario.positionAmt = "0.100";
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+
+    const outcome = await reconcile(execution.id);
+
+    expect(outcome.ok).toBe(false);
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+  });
+
+  // =========================================================================
+  // Every exposure status that can REACH the proof path must be able to
+  // record the outcome. The orchestrator routes PARTIALLY_FILLED and
+  // ENTRY_FILLED into ensureProtectionForExposure and PLACING_PROTECTION into
+  // resumeProtectionLifecycle; all three hand a flat position straight to
+  // reconcileProtectionAndClosure, so all three genuinely arrive here.
+  // =========================================================================
+
+  /** Proven flat, both owned identities proven absent (-2013), at `status`. */
+  async function flatExecutionAt(status: TradeExecutionStatusName) {
+    const seed = await filledExecution();
+    await protect(seed);
+    const execution = await reload(seed.id);
+    scenario.positionAmt = "0";
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: {
+        status: status as never,
+        requiresManualIntervention: status === "MANUAL_INTERVENTION",
+        version: { increment: 1 },
+      },
+    });
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+    scenario.mutations = [];
+    return reload(execution.id);
+  }
+
+  maybe()("1. PARTIALLY_FILLED reaches CLOSED_EXTERNAL through ensureProtectionForExposure", async () => {
+    const execution = await flatExecutionAt("PARTIALLY_FILLED");
+
+    const outcome = await protect(execution);
+
+    expect(outcome.ok).toBe(true);
+    const after = await reload(execution.id);
+    expect(after.status).toBe("CLOSED_EXTERNAL");
+    expect(after.exitReason).toBe("EXTERNAL");
+    expect(after.closedAt).not.toBeNull();
+    // Still nothing invented about a closure we did not perform.
+    expect(after.actualExitPrice).toBeNull();
+    expect(after.realizedPnl).toBeNull();
+    expect((await protectionOf(execution.id)).state).toBe("CLOSED");
+  });
+
+  maybe()("2. ENTRY_FILLED reaches CLOSED_EXTERNAL through ensureProtectionForExposure", async () => {
+    const execution = await flatExecutionAt("ENTRY_FILLED");
+
+    const outcome = await protect(execution);
+
+    expect(outcome.ok).toBe(true);
+    const after = await reload(execution.id);
+    expect(after.status).toBe("CLOSED_EXTERNAL");
+    expect(after.exitReason).toBe("EXTERNAL");
+    expect((await protectionOf(execution.id)).state).toBe("CLOSED");
+  });
+
+  maybe()("3. PLACING_PROTECTION reaches CLOSED_EXTERNAL through resumeProtectionLifecycle", async () => {
+    const execution = await flatExecutionAt("PLACING_PROTECTION");
+
+    const outcome = await protectionService.resumeProtectionLifecycle({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.ok).toBe(true);
+    const after = await reload(execution.id);
+    expect(after.status).toBe("CLOSED_EXTERNAL");
+    expect(after.exitReason).toBe("EXTERNAL");
+    expect((await protectionOf(execution.id)).state).toBe("CLOSED");
+  });
+
+  maybe()("4. PROTECTED still reaches CLOSED_EXTERNAL", async () => {
+    const execution = await flatExecutionAt("PROTECTED");
+
+    const outcome = await reconcile(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    expect((await reload(execution.id)).status).toBe("CLOSED_EXTERNAL");
+    expect((await protectionOf(execution.id)).state).toBe("CLOSED");
+  });
+
+  maybe()("5. MANUAL_INTERVENTION still reaches CLOSED_EXTERNAL and clears the flag", async () => {
+    const execution = await flatExecutionAt("MANUAL_INTERVENTION");
+    expect(execution.requiresManualIntervention).toBe(true);
+
+    const outcome = await reconcile(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    const after = await reload(execution.id);
+    expect(after.status).toBe("CLOSED_EXTERNAL");
+    expect(after.requiresManualIntervention).toBe(false);
+    expect((await protectionOf(execution.id)).state).toBe("CLOSED");
+  });
+
+  // =========================================================================
+  // Durable state must never become half-terminal: protection is closed ONLY
+  // after the TradeExecution terminalization commit has succeeded.
+  // =========================================================================
+
+  maybe()("7. a lost version race leaves protection OPEN, never half-terminal", async () => {
+    const execution = await flatExecutionAt("ENTRY_FILLED");
+
+    // A concurrent writer lands between the read and the compare-and-set, so
+    // the real CAS runs with a stale expectedVersion and returns null.
+    const service = protectionService as unknown as {
+      commitExecutionChange: (...args: unknown[]) => Promise<unknown>;
+    };
+    const original = service.commitExecutionChange.bind(protectionService);
+    service.commitExecutionChange = async (...args: unknown[]) => {
+      await prisma!.tradeExecution.update({
+        where: { id: execution.id },
+        data: { version: { increment: 1 } },
+      });
+      return original(...args);
+    };
+
+    let outcome;
+    try {
+      outcome = await protect(await reload(execution.id));
+    } finally {
+      service.commitExecutionChange = original;
+    }
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("CAPACITY_OR_VERSION_CONFLICT");
+
+    const after = await reload(execution.id);
+    // The execution is NOT terminal...
+    expect(after.status).toBe("ENTRY_FILLED");
+    // ...so protection must NOT be closed. A CLOSED row here would make
+    // resumeProtectionLifecycle return early forever and strand the execution.
+    expect((await protectionOf(execution.id)).state).not.toBe("CLOSED");
+
+    // 7b. The next tick retries and completes normally.
+    const retry = await protect(await reload(execution.id));
+    expect(retry.ok).toBe(true);
+    expect((await reload(execution.id)).status).toBe("CLOSED_EXTERNAL");
+    expect((await protectionOf(execution.id)).state).toBe("CLOSED");
+  });
+
+  maybe()("8/9. protection closes only on success, and repeat ticks stay idempotent", async () => {
+    const execution = await flatExecutionAt("PLACING_PROTECTION");
+    // Before terminalization protection is still open.
+    expect((await protectionOf(execution.id)).state).not.toBe("CLOSED");
+
+    await protectionService.resumeProtectionLifecycle({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    const first = await reload(execution.id);
+    expect(first.status).toBe("CLOSED_EXTERNAL");
+    expect((await protectionOf(execution.id)).state).toBe("CLOSED");
+    scenario.mutations = [];
+
+    const repeat = await reconcile(execution.id);
+    const second = await reload(execution.id);
+
+    expect(repeat.ok).toBe(true);
+    expect(second.status).toBe("CLOSED_EXTERNAL");
+    expect(second.version).toBe(first.version);
+    expect(scenario.mutations).toEqual([]);
+    // Attribution is never rewritten by a later winner.
+    expect(second.exitReason).toBe("EXTERNAL");
+  });
+
+  maybe()("10. resumeProtectionLifecycle treats CLOSED_EXTERNAL as terminal", async () => {
+    const execution = await flatExecutionAt("MANUAL_INTERVENTION");
+    await reconcile(execution.id);
+    expect((await reload(execution.id)).status).toBe("CLOSED_EXTERNAL");
+    scenario.mutations = [];
+
+    const resumed = await protectionService.resumeProtectionLifecycle({
+      executionId: execution.id,
+      expectedVersion: (await reload(execution.id)).version,
+      evaluatedAt: at(),
+    });
+
+    expect(resumed.ok).toBe(false);
+    expect(resumed.reasonCode).toBe("MANUAL_REVIEW_REQUIRED");
+    expect(resumed.message).toContain("CLOSED_EXTERNAL");
+    // A terminal execution is never re-protected.
+    expect(scenario.mutations).toEqual([]);
+    expect((await reload(execution.id)).status).toBe("CLOSED_EXTERNAL");
+  });
+
+  maybe()("12. an unknown sibling still blocks external closure from an exposure status", async () => {
+    const execution = await flatExecutionAt("ENTRY_FILLED");
+    // Re-arm one sibling as unreadable: absence is no longer proven.
+    scenario.queryFailures.add(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+
+    const outcome = await protect(execution);
+
+    expect(outcome.ok).toBe(false);
+    const after = await reload(execution.id);
+    expect(after.status).not.toBe("CLOSED_EXTERNAL");
+    expect((await protectionOf(execution.id)).state).not.toBe("CLOSED");
   });
 });

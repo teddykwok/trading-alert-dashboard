@@ -339,15 +339,76 @@ export interface MutationFailureShape {
 }
 
 /**
- * Documented Binance codes this phase is willing to interpret. Anything else
- * is deliberately left unclassified rather than guessed at.
- *  -2011 unknown order (cancel target absent)
- *  -2013 order does not exist (query)
- *  -4164/-1013/-1111/-2019/-4003 … validation or margin rejections
- *  -4015 client order id duplicated
+ * Which exchange operation produced the failure.
+ *
+ * Absence is NOT a global property of an error code — it depends on what was
+ * asked. -2011 is documented as CANCEL_REJECTED, "cancel failed because the
+ * open order was not found": that proves absence for a DELETE and says nothing
+ * whatsoever about a GET. Classifying it globally let a query inherit a
+ * cancel-only semantic, so the operation is now explicit.
  */
-const DUPLICATE_CLIENT_ORDER_ID_CODES: readonly number[] = [-4015];
-const ORDER_ABSENT_CODES: readonly number[] = [-2011, -2013];
+export type MutationOperation =
+  /** POST /fapi/v1/order — standard `clientOrderId` semantics apply. */
+  | "SUBMIT_ORDER"
+  /**
+   * POST /fapi/v1/algoOrder — the identity is `clientAlgoId`. Binance's
+   * duplicate-id semantics are documented for standard orders; the current
+   * Algo Order documentation does not establish the same code for
+   * `clientAlgoId`, so this family gets NO existence proof from a duplicate.
+   */
+  | "SUBMIT_ALGO"
+  /** marginType / leverage / positionMargin — no order identity is involved. */
+  | "SUBMIT_CONFIG"
+  | "CANCEL"
+  | "QUERY";
+
+/**
+ * Documented Binance codes this phase is willing to interpret, per operation.
+ * Anything else is deliberately left unclassified rather than guessed at.
+ *
+ *   -2013 NO_SUCH_ORDER      "Order does not exist."  — proves absence for a
+ *                            query AND for a cancel.
+ *   -2011 CANCEL_REJECTED    documented only in the cancel context, so it may
+ *                            prove absence for a DELETE and never for a GET.
+ *
+ * A submission can never prove absence: it was asking to CREATE something.
+ */
+const ABSENCE_CODES_BY_OPERATION: Record<MutationOperation, readonly number[]> = {
+  SUBMIT_ORDER: [],
+  SUBMIT_ALGO: [],
+  SUBMIT_CONFIG: [],
+  CANCEL: [-2011, -2013],
+  QUERY: [-2013],
+};
+
+/**
+ * The ONLY operation for which a duplicate-id error proves the order exists.
+ *
+ * Deliberately not `SUBMIT_ALGO`: an algo duplicate stays RESULT_UNKNOWN, which
+ * sends the caller to query the SAME deterministic `clientAlgoId` and resolve
+ * it definitively. No new identity is ever minted on an unestablished
+ * semantic.
+ */
+const DUPLICATE_PROVING_OPERATIONS: readonly MutationOperation[] = ["SUBMIT_ORDER"];
+
+/**
+ * -4116 DUPLICATED_CLIENT_ORDER_ID is the documented duplicate code, and only
+ * on submission — a duplicate id proves the order EXISTS, which is the one
+ * case that must never be mistaken for absence.
+ *
+ * -4015 is deliberately NOT here: it is INVALID_CL_ORD_ID_LEN ("client order
+ * id length should not be more than 36 chars"), a request-validation error.
+ * Reading it as "duplicate" would have claimed an order exists on the strength
+ * of a malformed id.
+ *
+ * Restricted to SUBMIT_ORDER, the standard-order family. Whether Algo Order
+ * submission reports duplicates the same way is not established by the current
+ * documentation, so SUBMIT_ALGO gets no existence proof: an algo duplicate
+ * stays RESULT_UNKNOWN, which makes the caller query the same deterministic
+ * `clientAlgoId` and resolve it definitively, rather than acting on an assumed
+ * semantic.
+ */
+const DUPLICATE_CLIENT_ORDER_ID_CODES: readonly number[] = [-4116];
 
 /**
  * Classifies a failed mutation.
@@ -356,12 +417,25 @@ const ORDER_ABSENT_CODES: readonly number[] = [-2011, -2013];
  * exchange did nothing. Those become RESULT_UNKNOWN, which obliges the caller
  * to reconcile by client order id instead of retrying blind.
  */
-export function classifyMutationOutcome(failure: MutationFailureShape | null): MutationOutcome {
+export function classifyMutationOutcome(
+  failure: MutationFailureShape | null,
+  /**
+   * Defaults to QUERY, the NARROWEST interpretation: only -2013 proves
+   * absence and no code proves a duplicate. A caller that genuinely cancelled
+   * or submitted must say so to widen it.
+   */
+  operation: MutationOperation = "QUERY"
+): MutationOutcome {
   if (!failure) return "CONFIRMED_ACCEPTED";
 
   if (failure.binanceCode !== null && failure.binanceCode !== undefined) {
-    if (DUPLICATE_CLIENT_ORDER_ID_CODES.includes(failure.binanceCode)) return "CONFLICT";
-    if (ORDER_ABSENT_CODES.includes(failure.binanceCode)) return "NOT_FOUND_CONFIRMED";
+    if (
+      DUPLICATE_PROVING_OPERATIONS.includes(operation) &&
+      DUPLICATE_CLIENT_ORDER_ID_CODES.includes(failure.binanceCode)
+    ) {
+      return "CONFLICT";
+    }
+    if (ABSENCE_CODES_BY_OPERATION[operation].includes(failure.binanceCode)) return "NOT_FOUND_CONFIRMED";
   }
 
   switch (failure.kind) {
@@ -384,6 +458,10 @@ export function classifyMutationOutcome(failure: MutationFailureShape | null): M
     case "MISSING_CREDENTIALS":
     case "READ_ONLY_VIOLATION":
     case "UNSUPPORTED_SYMBOL":
+    // Binance parsed the request and refused it on a documented validation
+    // code, so nothing was created. Treating this as ambiguous is what left
+    // the first real canary unprotected and parked for a human.
+    case "REQUEST_INVALID":
       // The request never reached the matching engine.
       return "CONFIRMED_REJECTED";
     default:

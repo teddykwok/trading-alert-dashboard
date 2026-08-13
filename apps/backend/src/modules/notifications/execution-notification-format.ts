@@ -161,6 +161,17 @@ export function formatExecutionNotification(payload: NotificationPayload, refere
       lines.push("🛑 CLOSED — STOP LOSS", "", headline(payload), ...financialLines(payload));
       break;
 
+    case "CLOSED_EXTERNAL":
+      lines.push(
+        // Never presented as a take profit, a stop loss or an emergency close:
+        // the position is provably flat but the cause is genuinely unknown.
+        "ℹ️ CLOSED — EXTERNAL",
+        "",
+        headline(payload),
+        "Position closure verified; the closing action was not one of ours."
+      );
+      break;
+
     case "CLOSED_EMERGENCY":
       lines.push(
         // Deliberately never presented as a take profit or a stop loss.

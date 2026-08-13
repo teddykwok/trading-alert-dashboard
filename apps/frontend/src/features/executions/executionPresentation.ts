@@ -42,6 +42,7 @@ export const EXECUTION_STATUSES = [
   "CLOSED_TP",
   "CLOSED_SL",
   "CLOSED_EMERGENCY",
+  "CLOSED_EXTERNAL",
   "CANCELED",
   "SKIPPED",
   "FAILED",
@@ -61,6 +62,9 @@ const EXECUTION_STATUS_MAP: Record<string, StatusPresentation> = {
   CLOSED_TP: { label: "Closed - take profit", tone: "green", critical: false, unknown: false },
   CLOSED_SL: { label: "Closed - stop loss", tone: "red", critical: false, unknown: false },
   CLOSED_EMERGENCY: { label: "Closed - emergency", tone: "red", critical: true, unknown: false },
+  // Provably flat, cause unattributed. Amber rather than red: nothing is
+  // wrong, but the closure was not one of ours and deserves a look.
+  CLOSED_EXTERNAL: { label: "Closed - external", tone: "yellow", critical: false, unknown: false },
   CANCELED: { label: "Canceled", tone: "gray", critical: false, unknown: false },
   SKIPPED: { label: "Skipped", tone: "gray", critical: false, unknown: false },
   FAILED: { label: "Failed", tone: "red", critical: false, unknown: false },
@@ -209,6 +213,8 @@ export function presentExitReason(exitReason: string | null, status: string): st
       return "Stop loss";
     case "CLOSED_EMERGENCY":
       return "Emergency close";
+    case "CLOSED_EXTERNAL":
+      return "External close";
     default:
       return null;
   }

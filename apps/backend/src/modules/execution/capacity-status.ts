@@ -54,6 +54,9 @@ export const CAPACITY_FREE_STATUSES: readonly TradeExecutionStatusName[] = [
   // protection sibling are all verified terminated, so its risk and margin
   // reservations are safe to release.
   "CLOSED_EMERGENCY",
+  // Proven flat with every owned sibling resolved, so its risk and margin
+  // reservations are as safe to release as any other closed state.
+  "CLOSED_EXTERNAL",
   "CANCELED",
   "SKIPPED",
   "FAILED",

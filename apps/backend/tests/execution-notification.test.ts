@@ -706,6 +706,8 @@ describe("type catalogue", () => {
     // CRITICAL_PROTECTION_FAILURE has no ExecutionNotification row: Phase 7's
     // CriticalAlert remains the one durable record for it.
     expect(EXECUTION_NOTIFICATION_TYPES).not.toContain("CRITICAL_PROTECTION_FAILURE" as never);
-    expect(EXECUTION_NOTIFICATION_TYPES).toHaveLength(9);
+    // +CLOSED_EXTERNAL: a proven-but-unattributed closure still deserves one
+    // truthful message.
+    expect(EXECUTION_NOTIFICATION_TYPES).toHaveLength(10);
   });
 });

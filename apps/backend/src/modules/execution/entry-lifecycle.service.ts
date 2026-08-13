@@ -365,7 +365,7 @@ export class EntryLifecycleService {
       await this.mutations.cancelReservedEntryOrder(context);
       cancelOutcome = "CONFIRMED_ACCEPTED";
     } catch (error) {
-      cancelOutcome = classifyMutationOutcome(this.asFailureShape(error));
+      cancelOutcome = classifyMutationOutcome(this.asFailureShape(error), "CANCEL");
     }
 
     // The HTTP result is never the final word — re-read before deciding.
@@ -1055,7 +1055,7 @@ export class EntryLifecycleService {
     try {
       await this.mutations.setIsolatedMarginType(this.mutations.authorizeLiveEntry(), symbol);
     } catch (error) {
-      mutationOutcome = classifyMutationOutcome(this.asFailureShape(error));
+      mutationOutcome = classifyMutationOutcome(this.asFailureShape(error), "SUBMIT_CONFIG");
       if (mutationOutcome === "CONFIRMED_REJECTED") {
         return { reasonCode: "MARGIN_TYPE_CONFIGURATION_FAILED", message: "Margin-type change was rejected." };
       }
@@ -1111,7 +1111,7 @@ export class EntryLifecycleService {
       const response = await this.mutations.setInitialLeverage(this.mutations.authorizeLiveEntry(), symbol, wanted);
       responseLeverage = response.leverage;
     } catch (error) {
-      mutationOutcome = classifyMutationOutcome(this.asFailureShape(error));
+      mutationOutcome = classifyMutationOutcome(this.asFailureShape(error), "SUBMIT_CONFIG");
       if (mutationOutcome === "CONFIRMED_REJECTED") {
         return { reasonCode: "LEVERAGE_CONFIGURATION_FAILED", message: "Leverage change was rejected." };
       }
@@ -1172,7 +1172,7 @@ export class EntryLifecycleService {
         newClientOrderId: order.clientOrderId,
       });
     } catch (error) {
-      outcome = classifyMutationOutcome(this.asFailureShape(error));
+      outcome = classifyMutationOutcome(this.asFailureShape(error), "SUBMIT_ORDER");
     }
 
     await this.prisma.binanceOrder.update({
