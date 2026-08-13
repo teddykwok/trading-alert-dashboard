@@ -8,6 +8,7 @@ import type {
   BinancePositionMode,
   BinanceAlgoOrderDto,
   BinanceMarginHistoryEntryDto,
+  BinanceMarkPriceDto,
   BinancePositionSide,
   BinanceQueriedOrderDto,
   BinanceSymbolFiltersDto,
@@ -97,6 +98,12 @@ export function decimalString(value: unknown): string | null {
 
 function text(value: unknown): string | null {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+/** Ids may arrive as a JSON number or string; both render exactly. */
+function idString(value: unknown): string | null {
+  if (value === undefined || value === null || value === "") return null;
+  return String(value);
 }
 
 function bool(value: unknown): boolean | null {
@@ -245,6 +252,32 @@ export function normalizeSymbolFilters(symbolRow: unknown): BinanceSymbolFilters
   };
 }
 
+/**
+ * GET /fapi/v1/premiumIndex for ONE symbol.
+ *
+ * Binance returns an object when `symbol` is supplied and an array when it is
+ * not; both shapes are accepted, but the row must match the symbol that was
+ * asked about — a reply about a different contract is never silently used.
+ *
+ * Returns null for anything unusable (missing, non-decimal, zero or negative
+ * mark price, or a symbol mismatch). The caller turns that into a typed
+ * failure: a trigger price must never be derived from a mark price we could
+ * not read, so this fails closed rather than guessing.
+ */
+export function normalizeMarkPrice(payload: unknown, symbol: string): BinanceMarkPriceDto | null {
+  const wanted = symbol.trim().toUpperCase();
+  const rows = Array.isArray(payload) ? asRows(payload) : [asRow(payload)];
+  const row = rows.find((entry) => text(entry.symbol)?.toUpperCase() === wanted);
+  if (!row) return null;
+
+  const markPrice = decimalString(row.markPrice);
+  // A mark price of "0", "-1" or "abc" is not a price. Plain decimal literals
+  // only — the same rule the rest of the decimal path enforces.
+  if (!markPrice || !/^\d+(\.\d+)?$/.test(markPrice) || !/[1-9]/.test(markPrice)) return null;
+
+  return { symbol: wanted, markPrice };
+}
+
 export function findSymbolRow(exchangeInfo: unknown, symbol: string): Row | undefined {
   const wanted = symbol.trim().toUpperCase();
   return asRows(asRow(exchangeInfo).symbols).find((row) => text(row.symbol)?.toUpperCase() === wanted);
@@ -334,19 +367,68 @@ export function normalizeAlgoOrder(payload: unknown): BinanceAlgoOrderDto {
     algoType: text(row.algoType),
     side: text(row.side),
     positionSide: row.positionSide === undefined ? null : normalizePositionSide(row.positionSide),
-    orderType: text(row.type ?? row.orderType ?? row.origType),
+    orderType: text(row.orderType ?? row.type ?? row.origType),
     quantity: decimalString(row.quantity ?? row.origQty),
-    triggerPrice: decimalString(row.stopPrice ?? row.triggerPrice),
+    triggerPrice: decimalString(row.triggerPrice ?? row.stopPrice),
     workingType: text(row.workingType),
     priceProtect: bool(row.priceProtect),
     closePosition: bool(row.closePosition),
     reduceOnly: bool(row.reduceOnly),
-    actualOrderId: row.orderId === undefined || row.orderId === null ? null : String(row.orderId),
-    executedQuantity: decimalString(row.executedQty),
-    averagePrice: decimalString(row.avgPrice),
+    // The Query Algo Order response names the fields describing the standard
+    // order the conditional order PRODUCED as `actualOrderId` / `actualQty` /
+    // `actualPrice`. Reading only the standard-order names (`orderId`,
+    // `executedQty`, `avgPrice`) left all three null for every algo fill —
+    // which silently blanked `actualExitPrice` on a real CLOSED_TP/CLOSED_SL.
+    // Documented names first, legacy names kept as a fallback.
+    actualOrderId: idString(row.actualOrderId ?? row.orderId),
+    executedQuantity: decimalString(row.actualQty ?? row.executedQty),
+    averagePrice: decimalString(row.actualPrice ?? row.avgPrice),
     triggerTimeMs: Number.isFinite(triggerTime) ? triggerTime : null,
     updateTimeMs: Number.isFinite(updateTime) ? updateTime : null,
   };
+}
+
+/**
+ * Normalizes GET /fapi/v1/openAlgoOrders for ONE requested symbol.
+ *
+ * FAILS CLOSED. Returns null — never a shorter list — for anything it cannot
+ * fully read, because the caller uses the LENGTH of this array as proof that
+ * no conditional orders exist. Silently dropping an unreadable row, or
+ * turning a non-array body into `[]`, would let malformed data masquerade as
+ * "the book is empty" and unlock a mutation run. That is the same
+ * absent-versus-unknown conflation that stranded the first mainnet canary.
+ *
+ *   []                        -> [] (a genuine, readable zero)
+ *   [validRow, validRow]      -> the normalized orders
+ *   non-array payload         -> null
+ *   any unreadable row        -> null (the WHOLE response is invalidated)
+ *   any row for another symbol-> null
+ *
+ * The symbol check matters because this helper is only ever called with an
+ * exact symbol: a non-empty row about a different contract means we are not
+ * reading the book we asked about.
+ */
+export function normalizeOpenAlgoOrders(payload: unknown, symbol: string): BinanceAlgoOrderDto[] | null {
+  if (!Array.isArray(payload)) return null;
+
+  const wanted = symbol.trim().toUpperCase();
+  if (wanted === "") return null;
+
+  const orders: BinanceAlgoOrderDto[] = [];
+  for (const raw of payload) {
+    // A row must be a plain object; a primitive or nested array is unreadable.
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+
+    const order = normalizeAlgoOrder(raw);
+    // Minimum identity for COUNTING an open algo order: it must say which
+    // contract it belongs to, and it must be addressable by at least one id.
+    if (order.symbol === null || order.symbol.toUpperCase() !== wanted) return null;
+    if (order.algoId === null && order.clientAlgoId === null) return null;
+
+    orders.push(order);
+  }
+
+  return orders;
 }
 
 /** Normalizes position-margin change history rows (ADD reconciliation only). */

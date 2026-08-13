@@ -20,6 +20,7 @@
     "binance:account-health": "tsx src/modules/binance/run-account-health.ts",
     "binance:set-hedge-mode": "tsx src/modules/binance/run-set-hedge-mode.ts",
     "binance:test-order": "tsx src/modules/binance/run-test-order.ts",
+    "binance:testnet-protection-verify": "tsx src/modules/binance/run-testnet-protection-verify.ts",
     "execution:canary-preflight": "tsx src/modules/execution/run-canary-preflight.ts",
     "execution:ensure-profile": "tsx src/modules/execution/run-ensure-profile.ts",
     "execution:prepare-canary": "tsx src/modules/execution/run-prepare-canary.ts",

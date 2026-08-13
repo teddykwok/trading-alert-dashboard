@@ -23,6 +23,14 @@ export interface BinanceConnectionInfo {
   roundTripMs: number | null;
 }
 
+/** GET /fapi/v1/premiumIndex, narrowed to the two fields anything here needs. */
+export interface BinanceMarkPriceDto {
+  symbol: string;
+  /** Decimal string, byte-for-byte as Binance sent it. Never null: a payload
+   *  without a usable mark price fails closed rather than returning one. */
+  markPrice: string;
+}
+
 export interface BinanceBalanceDto {
   asset: string;
   walletBalance: string | null;

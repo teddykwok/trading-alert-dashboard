@@ -281,11 +281,15 @@ describe("read-only safety boundary", () => {
       "/fapi/v1/exchangeInfo",
       "/fapi/v1/leverageBracket",
       "/fapi/v1/multiAssetsMargin",
+      "/fapi/v1/openAlgoOrders",
       "/fapi/v1/openOrders",
       "/fapi/v1/order",
       "/fapi/v1/ping",
       "/fapi/v1/positionMargin/history",
       "/fapi/v1/positionSide/dual",
+      // Mark price. Public and unsigned; the only way to read a mark price
+      // before a position exists.
+      "/fapi/v1/premiumIndex",
       "/fapi/v1/symbolConfig",
       "/fapi/v1/time",
       "/fapi/v3/account",
