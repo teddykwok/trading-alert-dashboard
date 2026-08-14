@@ -1270,6 +1270,194 @@ describe("incremental tranches", () => {
 // Everything else defers.
 // ===========================================================================
 
+// ===========================================================================
+// TRANSITION ENFORCEMENT AT THE PERSISTENCE BOUNDARY.
+//
+// `commitExecutionChange` used to write whatever status the caller supplied,
+// guarded only by the version CAS. The state machine was advisory: correctness
+// depended on every call site remembering to call canTransition first, and two
+// of the four did not.
+//
+// It now validates against the AUTHORITATIVE row read inside the transaction,
+// after the CAS check, so a lost race stays a race and an illegal transition
+// becomes a loud, non-mutating failure.
+// ===========================================================================
+
+describe("execution transition enforcement", () => {
+  const eventsOf = async (id: string) =>
+    prisma!.executionEvent.findMany({ where: { tradeExecutionId: id }, orderBy: { sequenceNumber: "asc" } });
+
+  /** Drives the private persistence helper exactly as production does. */
+  const commit = async (execution: { id: string; status: string; version: number }, status: string) =>
+    (
+      protectionService as unknown as {
+        commitExecutionChange: (
+          execution: unknown,
+          expectedVersion: number,
+          change: Record<string, unknown>
+        ) => Promise<unknown>;
+      }
+    ).commitExecutionChange(execution, execution.version, {
+      status,
+      reasonCode: "PROTECTION_VERIFIED",
+      message: `test transition to ${status}`,
+      eventType: "PROTECTION_CLEANUP",
+    });
+
+  async function executionAt(status: string) {
+    const seed = await filledExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: seed.id },
+      data: { status: status as never, version: { increment: 1 } },
+    });
+    return reload(seed.id);
+  }
+
+  maybe()("1-3. persists every legal transition and records the real fromStatus", async () => {
+    for (const [from, to] of [
+      ["ENTRY_FILLED", "PLACING_PROTECTION"],
+      ["PLACING_PROTECTION", "PROTECTED"],
+      ["PROTECTED", "CLOSED_TP"],
+    ] as const) {
+      const execution = await executionAt(from);
+
+      const committed = await commit(execution, to);
+
+      expect(committed, `${from} -> ${to}`).not.toBeNull();
+      const after = await reload(execution.id);
+      expect(after.status, `${from} -> ${to}`).toBe(to);
+      expect(after.version).toBe(execution.version + 1);
+      const last = (await eventsOf(execution.id)).at(-1)!;
+      expect(last.fromStatus).toBe(from);
+      expect(last.toStatus).toBe(to);
+    }
+  });
+
+  maybe()("4. CLOSED_EXTERNAL remains reachable from every documented source", async () => {
+    const { allowedTransitionsFrom } = await import("../src/modules/execution/execution-status");
+    for (const from of ["PARTIALLY_FILLED", "ENTRY_FILLED", "PLACING_PROTECTION", "PROTECTED", "MANUAL_INTERVENTION"] as const) {
+      expect(allowedTransitionsFrom(from), from).toContain("CLOSED_EXTERNAL");
+      const execution = await executionAt(from);
+      expect(await commit(execution, "CLOSED_EXTERNAL"), from).not.toBeNull();
+      expect((await reload(execution.id)).status).toBe("CLOSED_EXTERNAL");
+    }
+  });
+
+  maybe()("5. rejects an illegal transition, writing no status, no version and no event", async () => {
+    // PLAN_READY cannot jump straight to PROTECTED.
+    const execution = await executionAt("PLAN_READY");
+    const eventsBefore = await eventsOf(execution.id);
+
+    await expect(commit(execution, "PROTECTED")).rejects.toThrow(/illegal execution transition/i);
+
+    const after = await reload(execution.id);
+    expect(after.status).toBe("PLAN_READY");
+    expect(after.version).toBe(execution.version);
+    expect(await eventsOf(execution.id)).toHaveLength(eventsBefore.length);
+  });
+
+  maybe()("6. rejects a second clearly illegal transition from the authoritative graph", async () => {
+    // ENTRY_PENDING has no path to PROTECTED either.
+    const execution = await executionAt("ENTRY_PENDING");
+
+    await expect(commit(execution, "PROTECTED")).rejects.toThrow(/ENTRY_PENDING -> PROTECTED/);
+
+    const after = await reload(execution.id);
+    expect(after.status).toBe("ENTRY_PENDING");
+    expect(after.version).toBe(execution.version);
+  });
+
+  maybe()("10. a terminal execution can never return to an active status", async () => {
+    for (const terminal of ["CLOSED_TP", "CLOSED_SL", "CLOSED_EXTERNAL", "FAILED"] as const) {
+      const execution = await executionAt(terminal);
+      await expect(commit(execution, "PROTECTED"), terminal).rejects.toThrow(/terminal|illegal/i);
+      expect((await reload(execution.id)).status, terminal).toBe(terminal);
+      expect((await reload(execution.id)).version).toBe(execution.version);
+    }
+  });
+
+  maybe()("11. MANUAL_INTERVENTION may take only the graph's documented exits", async () => {
+    const { allowedTransitionsFrom, TRADE_EXECUTION_STATUSES } = await import(
+      "../src/modules/execution/execution-status"
+    );
+    const allowed = allowedTransitionsFrom("MANUAL_INTERVENTION");
+    // Its protection is still live, so an attributable fill is legal.
+    expect([...allowed].sort()).toEqual(["CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "CLOSED_SL", "CLOSED_TP"]);
+
+    // Every other target is refused at the persistence boundary.
+    for (const target of TRADE_EXECUTION_STATUSES) {
+      if (allowed.includes(target) || target === "MANUAL_INTERVENTION") continue;
+      const execution = await executionAt("MANUAL_INTERVENTION");
+      await expect(commit(execution, target), target).rejects.toThrow();
+      expect((await reload(execution.id)).status, target).toBe("MANUAL_INTERVENTION");
+    }
+  });
+
+  maybe()("7. a same-status write is a field update, not a transition", async () => {
+    // `escalate` re-stamps a parked execution to append an event; that must
+    // keep working even though canTransition models almost no self-edges.
+    const execution = await executionAt("MANUAL_INTERVENTION");
+
+    const committed = await commit(execution, "MANUAL_INTERVENTION");
+
+    expect(committed).not.toBeNull();
+    const after = await reload(execution.id);
+    expect(after.status).toBe("MANUAL_INTERVENTION");
+    expect(after.version).toBe(execution.version + 1);
+    // The event records a self-transition, not a fabricated one.
+    const last = (await eventsOf(execution.id)).at(-1)!;
+    expect(last.fromStatus).toBe("MANUAL_INTERVENTION");
+    expect(last.toStatus).toBe("MANUAL_INTERVENTION");
+  });
+
+  maybe()("8. a lost CAS writes nothing and creates no event — and does not throw", async () => {
+    const execution = await executionAt("ENTRY_FILLED");
+    const eventsBefore = await eventsOf(execution.id);
+    // Somebody else advances the row first.
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { version: { increment: 1 } },
+    });
+
+    // A stale-version commit is ordinary concurrency: null, never an error.
+    const committed = await commit(execution, "PLACING_PROTECTION");
+
+    expect(committed).toBeNull();
+    expect((await reload(execution.id)).status).toBe("ENTRY_FILLED");
+    expect(await eventsOf(execution.id)).toHaveLength(eventsBefore.length);
+  });
+
+  maybe()("8b. a CAS loser against an ALREADY-TERMINAL row loses quietly, not loudly", async () => {
+    // The ordering that matters: version is checked BEFORE legality, so a row
+    // that raced ahead to a terminal state produces a benign null rather than
+    // an invariant failure.
+    const execution = await executionAt("PROTECTED");
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { status: "CLOSED_TP", version: { increment: 1 } },
+    });
+
+    const committed = await commit(execution, "CLOSED_SL");
+
+    expect(committed).toBeNull();
+    expect((await reload(execution.id)).status).toBe("CLOSED_TP");
+  });
+
+  maybe()("9. concurrent legal transitions produce exactly one winner and one event", async () => {
+    const execution = await executionAt("ENTRY_FILLED");
+    const eventsBefore = (await eventsOf(execution.id)).length;
+
+    const results = await Promise.all([
+      commit(execution, "PLACING_PROTECTION"),
+      commit(execution, "PLACING_PROTECTION"),
+    ]);
+
+    expect(results.filter((result) => result !== null)).toHaveLength(1);
+    expect((await reload(execution.id)).status).toBe("PLACING_PROTECTION");
+    expect((await eventsOf(execution.id)).length).toBe(eventsBefore + 1);
+  });
+});
+
 describe("look-before-submit existence safety", () => {
   const submittedRoles = () => scenario.submitted.map((entry) => entry.role);
 

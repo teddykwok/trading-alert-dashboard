@@ -9,7 +9,12 @@ import type {
 } from "@prisma/client";
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
-import { canTransition, isTerminalStatus, type TradeExecutionStatusName } from "./execution-status";
+import {
+  IllegalExecutionTransitionError,
+  canTransition,
+  isTerminalStatus,
+  type TradeExecutionStatusName,
+} from "./execution-status";
 import { NotFoundError } from "../../utils/errors";
 import { BinanceError } from "../binance/binance.errors";
 import type { BinanceUsdMExecutionClient, WorkingTypeName } from "../binance/binance-execution.client";
@@ -1881,6 +1886,36 @@ export class ProtectionLifecycleService {
     }
   ): Promise<TradeExecution | null> {
     return this.prisma.$transaction(async (tx) => {
+      // The AUTHORITATIVE source status, read inside the transaction. The
+      // caller's `execution` may be older than `expectedVersion` — several
+      // paths load it before an intervening reservation bumps the version —
+      // so validating against it could judge a transition that is not the one
+      // about to be written.
+      const current = await tx.tradeExecution.findUnique({ where: { id: execution.id } });
+      if (!current) return null;
+
+      // CAS FIRST, then legality. Order matters: if the row has already moved
+      // on, this write is an ordinary lost race and must stay one. Validating
+      // before the version check would turn a benign concurrent update into a
+      // hard invariant failure — e.g. a row already CLOSED_TP while this
+      // caller still holds an older version.
+      if (current.version !== expectedVersion) return null;
+
+      // A same-status write is a field-only update, not a transition, and is
+      // intentionally supported (`escalate` re-stamps a parked execution to
+      // append an event). `canTransition` models almost no self-transitions,
+      // so it must not be consulted for one.
+      const from = current.status as TradeExecutionStatusName;
+      const to = change.status as TradeExecutionStatusName | undefined;
+      if (to !== undefined && to !== from) {
+        const check = canTransition(from, to);
+        if (!check.allowed) {
+          // Nothing is written and no event is created: throwing inside the
+          // transaction rolls back anything this function has begun.
+          throw new IllegalExecutionTransitionError(execution.id, from, to, check.reason);
+        }
+      }
+
       const updated = await tx.tradeExecution.updateMany({
         where: { id: execution.id, version: expectedVersion },
         data: {
@@ -1901,7 +1936,8 @@ export class ProtectionLifecycleService {
           tradeExecutionId: execution.id,
           sequenceNumber: next.version,
           eventType: change.eventType,
-          fromStatus: execution.status,
+          // The status the row actually moved FROM, not the caller's snapshot.
+          fromStatus: from,
           toStatus: next.status,
           reasonCode: change.reasonCode,
           message: change.message.slice(0, 1000),

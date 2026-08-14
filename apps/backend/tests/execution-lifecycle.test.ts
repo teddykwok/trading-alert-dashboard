@@ -70,7 +70,11 @@ describe("execution state machine", () => {
     // The two documented ways out of a parked execution, both requiring
     // exchange proof: a verified emergency close, or a position proven flat
     // whose closure cannot be attributed to one of our owned orders.
-    ["MANUAL_INTERVENTION", ["CLOSED_EMERGENCY", "CLOSED_EXTERNAL"]],
+    // A parked execution still has LIVE protection on the exchange, so it can
+    // close on its own. The orchestrator routes MANUAL_INTERVENTION into
+    // closure reconciliation, which attributes a fill to an owned STOP or TP —
+    // recording that as CLOSED_EXTERNAL would discard attribution we have.
+    ["MANUAL_INTERVENTION", ["CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "CLOSED_TP", "CLOSED_SL"]],
   ];
 
   it("permits exactly the documented transitions", () => {

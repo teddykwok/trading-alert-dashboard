@@ -59,6 +59,93 @@ const ENTRY_ORDER_POSSIBLE_STATUSES: readonly TradeExecutionStatusName[] = [
   "MANUAL_INTERVENTION",
 ];
 
+interface ResolvedReconciledStatus {
+  /** What will actually be written. Equal to the current status means "no change". */
+  targetStatus: TradeExecutionStatusName;
+  /** The mapped status the state machine refused, or null when it was legal. */
+  refusedStatus: TradeExecutionStatusName | null;
+  explanation: string;
+}
+
+/**
+ * Reconciles what the ORDER is with what the EXECUTION may legally become.
+ *
+ * `mapOrderToExecutionStatus` answers only the first question: it sees a
+ * cancelled order carrying no fill and correctly says "this order expired".
+ * Whether the execution may FOLLOW the order into that state is a different
+ * question, and the state machine — not the order — owns it.
+ *
+ * The gap that made this necessary: an execution still in ENTRY_SUBMITTING
+ * whose order comes back CANCELED with a zero fill mapped to ENTRY_EXPIRED (or
+ * to CANCELED for an operator cancellation) and was written directly, pinned
+ * only on `version`. Both are edges the graph deliberately omits, with the
+ * reason spelled out on ENTRY_SUBMITTING itself: once submission is attempted
+ * an order may exist, so the lifecycle must not casually terminalize.
+ *
+ * The substitution is MANUAL_INTERVENTION, and that is not a catch-all — it is
+ * what this codebase already prescribes for every reachable case:
+ *
+ *   - ENTRY_SUBMITTING -> CANCELED / ENTRY_EXPIRED: `canTransition` answers
+ *     these itself with "use MANUAL_INTERVENTION and unwind explicitly". The
+ *     normal path never lands here — a confirmed order leaves ENTRY_SUBMITTING
+ *     on the first reconciliation — so this only fires when submission never
+ *     resolved, which is precisely when a human should look.
+ *   - PARTIALLY_FILLED -> CANCELED / FAILED / ENTRY_PENDING: exposure is
+ *     recorded, so both terminal claims are false and a backwards ENTRY_PENDING
+ *     contradicts a fill we already hold. `mapOrderToExecutionStatus` reaches
+ *     for MANUAL_INTERVENTION in the identical "cancelled while filled" case.
+ *   - MANUAL_INTERVENTION -> anything: already parked, and the graph lets it
+ *     leave only on proven closure. Here the substitution equals the current
+ *     status, so it degenerates to "observe, stay parked, change nothing" —
+ *     an execution can never quietly un-park itself.
+ *
+ * A terminal source is the one case where MANUAL_INTERVENTION is illegal too.
+ * No production caller reconciles a terminal execution (the orchestrator and
+ * `resumeEntrySubmission` both stop first, and `expireEntryOrderIfDue` is
+ * gated on ENTRY_ORDER_POSSIBLE_STATUSES), but the public method is callable,
+ * so it is handled rather than assumed away: the status is left exactly as it
+ * is and the contradiction is carried by the manual-intervention FLAG and the
+ * event. Nothing leaves a terminal state.
+ *
+ * The observation itself is always persisted either way. Refusing a status is
+ * never a reason to discard a fill, an exchange order id or an event.
+ */
+function resolveReconciledStatus(
+  currentStatus: TradeExecutionStatusName,
+  mappedStatus: TradeExecutionStatusName
+): ResolvedReconciledStatus {
+  if (mappedStatus === currentStatus) {
+    // Not a transition at all — the reconciliation only refreshes fields.
+    return { targetStatus: currentStatus, refusedStatus: null, explanation: "" };
+  }
+
+  const direct = canTransition(currentStatus, mappedStatus);
+  if (direct.allowed) {
+    return { targetStatus: mappedStatus, refusedStatus: null, explanation: "" };
+  }
+
+  const parked = canTransition(currentStatus, "MANUAL_INTERVENTION");
+  if (parked.allowed) {
+    return {
+      targetStatus: "MANUAL_INTERVENTION",
+      refusedStatus: mappedStatus,
+      explanation:
+        `${currentStatus} -> ${mappedStatus} is not a legal transition ` +
+        `(${direct.reason ?? "refused by the execution state machine"}), ` +
+        `so the execution was parked for a human instead.`,
+    };
+  }
+
+  return {
+    targetStatus: currentStatus,
+    refusedStatus: mappedStatus,
+    explanation:
+      `${currentStatus} -> ${mappedStatus} is not a legal transition ` +
+      `(${direct.reason ?? "refused by the execution state machine"}), ` +
+      `and ${currentStatus} is terminal, so the status was left unchanged and flagged for a human.`,
+  };
+}
+
 export interface EntryLifecycleOptions {
   ttlSeconds?: number;
   reconcileMaxAttempts?: number;
@@ -1239,7 +1326,12 @@ export class EntryLifecycleService {
     });
 
     const currentStatus = execution.status as TradeExecutionStatusName;
-    const targetStatus = mapping.executionStatus;
+    const resolved = resolveReconciledStatus(currentStatus, mapping.executionStatus);
+    const targetStatus = resolved.targetStatus;
+    const reasonCode = resolved.refusedStatus ? "MANUAL_REVIEW_REQUIRED" : mapping.reasonCode;
+    const message = resolved.refusedStatus
+      ? `Entry order is ${localStatus}, but ${resolved.explanation}`
+      : `Entry order is ${localStatus}.`;
     const filled = new D(progress.executedQuantity).greaterThan(0);
 
     const committed = await this.prisma.$transaction(async (tx) => {
@@ -1249,9 +1341,10 @@ export class EntryLifecycleService {
           // A same-status reconciliation still records the observation.
           status: targetStatus === currentStatus ? undefined : targetStatus,
           version: { increment: 1 },
-          decisionReasonCode: mapping.reasonCode,
-          sanitizedMessage: `Entry order is ${localStatus}.`,
-          requiresManualIntervention: mapping.requiresManualIntervention ? true : undefined,
+          decisionReasonCode: reasonCode,
+          sanitizedMessage: message.slice(0, 1000),
+          requiresManualIntervention:
+            mapping.requiresManualIntervention || resolved.refusedStatus ? true : undefined,
           filledQuantity: filled ? new D(progress.executedQuantity) : undefined,
           averageFillPrice: progress.averageFillPrice ? new D(progress.averageFillPrice) : undefined,
           submittedEntryPrice: execution.submittedEntryPrice ?? order.price ?? undefined,
@@ -1287,18 +1380,25 @@ export class EntryLifecycleService {
         data: {
           tradeExecutionId: execution.id,
           sequenceNumber: next.version,
-          eventType: "ENTRY_RECONCILED",
+          eventType: resolved.refusedStatus ? "MANUAL_INTERVENTION_REQUIRED" : "ENTRY_RECONCILED",
           fromStatus: currentStatus,
           toStatus: next.status,
-          reasonCode: mapping.reasonCode,
-          message: `Entry order reconciled as ${localStatus}${
-            filled ? " with a recorded fill" : ""
-          }; no compensating order was submitted.`,
+          reasonCode,
+          message: resolved.refusedStatus
+            ? `Entry order reconciled as ${localStatus}${filled ? " with a recorded fill" : ""}; ` +
+              `${resolved.explanation} No compensating order was submitted.`
+            : `Entry order reconciled as ${localStatus}${
+                filled ? " with a recorded fill" : ""
+              }; no compensating order was submitted.`,
           metadata: {
             localOrderStatus: localStatus,
             exchangeStatus: observed.status,
             cancelCause,
             regressionIgnored: progress.regressionIgnored,
+            // What the ORDER mapped to, kept even when the execution could not
+            // legally take it, so the refusal is auditable rather than silent.
+            mappedExecutionStatus: mapping.executionStatus,
+            refusedStatus: resolved.refusedStatus,
             // Exact decimal STRINGS (never JS numbers) of the fill as it stood
             // at THIS reconciliation. The mutable order row only ever shows the
             // latest quantity, so without this an observer that was offline
@@ -1328,8 +1428,10 @@ export class EntryLifecycleService {
     }
 
     return this.result(
-      true,
-      mapping.reasonCode,
+      // A refused status parks the execution, so the caller must stop exactly
+      // as it does for `escalate` rather than continuing down the entry path.
+      !resolved.refusedStatus,
+      reasonCode,
       `Entry order is ${localStatus}; execution is ${committed.status}.`,
       committed,
       await this.loadEntryOrder(execution.id)
