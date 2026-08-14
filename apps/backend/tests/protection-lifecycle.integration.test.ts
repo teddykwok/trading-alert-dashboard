@@ -897,36 +897,175 @@ describe("execution status reflects verified protection", () => {
     expect((await protectionOf(execution.id)).confirmedOpenQuantity.toString()).toBe("0.2");
   });
 
-  maybe()("5. an UNKNOWN protection query never marks the original leg absent", async () => {
+  // =========================================================================
+  // UNKNOWN vs ABSENT — protection observation safety.
+  //
+  // `measureVerifiedCoverage` used to count an UNREADABLE leg as ZERO, making
+  // it indistinguishable from a conclusively absent one. The lifecycle then saw
+  // a gap and minted a REPLACEMENT generation, submitting a duplicate STOP and
+  // TAKE_PROFIT while the originals may still have been live on Binance.
+  //
+  // Three states must stay distinct:
+  //   PRESENT  — observed active         -> counts as coverage
+  //   ABSENT   — proven gone (-2013)     -> a real gap, repair allowed
+  //   UNKNOWN  — could not be determined -> no coverage claim, NO mutation
+  // =========================================================================
+
+  const generationsOf = async (id: string, role: "STOP_LOSS" | "TAKE_PROFIT") =>
+    (await ordersOf(id)).filter((order) => order.role === role).map((order) => order.generation);
+
+  maybe()("1. UNKNOWN STOP with a verified TP reserves nothing and submits nothing", async () => {
     const execution = await protectedExecution();
     const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
-    // The stop cannot be read at all — which is NOT proof that it is gone.
+    // Unreadable — which is NOT proof the stop is gone.
     scenario.queryFailures.add(stopId);
+
+    const outcome = await protect(await reload(execution.id));
+
+    // No replacement tranche, no new identity, nothing sent to the exchange.
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1]);
+    expect(scenario.submitted).toEqual([]);
+    expect(scenario.mutations).toEqual([]);
+    // Deferred and retryable, not a false success and not an escalation.
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("STOP_QUERY_UNAVAILABLE");
+    // The original local intent is untouched — never rewritten as absent.
+    const stop = (await ordersOf(execution.id)).find((order) => order.role === "STOP_LOSS")!;
+    expect(stop.status).toBe("NEW");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(false);
+  });
+
+  maybe()("2. UNKNOWN TAKE_PROFIT with a verified STOP reserves nothing and submits nothing", async () => {
+    const execution = await protectedExecution();
+    scenario.queryFailures.add(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1]);
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect(scenario.submitted).toEqual([]);
+    expect(outcome.reasonCode).toBe("TAKE_PROFIT_QUERY_UNAVAILABLE");
+  });
+
+  maybe()("3. a CONFIRMED ABSENT STOP is a real gap and is still repaired", async () => {
+    const execution = await protectedExecution();
+    // Binance PROVES this exact id is gone (-2013), unlike an unreadable query.
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "STOP_LOSS", 1));
 
     await protect(await reload(execution.id));
 
-    // The local intent for the unreadable leg is left intact: an unreadable
-    // order is never rewritten as absent, cancelled or rejected.
-    const stops = (await ordersOf(execution.id)).filter((order) => order.role === "STOP_LOSS");
-    expect(stops.find((order) => order.generation === 1)?.status).toBe("NEW");
-
-    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toContain(2);
+    expect(scenario.submitted.map((entry) => entry.role)).toContain("STOP_LOSS");
   });
 
-  // FOLLOW-UP, deliberately out of scope for this branch.
-  //
-  // `measureVerifiedCoverage` skips any protection order whose query is not
-  // CONFIRMED_ACCEPTED, so an UNREADABLE leg is counted as ZERO coverage and is
-  // indistinguishable from an absent one. A transient query failure on a live,
-  // healthy stop therefore reserves and SUBMITS a duplicate tranche.
-  //
-  // This is PRE-EXISTING and is not widened by the status-sync work: before it,
-  // executions sat at ENTRY_FILLED for their whole life and ran this same path
-  // every tick (Canary #3: 70 ticks over 35 minutes).
-  //
-  // Left as a todo rather than a passing assertion on purpose — codifying the
-  // current behaviour would mean this suite fails the day the defect is fixed.
-  it.todo("does not treat an UNKNOWN protection observation as absent coverage");
+  maybe()("4. a CONFIRMED ABSENT TAKE_PROFIT is a real gap and is still repaired", async () => {
+    const execution = await protectedExecution();
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+
+    await protect(await reload(execution.id));
+
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toContain(2);
+  });
+
+  maybe()("5. UNKNOWN then PRESENT self-recovers with no mutation at all", async () => {
+    const execution = await protectedExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+
+    // Tick N: unreadable.
+    scenario.queryFailures.add(stopId);
+    await protect(await reload(execution.id));
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+
+    // Tick N+1: readable again, still active.
+    scenario.queryFailures.delete(stopId);
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reasonCode).toBe("PROTECTION_VERIFIED");
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect(scenario.submitted).toEqual([]);
+    expect((await reload(execution.id)).status).toBe("PROTECTED");
+  });
+
+  maybe()("6. UNKNOWN then ABSENT repairs only once absence is proven", async () => {
+    const execution = await protectedExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+
+    // Tick N: unreadable -> no mutation.
+    scenario.queryFailures.add(stopId);
+    await protect(await reload(execution.id));
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect(scenario.submitted).toEqual([]);
+
+    // Tick N+1: the exchange now PROVES it is gone.
+    scenario.queryFailures.delete(stopId);
+    scenario.algoOrders.delete(stopId);
+    await protect(await reload(execution.id));
+
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toContain(2);
+  });
+
+  maybe()("7. both legs UNKNOWN yields neither a mutation nor a coverage claim", async () => {
+    const execution = await protectedExecution();
+    scenario.queryFailures.add(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    scenario.queryFailures.add(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(scenario.submitted).toEqual([]);
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1]);
+    // Not claimed healthy either — unknown is not "verified".
+    expect(outcome.ok).toBe(false);
+    expect(["STOP_QUERY_UNAVAILABLE", "TAKE_PROFIT_QUERY_UNAVAILABLE"]).toContain(outcome.reasonCode);
+  });
+
+  maybe()("8. repeated UNKNOWN ticks cause no generation, version or event churn", async () => {
+    const execution = await protectedExecution();
+    scenario.queryFailures.add(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+
+    const before = await reload(execution.id);
+    const eventsBefore = await prisma!.executionEvent.count({ where: { tradeExecutionId: execution.id } });
+
+    for (let tick = 0; tick < 4; tick += 1) await protect(await reload(execution.id));
+
+    const after = await reload(execution.id);
+    expect(after.version).toBe(before.version);
+    expect(await prisma!.executionEvent.count({ where: { tradeExecutionId: execution.id } })).toBe(eventsBefore);
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect(scenario.submitted).toEqual([]);
+  });
+
+  maybe()("9. a fully verified execution is unaffected by the unresolved gate", async () => {
+    const execution = await protectedExecution();
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reasonCode).toBe("PROTECTION_VERIFIED");
+    expect(scenario.submitted).toEqual([]);
+    expect((await reload(execution.id)).status).toBe("PROTECTED");
+  });
+
+  maybe()("a locally terminal generation never blocks the health path", async () => {
+    // A dead generation 1 whose query later becomes unreadable must not stall
+    // repair forever: we already know it is finished.
+    const execution = await protectedExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    scenario.algoOrders.get(stopId)!.algoStatus = "CANCELED";
+    await protect(await reload(execution.id));
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toContain(2);
+
+    // Now generation 1 becomes unreadable. Generation 2 still covers.
+    scenario.queryFailures.add(stopId);
+    scenario.submitted = [];
+    const outcome = await protect(await reload(execution.id));
+
+    // No third generation: the unreadable leg is already locally terminal.
+    expect(await generationsOf(execution.id, "STOP_LOSS")).not.toContain(3);
+    expect(outcome.reasonCode).not.toBe("STOP_QUERY_UNAVAILABLE");
+  });
 
   maybe()("6. an externally flat PROTECTED position still reaches CLOSED_EXTERNAL", async () => {
     const execution = await protectedExecution();
