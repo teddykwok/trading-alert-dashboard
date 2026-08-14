@@ -117,6 +117,21 @@ interface VerifiedCoverage {
  */
 const LOCALLY_RESOLVED_ORDER_STATUSES: readonly string[] = ["FILLED", "CANCELED", "EXPIRED", "REJECTED"];
 
+/**
+ * Reason codes meaning "the exchange state could not be read", as opposed to
+ * "the exchange told us something bad". They are DEFERRALS: nothing is known
+ * to be wrong, so they must not alert, escalate or rewrite protection state —
+ * only cause the next reconciliation tick to ask again.
+ */
+const UNREADABLE_PROTECTION_REASON_CODES: readonly ProtectionReasonCode[] = [
+  "STOP_QUERY_UNAVAILABLE",
+  "TAKE_PROFIT_QUERY_UNAVAILABLE",
+];
+
+function isUnreadableProtectionState(reasonCode: ProtectionReasonCode): boolean {
+  return UNREADABLE_PROTECTION_REASON_CODES.includes(reasonCode);
+}
+
 interface PositionSnapshot {
   quantity: string;
   entryPrice: string | null;
@@ -893,6 +908,16 @@ export class ProtectionLifecycleService {
 
     const stopResult = await this.submitAndVerifyProtection(execution, stop, input.evaluatedAt);
     if (!stopResult.verified) {
+      // DEFERRED, NOT FAILED. An unreadable existence query says nothing is
+      // wrong — only that we could not look. Escalating here would park the
+      // execution at MANUAL_INTERVENTION, which today has no automatic
+      // protection-restoration path, so a transient query blip would strand a
+      // live position permanently. The reserved tranche stays incomplete and
+      // the next tick asks again.
+      if (isUnreadableProtectionState(stopResult.reasonCode)) {
+        return this.outcome(false, stopResult.reasonCode, stopResult.message, execution, protection);
+      }
+
       await this.setProtectionState(protection.id, "PROTECTION_INCOMPLETE", stopResult.reasonCode, stopResult.message);
       await this.alerts.raise({
         tradeExecutionId: execution.id,
@@ -923,6 +948,13 @@ export class ProtectionLifecycleService {
     await this.setProtectionState(protection.id, "PLACING_TAKE_PROFIT", null, null);
     const takeProfitResult = await this.submitAndVerifyProtection(execution, takeProfit, input.evaluatedAt);
     if (!takeProfitResult.verified) {
+      // Same deferral as the stop: unreadable is not failed, so it raises no
+      // critical alert and rewrites no protection state. The verified STOP is
+      // untouched either way.
+      if (isUnreadableProtectionState(takeProfitResult.reasonCode)) {
+        return this.outcome(false, takeProfitResult.reasonCode, takeProfitResult.message, execution, protection);
+      }
+
       // The verified STOP is retained — never cancelled because TP failed.
       await this.setProtectionState(
         protection.id,
@@ -961,8 +993,49 @@ export class ProtectionLifecycleService {
     const notVerifiedCode: ProtectionReasonCode = role === "STOP_LOSS" ? "STOP_NOT_VERIFIED" : "TAKE_PROFIT_NOT_VERIFIED";
     const mismatchCode: ProtectionReasonCode = role === "STOP_LOSS" ? "STOP_IDENTITY_MISMATCH" : "TAKE_PROFIT_IDENTITY_MISMATCH";
 
+    const queryUnavailableCode: ProtectionReasonCode =
+      role === "STOP_LOSS" ? "STOP_QUERY_UNAVAILABLE" : "TAKE_PROFIT_QUERY_UNAVAILABLE";
+
     // Look before leaping: a crash may already have placed this exact order.
     let existing = await this.queryProtection(execution.symbol, order.clientAlgoId!);
+
+    // FAIL CLOSED WHEN EXISTENCE CANNOT BE DETERMINED.
+    //
+    // Only two answers settle it: the exchange returned the order, or it
+    // PROVED this exact id does not exist (-2013). A timeout, 5xx, rate limit
+    // or auth failure settles nothing — and this branch used to submit on all
+    // of them alike, firing a fresh POST every tick for as long as the query
+    // stayed unreadable.
+    //
+    // Re-sending the same deterministic clientAlgoId is NOT provably
+    // idempotent here. This codebase deliberately restricts the -4116
+    // duplicate semantic to SUBMIT_ORDER (DUPLICATE_PROVING_OPERATIONS), so a
+    // duplicate clientAlgoId on the Algo endpoint classifies as RESULT_UNKNOWN
+    // — the architecture's own position is that a duplicate response proves
+    // nothing for algo orders. Submitting on unreadable evidence therefore
+    // risks a real second mutation, not a harmless replay.
+    //
+    // The reserved SUBMITTING intent is left exactly as it is: the tranche
+    // stays incomplete, so the next tick resumes it and asks again. Nothing is
+    // marked absent, rejected or verified, and no new identity is minted.
+    if (existing.outcome !== "CONFIRMED_ACCEPTED" && existing.outcome !== "NOT_FOUND_CONFIRMED") {
+      logger.warn(
+        {
+          executionId: execution.id,
+          role,
+          generation: order.generation,
+          clientAlgoId: order.clientAlgoId,
+          outcome: existing.outcome,
+        },
+        "Protection existence could not be determined; deferring submission"
+      );
+      return {
+        verified: false,
+        reasonCode: queryUnavailableCode,
+        message: "Protection existence could not be determined; submission deferred until the state is readable.",
+      };
+    }
+
     if (existing.outcome !== "CONFIRMED_ACCEPTED") {
       let outcome: MutationOutcome = "CONFIRMED_ACCEPTED";
       try {
