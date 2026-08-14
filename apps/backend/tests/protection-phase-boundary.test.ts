@@ -1,6 +1,10 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import {
+  PROTECTION_WORKING_TYPES,
+  resolveProtectionPolicy,
+} from "../src/modules/execution/protection-policy";
 
 /**
  * Phase 7 boundary, configuration and credential guards.
@@ -270,10 +274,21 @@ describe("locked Phase 7 configuration", () => {
   });
 
   it("validates the working types as a closed enum", () => {
-    expect(envSource).toMatch(/EXECUTION_SL_WORKING_TYPE: z\.enum\(\["MARK_PRICE", "CONTRACT_PRICE"\]\)\.default\("MARK_PRICE"\)/);
+    // The enum and its defaults now come from the shared pure policy module,
+    // so the env schema and the testnet verifier cannot drift apart. The
+    // closed-enum property is asserted through that single source rather than
+    // by re-typing the literals here.
+    expect(envSource).toMatch(/EXECUTION_SL_WORKING_TYPE: z\.enum\(PROTECTION_WORKING_TYPES\)\.default\(DEFAULT_STOP_WORKING_TYPE\)/);
     expect(envSource).toMatch(
-      /EXECUTION_TP_WORKING_TYPE: z\.enum\(\["MARK_PRICE", "CONTRACT_PRICE"\]\)\.default\("CONTRACT_PRICE"\)/
+      /EXECUTION_TP_WORKING_TYPE: z\.enum\(PROTECTION_WORKING_TYPES\)\.default\(DEFAULT_TAKE_PROFIT_WORKING_TYPE\)/
     );
+    // And the values behind those names are still exactly the locked ones.
+    expect(PROTECTION_WORKING_TYPES).toEqual(["MARK_PRICE", "CONTRACT_PRICE"]);
+    expect(resolveProtectionPolicy({})).toEqual({
+      stopWorkingType: "MARK_PRICE",
+      takeProfitWorkingType: "CONTRACT_PRICE",
+      priceProtect: false,
+    });
   });
 
   it("rejects a malformed boolean rather than defaulting it on", () => {

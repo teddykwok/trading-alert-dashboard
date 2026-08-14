@@ -92,6 +92,8 @@ interface Scenario {
   entryQueryUnavailable: boolean;
   /** Position reported by the query that follows entry cleanup. */
   positionAfterEntryCleanup: string | null;
+  /** Makes the algo readback report closePosition=true (a real contradiction). */
+  closePositionOnReadback: boolean;
 }
 
 const scenario: Scenario = {} as Scenario;
@@ -123,6 +125,7 @@ function resetScenario() {
     entryCancelFailure: null,
     entryQueryUnavailable: false,
     positionAfterEntryCleanup: null,
+    closePositionOnReadback: false,
   } satisfies Scenario);
 }
 
@@ -202,8 +205,14 @@ const readOnlyStub = {
       triggerPrice: row.triggerPrice,
       workingType: row.workingType,
       priceProtect: row.priceProtect,
-      closePosition: false,
-      reduceOnly: false,
+      closePosition: scenario.closePositionOnReadback,
+      // Binance's Algo Service sets reduceOnly ITSELF on a hedge-mode closing
+      // conditional order and reports it back as true, even though we never
+      // send it. Proven against the real mainnet order tad-sl-1-ed8fa3f5d4f2.
+      // This fixture previously returned false, modelling an exchange that
+      // does not exist — which is exactly why every protection test passed
+      // while Mainnet Canary #2 failed.
+      reduceOnly: true,
       actualOrderId: null,
       executedQuantity: row.executedQty,
       averagePrice: row.avgPrice,
@@ -542,6 +551,72 @@ describe("first fill", () => {
 
     const roles = scenario.submitted.map((entry) => entry.role);
     expect(roles).toEqual(["STOP_LOSS", "TAKE_PROFIT"]);
+  });
+
+  // ===========================================================================
+  // MAINNET CANARY #2 REGRESSION — execution cmssohd070004t9h226c92lfn.
+  //
+  // A live, correct DOGSUSDT STOP was rejected because Binance's Algo Service
+  // reported reduceOnly=true on the hedge-mode closing conditional order. The
+  // STOP therefore never verified, submitTranche returned before the take
+  // profit, and the TP was NEVER SUBMITTED — its row sat at SUBMITTING with
+  // reconcileAttempts=0 while the execution parked at MANUAL_INTERVENTION with
+  // a live, genuinely-protected position.
+  //
+  // This test fails on the pre-fix implementation with
+  // reasonCode STOP_IDENTITY_MISMATCH and zero TAKE_PROFIT submissions.
+  // ===========================================================================
+
+  maybe()("MAINNET CANARY #2: reduceOnly=true on the STOP readback still verifies and reaches the TP", async () => {
+    const execution = await filledExecution();
+
+    const outcome = await protect(execution);
+
+    // 1. The STOP verified rather than being rejected as a foreign identity.
+    expect(outcome.reasonCode).not.toBe("STOP_IDENTITY_MISMATCH");
+    // 2. submitTranche continued past the stop: the TP was ACTUALLY submitted.
+    expect(scenario.submitted.map((entry) => entry.role)).toEqual(["STOP_LOSS", "TAKE_PROFIT"]);
+    // 3. Both protections are live on the exchange under their own ids.
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    const takeProfitId = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+    expect(scenario.algoOrders.get(stopId)?.algoStatus).toBe("NEW");
+    expect(scenario.algoOrders.get(takeProfitId)?.algoStatus).toBe("NEW");
+    // 4. And the exchange really is reporting the mainnet shape.
+    expect((await readOnlyStub.queryAlgoOrderByClientAlgoId(SYMBOL, stopId)).reduceOnly).toBe(true);
+
+    // 5. Both local rows left SUBMITTING and became active coverage.
+    const orders = await ordersOf(execution.id);
+    const stop = orders.find((order) => order.role === "STOP_LOSS")!;
+    const takeProfit = orders.find((order) => order.role === "TAKE_PROFIT")!;
+    expect(stop.status).toBe("NEW");
+    expect(takeProfit.status).toBe("NEW");
+    expect(takeProfit.status).not.toBe("SUBMITTING");
+
+    // 6. The execution is protected, not parked for a human.
+    const reloaded = await reload(execution.id);
+    expect(reloaded.status).not.toBe("MANUAL_INTERVENTION");
+    expect(reloaded.requiresManualIntervention).toBe(false);
+    expect((await protectionOf(execution.id)).state).toBe("PROTECTED");
+    expect(outcome.ok).toBe(true);
+  });
+
+  maybe()("MAINNET CANARY #2: closePosition=true is still rejected as a foreign identity", async () => {
+    // The relaxation must not have weakened the check that actually matters.
+    const execution = await filledExecution();
+    scenario.closePositionOnReadback = true;
+
+    const outcome = await protect(execution);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("STOP_IDENTITY_MISMATCH");
+    // The take profit is never reached when the stop is unverified.
+    expect(scenario.submitted.map((entry) => entry.role)).toEqual(["STOP_LOSS"]);
+
+    // This is the only test here that deliberately raises alerts, and
+    // `flushPending` drains the OLDEST 20 outbox rows globally. Leaving them
+    // behind would eat the batch budget of the alert-outbox tests further
+    // down the file, so this test cleans up after itself.
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
   });
 
   maybe()("uses the exact confirmed position quantity, not the local fill", async () => {

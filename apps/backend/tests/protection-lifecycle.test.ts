@@ -340,13 +340,68 @@ describe("protection identity", () => {
     }
   });
 
-  it("rejects closePosition=true and reduceOnly=true outright", () => {
+  it("rejects closePosition=true outright", () => {
+    // closePosition ignores our tranche quantity and closes the whole
+    // position, so it genuinely contradicts the intent.
     expect(findProtectionIdentityMismatches(expectedIdentity(), observedIdentity({ closePosition: true }))).toContain(
       "closePosition"
     );
-    expect(findProtectionIdentityMismatches(expectedIdentity(), observedIdentity({ reduceOnly: true }))).toContain(
-      "reduceOnly"
+  });
+
+  // -------------------------------------------------------------------------
+  // Mainnet Canary #2 (execution cmssohd070004t9h226c92lfn).
+  //
+  // Binance's Algo Service sets reduceOnly ITSELF on a hedge-mode closing
+  // conditional order and reports it back as true, even though we never send
+  // it. The historical order tad-sl-1-ed8fa3f5d4f2 matched on every other
+  // field and was rejected on this alone; the take profit was then never
+  // submitted, because submitTranche returns before TP when the STOP is
+  // unverified. These three tests pin the corrected semantics.
+  // -------------------------------------------------------------------------
+
+  it("A. accepts reduceOnly=true when every other field matches", () => {
+    // The exact mainnet shape. reduceOnly=true is strictly risk-reducing.
+    expect(findProtectionIdentityMismatches(expectedIdentity(), observedIdentity({ reduceOnly: true }))).toEqual([]);
+  });
+
+  it("B. still rejects closePosition=true", () => {
+    expect(findProtectionIdentityMismatches(expectedIdentity(), observedIdentity({ closePosition: true }))).toEqual([
+      "closePosition",
+    ]);
+  });
+
+  it("C. reports closePosition as the only mismatch when BOTH flags are true", () => {
+    const mismatches = findProtectionIdentityMismatches(
+      expectedIdentity(),
+      observedIdentity({ reduceOnly: true, closePosition: true })
     );
+    expect(mismatches).toEqual(["closePosition"]);
+    expect(mismatches).not.toContain("reduceOnly");
+  });
+
+  it("never reports reduceOnly as a mismatch for any observed value", () => {
+    for (const reduceOnly of [true, false, null]) {
+      expect(
+        findProtectionIdentityMismatches(expectedIdentity(), observedIdentity({ reduceOnly })),
+        String(reduceOnly)
+      ).not.toContain("reduceOnly");
+    }
+  });
+
+  it("keeps every genuine contradiction detectable alongside reduceOnly=true", () => {
+    // The relaxation must not blind the comparator to a real substitution.
+    for (const [override, field] of [
+      [{ clientAlgoId: "tad-sl-2-ffffffffffff" }, "clientAlgoId"],
+      [{ quantity: "0.2" }, "quantity"],
+      [{ triggerPrice: "95" }, "triggerPrice"],
+      [{ workingType: "CONTRACT_PRICE" }, "workingType"],
+      [{ positionSide: "SHORT" }, "positionSide"],
+    ] as const) {
+      expect(
+        findProtectionIdentityMismatches(expectedIdentity(), observedIdentity({ ...override, reduceOnly: true })),
+        field
+      ).toContain(field);
+    }
   });
 
   it("treats missing decimals as a mismatch, not a match", () => {

@@ -1,5 +1,13 @@
 import "dotenv/config";
 import { z } from "zod";
+// Dependency-free pure module: safe to import here, and the single home of the
+// role-specific protection working types.
+import {
+  DEFAULT_PROTECTION_PRICE_PROTECT,
+  DEFAULT_STOP_WORKING_TYPE,
+  DEFAULT_TAKE_PROFIT_WORKING_TYPE,
+  PROTECTION_WORKING_TYPES,
+} from "../modules/execution/protection-policy";
 
 /**
  * Decimal-string config values. Validated as plain decimal literals and kept
@@ -207,12 +215,14 @@ const envSchema = z.object({
   EXECUTION_PROTECTION_RECONCILE_MAX_ATTEMPTS: z.coerce.number().int().positive().max(20).default(5),
   EXECUTION_PROTECTION_RECONCILE_DELAY_MS: z.coerce.number().int().positive().max(60_000).default(1000),
   // Stops trigger on MARK_PRICE so a thin-book wick cannot fire them; take
-  // profits trigger on the traded CONTRACT_PRICE.
-  EXECUTION_SL_WORKING_TYPE: z.enum(["MARK_PRICE", "CONTRACT_PRICE"]).default("MARK_PRICE"),
-  EXECUTION_TP_WORKING_TYPE: z.enum(["MARK_PRICE", "CONTRACT_PRICE"]).default("CONTRACT_PRICE"),
+  // profits trigger on the traded CONTRACT_PRICE. The names and defaults come
+  // from modules/execution/protection-policy so the schema and the shared
+  // resolver used by the testnet verifier cannot drift apart.
+  EXECUTION_SL_WORKING_TYPE: z.enum(PROTECTION_WORKING_TYPES).default(DEFAULT_STOP_WORKING_TYPE),
+  EXECUTION_TP_WORKING_TYPE: z.enum(PROTECTION_WORKING_TYPES).default(DEFAULT_TAKE_PROFIT_WORKING_TYPE),
   EXECUTION_PROTECTION_PRICE_PROTECT: z
     .enum(["true", "false"])
-    .default("false")
+    .default(DEFAULT_PROTECTION_PRICE_PROTECT ? "true" : "false")
     .transform((value) => value === "true"),
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value
