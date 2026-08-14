@@ -1253,12 +1253,217 @@ describe("incremental tranches", () => {
   });
 });
 
+// ===========================================================================
+// LOOK-BEFORE-SUBMIT: UNKNOWN existence must not fire a mutation.
+//
+// `submitAndVerifyProtection` queries the deterministic clientAlgoId before
+// submitting. It used to submit on EVERY outcome that was not
+// CONFIRMED_ACCEPTED — including a timeout or 5xx — so a sustained query
+// outage fired a fresh POST on every reconciliation tick.
+//
+// Re-sending the same clientAlgoId is NOT provably idempotent here: this
+// codebase restricts the -4116 duplicate semantic to SUBMIT_ORDER, so a
+// duplicate clientAlgoId on the Algo endpoint classifies as RESULT_UNKNOWN.
+// Only two answers may drive the decision:
+//   CONFIRMED_ACCEPTED  -> already there, do not submit
+//   NOT_FOUND_CONFIRMED -> conclusively absent, submit exactly once
+// Everything else defers.
+// ===========================================================================
+
+describe("look-before-submit existence safety", () => {
+  const submittedRoles = () => scenario.submitted.map((entry) => entry.role);
+
+  maybe()("1. FOUND: an already-placed order is reconciled, never re-submitted", async () => {
+    const execution = await filledExecution();
+    // A crash left this exact identity live on the exchange.
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    await protect(execution);
+    expect(scenario.algoOrders.get(stopId)?.algoStatus).toBe("NEW");
+
+    scenario.submitted = [];
+    await protect(await reload(execution.id));
+
+    // Nothing re-submitted for an identity that is already present.
+    expect(submittedRoles()).toEqual([]);
+  });
+
+  maybe()("2. NOT_FOUND_CONFIRMED: submits exactly once, under the same deterministic id", async () => {
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    const takeProfitId = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+
+    await protect(execution);
+
+    // Both legs absent beforehand (-2013), so both are submitted once each.
+    expect(submittedRoles()).toEqual(["STOP_LOSS", "TAKE_PROFIT"]);
+    expect(scenario.submitted[0].clientAlgoId).toBe(stopId);
+    expect(scenario.submitted[1].clientAlgoId).toBe(takeProfitId);
+  });
+
+  maybe()("3. UNKNOWN on the STOP defers instead of submitting", async () => {
+    const execution = await filledExecution();
+    scenario.queryFailures.add(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+
+    const outcome = await protect(execution);
+
+    // No POST at all — not for the stop, and not for the take profit.
+    expect(submittedRoles()).toEqual([]);
+    expect(scenario.mutations).toEqual([]);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("STOP_QUERY_UNAVAILABLE");
+    // The reserved intent survives untouched — no new identity, no rewrite.
+    const stop = (await ordersOf(execution.id)).find((order) => order.role === "STOP_LOSS")!;
+    expect(stop.status).toBe("SUBMITTING");
+    expect(stop.clientAlgoId).toBe(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    // Deferral is not failure: no escalation, no critical alert.
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(false);
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+  });
+
+  maybe()("3b. UNKNOWN on the TAKE_PROFIT defers after a verified STOP", async () => {
+    const execution = await filledExecution();
+    scenario.queryFailures.add(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+
+    const outcome = await protect(execution);
+
+    // The stop is genuinely absent so it is placed; the TP is only unreadable.
+    expect(submittedRoles()).toEqual(["STOP_LOSS"]);
+    expect(outcome.reasonCode).toBe("TAKE_PROFIT_QUERY_UNAVAILABLE");
+    const takeProfit = (await ordersOf(execution.id)).find((order) => order.role === "TAKE_PROFIT")!;
+    expect(takeProfit.status).toBe("SUBMITTING");
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+  });
+
+  maybe()("4. repeated UNKNOWN ticks fire no mutation storm and churn no identity", async () => {
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    scenario.queryFailures.add(stopId);
+
+    for (let tick = 0; tick < 5; tick += 1) await protect(await reload(execution.id));
+
+    // Zero submissions across five ticks — the old code sent one per tick.
+    expect(submittedRoles()).toEqual([]);
+    expect(scenario.mutations).toEqual([]);
+    // One generation, one identity, no false absence, no false PROTECTED.
+    const orders = await ordersOf(execution.id);
+    expect(orders.filter((order) => order.role === "STOP_LOSS").map((order) => order.generation)).toEqual([1]);
+    expect(orders.find((order) => order.role === "STOP_LOSS")!.clientAlgoId).toBe(stopId);
+    expect((await protectionOf(execution.id)).state).not.toBe("PROTECTED");
+    expect((await reload(execution.id)).status).not.toBe("PROTECTED");
+  });
+
+  maybe()("5. UNKNOWN then FOUND converges onto the existing order without duplicating it", async () => {
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+
+    // Tick N: the stop is already live on the exchange but unreadable.
+    scenario.algoOrders.set(stopId, {
+      algoId: "A-recovered",
+      clientAlgoId: stopId,
+      symbol: SYMBOL,
+      algoStatus: "NEW",
+      side: "SELL",
+      positionSide: "LONG",
+      orderType: "STOP_MARKET",
+      quantity: "0.100",
+      triggerPrice: "96",
+      workingType: "MARK_PRICE",
+      priceProtect: false,
+    });
+    scenario.queryFailures.add(stopId);
+    await protect(execution);
+    expect(submittedRoles()).toEqual([]);
+
+    // Tick N+1: readable again.
+    scenario.queryFailures.delete(stopId);
+    await protect(await reload(execution.id));
+
+    // The pre-existing order was adopted; only the take profit was ever sent.
+    expect(submittedRoles()).toEqual(["TAKE_PROFIT"]);
+    expect(scenario.algoOrders.get(stopId)!.algoId).toBe("A-recovered");
+    expect((await protectionOf(execution.id)).state).toBe("PROTECTED");
+  });
+
+  maybe()("6. UNKNOWN then NOT_FOUND_CONFIRMED submits only once absence is proven", async () => {
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+
+    scenario.queryFailures.add(stopId);
+    await protect(execution);
+    expect(submittedRoles()).toEqual([]);
+
+    // The exchange now conclusively answers -2013 for that id.
+    scenario.queryFailures.delete(stopId);
+    await protect(await reload(execution.id));
+
+    expect(submittedRoles()).toEqual(["STOP_LOSS", "TAKE_PROFIT"]);
+    expect((await protectionOf(execution.id)).state).toBe("PROTECTED");
+  });
+
+  maybe()("7. a lost POST response is recovered by querying the same id, never a second identity", async () => {
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    // The POST reaches Binance and lands, but the response is lost.
+    const originalSubmit = mutationStub.submitProtectionOrder;
+    let firstStop = true;
+    mutationStub.submitProtectionOrder = async (context: Record<string, string>) => {
+      if (context.role === "STOP_LOSS" && firstStop) {
+        firstStop = false;
+        await originalSubmit.call(mutationStub, context); // it DID land
+        throw timeoutError("newAlgoOrder");
+      }
+      return originalSubmit.call(mutationStub, context);
+    };
+
+    try {
+      await protect(execution);
+
+      // Exactly one STOP submission; the bounded re-query adopted it.
+      expect(submittedRoles().filter((role) => role === "STOP_LOSS")).toHaveLength(1);
+      const stops = (await ordersOf(execution.id)).filter((order) => order.role === "STOP_LOSS");
+      expect(stops.map((order) => order.generation)).toEqual([1]);
+      expect(stops[0].clientAlgoId).toBe(stopId);
+      expect((await protectionOf(execution.id)).state).toBe("PROTECTED");
+    } finally {
+      mutationStub.submitProtectionOrder = originalSubmit;
+    }
+  });
+
+  maybe()("9. a POST that never reached the exchange is eventually retried, not deadlocked", async () => {
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+
+    // Tick N: the POST never lands and the id is briefly unreadable.
+    scenario.submitFailure = timeoutError("newAlgoOrder");
+    scenario.submitLands = false;
+    await protect(execution);
+    expect(submittedRoles()).toEqual(["STOP_LOSS"]);
+
+    scenario.queryFailures.add(stopId);
+    await protect(await reload(execution.id));
+    // Still exactly one attempt — the unreadable tick added none.
+    expect(submittedRoles().filter((role) => role === "STOP_LOSS")).toHaveLength(1);
+
+    // Tick N+2: readable, conclusively absent, and the submit now works.
+    scenario.queryFailures.delete(stopId);
+    scenario.submitFailure = null;
+    scenario.submitLands = true;
+    await protect(await reload(execution.id));
+
+    // No deadlock: the protection is finally placed under the SAME identity.
+    expect(scenario.algoOrders.get(stopId)?.algoStatus).toBe("NEW");
+    expect((await protectionOf(execution.id)).state).toBe("PROTECTED");
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+});
+
 describe("stop-first verification", () => {
   maybe()("does not submit the take profit when the stop cannot be verified", async () => {
     const execution = await filledExecution();
     scenario.submitFailure = timeoutError("newAlgoOrder");
     scenario.submitLands = false;
-    scenario.queryFailures.add(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    // No queryFailures here: the order must be conclusively ABSENT so the
+    // submission proceeds. Unreadable would now defer without submitting.
 
     const outcome = await protect(execution);
 
@@ -1376,7 +1581,8 @@ describe("critical alert outbox", () => {
     const execution = await filledExecution();
     scenario.submitFailure = timeoutError("newAlgoOrder");
     scenario.submitLands = false;
-    scenario.queryFailures.add(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    // No queryFailures here: the order must be conclusively ABSENT so the
+    // submission proceeds. Unreadable would now defer without submitting.
 
     await protect(execution);
 
@@ -1441,7 +1647,8 @@ describe("emergency close", () => {
     const execution = await filledExecution();
     scenario.submitFailure = timeoutError("newAlgoOrder");
     scenario.submitLands = false;
-    scenario.queryFailures.add(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    // No queryFailures here: the order must be conclusively ABSENT so the
+    // submission proceeds. Unreadable would now defer without submitting.
 
     const outcome = await protect(execution);
 
