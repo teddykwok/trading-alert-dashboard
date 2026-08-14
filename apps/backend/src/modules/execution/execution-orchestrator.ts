@@ -323,9 +323,35 @@ export class ExecutionOrchestrator {
         case "PLACING_PROTECTION":
           return (await this.deps.protection.resumeProtectionLifecycle(input)).mutationsDispatched;
 
-        // Verified protection: watch for closure and for coverage drift.
-        case "PROTECTED":
-          return (await this.deps.protection.reconcileProtectionAndClosure(input)).mutationsDispatched;
+        // Verified protection: watch for closure AND for coverage drift.
+        //
+        // Both halves are required, and the ORDER is load-bearing.
+        //
+        // `reconcileProtectionAndClosure` owns the flat case and must run
+        // first: on a real exchange a closed position makes positionRisk omit
+        // the row entirely, and only this function reads a missing row as
+        // "flat". `ensureProtectionForExposure` escalates it as
+        // POSITION_NOT_FOUND_AFTER_FILL, so leading with the health path would
+        // turn every normal close into a spurious MANUAL_INTERVENTION — from
+        // which CLOSED_TP and CLOSED_SL are not even legal transitions.
+        //
+        // But closure reconciliation returns early while exposure remains and
+        // performs NO coverage measurement, liquidation check, margin top-up or
+        // repair. Without the second half a PROTECTED execution would never
+        // notice a stop that was cancelled out from under it. So when the
+        // position is still open — proven by the execution still being
+        // PROTECTED afterwards — the full health path runs too.
+        case "PROTECTED": {
+          const closure = await this.deps.protection.reconcileProtectionAndClosure(input);
+          // Terminalized, escalated, or otherwise moved on: closure owns it.
+          if (closure.execution.status !== "PROTECTED") return closure.mutationsDispatched;
+
+          const health = await this.deps.protection.ensureProtectionForExposure({
+            ...input,
+            expectedVersion: closure.execution.version,
+          });
+          return closure.mutationsDispatched + health.mutationsDispatched;
+        }
 
         // Parked for a human. Reconciliation still observes the exchange so the
         // journal stays truthful, but nothing is auto-unwound.

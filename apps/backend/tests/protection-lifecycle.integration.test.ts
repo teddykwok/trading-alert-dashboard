@@ -648,6 +648,326 @@ describe("first fill", () => {
   });
 });
 
+// ===========================================================================
+// MAINNET CANARY #3 REGRESSION — execution cmst5kcdw0004au5034zwpqq6.
+//
+// ExecutionProtectionState reached PROTECTED with full verified coverage on
+// both legs and 70 consecutive verifications, while TradeExecution.status sat
+// at ENTRY_FILLED forever. The service could commit every way protection goes
+// WRONG (MANUAL_INTERVENTION, CLOSED_*), and no way it goes right: nothing in
+// the codebase ever wrote PLACING_PROTECTION or PROTECTED to the execution.
+// ===========================================================================
+
+describe("execution status reflects verified protection", () => {
+  /** A fully filled entry — the real Canary #3 shape. */
+  async function entryFilledExecution() {
+    const seed = await filledExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: seed.id },
+      data: { status: "ENTRY_FILLED", version: { increment: 1 } },
+    });
+    return reload(seed.id);
+  }
+
+  const eventsOf = async (id: string) =>
+    prisma!.executionEvent.findMany({ where: { tradeExecutionId: id }, orderBy: { sequenceNumber: "asc" } });
+
+  maybe()("A. a fully covered execution reaches status PROTECTED", async () => {
+    const execution = await entryFilledExecution();
+
+    const outcome = await protect(execution);
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reasonCode).toBe("PROTECTION_VERIFIED");
+    const after = await reload(execution.id);
+    expect(after.status).toBe("PROTECTED");
+    // The protection row and the execution row now AGREE — the whole defect.
+    expect((await protectionOf(execution.id)).state).toBe("PROTECTED");
+    expect(after.requiresManualIntervention).toBe(false);
+  });
+
+  maybe()("B. takes the documented legal path ENTRY_FILLED -> PLACING_PROTECTION -> PROTECTED", async () => {
+    const { canTransition } = await import("../src/modules/execution/execution-status");
+    const execution = await entryFilledExecution();
+
+    await protect(execution);
+
+    const transitions = (await eventsOf(execution.id))
+      .filter((event) => event.fromStatus !== null && event.fromStatus !== event.toStatus)
+      .map((event) => `${event.fromStatus}->${event.toStatus}`);
+    expect(transitions).toEqual(["ENTRY_FILLED->PLACING_PROTECTION", "PLACING_PROTECTION->PROTECTED"]);
+    // Every hop is legal, so no new state-machine edge was needed.
+    expect(canTransition("ENTRY_FILLED", "PLACING_PROTECTION").allowed).toBe(true);
+    expect(canTransition("PLACING_PROTECTION", "PROTECTED").allowed).toBe(true);
+    expect(canTransition("ENTRY_FILLED", "PROTECTED").allowed).toBe(false);
+  });
+
+  maybe()("C. incomplete coverage never reaches PROTECTED", async () => {
+    const execution = await entryFilledExecution();
+    const takeProfitId = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+    // The stop lands; the take profit is lost, so aggregate coverage has a gap.
+    const originalSubmit = mutationStub.submitProtectionOrder;
+    mutationStub.submitProtectionOrder = async (context: Record<string, string>) => {
+      if (context.role === "TAKE_PROFIT") {
+        scenario.queryFailures.add(takeProfitId);
+        throw timeoutError("newAlgoOrder");
+      }
+      return originalSubmit.call(mutationStub, context);
+    };
+
+    try {
+      const outcome = await protect(execution);
+      expect(outcome.ok).toBe(false);
+      const after = await reload(execution.id);
+      // It may legitimately sit at PLACING_PROTECTION, but never PROTECTED.
+      expect(after.status).not.toBe("PROTECTED");
+      expect((await protectionOf(execution.id)).state).not.toBe("PROTECTED");
+    } finally {
+      mutationStub.submitProtectionOrder = originalSubmit;
+      await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+    }
+  });
+
+  maybe()("D. an unverified STOP never reaches PROTECTED", async () => {
+    const execution = await entryFilledExecution();
+    scenario.submitFailure = timeoutError("newAlgoOrder");
+    scenario.submitLands = false;
+
+    await protect(execution);
+
+    const after = await reload(execution.id);
+    expect(after.status).not.toBe("PROTECTED");
+    expect((await protectionOf(execution.id)).state).not.toBe("PROTECTED");
+    // `flushPending` drains the OLDEST 20 outbox rows globally, so a test that
+    // deliberately raises alerts must not eat the alert-outbox tests' budget.
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("E. is idempotent across repeated ticks", async () => {
+    const execution = await entryFilledExecution();
+    await protect(execution);
+
+    const first = await reload(execution.id);
+    const firstEvents = await eventsOf(execution.id);
+    expect(first.status).toBe("PROTECTED");
+
+    // Two more reconciliation ticks.
+    await protect(await reload(execution.id));
+    await protect(await reload(execution.id));
+
+    const second = await reload(execution.id);
+    expect(second.status).toBe("PROTECTED");
+    // No duplicate transition, no event churn, no version churn.
+    expect(second.version).toBe(first.version);
+    expect((await eventsOf(execution.id)).length).toBe(firstEvents.length);
+    // And no second protection generation was ever reserved.
+    const orders = await ordersOf(execution.id);
+    expect(orders.filter((order) => order.role === "STOP_LOSS")).toHaveLength(1);
+    expect(orders.filter((order) => order.role === "TAKE_PROFIT")).toHaveLength(1);
+  });
+
+  maybe()("F. closure is still detected from the new PROTECTED status", async () => {
+    const execution = await entryFilledExecution();
+    await protect(execution);
+    expect((await reload(execution.id)).status).toBe("PROTECTED");
+
+    // The take profit fills and the position goes flat.
+    const takeProfitId = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+    scenario.algoOrders.get(takeProfitId)!.algoStatus = "FILLED";
+    scenario.algoOrders.get(takeProfitId)!.executedQty = "0.100";
+    scenario.positionAmt = "0";
+    const current = await reload(execution.id);
+    const outcome = await protectionService.reconcileProtectionAndClosure({
+      executionId: execution.id,
+      expectedVersion: current.version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.ok).toBe(true);
+    expect((await reload(execution.id)).status).toBe("CLOSED_TP");
+  });
+
+  maybe()("F2. external flat recovery still reaches CLOSED_EXTERNAL from PROTECTED", async () => {
+    const execution = await entryFilledExecution();
+    await protect(execution);
+    expect((await reload(execution.id)).status).toBe("PROTECTED");
+
+    // Closed by something that is not one of our orders.
+    scenario.positionAmt = "0";
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+
+    const current = await reload(execution.id);
+    await protectionService.reconcileProtectionAndClosure({
+      executionId: execution.id,
+      expectedVersion: current.version,
+      evaluatedAt: at(),
+    });
+
+    expect((await reload(execution.id)).status).toBe("CLOSED_EXTERNAL");
+  });
+
+  maybe()("never promotes a PARTIALLY_FILLED entry, which still holds pending-entry capacity", async () => {
+    const { consumesPendingEntry } = await import("../src/modules/execution/capacity-status");
+    // filledExecution() is PARTIALLY_FILLED: its entry is still on the book.
+    const execution = await filledExecution();
+
+    const outcome = await protect(execution);
+
+    expect(outcome.ok).toBe(true);
+    const after = await reload(execution.id);
+    expect(after.status).toBe("PARTIALLY_FILLED");
+    // Promoting it would have released the capacity its resting entry holds.
+    expect(consumesPendingEntry("PARTIALLY_FILLED")).toBe(true);
+    expect(consumesPendingEntry("PROTECTED")).toBe(false);
+    // The protection row still records the truth.
+    expect((await protectionOf(execution.id)).state).toBe("PROTECTED");
+  });
+
+  // -------------------------------------------------------------------------
+  // PROTECTED must keep receiving the FULL health path.
+  //
+  // `reconcileProtectionAndClosure` returns early while exposure remains and
+  // measures no coverage at all, so these prove the health pass — which the
+  // orchestrator now runs after closure — still detects and repairs a leg that
+  // vanished from the exchange.
+  // -------------------------------------------------------------------------
+
+  /** A PROTECTED execution with both legs live, as the fix now produces. */
+  async function protectedExecution() {
+    const execution = await entryFilledExecution();
+    await protect(execution);
+    expect((await reload(execution.id)).status).toBe("PROTECTED");
+    scenario.submitted = [];
+    scenario.mutations = [];
+    return reload(execution.id);
+  }
+
+  maybe()("closure reconciliation ALONE never notices a cancelled STOP", async () => {
+    // Characterises the gap the routing fix works around. This is why the
+    // orchestrator cannot route PROTECTED to closure reconciliation alone.
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(buildClientOrderId(execution.id, "STOP_LOSS", 1))!.algoStatus = "CANCELED";
+
+    const outcome = await protectionService.reconcileProtectionAndClosure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    // It reports only "position still open" and repairs nothing.
+    expect(outcome.ok).toBe(false);
+    expect(scenario.submitted).toEqual([]);
+  });
+
+  maybe()("2. the health path detects a cancelled STOP and repairs it", async () => {
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(buildClientOrderId(execution.id, "STOP_LOSS", 1))!.algoStatus = "CANCELED";
+
+    // Exactly what the orchestrator now runs for a still-open PROTECTED row.
+    await protect(await reload(execution.id));
+
+    // A replacement tranche was reserved and submitted for the missing leg.
+    const stops = (await ordersOf(execution.id)).filter((order) => order.role === "STOP_LOSS");
+    expect(stops.length).toBeGreaterThan(1);
+    expect(stops.some((order) => order.generation === 2)).toBe(true);
+    expect(scenario.submitted.map((entry) => entry.role)).toContain("STOP_LOSS");
+  });
+
+  maybe()("3. the health path detects a cancelled TAKE_PROFIT and repairs it", async () => {
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(buildClientOrderId(execution.id, "TAKE_PROFIT", 1))!.algoStatus = "CANCELED";
+
+    await protect(await reload(execution.id));
+
+    const takeProfits = (await ordersOf(execution.id)).filter((order) => order.role === "TAKE_PROFIT");
+    expect(takeProfits.some((order) => order.generation === 2)).toBe(true);
+  });
+
+  maybe()("4. a partial coverage gap is detected and repaired", async () => {
+    const execution = await protectedExecution();
+    // The exchange now reports MORE exposure than the tranche covers.
+    scenario.positionAmt = "0.200";
+
+    await protect(await reload(execution.id));
+
+    // A second generation covers exactly the missing delta.
+    const orders = await ordersOf(execution.id);
+    expect(orders.some((order) => order.generation === 2)).toBe(true);
+    expect((await protectionOf(execution.id)).confirmedOpenQuantity.toString()).toBe("0.2");
+  });
+
+  maybe()("5. an UNKNOWN protection query never marks the original leg absent", async () => {
+    const execution = await protectedExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    // The stop cannot be read at all — which is NOT proof that it is gone.
+    scenario.queryFailures.add(stopId);
+
+    await protect(await reload(execution.id));
+
+    // The local intent for the unreadable leg is left intact: an unreadable
+    // order is never rewritten as absent, cancelled or rejected.
+    const stops = (await ordersOf(execution.id)).filter((order) => order.role === "STOP_LOSS");
+    expect(stops.find((order) => order.generation === 1)?.status).toBe("NEW");
+
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  // FOLLOW-UP, deliberately out of scope for this branch.
+  //
+  // `measureVerifiedCoverage` skips any protection order whose query is not
+  // CONFIRMED_ACCEPTED, so an UNREADABLE leg is counted as ZERO coverage and is
+  // indistinguishable from an absent one. A transient query failure on a live,
+  // healthy stop therefore reserves and SUBMITS a duplicate tranche.
+  //
+  // This is PRE-EXISTING and is not widened by the status-sync work: before it,
+  // executions sat at ENTRY_FILLED for their whole life and ran this same path
+  // every tick (Canary #3: 70 ticks over 35 minutes).
+  //
+  // Left as a todo rather than a passing assertion on purpose — codifying the
+  // current behaviour would mean this suite fails the day the defect is fixed.
+  it.todo("does not treat an UNKNOWN protection observation as absent coverage");
+
+  maybe()("6. an externally flat PROTECTED position still reaches CLOSED_EXTERNAL", async () => {
+    const execution = await protectedExecution();
+    scenario.positionAmt = "0";
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+
+    await protectionService.reconcileProtectionAndClosure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    expect((await reload(execution.id)).status).toBe("CLOSED_EXTERNAL");
+  });
+
+  maybe()("8. a filled STOP on a PROTECTED position reaches CLOSED_SL", async () => {
+    const execution = await protectedExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    scenario.algoOrders.get(stopId)!.algoStatus = "FILLED";
+    scenario.algoOrders.get(stopId)!.executedQty = "0.100";
+    scenario.positionAmt = "0";
+
+    await protectionService.reconcileProtectionAndClosure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    expect((await reload(execution.id)).status).toBe("CLOSED_SL");
+  });
+
+  maybe()("keeps every protected status counted as an open position", async () => {
+    const { consumesOpenPosition } = await import("../src/modules/execution/capacity-status");
+    // The fix must not change openPositionCount for a live protected trade.
+    for (const status of ["ENTRY_FILLED", "PLACING_PROTECTION", "PROTECTED"] as const) {
+      expect(consumesOpenPosition(status), status).toBe(true);
+    }
+  });
+});
+
 describe("protection parameters", () => {
   maybe()("maps LONG protection to SELL on positionSide LONG", async () => {
     const execution = await filledExecution({ direction: "LONG" });
