@@ -622,7 +622,19 @@ export class ProtectionLifecycleService {
           verifiedAt: input.evaluatedAt,
         }
       );
-      return this.outcome(true, "PROTECTION_VERIFIED", "Position is fully protected.", execution, await this.loadProtection(execution.id));
+      // The execution row must say so too, or the position reads as merely
+      // filled to every consumer of `status`.
+      const protectedExecution = await this.markExecutionProtected(
+        execution.id,
+        "Aggregate protection covers the full position."
+      );
+      return this.outcome(
+        true,
+        "PROTECTION_VERIFIED",
+        "Position is fully protected.",
+        protectedExecution,
+        await this.loadProtection(execution.id)
+      );
     }
 
     // Resolve any half-finished tranche before creating a new one.
@@ -816,6 +828,11 @@ export class ProtectionLifecycleService {
     if (!stop) {
       return this.outcome(false, "STOP_INTENT_CONFLICT", "No stop reservation exists for this tranche.", execution, protection);
     }
+
+    // Protection placement is starting. This is the single funnel for BOTH a
+    // freshly reserved tranche and a resumed incomplete one, so recording it
+    // here covers every path that submits.
+    await this.recordProtectionStatus(execution.id, "PLACING_PROTECTION", "Placing protection for the confirmed fill.");
 
     const stopResult = await this.submitAndVerifyProtection(execution, stop, input.evaluatedAt);
     if (!stopResult.verified) {
@@ -1035,7 +1052,80 @@ export class ProtectionLifecycleService {
       );
     }
 
-    return this.outcome(true, "PROTECTION_VERIFIED", "Aggregate protection covers the full position.", execution, await this.loadProtection(execution.id));
+    const protectedExecution = await this.markExecutionProtected(
+      execution.id,
+      "Aggregate protection covers the full position."
+    );
+    return this.outcome(
+      true,
+      "PROTECTION_VERIFIED",
+      "Aggregate protection covers the full position.",
+      protectedExecution,
+      await this.loadProtection(execution.id)
+    );
+  }
+
+  /**
+   * Records the SUCCESS half of the protection lifecycle on the execution ROW.
+   *
+   * Until this existed the service could commit every way protection goes
+   * WRONG — MANUAL_INTERVENTION, CLOSED_TP/SL/EMERGENCY, CLOSED_EXTERNAL — and
+   * no way it goes right. `ExecutionProtectionState` reached PROTECTED while
+   * `TradeExecution.status` stayed ENTRY_FILLED forever, which is exactly what
+   * Mainnet Canary #3 showed: full verified coverage on both legs, 70
+   * consecutive verifications, and a status that still claimed the position
+   * was merely filled.
+   *
+   * Deliberately narrow:
+   *
+   *  - IDEMPOTENT. Already at the target means no commit, no event, no version
+   *    churn — the reconciliation tick repeats indefinitely.
+   *  - ONE legal hop only, and only along the documented path
+   *    ENTRY_FILLED -> PLACING_PROTECTION -> PROTECTED. The caller walks the
+   *    two hops in order, so no new state-machine edge is needed.
+   *  - PARTIALLY_FILLED IS NEVER MOVED. A partial entry still has a resting
+   *    order consuming pending-entry capacity; promoting it would release that
+   *    capacity while the remainder is still live on the book.
+   *  - A lost version race is not an error. The next tick re-derives the same
+   *    conclusion from the exchange and tries again.
+   */
+  private async recordProtectionStatus(
+    executionId: string,
+    target: "PLACING_PROTECTION" | "PROTECTED",
+    message: string
+  ): Promise<TradeExecution> {
+    const current = await this.loadExecution(executionId);
+    const status = current.status as TradeExecutionStatusName;
+
+    if (status === target) return current;
+
+    // Only the documented predecessor may advance, which is what keeps
+    // PARTIALLY_FILLED (and every terminal state) untouched.
+    const requiredFrom = target === "PLACING_PROTECTION" ? "ENTRY_FILLED" : "PLACING_PROTECTION";
+    if (status !== requiredFrom) return current;
+    if (!canTransition(status, target).allowed) return current;
+
+    const committed = await this.commitExecutionChange(current, current.version, {
+      status: target,
+      reasonCode: "PROTECTION_VERIFIED",
+      message,
+      eventType: target === "PLACING_PROTECTION" ? "PROTECTION_SUBMITTED" : "PROTECTION_VERIFIED",
+    });
+
+    return committed ?? current;
+  }
+
+  /**
+   * Walks ENTRY_FILLED -> PLACING_PROTECTION -> PROTECTED in order.
+   *
+   * Both hops are attempted because protection can legitimately be discovered
+   * already complete — after a restart, or on a tick where the tranche was
+   * placed by a previous run — in which case the execution has never been
+   * moved off ENTRY_FILLED and must still end up PROTECTED.
+   */
+  private async markExecutionProtected(executionId: string, message: string): Promise<TradeExecution> {
+    await this.recordProtectionStatus(executionId, "PLACING_PROTECTION", message);
+    return this.recordProtectionStatus(executionId, "PROTECTED", message);
   }
 
   /**

@@ -40,6 +40,8 @@ function harness(options: {
   profile?: { id: string; found: boolean };
   admissionDecision?: string;
   mutationsPerCall?: number;
+  /** Status the closure reconciliation leaves the execution in. */
+  closureResultStatus?: string;
 } = {}) {
   const calls: Call[] = [];
   const executions = options.executions ?? [];
@@ -48,9 +50,17 @@ function harness(options: {
 
   const record = (service: string, method: string) => async (input: { executionId: string; expectedVersion: number }) => {
     calls.push({ service, method, executionId: input.executionId, expectedVersion: input.expectedVersion });
+    // The routing for PROTECTED branches on the status the call LEAVES the
+    // execution in, so the stub has to model it. `closureResultStatus` lets a
+    // test say "this reconciliation terminalized or escalated".
+    const source = executions.find((row: { id: string }) => row.id === input.executionId);
+    const status =
+      method === "reconcileProtectionAndClosure" && options.closureResultStatus !== undefined
+        ? options.closureResultStatus
+        : (source?.status as string | undefined);
     return {
       mutationsDispatched: mutations,
-      execution: { id: input.executionId, version: input.expectedVersion + 1 },
+      execution: { id: input.executionId, version: input.expectedVersion + 1, status },
       reasonCode: "OK",
     };
   };
@@ -227,7 +237,65 @@ describe("reconciliation routing", () => {
   });
 
   it("watches a protected position for closure", async () => {
-    expect(await route("PROTECTED")).toEqual(["protection.reconcileProtectionAndClosure"]);
+    // Closure FIRST (it owns the flat case), then the health/repair pass while
+    // exposure remains. See the PROTECTED case in the orchestrator for why the
+    // order is load-bearing.
+    expect(await route("PROTECTED")).toEqual([
+      "protection.reconcileProtectionAndClosure",
+      "protection.ensureProtectionForExposure",
+    ]);
+  });
+
+  // -------------------------------------------------------------------------
+  // PROTECTED routing — the adversarial-review blocker.
+  //
+  // Closure reconciliation returns early while exposure remains and performs
+  // NO coverage measurement, liquidation check, margin top-up or repair. If
+  // PROTECTED routed only there, a stop cancelled out from under a live
+  // position would never be detected. These pin both halves and their order.
+  // -------------------------------------------------------------------------
+
+  it("runs the health/repair pass after closure while a PROTECTED position is still open", async () => {
+    const routed = await route("PROTECTED");
+    // Closure must be FIRST: only it reads a missing positionRisk row as flat.
+    expect(routed.indexOf("protection.reconcileProtectionAndClosure")).toBeLessThan(
+      routed.indexOf("protection.ensureProtectionForExposure")
+    );
+    expect(routed).toContain("protection.ensureProtectionForExposure");
+  });
+
+  it("skips the health pass when closure already terminalized the execution", async () => {
+    for (const terminal of ["CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL"]) {
+      const { orchestrator, calls } = harness({
+        executions: [execution({ status: "PROTECTED", version: 5 })],
+        closureResultStatus: terminal,
+      });
+      await orchestrator.runExecutionReconciliationTick();
+      expect(calls.map((c) => `${c.service}.${c.method}`), terminal).toEqual([
+        "protection.reconcileProtectionAndClosure",
+      ]);
+    }
+  });
+
+  it("skips the health pass when closure escalated to MANUAL_INTERVENTION", async () => {
+    // A parked execution must not have protection auto-placed underneath it.
+    const { orchestrator, calls } = harness({
+      executions: [execution({ status: "PROTECTED", version: 5 })],
+      closureResultStatus: "MANUAL_INTERVENTION",
+    });
+    await orchestrator.runExecutionReconciliationTick();
+    expect(calls.map((c) => `${c.service}.${c.method}`)).toEqual(["protection.reconcileProtectionAndClosure"]);
+  });
+
+  it("threads the post-closure version into the health pass", async () => {
+    const { orchestrator, calls } = harness({ executions: [execution({ status: "PROTECTED", version: 5 })] });
+    await orchestrator.runExecutionReconciliationTick();
+
+    const closure = calls.find((c) => c.method === "reconcileProtectionAndClosure")!;
+    const health = calls.find((c) => c.method === "ensureProtectionForExposure")!;
+    expect(closure.expectedVersion).toBe(5);
+    // The health pass must not CAS against a version closure already consumed.
+    expect(health.expectedVersion).toBe(6);
   });
 
   it("observes a parked execution without auto-unwinding it", async () => {
@@ -351,9 +419,10 @@ describe("startup recovery", () => {
     await orchestrator.runStartupRecovery();
 
     // A second run reconciles the same rows and adds nothing new beyond the
-    // repeated (idempotent) service call.
+    // repeated (idempotent) service calls — the same sequence, twice.
     expect(calls.length).toBe(first * 2);
-    expect(new Set(calls.map((c) => `${c.service}.${c.method}`)).size).toBe(1);
+    const routed = calls.map((c) => `${c.service}.${c.method}`);
+    expect(routed.slice(first)).toEqual(routed.slice(0, first));
   });
 
   it("reports outstanding recovery so new work stays blocked", async () => {
