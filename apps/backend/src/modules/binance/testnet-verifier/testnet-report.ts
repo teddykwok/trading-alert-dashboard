@@ -96,8 +96,19 @@ export function formatRunReport(report: VerifierRunReport): string[] {
       `  orderType                       ${observation?.orderType ?? "—"}`,
       `  positionSide                    ${observation?.positionSide ?? "—"}`,
       `  symbol                          ${observation?.symbol ?? "—"}`,
+      `  side                            ${observation?.side ?? "—"}`,
+      `  quantity                        ${observation?.quantity ?? "—"}`,
+      `  triggerPrice                    ${observation?.triggerPrice ?? "—"}`,
+      `  workingType                     ${observation?.workingType ?? "—"}`,
+      `  priceProtect                    ${flag(observation?.priceProtect ?? null)}`,
+      `  closePosition                   ${flag(observation?.closePosition ?? null)}`,
+      `  reduceOnly                      ${flag(observation?.reduceOnly ?? null)}`,
       `  productionQueryForm             ${observation?.productionQueryForm ?? "—"}`,
       `  documentedQueryForm             ${observation?.documentedQueryForm ?? "—"}`,
+      // The mandatory PASS condition: production's own identity rules.
+      `  productionComparator            ${
+        observation ? (observation.identityMismatches.length === 0 ? "ACCEPTED" : `REJECTED: ${observation.identityMismatches.join(", ")}`) : "—"
+      }`,
       `  confirmedActive                 ${flag(observation?.confirmedActive ?? null)}`,
       `  confirmationReason              ${sanitizeBinanceText(observation?.confirmationReason ?? "—")}`
     );

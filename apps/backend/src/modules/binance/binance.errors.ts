@@ -29,6 +29,13 @@ export type BinanceErrorKind =
   // was created — distinct from MALFORMED_RESPONSE, which means WE could not
   // understand the reply and therefore know nothing.
   | "REQUEST_INVALID"
+  // Binance answered about a SPECIFIC order id and said it does not exist
+  // (-2013) or refused to cancel it (-2011). Purely a label: what this means
+  // for a caller depends on WHICH operation asked, so absence is decided by
+  // the per-operation table in classifyMutationOutcome, never by this kind.
+  // Before this existed, a -2013 fell through to MALFORMED_RESPONSE and every
+  // log line read "malformed" for a perfectly well-formed answer.
+  | "ORDER_NOT_FOUND"
   | "READ_ONLY_VIOLATION";
 
 /** Kinds that a bounded retry may help with. Auth/permission/validation never retry. */
@@ -157,6 +164,13 @@ export function classifyBinanceFailure(
       // refused, never that an order exists.
       case -4015:
         return "REQUEST_INVALID";
+      // -2011 CANCEL_REJECTED, -2013 NO_SUCH_ORDER. Both are well-formed
+      // answers about one specific order id. Whether either PROVES absence is
+      // decided per operation (a -2011 means absence only in a cancel
+      // context), so this kind carries no absence semantics of its own.
+      case -2011:
+      case -2013:
+        return "ORDER_NOT_FOUND";
       case -1000:
       case -1001:
         return "SERVER";

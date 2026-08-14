@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
   ACTIVE_ALGO_STATUSES,
   TERMINAL_ALGO_STATUSES,
@@ -21,21 +23,43 @@ import { normalizeAlgoOrder } from "../src/modules/binance/binance.normalize";
  */
 
 const ID = "tad-tp-1-abcdef012345";
-const EXPECTED: ProtectionExpectation = { symbol: "BTCUSDT", positionSide: "LONG", orderType: "TAKE_PROFIT_MARKET" };
 
-/** Both forms agree, so overriding the status must change BOTH sides. */
+/** The FULL identity the verifier submitted, as production compares it. */
+const EXPECTED: ProtectionExpectation = {
+  symbol: "BTCUSDT",
+  positionSide: "LONG",
+  orderType: "TAKE_PROFIT_MARKET",
+  side: "SELL",
+  quantity: "0.002",
+  triggerPrice: "55000.0",
+  workingType: "MARK_PRICE",
+  priceProtect: false,
+};
+
+/** Exactly what a correct Binance readback of that order looks like. */
+const EXCHANGE_FIELDS = {
+  orderType: "TAKE_PROFIT_MARKET",
+  positionSide: "LONG",
+  symbol: "BTCUSDT",
+  side: "SELL",
+  quantity: "0.002",
+  triggerPrice: "55000.0",
+  workingType: "MARK_PRICE",
+  priceProtect: false,
+  closePosition: false,
+  // The mainnet shape: Binance sets this itself on a hedge-mode closing
+  // conditional order. Default it to TRUE so every test here runs against
+  // reality rather than against a Binance that does not exist.
+  reduceOnly: true,
+} as const;
+
+/** Both forms agree, so an override must change BOTH sides. */
 const found = (over: Partial<AlgoIdentityInput["documented"]> = {}) => {
   const algoStatus = "algoStatus" in over ? (over.algoStatus ?? null) : "NEW";
   return observeAlgoIdentity({
     clientAlgoId: ID,
-    production: {
-      lookup: "FOUND",
-      algoStatus,
-      orderType: "TAKE_PROFIT_MARKET",
-      positionSide: "LONG",
-      symbol: "BTCUSDT",
-    },
-    documented: { lookup: "FOUND", statusKeyPresent: true, ...over, algoStatus },
+    production: { lookup: "FOUND", ...EXCHANGE_FIELDS, ...over, algoStatus },
+    documented: { lookup: "FOUND", statusKeyPresent: true, ...EXCHANGE_FIELDS, ...over, algoStatus },
   });
 };
 
@@ -149,37 +173,66 @@ describe("active protection confirmation", () => {
     expect(confirmActiveProtection(observation, EXPECTED).confirmed).toBe(false);
   });
 
-  it("requires the symbol, positionSide and orderType to match", () => {
-    expect(confirmActiveProtection(found(), EXPECTED).confirmed).toBe(true);
+  // -------------------------------------------------------------------------
+  // The verifier delegates identity to the PRODUCTION comparator.
+  //
+  // Phase 20 verified demo with its own weaker copy of these rules, which is
+  // exactly how Mainnet Canary #2's defect escaped: demo never exercised
+  // findProtectionIdentityMismatches, so it never noticed that production
+  // rejected a valid hedge-mode STOP carrying reduceOnly=true.
+  // -------------------------------------------------------------------------
 
-    for (const [field, value] of [
-      ["symbol", "ETHUSDT"],
-      ["positionSide", "SHORT"],
-      ["orderType", "STOP_MARKET"],
+  it("MAINNET CANARY #2: accepts reduceOnly=true through the production comparator", () => {
+    const result = confirmActiveProtection(found({ reduceOnly: true }), EXPECTED);
+    expect(result.confirmed).toBe(true);
+    expect(result.identityMismatches).toEqual([]);
+    expect(result.reason).toMatch(/production identity comparator accepted/);
+  });
+
+  it("MAINNET CANARY #2 (negative): closePosition=true fails through the production comparator", () => {
+    const result = confirmActiveProtection(found({ closePosition: true }), EXPECTED);
+    expect(result.confirmed).toBe(false);
+    expect(result.identityMismatches).toEqual(["closePosition"]);
+    expect(result.reason).toMatch(/production identity comparator rejected: closePosition/);
+  });
+
+  it("fails whenever the production comparator reports ANY mismatch", () => {
+    // Every field the production comparator judges, proven to fail the
+    // verifier — including the ones the old local copy never checked at all.
+    for (const [field, override] of [
+      ["symbol", { symbol: "ETHUSDT" }],
+      ["positionSide", { positionSide: "SHORT" }],
+      ["orderType", { orderType: "STOP_MARKET" }],
+      ["side", { side: "BUY" }],
+      ["quantity", { quantity: "0.999" }],
+      ["triggerPrice", { triggerPrice: "12345.0" }],
+      ["workingType", { workingType: "CONTRACT_PRICE" }],
+      ["priceProtect", { priceProtect: true }],
+      ["closePosition", { closePosition: true }],
     ] as const) {
-      const observation = observeAlgoIdentity({
-        clientAlgoId: ID,
-        production: {
-          lookup: "FOUND",
-          algoStatus: "NEW",
-          symbol: "BTCUSDT",
-          positionSide: "LONG",
-          orderType: "TAKE_PROFIT_MARKET",
-          [field]: value,
-        } as never,
-        documented: { lookup: "FOUND", statusKeyPresent: true, algoStatus: "NEW" },
-      });
-      expect(confirmActiveProtection(observation, EXPECTED).confirmed, field).toBe(false);
+      const result = confirmActiveProtection(found(override), EXPECTED);
+      expect(result.confirmed, field).toBe(false);
+      expect(result.identityMismatches, field).toContain(field);
     }
   });
 
   it("refuses when the reply carries no symbol at all", () => {
-    const observation = observeAlgoIdentity({
-      clientAlgoId: ID,
-      production: { lookup: "FOUND", algoStatus: "NEW", positionSide: "LONG", orderType: "TAKE_PROFIT_MARKET" },
-      documented: { lookup: "FOUND", statusKeyPresent: true, algoStatus: "NEW" },
-    });
-    expect(confirmActiveProtection(observation, EXPECTED).confirmed).toBe(false);
+    const result = confirmActiveProtection(found({ symbol: null }), EXPECTED);
+    expect(result.confirmed).toBe(false);
+    expect(result.identityMismatches).toContain("symbol");
+  });
+
+  it("uses the production comparator rather than a private copy of the rules", () => {
+    // A structural guard: the module must IMPORT the production comparator and
+    // must not re-implement the field checks locally.
+    const source = readFileSync(
+      path.join(process.cwd(), "src/modules/binance/testnet-verifier/testnet-algo-observation.ts"),
+      "utf8"
+    );
+    expect(source).toMatch(/import\s*\{[\s\S]*findProtectionIdentityMismatches[\s\S]*\}\s*from\s*"\.\.\/\.\.\/execution\/protection-lifecycle"/);
+    expect(source).toContain("findProtectionIdentityMismatches(");
+    // No second implementation: the verifier must not push its own field names.
+    expect(source).not.toMatch(/mismatches\.push\(/);
   });
 
   it("gives a sanitized reason for every refusal", () => {

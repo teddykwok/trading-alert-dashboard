@@ -7,6 +7,7 @@ import {
   createTestnetProbeClients,
 } from "../src/modules/binance/testnet-verifier/testnet-clients";
 import { deriveIdentities } from "../src/modules/binance/testnet-verifier/testnet-identities";
+import { protectionWorkingType, resolveProtectionPolicy } from "../src/modules/execution/protection-policy";
 import { MemoryStateStore } from "../src/modules/binance/testnet-verifier/testnet-state";
 import { formatRunReport } from "../src/modules/binance/testnet-verifier/testnet-report";
 import {
@@ -69,6 +70,12 @@ class FakeExchange {
   unreadableAlgoIds = new Set<string>();
   /** Position reads that cannot be completed at all. */
   positionUnreadable = false;
+  /** Makes the algo readback report closePosition=true (a real contradiction). */
+  closePositionOnAlgoReadback = false;
+  /** Substitutes a contradictory workingType for ONE role on readback. */
+  corruptAlgoWorkingType: { orderType: string; workingType: string } | null = null;
+  /** Substitutes a contradictory triggerPrice into the algo readback. */
+  corruptAlgoTriggerPrice: string | null = null;
   /** Position read fails only AFTER the emergency close. */
   positionUnreadableAfterClose = false;
   private closed = false;
@@ -227,10 +234,19 @@ class FakeExchange {
       positionSide: params.positionSide,
       type: params.type,
       quantity: params.quantity,
-      triggerPrice: params.triggerPrice,
-      workingType: params.workingType,
+      triggerPrice: this.corruptAlgoTriggerPrice ?? params.triggerPrice,
+      workingType:
+        this.corruptAlgoWorkingType && this.corruptAlgoWorkingType.orderType === params.type
+          ? this.corruptAlgoWorkingType.workingType
+          : params.workingType,
       priceProtect: params.priceProtect === "true",
-      closePosition: params.closePosition === "true",
+      closePosition: this.closePositionOnAlgoReadback ? true : params.closePosition === "true",
+      // Binance sets reduceOnly ITSELF on a hedge-mode closing conditional
+      // order and reports it back as true, even though we never send it.
+      // Proven against mainnet order tad-sl-1-ed8fa3f5d4f2. Modelling this
+      // faithfully is what makes the demo verifier able to catch the
+      // Canary #2 class of identity defect.
+      reduceOnly: true,
     });
     return json({ algoId: 500, clientAlgoId: id, symbol: params.symbol, algoStatus: "NEW" });
   }
@@ -292,6 +308,10 @@ const OPTIONS: VerifierOptions = {
   entryCrossBps: 20,
   fillPollAttempts: 3,
   fillPollIntervalMs: 0,
+  // The real production policy: STOP on MARK_PRICE, TAKE_PROFIT on
+  // CONTRACT_PRICE. Resolved through the shared production resolver so the
+  // demo path cannot quietly diverge from mainnet.
+  protectionPolicy: resolveProtectionPolicy({}),
 };
 
 beforeEach(() => {
@@ -608,6 +628,103 @@ describe("mutation flow", () => {
     expect(entry?.params.quantity).toBe("0.002");
     // 50000 + 20bps = 50100, on the 0.10 tick grid.
     expect(entry?.params.price).toBe("50100.0");
+  });
+
+  // -------------------------------------------------------------------------
+  // MAINNET CANARY #2 — the demo verifier must now catch this class of defect.
+  // -------------------------------------------------------------------------
+
+  it("MAINNET CANARY #2: passes end-to-end when Binance reports reduceOnly=true", async () => {
+    // The fake exchange already echoes the mainnet shape (reduceOnly=true on
+    // every algo readback), so a PASS here is a PASS against reality.
+    const report = await runVerification(OPTIONS, buildDeps());
+
+    expect(report.verdict).toBe("PASS");
+    for (const observation of [report.stop, report.takeProfit]) {
+      expect(observation?.reduceOnly).toBe(true);
+      expect(observation?.closePosition).toBe(false);
+      expect(observation?.confirmedActive).toBe(true);
+      expect(observation?.confirmationReason).toMatch(/production identity comparator accepted/);
+    }
+  });
+
+  it("MAINNET CANARY #2 (negative): fails when Binance reports closePosition=true", async () => {
+    exchange.closePositionOnAlgoReadback = true;
+
+    const report = await runVerification(OPTIONS, buildDeps());
+
+    expect(report.verdict).not.toBe("PASS");
+    expect(report.stop?.confirmedActive).toBe(false);
+    expect(report.stop?.confirmationReason).toMatch(/production identity comparator rejected: closePosition/);
+    // STOP-before-TP still holds: an unconfirmed stop never reaches the TP.
+    expect(report.failures.join(" ")).toMatch(/take profit was deliberately not submitted/i);
+  });
+
+  it("fails whenever the production comparator rejects the readback", async () => {
+    // A substituted trigger price is a genuine contradiction and must fail —
+    // proving the verifier is bound to the production rules, not to a copy.
+    exchange.corruptAlgoTriggerPrice = "99999.9";
+
+    const report = await runVerification(OPTIONS, buildDeps());
+
+    expect(report.verdict).not.toBe("PASS");
+    expect(report.stop?.confirmedActive).toBe(false);
+    expect(report.stop?.confirmationReason).toMatch(/triggerPrice/);
+  });
+
+  // -------------------------------------------------------------------------
+  // Production working-type parity.
+  //
+  // Production sends a STOP on EXECUTION_SL_WORKING_TYPE (MARK_PRICE) and a
+  // TAKE_PROFIT on EXECUTION_TP_WORKING_TYPE (CONTRACT_PRICE). The verifier
+  // used to send MARK_PRICE for both, so the demo run never exercised the real
+  // TAKE_PROFIT identity — and `workingType` is a field the production
+  // comparator judges.
+  // -------------------------------------------------------------------------
+
+  it("A/B. submits each role with the PRODUCTION working type for that role", async () => {
+    await runVerification(OPTIONS, buildDeps());
+
+    const posts = algoPosts();
+    const stop = posts.find((call) => call.params.type === "STOP_MARKET");
+    const takeProfit = posts.find((call) => call.params.type === "TAKE_PROFIT_MARKET");
+
+    expect(stop?.params.workingType).toBe(protectionWorkingType("STOP_LOSS", OPTIONS.protectionPolicy));
+    expect(takeProfit?.params.workingType).toBe(protectionWorkingType("TAKE_PROFIT", OPTIONS.protectionPolicy));
+    // With the shipped configuration, concretely:
+    expect(stop?.params.workingType).toBe("MARK_PRICE");
+    expect(takeProfit?.params.workingType).toBe("CONTRACT_PRICE");
+    // The two roles genuinely differ — the old bug was that they did not.
+    expect(stop?.params.workingType).not.toBe(takeProfit?.params.workingType);
+  });
+
+  it("C. hands the same per-role working type to the production comparator", async () => {
+    const report = await runVerification(OPTIONS, buildDeps());
+
+    expect(report.verdict).toBe("PASS");
+    // The comparator accepted, and what it compared is what was submitted.
+    expect(report.stop?.workingType).toBe("MARK_PRICE");
+    expect(report.takeProfit?.workingType).toBe("CONTRACT_PRICE");
+    expect(report.stop?.identityMismatches).toEqual([]);
+    expect(report.takeProfit?.identityMismatches).toEqual([]);
+
+    const submittedTp = algoPosts().find((call) => call.params.type === "TAKE_PROFIT_MARKET");
+    expect(report.takeProfit?.workingType).toBe(submittedTp?.params.workingType);
+  });
+
+  it("D. fails with a workingType mismatch when the TP readback disagrees", async () => {
+    // Binance echoes MARK_PRICE for the take profit while production expects
+    // CONTRACT_PRICE. This must be caught, and only by the production rules.
+    exchange.corruptAlgoWorkingType = { orderType: "TAKE_PROFIT_MARKET", workingType: "MARK_PRICE" };
+
+    const report = await runVerification(OPTIONS, buildDeps());
+
+    expect(report.verdict).not.toBe("PASS");
+    expect(report.takeProfit?.confirmedActive).toBe(false);
+    expect(report.takeProfit?.identityMismatches).toContain("workingType");
+    expect(report.takeProfit?.confirmationReason).toMatch(/production identity comparator rejected: workingType/);
+    // The STOP is unaffected — its own working type still matches.
+    expect(report.stop?.identityMismatches).toEqual([]);
   });
 
   it("submits STOP_MARKET BEFORE TAKE_PROFIT_MARKET", async () => {
@@ -1101,7 +1218,14 @@ describe("crash recovery", () => {
       algoStatus: "NEW",
       orderType: "STOP_MARKET",
       positionSide: "LONG",
+      side: "SELL",
       quantity: "0.002",
+      triggerPrice: "45000.0",
+      workingType: "MARK_PRICE",
+      priceProtect: false,
+      closePosition: false,
+      // Binance sets this itself on hedge-mode closing conditionals.
+      reduceOnly: true,
     });
 
     await runVerification(OPTIONS, buildDeps(storedAt("STOP_SUBMITTED")));
@@ -1132,7 +1256,14 @@ describe("crash recovery", () => {
         algoStatus: "NEW",
         orderType: type,
         positionSide: "LONG",
+        side: "SELL",
         quantity: "0.002",
+        triggerPrice: type === "STOP_MARKET" ? "45000.0" : "55000.0",
+        workingType: "MARK_PRICE",
+        priceProtect: false,
+        closePosition: false,
+        // Binance sets this itself on hedge-mode closing conditionals.
+        reduceOnly: true,
       });
     }
 
@@ -1170,7 +1301,14 @@ describe("crash recovery", () => {
       algoStatus: "NEW",
       orderType: "STOP_MARKET",
       positionSide: "LONG",
+      side: "SELL",
       quantity: "0.002",
+      triggerPrice: "45000.0",
+      workingType: "MARK_PRICE",
+      priceProtect: false,
+      closePosition: false,
+      // Binance sets this itself on hedge-mode closing conditionals.
+      reduceOnly: true,
     });
     // The baseline sees its own live order and its own position.
     exchange.foreignAlgoOpenOrders = 1;

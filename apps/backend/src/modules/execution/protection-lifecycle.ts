@@ -506,10 +506,27 @@ export function findProtectionIdentityMismatches(
   if (observed.priceProtect !== null && observed.priceProtect !== expected.priceProtect) {
     mismatches.push("priceProtect");
   }
-  // The strategy tracks filled quantity explicitly, so neither of these may
-  // ever be true on our protection orders.
+  // The strategy protects an explicit tranche QUANTITY, so closePosition=true
+  // is a real contradiction: it ignores the quantity and closes the entire
+  // position. That check stays.
   if (observed.closePosition === true) mismatches.push("closePosition");
-  if (observed.reduceOnly === true) mismatches.push("reduceOnly");
+
+  // `reduceOnly` is deliberately NOT compared.
+  //
+  // We never send it — it is in FORBIDDEN_PROTECTION_PARAMS, and Binance
+  // documents it as "cannot be sent in Hedge Mode". But the Algo Service sets
+  // it ITSELF on a hedge-mode closing conditional order and reports it back as
+  // true. Mainnet Canary #2 proved this: a live, correct STOP
+  // (tad-sl-1-ed8fa3f5d4f2, DOGSUSDT, SELL/LONG, STOP_MARKET, qty 1595744,
+  // trigger 0.00003425, MARK_PRICE, priceProtect=false, closePosition=false)
+  // matched on every field and was rejected on reduceOnly=true alone. Because
+  // the STOP never verified, submitTranche returned before the take profit,
+  // which was therefore never submitted at all.
+  //
+  // Treating it as a contradiction was also backwards on the merits:
+  // reduceOnly=true is strictly RISK-REDUCING — the order can only shrink the
+  // position, never flip it — and the tranche size is still governed by the
+  // quantity check above.
 
   return mismatches;
 }

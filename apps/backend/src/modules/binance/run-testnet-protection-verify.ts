@@ -6,6 +6,7 @@
 // would not be present at all.
 import "dotenv/config";
 import { resolve } from "node:path";
+import { resolveProtectionPolicy } from "../execution/protection-policy";
 import { createTestnetMutationClients, createTestnetProbeClients } from "./testnet-verifier/testnet-clients";
 import { resolveTestnetConfig } from "./testnet-verifier/testnet-config";
 import { deriveIdentities, generateRunId } from "./testnet-verifier/testnet-identities";
@@ -118,6 +119,15 @@ async function main(): Promise<void> {
     entryCrossBps: numeric("entry-cross-bps") ?? 20,
     fillPollAttempts: numeric("fill-poll-attempts") ?? 10,
     fillPollIntervalMs: numeric("fill-poll-interval-ms") ?? 1_000,
+    // The PRODUCTION protection policy, read from the same environment names
+    // production uses (via the shared pure resolver, not `config/env`). This
+    // is what makes the demo run submit a TAKE_PROFIT with the real
+    // production TP working type instead of a convenient MARK_PRICE.
+    protectionPolicy: resolveProtectionPolicy({
+      EXECUTION_SL_WORKING_TYPE: process.env.EXECUTION_SL_WORKING_TYPE,
+      EXECUTION_TP_WORKING_TYPE: process.env.EXECUTION_TP_WORKING_TYPE,
+      EXECUTION_PROTECTION_PRICE_PROTECT: process.env.EXECUTION_PROTECTION_PRICE_PROTECT,
+    }),
   };
   const log = (line: string) => console.log(`  · ${line}`);
 

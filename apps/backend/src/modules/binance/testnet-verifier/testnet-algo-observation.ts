@@ -24,6 +24,15 @@
  * result separately.
  */
 
+// The PRODUCTION identity comparator — imported, never re-implemented. Phase 20
+// verified demo with its own weaker copy of these rules, which is exactly how
+// Mainnet Canary #2's identity defect escaped. If this import ever disappears,
+// the demo verifier has stopped proving the thing it exists to prove.
+import {
+  findProtectionIdentityMismatches,
+  type ExpectedProtectionIdentity,
+} from "../../execution/protection-lifecycle";
+
 export type IdentityLookup =
   /** The exchange returned this exact identity. */
   | "FOUND"
@@ -58,7 +67,13 @@ export const TERMINAL_ALGO_STATUSES: readonly string[] = [
   "REJECTED",
 ];
 
-/** Sanitized. Field NAMES and normalized values only — never a payload. */
+/**
+ * Sanitized. Field NAMES and normalized values only — never a payload.
+ *
+ * Carries the FULL protection identity, not just the few fields the verifier
+ * once checked for itself, because the whole set is handed to the production
+ * comparator `findProtectionIdentityMismatches`.
+ */
 export interface AlgoIdentityObservation {
   readonly clientAlgoId: string;
   readonly outcome: AlgoIdentityOutcome;
@@ -74,27 +89,45 @@ export interface AlgoIdentityObservation {
   readonly orderType: string | null;
   readonly positionSide: string | null;
   readonly symbol: string | null;
+  // --- the rest of the production identity surface -------------------------
+  readonly side: string | null;
+  readonly quantity: string | null;
+  readonly triggerPrice: string | null;
+  readonly workingType: string | null;
+  readonly priceProtect: boolean | null;
+  readonly closePosition: boolean | null;
+  /**
+   * Reported by Binance on hedge-mode closing conditional orders even though
+   * we never send it. Recorded so the production comparator sees exactly what
+   * the exchange said — this is the field Mainnet Canary #2 turned on.
+   */
+  readonly reduceOnly: boolean | null;
   readonly productionQueryForm: IdentityLookup;
   readonly documentedQueryForm: IdentityLookup;
 }
 
+/** Identity fields either query form may report. */
+export interface AlgoIdentityFields {
+  readonly algoStatus?: string | null;
+  readonly orderType?: string | null;
+  readonly positionSide?: string | null;
+  readonly symbol?: string | null;
+  readonly side?: string | null;
+  readonly quantity?: string | null;
+  readonly triggerPrice?: string | null;
+  readonly workingType?: string | null;
+  readonly priceProtect?: boolean | null;
+  readonly closePosition?: boolean | null;
+  readonly reduceOnly?: boolean | null;
+}
+
 export interface AlgoIdentityInput {
   readonly clientAlgoId: string;
-  readonly production: {
-    readonly lookup: IdentityLookup;
-    readonly algoStatus?: string | null;
-    readonly orderType?: string | null;
-    readonly positionSide?: string | null;
-    readonly symbol?: string | null;
-  };
-  readonly documented: {
+  readonly production: AlgoIdentityFields & { readonly lookup: IdentityLookup };
+  readonly documented: AlgoIdentityFields & {
     readonly lookup: IdentityLookup;
     /** Only whether the key was present — never the payload itself. */
     readonly statusKeyPresent?: boolean;
-    readonly algoStatus?: string | null;
-    readonly orderType?: string | null;
-    readonly positionSide?: string | null;
-    readonly symbol?: string | null;
   };
 }
 
@@ -158,6 +191,13 @@ export function observeAlgoIdentity(input: AlgoIdentityInput): AlgoIdentityObser
     orderType,
     positionSide,
     symbol,
+    side: pick(production.side, documented.side),
+    quantity: pick(production.quantity, documented.quantity),
+    triggerPrice: pick(production.triggerPrice, documented.triggerPrice),
+    workingType: pick(production.workingType, documented.workingType),
+    priceProtect: pick(production.priceProtect, documented.priceProtect),
+    closePosition: pick(production.closePosition, documented.closePosition),
+    reduceOnly: pick(production.reduceOnly, documented.reduceOnly),
     productionQueryForm: production.lookup,
     documentedQueryForm: documented.lookup,
   };
@@ -168,43 +208,74 @@ export function isResolved(observation: AlgoIdentityObservation): boolean {
   return observation.outcome === "ABSENT_CONFIRMED" || observation.outcome === "IDENTITY_FOUND_STATUS_TERMINAL";
 }
 
-export interface ProtectionExpectation {
-  readonly symbol: string;
-  readonly positionSide: "LONG" | "SHORT";
-  readonly orderType: "STOP_MARKET" | "TAKE_PROFIT_MARKET";
-}
+/**
+ * The FULL identity the verifier submitted, in the exact shape the production
+ * comparator consumes. It is `ExpectedProtectionIdentity` minus `clientAlgoId`,
+ * which the observation already carries.
+ */
+export type ProtectionExpectation = Omit<ExpectedProtectionIdentity, "clientAlgoId">;
 
 export interface ConfirmationResult {
   readonly confirmed: boolean;
   readonly reason: string;
+  /** Fields the PRODUCTION comparator rejected. Empty on a pass. */
+  readonly identityMismatches: readonly string[];
 }
 
 /**
- * Confirms that an owned protection order is genuinely LIVE.
+ * Confirms that an owned protection order is genuinely LIVE **and** that the
+ * production identity rules accept it.
  *
- * A matching `clientAlgoId` alone is NOT confirmation — that was the flaw the
- * first demo run exposed. Every field the exchange documents for this response
- * must agree with what we asked for, and the status must be a recognised
- * ACTIVE value. Anything else fails safe: the caller re-queries boundedly and,
- * if still unresolved, stops. It never resubmits and never proceeds to the
- * take profit.
+ * WHY THIS DELEGATES.
+ *
+ * This function used to check symbol / positionSide / orderType itself. That
+ * was a SECOND, weaker identity implementation living beside the real one, and
+ * it is precisely why Phase 20 demo verification passed while Mainnet Canary
+ * #2 failed: demo never exercised `findProtectionIdentityMismatches`, so it
+ * never saw that the production comparator rejected a valid hedge-mode STOP
+ * carrying `reduceOnly=true`.
+ *
+ * There is now ONE source of truth. Identity is decided entirely by the
+ * production comparator; this function contributes only the thing the
+ * comparator deliberately does not judge — whether the order is ACTIVE.
  */
 export function confirmActiveProtection(
   observation: AlgoIdentityObservation,
   expected: ProtectionExpectation
 ): ConfirmationResult {
   if (observation.outcome !== "IDENTITY_FOUND_STATUS_ACTIVE") {
-    return { confirmed: false, reason: `status outcome is ${observation.outcome}` };
+    return { confirmed: false, reason: `status outcome is ${observation.outcome}`, identityMismatches: [] };
   }
-  if (observation.symbol !== null && observation.symbol.toUpperCase() !== expected.symbol.toUpperCase()) {
-    return { confirmed: false, reason: `symbol ${observation.symbol} does not match ${expected.symbol}` };
+
+  // The production comparator, unmodified, on the real exchange response.
+  const identityMismatches = findProtectionIdentityMismatches(
+    { ...expected, clientAlgoId: observation.clientAlgoId },
+    {
+      clientAlgoId: observation.clientAlgoId,
+      symbol: observation.symbol,
+      orderType: observation.orderType,
+      side: observation.side,
+      positionSide: observation.positionSide,
+      quantity: observation.quantity,
+      triggerPrice: observation.triggerPrice,
+      workingType: observation.workingType,
+      priceProtect: observation.priceProtect,
+      closePosition: observation.closePosition,
+      reduceOnly: observation.reduceOnly,
+    }
+  );
+
+  if (identityMismatches.length > 0) {
+    return {
+      confirmed: false,
+      reason: `production identity comparator rejected: ${identityMismatches.join(", ")}`,
+      identityMismatches,
+    };
   }
-  if (observation.symbol === null) return { confirmed: false, reason: "the reply carried no symbol" };
-  if (observation.positionSide !== expected.positionSide) {
-    return { confirmed: false, reason: `positionSide ${observation.positionSide ?? "—"} is not ${expected.positionSide}` };
-  }
-  if (observation.orderType !== expected.orderType) {
-    return { confirmed: false, reason: `orderType ${observation.orderType ?? "—"} is not ${expected.orderType}` };
-  }
-  return { confirmed: true, reason: `active as ${observation.normalizedStatus}` };
+
+  return {
+    confirmed: true,
+    reason: `active as ${observation.normalizedStatus}; production identity comparator accepted`,
+    identityMismatches: [],
+  };
 }

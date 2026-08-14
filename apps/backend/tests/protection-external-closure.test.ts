@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { classifyMutationOutcome, type MutationOperation } from "../src/modules/execution/entry-lifecycle";
 const BACKEND = process.cwd();
-import { classifyBinanceFailure } from "../src/modules/binance/binance.errors";
+import { BinanceError, classifyBinanceFailure } from "../src/modules/binance/binance.errors";
 import {
   CAPACITY_FREE_STATUSES,
   OPEN_POSITION_STATUSES,
@@ -94,6 +94,45 @@ describe("mutation failure classification", () => {
     expect(classifyMutationOutcome({ kind: "AUTH", httpStatus: 401, binanceCode: null })).not.toBe(
       "NOT_FOUND_CONFIRMED"
     );
+  });
+
+  it("labels -2013 and -2011 as ORDER_NOT_FOUND, not MALFORMED_RESPONSE", () => {
+    // Mainnet Canary #2 logged `binanceKind: MALFORMED_RESPONSE` alongside
+    // `outcome: NOT_FOUND_CONFIRMED` for a perfectly well-formed -2013 answer.
+    // The behaviour was right and the label was wrong, and the wrong label
+    // actively misdirected the investigation.
+    expect(classifyBinanceFailure(400, -2013, "Order does not exist.")).toBe("ORDER_NOT_FOUND");
+    expect(classifyBinanceFailure(400, -2011, "Unknown order sent.")).toBe("ORDER_NOT_FOUND");
+    // An unknown 4xx is still genuinely unreadable.
+    expect(classifyBinanceFailure(400, -9999, "something new")).toBe("MALFORMED_RESPONSE");
+  });
+
+  it("keeps the ORDER_NOT_FOUND label free of absence semantics", () => {
+    // The label must not decide absence — the per-operation table does.
+    const failure = (operation: MutationOperation) =>
+      classifyMutationOutcome(
+        { kind: classifyBinanceFailure(400, -2013, "x"), httpStatus: 400, binanceCode: -2013 },
+        operation
+      );
+    expect(failure("QUERY")).toBe("NOT_FOUND_CONFIRMED");
+    expect(failure("CANCEL")).toBe("NOT_FOUND_CONFIRMED");
+    // A submission asking to CREATE something learns nothing from -2013.
+    for (const operation of ["SUBMIT_ORDER", "SUBMIT_ALGO", "SUBMIT_CONFIG"] as const) {
+      expect(`${operation}:${failure(operation)}`).toBe(`${operation}:RESULT_UNKNOWN`);
+    }
+    // -2011 stays cancel-only, exactly as before the relabel.
+    const cancelRejected = (operation: MutationOperation) =>
+      classifyMutationOutcome(
+        { kind: classifyBinanceFailure(400, -2011, "x"), httpStatus: 400, binanceCode: -2011 },
+        operation
+      );
+    expect(cancelRejected("CANCEL")).toBe("NOT_FOUND_CONFIRMED");
+    expect(cancelRejected("QUERY")).toBe("RESULT_UNKNOWN");
+  });
+
+  it("does not make ORDER_NOT_FOUND retryable", () => {
+    // MALFORMED_RESPONSE was never retryable; the relabel must not change that.
+    expect(new BinanceError({ kind: "ORDER_NOT_FOUND", message: "x" }).retryable).toBe(false);
   });
 
   it("proves QUERY absence only from -2013 (NO_SUCH_ORDER)", () => {

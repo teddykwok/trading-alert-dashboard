@@ -24,6 +24,7 @@ import {
   type MutationOutcome,
 } from "./entry-lifecycle";
 import { buildClientOrderId } from "./execution-safety";
+import { protectionWorkingType, type ProtectionPolicy } from "./protection-policy";
 import {
   calculateCoverage,
   classifyPostCleanupPosition,
@@ -711,9 +712,16 @@ export class ProtectionLifecycleService {
     }
 
     const generation = (await this.highestGeneration(execution.id)) + 1;
-    const workingTypeStop = env.EXECUTION_SL_WORKING_TYPE;
-    const workingTypeTakeProfit = env.EXECUTION_TP_WORKING_TYPE;
-    const priceProtect = env.EXECUTION_PROTECTION_PRICE_PROTECT;
+    // The role -> workingType rule lives in ONE place, shared with the demo
+    // verifier so the two cannot disagree about what a TAKE_PROFIT sends.
+    const policy: ProtectionPolicy = {
+      stopWorkingType: env.EXECUTION_SL_WORKING_TYPE,
+      takeProfitWorkingType: env.EXECUTION_TP_WORKING_TYPE,
+      priceProtect: env.EXECUTION_PROTECTION_PRICE_PROTECT,
+    };
+    const workingTypeStop = protectionWorkingType("STOP_LOSS", policy);
+    const workingTypeTakeProfit = protectionWorkingType("TAKE_PROFIT", policy);
+    const priceProtect = policy.priceProtect;
 
     const committed = await this.prisma.$transaction(async (tx) => {
       // Serialize per (profile, symbol, positionSide) so two concurrent
@@ -748,7 +756,7 @@ export class ProtectionLifecycleService {
             originalQuantity: new D(missingQuantity),
             triggerPrice: new D(trigger),
             // Frozen into the intent so a retry cannot silently change policy.
-            workingType: role === "STOP_LOSS" ? workingTypeStop : workingTypeTakeProfit,
+            workingType: protectionWorkingType(role, policy),
             priceProtect,
             status: "SUBMITTING",
           },

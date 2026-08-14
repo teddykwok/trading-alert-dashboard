@@ -7,10 +7,12 @@ import {
   confirmActiveProtection,
   isResolved,
   observeAlgoIdentity,
+  type AlgoIdentityFields,
   type AlgoIdentityObservation,
   type IdentityLookup,
   type ProtectionExpectation,
 } from "./testnet-algo-observation";
+import { protectionWorkingType, type ProtectionPolicy } from "../../execution/protection-policy";
 import { BINANCE_TESTNET_ORIGIN } from "./testnet-config";
 import type { DocumentedFormClient } from "./testnet-documented-form";
 import { TESTNET_VERIFIER_VERSION, deriveIdentities, ownsIdentity, type VerifierIdentities } from "./testnet-identities";
@@ -89,6 +91,15 @@ export interface VerifierOptions {
   /** Bounded poll for a definitive entry outcome. Never a blind resubmit. */
   readonly fillPollAttempts: number;
   readonly fillPollIntervalMs: number;
+  /**
+   * The PRODUCTION protection policy, resolved from the same environment
+   * names production uses. The verifier must submit a TAKE_PROFIT with the
+   * production TP working type (CONTRACT_PRICE by default), not a convenient
+   * MARK_PRICE for both — `workingType` is a field the production identity
+   * comparator judges, so submitting the wrong one means the demo run never
+   * exercises the real TAKE_PROFIT identity.
+   */
+  readonly protectionPolicy: ProtectionPolicy;
 }
 
 /** Read-only capability set. A probe run is given nothing more than this. */
@@ -133,6 +144,7 @@ function entryResolved(state: OwnedEntryState): boolean {
 }
 
 const LONG = "LONG" as const;
+
 const PLAIN_DECIMAL = /^\d+(\.\d+)?$/;
 const NO_SUCH_ORDER = -2013;
 
@@ -236,7 +248,7 @@ async function observeAlgoBothForms(
   symbol: string,
   clientAlgoId: string
 ): Promise<AlgoIdentityObservation> {
-  let production: { lookup: IdentityLookup; algoStatus?: string | null; orderType?: string | null; positionSide?: string | null; symbol?: string | null };
+  let production: AlgoIdentityFields & { lookup: IdentityLookup };
   try {
     const order = await deps.readOnly.queryAlgoOrderByClientAlgoId(symbol, clientAlgoId);
     production =
@@ -247,6 +259,15 @@ async function observeAlgoBothForms(
             orderType: order.orderType,
             positionSide: order.positionSide,
             symbol: order.symbol,
+            // The full identity surface, so the PRODUCTION comparator judges
+            // exactly what the exchange returned.
+            side: order.side,
+            quantity: order.quantity,
+            triggerPrice: order.triggerPrice,
+            workingType: order.workingType,
+            priceProtect: order.priceProtect,
+            closePosition: order.closePosition,
+            reduceOnly: order.reduceOnly,
           }
         : // A reply about a DIFFERENT identity establishes nothing about ours.
           { lookup: "UNKNOWN" };
@@ -256,16 +277,10 @@ async function observeAlgoBothForms(
   }
 
   const reply = await deps.documented.queryByClientAlgoId(clientAlgoId);
-  let documented: {
-    lookup: IdentityLookup;
-    statusKeyPresent?: boolean;
-    algoStatus?: string | null;
-    orderType?: string | null;
-    positionSide?: string | null;
-    symbol?: string | null;
-  };
+  let documented: AlgoIdentityFields & { lookup: IdentityLookup; statusKeyPresent?: boolean };
   if (reply.outcome === "ACCEPTED" && reply.payload && textField(reply.payload.clientAlgoId) === clientAlgoId) {
     const payload = reply.payload;
+    const flag = (value: unknown): boolean | null => (typeof value === "boolean" ? value : null);
     documented = {
       lookup: "FOUND",
       // The one place the RAW key presence is visible: this path keeps the
@@ -275,6 +290,13 @@ async function observeAlgoBothForms(
       orderType: textField(payload.orderType) ?? textField(payload.type),
       positionSide: textField(payload.positionSide),
       symbol: textField(payload.symbol),
+      side: textField(payload.side),
+      quantity: textField(payload.quantity) ?? textField(payload.origQty),
+      triggerPrice: textField(payload.triggerPrice) ?? textField(payload.stopPrice),
+      workingType: textField(payload.workingType),
+      priceProtect: flag(payload.priceProtect),
+      closePosition: flag(payload.closePosition),
+      reduceOnly: flag(payload.reduceOnly),
     };
   } else if (reply.outcome === "REJECTED" && reply.binanceCode === NO_SUCH_ORDER) {
     documented = { lookup: "CONFIRMED_ABSENT" };
@@ -392,9 +414,18 @@ export interface OrderObservation {
   readonly orderType: string | null;
   readonly positionSide: string | null;
   readonly symbol: string | null;
+  readonly side: string | null;
+  readonly quantity: string | null;
+  readonly triggerPrice: string | null;
+  readonly workingType: string | null;
+  readonly priceProtect: boolean | null;
+  readonly closePosition: boolean | null;
+  readonly reduceOnly: boolean | null;
   readonly productionQueryForm: IdentityLookup;
   readonly documentedQueryForm: IdentityLookup;
   readonly confirmedActive: boolean;
+  /** Fields the PRODUCTION comparator rejected. Empty when it accepted. */
+  readonly identityMismatches: readonly string[];
   readonly confirmationReason: string;
 }
 
@@ -424,9 +455,17 @@ function toOrderObservation(
     orderType: observation.orderType,
     positionSide: observation.positionSide,
     symbol: observation.symbol,
+    side: observation.side,
+    quantity: observation.quantity,
+    triggerPrice: observation.triggerPrice,
+    workingType: observation.workingType,
+    priceProtect: observation.priceProtect,
+    closePosition: observation.closePosition,
+    reduceOnly: observation.reduceOnly,
     productionQueryForm: observation.productionQueryForm,
     documentedQueryForm: observation.documentedQueryForm,
     confirmedActive: confirmation.confirmed,
+    identityMismatches: confirmation.identityMismatches,
     confirmationReason: confirmation.reason,
   };
 }
@@ -795,10 +834,17 @@ export async function runVerification(options: VerifierOptions, deps: VerifierDe
     ) {
       deps.log(`Run ${stored.state.runId}: every owned identity is resolved and the position is flat.`);
       deps.state.clear();
+      // A recovery run submitted nothing this pass, so the expectation is
+      // reconstructed from the persisted state's own resolved identity.
       const expectation = (orderType: ProtectionExpectation["orderType"]): ProtectionExpectation => ({
         symbol,
         positionSide: LONG,
         orderType,
+        side: "SELL",
+        quantity: observed.longPosition.status === "OPEN" ? observed.longPosition.quantity : "0",
+        triggerPrice: "0",
+        workingType: protectionWorkingType(orderType === "STOP_MARKET" ? "STOP_LOSS" : "TAKE_PROFIT", options.protectionPolicy),
+        priceProtect: options.protectionPolicy.priceProtect,
       });
       return {
         ...bail(shell, "RECOVERY_COMPLETE", [], false),
@@ -1007,10 +1053,23 @@ async function runFlow(
     });
   }
 
+  // The FULL identity this run submitted, handed verbatim to the production
+  // comparator. Anything less would be a second, weaker identity check.
   const expectation = (orderType: ProtectionExpectation["orderType"]): ProtectionExpectation => ({
     symbol,
     positionSide: LONG,
     orderType,
+    side: "SELL", // closing side for a LONG
+    quantity: actualQuantity,
+    triggerPrice:
+      orderType === "STOP_MARKET" ? triggers.value.stopTriggerPrice : triggers.value.takeProfitTriggerPrice,
+    // Role-specific, from the PRODUCTION policy: a STOP submits the production
+    // stop working type and a TAKE_PROFIT the production TP working type.
+    workingType: protectionWorkingType(
+      orderType === "STOP_MARKET" ? "STOP_LOSS" : "TAKE_PROFIT",
+      options.protectionPolicy
+    ),
+    priceProtect: options.protectionPolicy.priceProtect,
   });
 
   // ---- STOP FIRST --------------------------------------------------------
@@ -1033,6 +1092,7 @@ async function runFlow(
       clientAlgoId: deps.identities.stopClientAlgoId,
       quantity: actualQuantity,
       triggerPrice: triggers.value.stopTriggerPrice,
+      policy: options.protectionPolicy,
     });
     stopAttempted = result.attempted;
     advance("STOP_SUBMITTED");
@@ -1083,6 +1143,7 @@ async function runFlow(
       clientAlgoId: deps.identities.takeProfitClientAlgoId,
       quantity: actualQuantity,
       triggerPrice: triggers.value.takeProfitTriggerPrice,
+      policy: options.protectionPolicy,
     });
     tpAttempted = result.attempted;
     advance("TP_SUBMITTED");
@@ -1192,6 +1253,7 @@ async function submitProtection(
     clientAlgoId: string;
     quantity: string;
     triggerPrice: string;
+    policy: ProtectionPolicy;
   }
 ): Promise<{ attempted: boolean; present: boolean }> {
   const context = deps.mutations.authorizeProtectionSubmission({
@@ -1204,8 +1266,9 @@ async function submitProtection(
     positionSide: LONG,
     quantity: input.quantity,
     triggerPrice: input.triggerPrice,
-    workingType: "MARK_PRICE",
-    priceProtect: false,
+    // The SAME resolver production uses, keyed by this submission's role.
+    workingType: protectionWorkingType(input.role, input.policy),
+    priceProtect: input.policy.priceProtect,
   });
 
   try {
