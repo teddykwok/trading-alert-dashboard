@@ -97,6 +97,26 @@ export interface ProtectionOutcome {
   mutationsDispatched: number;
 }
 
+/**
+ * Aggregate protection coverage, WITH the confidence of the observation.
+ *
+ * `stop` / `takeProfit` are the quantities proven active. `unresolved` names
+ * the roles whose exchange state could be proven neither present nor absent —
+ * the distinction that separates "there is a real gap to repair" from "we
+ * could not look". Only the former may drive a mutation.
+ */
+interface VerifiedCoverage {
+  stop: string;
+  takeProfit: string;
+  unresolved: ReadonlyArray<"STOP_LOSS" | "TAKE_PROFIT">;
+}
+
+/**
+ * Local order statuses that already settle the question: whatever the exchange
+ * says now, an order in one of these cannot be providing live coverage.
+ */
+const LOCALLY_RESOLVED_ORDER_STATUSES: readonly string[] = ["FILLED", "CANCELED", "EXPIRED", "REJECTED"];
+
 interface PositionSnapshot {
   quantity: string;
   entryPrice: string | null;
@@ -639,6 +659,43 @@ export class ProtectionLifecycleService {
 
     // Resolve any half-finished tranche before creating a new one.
     const pending = await this.findIncompleteTranche(execution);
+
+    // FAIL CLOSED ON AN UNRESOLVED OBSERVATION.
+    //
+    // Reaching here means coverage looks short. But a leg whose exchange state
+    // could not be read contributes zero, so "short" may simply mean "we could
+    // not look". Minting a REPLACEMENT generation on that evidence submits a
+    // fresh STOP *and* TAKE_PROFIT under new ids — the tranche model always
+    // reserves the pair — while the originals may still be live on Binance.
+    //
+    // So a new generation requires the gap to be PROVEN: every leg either
+    // observed active or conclusively absent. Resuming an already-reserved
+    // tranche (`pending`) is deliberately still allowed: it re-uses the same
+    // deterministic clientAlgoId and mints no new identity.
+    //
+    // This defers rather than escalates: nothing is known to be wrong, only
+    // unreadable, and the next tick asks again. The protection row is left
+    // untouched so repeated unreadable ticks cause no state churn.
+    if (pending === null && coverage.missingQuantity !== "0" && coverageNow.unresolved.length > 0) {
+      const reasonCode: ProtectionReasonCode = coverageNow.unresolved.includes("STOP_LOSS")
+        ? "STOP_QUERY_UNAVAILABLE"
+        : "TAKE_PROFIT_QUERY_UNAVAILABLE";
+      const message =
+        `Protection state is unreadable for ${coverageNow.unresolved.join(" and ")}; ` +
+        "refusing to reserve a replacement tranche until the exchange state is known.";
+      logger.warn(
+        {
+          executionId: execution.id,
+          unresolved: coverageNow.unresolved,
+          measuredStop: coverageNow.stop,
+          measuredTakeProfit: coverageNow.takeProfit,
+          confirmedOpenQuantity: openQuantity,
+        },
+        "Protection coverage could not be resolved; deferring repair"
+      );
+      return this.outcome(false, reasonCode, message, execution, await this.loadProtection(execution.id));
+    }
+
     const generation = pending ?? (await this.reserveNextTranche(execution, coverage.missingQuantity, position, input));
 
     if (typeof generation === "object") return generation; // a failure outcome
@@ -1132,23 +1189,50 @@ export class ProtectionLifecycleService {
    * Aggregate VERIFIED coverage, proven against the exchange rather than local
    * rows alone.
    */
-  private async measureVerifiedCoverage(execution: TradeExecution): Promise<{ stop: string; takeProfit: string }> {
+  private async measureVerifiedCoverage(execution: TradeExecution): Promise<VerifiedCoverage> {
     const orders = await this.loadProtectionOrders(execution.id);
     let stop = new D(0);
     let takeProfit = new D(0);
+    const unresolved = new Set<"STOP_LOSS" | "TAKE_PROFIT">();
 
     for (const order of orders) {
-      const query = await this.queryProtection(execution.symbol, order.clientAlgoId!);
-      if (query.outcome !== "CONFIRMED_ACCEPTED" || !query.order) continue;
-      const status = normalizeAlgoStatus(query.order.algoStatus);
-      if (!countsAsActiveCoverage(status)) continue;
+      const role = order.role as "STOP_LOSS" | "TAKE_PROFIT";
 
-      const quantity = new D(query.order.quantity ?? order.originalQuantity.toString());
-      if (order.role === "STOP_LOSS") stop = stop.plus(quantity);
-      else takeProfit = takeProfit.plus(quantity);
+      // An order we already know is finished cannot be contributing coverage,
+      // so an unreadable query about it establishes nothing new. Skipping it
+      // here is what stops a long-dead generation 1 from blocking the health
+      // path forever once a generation 2 has replaced it.
+      if (LOCALLY_RESOLVED_ORDER_STATUSES.includes(order.status)) continue;
+
+      const query = await this.queryProtection(execution.symbol, order.clientAlgoId!);
+
+      // THE ABSENT-VS-UNKNOWN BOUNDARY.
+      //
+      // Only two answers are conclusive: the exchange returned the order, or
+      // it PROVED the exact id does not exist (-2013). Everything else — a
+      // timeout, a 5xx, a rate limit, an auth failure, an unparseable body —
+      // means we could not determine the state at all.
+      //
+      // This used to `continue` on all of them alike, so an unreadable leg was
+      // counted as ZERO coverage and was indistinguishable from a confirmed
+      // absent one. The lifecycle then saw a gap and minted a REPLACEMENT
+      // generation, submitting a duplicate STOP and TAKE_PROFIT while the
+      // originals may well have still been live on Binance.
+      if (query.outcome === "CONFIRMED_ACCEPTED" && query.order) {
+        const status = normalizeAlgoStatus(query.order.algoStatus);
+        if (!countsAsActiveCoverage(status)) continue; // proven inactive
+        const quantity = new D(query.order.quantity ?? order.originalQuantity.toString());
+        if (role === "STOP_LOSS") stop = stop.plus(quantity);
+        else takeProfit = takeProfit.plus(quantity);
+        continue;
+      }
+
+      if (query.outcome === "NOT_FOUND_CONFIRMED") continue; // proven absent
+
+      unresolved.add(role);
     }
 
-    return { stop: stop.toString(), takeProfit: takeProfit.toString() };
+    return { stop: stop.toString(), takeProfit: takeProfit.toString(), unresolved: [...unresolved] };
   }
 
   // ==========================================================================
