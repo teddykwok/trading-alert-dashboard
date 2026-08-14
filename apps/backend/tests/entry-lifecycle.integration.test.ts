@@ -1276,6 +1276,285 @@ describe("submission and reconciliation", () => {
   });
 });
 
+// ===========================================================================
+// STATE-MACHINE ENFORCEMENT IN RECONCILIATION.
+//
+// `mapOrderToExecutionStatus` answers "what is the ORDER". Its answer used to
+// be written to TradeExecution.status directly, pinned only on `version`, with
+// no canTransition check anywhere in the path — so an execution still in
+// ENTRY_SUBMITTING whose order came back CANCELED with a zero fill was written
+// straight to ENTRY_EXPIRED (or to CANCELED for an operator cancellation).
+// Both are edges the graph deliberately omits: once submission is attempted an
+// order may exist, so the lifecycle must not casually terminalize.
+//
+// These prove the illegal target is never persisted, that the replacement is a
+// legal edge, and that the observation itself is still recorded.
+// ===========================================================================
+
+describe("reconciliation cannot persist an illegal transition", () => {
+  const eventsOf = async (id: string) =>
+    prisma!.executionEvent.findMany({ where: { tradeExecutionId: id }, orderBy: { sequenceNumber: "asc" } });
+
+  /** An execution whose submission never resolved: ENTRY_SUBMITTING, order reserved. */
+  const stuckSubmitting = async () => {
+    const execution = await admittedExecution();
+    scenario.failSubmitWith = timeoutError("newOrder");
+    scenario.submitLandsWithStatus = "NEW";
+    // Call 1 is the pre-submission look-ahead; call 2 is the reconciliation.
+    scenario.failQueryWith = new BinanceError({ kind: "RATE_LIMIT", message: "Too many requests", endpoint: "order" });
+    scenario.failQueryFromCall = 2;
+
+    await entries.prepareEntrySubmission({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    scenario.failQueryWith = null;
+    const current = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    expect(current.status).toBe("ENTRY_SUBMITTING");
+    return current;
+  };
+
+  maybe()("1. parks ENTRY_SUBMITTING instead of writing ENTRY_EXPIRED on a confirmed zero-fill cancel", async () => {
+    const execution = await admittedExecution();
+    scenario.failSubmitWith = timeoutError("newOrder");
+    // The order reached the book and was then cancelled before our first read.
+    scenario.submitLandsWithStatus = "CANCELED";
+    scenario.submitLandsExecutedQty = "0";
+
+    const outcome = await entries.prepareEntrySubmission({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    const reloaded = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    // The mapped target was ENTRY_EXPIRED — terminal, and illegal from here.
+    expect(reloaded.status).toBe("MANUAL_INTERVENTION");
+    expect(reloaded.requiresManualIntervention).toBe(true);
+    expect(reloaded.decisionReasonCode).toBe("MANUAL_REVIEW_REQUIRED");
+    expect(outcome.ok).toBe(false);
+
+    const events = await eventsOf(execution.id);
+    // No event anywhere claims the refused transition.
+    expect(events.some((event) => event.toStatus === "ENTRY_EXPIRED")).toBe(false);
+    const last = events.at(-1)!;
+    expect(last.eventType).toBe("MANUAL_INTERVENTION_REQUIRED");
+    expect(last.fromStatus).toBe("ENTRY_SUBMITTING");
+    expect(last.toStatus).toBe("MANUAL_INTERVENTION");
+    // The refusal is auditable rather than silent.
+    expect((last.metadata as Record<string, unknown>).mappedExecutionStatus).toBe("ENTRY_EXPIRED");
+    expect((last.metadata as Record<string, unknown>).refusedStatus).toBe("ENTRY_EXPIRED");
+
+    // The observation was still persisted — a refused status never discards evidence.
+    const order = await prisma!.binanceOrder.findFirstOrThrow({ where: { tradeExecutionId: execution.id } });
+    expect(order.status).toBe("CANCELED");
+  });
+
+  maybe()("2. parks ENTRY_SUBMITTING instead of writing CANCELED on an operator cancellation", async () => {
+    const execution = await stuckSubmitting();
+    scenario.order!.status = "CANCELED";
+    scenario.order!.executedQty = "0";
+
+    // The only caller-suppliable route to a CANCELED mapping.
+    await entries.reconcileEntryOrder(
+      { executionId: execution.id, expectedVersion: execution.version, evaluatedAt: at() },
+      "OPERATOR"
+    );
+
+    const reloaded = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    expect(reloaded.status).toBe("MANUAL_INTERVENTION");
+    expect(reloaded.version).toBe(execution.version + 1);
+    const events = await eventsOf(execution.id);
+    expect(events.some((event) => event.toStatus === "CANCELED")).toBe(false);
+    expect((events.at(-1)!.metadata as Record<string, unknown>).refusedStatus).toBe("CANCELED");
+  });
+
+  maybe()("3. parks ENTRY_SUBMITTING instead of writing ENTRY_EXPIRED at TTL", async () => {
+    const execution = await stuckSubmitting();
+    const order = await prisma!.binanceOrder.findFirstOrThrow({ where: { tradeExecutionId: execution.id } });
+
+    // The realistic production route: TTL is due while the submission never
+    // resolved, so the remainder is cancelled and reconciled with cause TTL.
+    await entries.expireEntryOrderIfDue({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: order.entryOrderExpiresAt!,
+    });
+
+    const reloaded = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    expect(reloaded.status).toBe("MANUAL_INTERVENTION");
+    const events = await eventsOf(execution.id);
+    expect(events.some((event) => event.toStatus === "ENTRY_EXPIRED")).toBe(false);
+  });
+
+  maybe()("4. every replacement transition is one the state machine allows", async () => {
+    const { canTransition } = await import("../src/modules/execution/execution-status");
+    const execution = await stuckSubmitting();
+    scenario.order!.status = "CANCELED";
+
+    await entries.reconcileEntryOrder({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    const events = await eventsOf(execution.id);
+    for (const event of events) {
+      if (!event.fromStatus || !event.toStatus || event.fromStatus === event.toStatus) continue;
+      expect(
+        canTransition(event.fromStatus as never, event.toStatus as never).allowed,
+        `${event.fromStatus} -> ${event.toStatus}`
+      ).toBe(true);
+    }
+  });
+
+  maybe()("5. a legal ENTRY_SUBMITTING mapping is untouched", async () => {
+    const execution = await stuckSubmitting();
+    scenario.order!.status = "PARTIALLY_FILLED";
+    scenario.order!.executedQty = "0.125";
+    scenario.order!.avgPrice = "99.98";
+
+    const outcome = await entries.reconcileEntryOrder({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.ok).toBe(true);
+    const reloaded = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    expect(reloaded.status).toBe("PARTIALLY_FILLED");
+    expect(reloaded.filledQuantity?.toString()).toBe("0.125");
+    const last = (await eventsOf(execution.id)).at(-1)!;
+    expect(last.eventType).toBe("ENTRY_RECONCILED");
+    expect((last.metadata as Record<string, unknown>).refusedStatus).toBeNull();
+  });
+
+  maybe()("6. PARTIALLY_FILLED keeps its fill and never regresses to a zero-fill terminal", async () => {
+    const execution = await admittedExecution();
+    await entries.prepareEntrySubmission({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+    scenario.order!.status = "PARTIALLY_FILLED";
+    scenario.order!.executedQty = "0.125";
+    scenario.order!.avgPrice = "99.98";
+    let current = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    await entries.reconcileEntryOrder({
+      executionId: execution.id,
+      expectedVersion: current.version,
+      evaluatedAt: at(),
+    });
+    expect((await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } })).status).toBe(
+      "PARTIALLY_FILLED"
+    );
+
+    // The remainder is cancelled and the exchange now reports a zero fill.
+    scenario.order!.status = "CANCELED";
+    scenario.order!.executedQty = "0";
+    current = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    await entries.reconcileEntryOrder({
+      executionId: execution.id,
+      expectedVersion: current.version,
+      evaluatedAt: at(),
+    });
+
+    const reloaded = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    // mergeFillProgress preserves the fill, so the mapping still sees exposure.
+    expect(reloaded.status).toBe("MANUAL_INTERVENTION");
+    expect(reloaded.filledQuantity?.toString()).toBe("0.125");
+    const order = await prisma!.binanceOrder.findFirstOrThrow({ where: { tradeExecutionId: execution.id } });
+    expect(order.executedQuantity.toString()).toBe("0.125");
+    // This one was a LEGAL edge, not a refusal.
+    expect((await eventsOf(execution.id)).at(-1)!.eventType).toBe("ENTRY_RECONCILED");
+  });
+
+  maybe()("7. a parked execution observes the exchange but never un-parks itself", async () => {
+    const { execution } = await (async () => {
+      const created = await admittedExecution();
+      await entries.prepareEntrySubmission({
+        executionId: created.id,
+        expectedVersion: created.version,
+        evaluatedAt: at(),
+      });
+      return { execution: created };
+    })();
+
+    // Park it through a real production path: a contradictory order identity.
+    scenario.order!.side = "SELL";
+    let current = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    await entries.reconcileEntryOrder({
+      executionId: execution.id,
+      expectedVersion: current.version,
+      evaluatedAt: at(),
+    });
+    expect((await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } })).status).toBe(
+      "MANUAL_INTERVENTION"
+    );
+
+    // The identity now matches and the order is fully filled.
+    scenario.order!.side = "BUY";
+    scenario.order!.status = "FILLED";
+    scenario.order!.executedQty = "0.375";
+    scenario.order!.avgPrice = "100";
+    current = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    await entries.reconcileEntryOrder({
+      executionId: execution.id,
+      expectedVersion: current.version,
+      evaluatedAt: at(),
+    });
+
+    const reloaded = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    // ENTRY_FILLED is not a legal exit from MANUAL_INTERVENTION.
+    expect(reloaded.status).toBe("MANUAL_INTERVENTION");
+    // The fill was still recorded, so a human sees the real exposure.
+    expect(reloaded.filledQuantity?.toString()).toBe("0.375");
+    const last = (await eventsOf(execution.id)).at(-1)!;
+    expect(last.fromStatus).toBe("MANUAL_INTERVENTION");
+    expect(last.toStatus).toBe("MANUAL_INTERVENTION");
+    expect((last.metadata as Record<string, unknown>).refusedStatus).toBe("ENTRY_FILLED");
+  });
+
+  maybe()("8. a stale version writes nothing and appends no event on the refusal path", async () => {
+    const execution = await stuckSubmitting();
+    scenario.order!.status = "CANCELED";
+    const before = await eventsOf(execution.id);
+
+    const outcome = await entries.reconcileEntryOrder({
+      executionId: execution.id,
+      expectedVersion: execution.version - 1, // deliberately stale
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.reasonCode).toBe("CAPACITY_OR_VERSION_CONFLICT");
+    const reloaded = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    expect(reloaded.status).toBe("ENTRY_SUBMITTING");
+    expect(reloaded.version).toBe(execution.version);
+    expect(await eventsOf(execution.id)).toHaveLength(before.length);
+  });
+
+  maybe()("9. repeated reconciliation converges and never reaches the refused status", async () => {
+    const execution = await stuckSubmitting();
+    scenario.order!.status = "CANCELED";
+
+    for (let round = 0; round < 3; round += 1) {
+      const current = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+      await entries.reconcileEntryOrder({
+        executionId: execution.id,
+        expectedVersion: current.version,
+        evaluatedAt: at(round),
+      });
+      const after = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+      expect(after.status, `round ${round}`).toBe("MANUAL_INTERVENTION");
+    }
+
+    const events = await eventsOf(execution.id);
+    expect(events.some((event) => ["ENTRY_EXPIRED", "CANCELED"].includes(event.toStatus ?? ""))).toBe(false);
+  });
+});
+
 describe("TTL cancellation", () => {
   const submitted = async () => {
     const execution = await admittedExecution();

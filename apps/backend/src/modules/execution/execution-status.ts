@@ -142,12 +142,51 @@ const TRANSITIONS: Record<TradeExecutionStatusName, readonly TradeExecutionStatu
   SKIPPED: [],
   FAILED: [],
   CLOSED_EXTERNAL: [],
-  // Parked for a human. A verified emergency close is the one way out: the
-  // exposure it was parked for has been provably removed.
-  // A verified emergency close, or a proven-flat position whose closure we
-  // cannot attribute. Both require exchange proof before they may be taken.
-  MANUAL_INTERVENTION: ["CLOSED_EMERGENCY", "CLOSED_EXTERNAL"],
+  // Parked for a human — but its protection orders are still LIVE on the
+  // exchange, so it can still close on its own.
+  //
+  // Every exit here requires exchange proof: a verified emergency close, an
+  // owned STOP or TAKE_PROFIT that actually filled, or a proven-flat position
+  // whose closure cannot be attributed to any owned order.
+  //
+  // CLOSED_TP/CLOSED_SL were missing. The orchestrator routes
+  // MANUAL_INTERVENTION into reconcileProtectionAndClosure, which attributes a
+  // closure from a filled owned order, so a parked execution whose stop fires
+  // genuinely reaches CLOSED_SL. Mainnet Canary #2 sat parked for 16 minutes
+  // with a live STOP on Binance; had it triggered, this is the transition that
+  // would have been taken. Omitting them did not prevent the write — nothing
+  // enforced the graph — it only meant the write bypassed the state machine.
+  // Recording such a closure as CLOSED_EXTERNAL would discard attribution we
+  // demonstrably have.
+  MANUAL_INTERVENTION: ["CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "CLOSED_TP", "CLOSED_SL"],
 };
+
+/**
+ * A persistence layer refused to write a transition the state machine forbids.
+ *
+ * Deliberately DISTINCT from a lost compare-and-swap. A CAS loss is ordinary
+ * concurrency — the next reconciliation tick simply retries and succeeds. This
+ * is a modelling error: the same call will be refused forever, so it must be
+ * loud rather than silently indistinguishable from a race.
+ *
+ * A plain Error subclass keeps this module dependency-free.
+ */
+export class IllegalExecutionTransitionError extends Error {
+  readonly executionId: string;
+  readonly fromStatus: string;
+  readonly toStatus: string;
+
+  constructor(executionId: string, fromStatus: string, toStatus: string, reason: string | null) {
+    super(
+      `Refusing to persist illegal execution transition ${fromStatus} -> ${toStatus} ` +
+        `for ${executionId}${reason ? `: ${reason}` : "."}`
+    );
+    this.name = "IllegalExecutionTransitionError";
+    this.executionId = executionId;
+    this.fromStatus = fromStatus;
+    this.toStatus = toStatus;
+  }
+}
 
 export function isTerminalStatus(status: TradeExecutionStatusName): boolean {
   return TERMINAL_STATUSES.includes(status);
