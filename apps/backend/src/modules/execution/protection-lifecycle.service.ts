@@ -138,6 +138,29 @@ function isUnreadableProtectionState(reasonCode: ProtectionReasonCode): boolean 
 }
 
 /**
+ * Reason codes meaning "our own accepted submission is not visible YET".
+ *
+ * Deliberately separate from the unreadable set above: there the exchange
+ * could not be read at all, here it answered clearly and proved this exact id
+ * does not exist — while we hold a persisted, accepted POST for it. That
+ * combination is a read-after-write visibility gap, not a protection failure,
+ * and it is bounded by propagationDeadline.
+ */
+const PROPAGATION_PENDING_REASON_CODES: readonly ProtectionReasonCode[] = [
+  "STOP_SUBMISSION_PROPAGATION_PENDING",
+  "TAKE_PROFIT_SUBMISSION_PROPAGATION_PENDING",
+];
+
+/**
+ * Outcomes submitTranche must DEFER rather than escalate: nothing is known to
+ * be wrong, so the reserved tranche is left incomplete and the next tick asks
+ * again.
+ */
+function isDeferredProtectionState(reasonCode: ProtectionReasonCode): boolean {
+  return isUnreadableProtectionState(reasonCode) || PROPAGATION_PENDING_REASON_CODES.includes(reasonCode);
+}
+
+/**
  * The ONLY reasons an execution may be automatically un-parked, as an explicit
  * allowlist rather than "everything not forbidden".
  *
@@ -249,15 +272,42 @@ export function protectionLockKey(profileId: string, symbol: string, positionSid
 
 export class ProtectionLifecycleService {
   private readonly maxAttempts: number;
+  private readonly reconcileDelayMs: number;
 
   constructor(
     private readonly prisma: PrismaClient,
     private readonly readOnly: BinanceReadOnlyService,
     private readonly mutations: BinanceUsdMExecutionClient,
     private readonly alerts: CriticalAlertService,
-    options: { reconcileMaxAttempts?: number } = {}
+    options: { reconcileMaxAttempts?: number; reconcileDelayMs?: number } = {}
   ) {
     this.maxAttempts = options.reconcileMaxAttempts ?? env.EXECUTION_PROTECTION_RECONCILE_MAX_ATTEMPTS;
+    this.reconcileDelayMs = options.reconcileDelayMs ?? env.EXECUTION_PROTECTION_RECONCILE_DELAY_MS;
+  }
+
+  /**
+   * How long an ACCEPTED submission may remain invisible before its absence
+   * stops being read as propagation.
+   *
+   * The budget is the configured bounded re-query schedule, not a new number:
+   * EXECUTION_PROTECTION_RECONCILE_DELAY_MS is the spacing between attempts and
+   * EXECUTION_PROTECTION_RECONCILE_MAX_ATTEMPTS is how many are allowed. The
+   * FIRST attempt is immediate, so the schedule spans (attempts - 1) gaps —
+   * 4s at the defaults, not 5s. One attempt configures no retry at all and
+   * therefore no grace.
+   *
+   * Like the entry lifecycle's identical `reconcileDelayMs`, this is a DEADLINE
+   * rather than a sleep: the work is deferred to the next reconciliation tick,
+   * never blocked on inside one. The budget is far below the 30s tick cadence,
+   * so at most one tick can ever defer on it.
+   *
+   * Anchored to the FIRST accepted submission for this deterministic identity,
+   * which is why `submittedAt` is written once and never refreshed: a deadline
+   * that moved with each attempt could be pushed forward forever, suppressing
+   * escalation indefinitely.
+   */
+  private propagationDeadline(submittedAt: Date): number {
+    return submittedAt.getTime() + Math.max(this.maxAttempts - 1, 0) * this.reconcileDelayMs;
   }
 
   // ==========================================================================
@@ -1239,7 +1289,7 @@ export class ProtectionLifecycleService {
       // protection-restoration path, so a transient query blip would strand a
       // live position permanently. The reserved tranche stays incomplete and
       // the next tick asks again.
-      if (isUnreadableProtectionState(stopResult.reasonCode)) {
+      if (isDeferredProtectionState(stopResult.reasonCode)) {
         return this.outcome(false, stopResult.reasonCode, stopResult.message, execution, protection);
       }
 
@@ -1276,7 +1326,7 @@ export class ProtectionLifecycleService {
       // Same deferral as the stop: unreadable is not failed, so it raises no
       // critical alert and rewrites no protection state. The verified STOP is
       // untouched either way.
-      if (isUnreadableProtectionState(takeProfitResult.reasonCode)) {
+      if (isDeferredProtectionState(takeProfitResult.reasonCode)) {
         return this.outcome(false, takeProfitResult.reasonCode, takeProfitResult.message, execution, protection);
       }
 
@@ -1361,7 +1411,95 @@ export class ProtectionLifecycleService {
       };
     }
 
+    // AN IDENTITY THAT MAY ALREADY HAVE ESCAPED IS NEVER RE-POSTED.
+    //
+    // -2013 proves this id is not visible; it does not prove our mutation never
+    // created it. Either timestamp is proof that a POST for this exact
+    // deterministic identity MAY be live on Binance: `submittedAt` because the
+    // exchange accepted it, `submissionUnknownAt` because the request was
+    // claimed before it was sent and its fate is not established. From then on
+    // an absence is a VERIFICATION problem, never permission to submit a second
+    // one. Inside the propagation budget that is deferred; past it, it becomes
+    // the ordinary unresolved-submission failure — but still never a re-POST.
+    //
+    // A locally resolved row is excluded: a REJECTED (or filled/cancelled)
+    // identity is settled, so the claim marker must not make it look
+    // perpetually propagation-pending. Rejection semantics win, and the
+    // generation machinery stays free to mint a genuinely new identity.
+    //
+    // Only that machinery may introduce a new identity, and it does so with a
+    // new clientAlgoId carrying its own untouched timestamps.
+    // AT MOST ONE EXTERNAL MUTATION PER PROTECTION INTENT.
+    //
+    // Either timestamp means a POST for this exact deterministic identity MAY
+    // be live on Binance: `submittedAt` because the exchange accepted it,
+    // `submissionUnknownAt` because the request was CLAIMED before it was sent
+    // and its fate was never established. From then on -2013 is a visibility
+    // fact, never permission to submit a second one — it proves the id is not
+    // observable, not that our mutation failed to create it.
+    //
+    // This deliberately supersedes the older liveness rule, under which a
+    // timed-out submission that later read as conclusively absent was retried
+    // under the same id. Both properties cannot hold: the persisted state
+    // cannot distinguish "the request never left" from "it landed and is not
+    // visible yet", so automatic retry necessarily risks a second live STOP
+    // against the same exposure. Duplicating an economic protection mutation
+    // is the worse failure, so ambiguity is fail-closed and resolved by an
+    // operator.
+    //
+    // A locally resolved row is excluded: a REJECTED (or filled/cancelled)
+    // identity is conclusively settled, so the claim marker must not make it
+    // look perpetually unresolved. Rejection semantics stay authoritative.
+    //
+    // "May be live" is the whole test. A locally resolved row — REJECTED above
+    // all — is conclusively NOT live, so neither the ban nor the claim applies
+    // to it and the existing rejected-identity semantics continue untouched.
+    const identityMayBeLive = !LOCALLY_RESOLVED_ORDER_STATUSES.includes(order.status);
+    const attemptAnchor = order.submittedAt ?? order.submissionUnknownAt;
+    if (existing.outcome !== "CONFIRMED_ACCEPTED" && attemptAnchor && identityMayBeLive) {
+      return this.unresolvedAcceptedSubmission(order, role, evaluatedAt);
+    }
+
     if (existing.outcome !== "CONFIRMED_ACCEPTED") {
+      // CLAIM THE MUTATION BEFORE IT CAN ESCAPE.
+      //
+      // The external POST and the local record of it can never be one
+      // transaction, so a crash between them is unavoidable — but WHICH SIDE
+      // holds the durable evidence is a choice. Recording only after the
+      // response left `submittedAt` null on rows whose order may already be
+      // live, and the next worker read -2013 and submitted a second one. The
+      // marker therefore goes FIRST: after this commit the system can never
+      // again believe no attempt was made.
+      //
+      // The conditional `updateMany` makes it a CLAIM rather than a note. Two
+      // workers reading the same unattempted intent both see null, but only one
+      // UPDATE can match `submissionUnknownAt: null` — Postgres serializes the
+      // row write — so exactly one may POST. The loser falls through to the
+      // same query-and-reconcile path a restarted worker takes. Being a single
+      // atomic statement, it holds across processes and across restarts; no
+      // process-local lock is involved.
+      //
+      // Fail-closed: if this write throws, the exception propagates and
+      // submitProtectionOrder is never reached, so no mutation can escape
+      // unrecorded.
+      //
+      // A conclusively resolved identity is exempt: its marker is a historical
+      // record of an attempt that is already settled, so failing to re-win the
+      // claim must not strand it. Without this a REJECTED order — proven not
+      // live — could never be retried at all.
+      if (identityMayBeLive) {
+        const claim = await this.prisma.binanceOrder.updateMany({
+          where: { id: order.id, submissionUnknownAt: null },
+          data: { submissionUnknownAt: evaluatedAt },
+        });
+        if (claim.count === 0) {
+          // Another worker claimed it between our read and this write.
+          const current = await this.prisma.binanceOrder.findUniqueOrThrow({ where: { id: order.id } });
+          return this.unresolvedAcceptedSubmission(current, role, evaluatedAt);
+        }
+        order = { ...order, submissionUnknownAt: evaluatedAt };
+      }
+
       let outcome: MutationOutcome = "CONFIRMED_ACCEPTED";
       try {
         const context = this.mutations.authorizeProtectionSubmission({
@@ -1390,6 +1528,25 @@ export class ProtectionLifecycleService {
         }
       }
 
+      // WRITE-ONCE, and only for an ACCEPTED submission.
+      //
+      // `submittedAt` upgrades the anchor from "may have escaped" to "the
+      // exchange took it", which is what earns the propagation reading of a
+      // later -2013. It is written once: refreshing it on a later attempt would
+      // push the deadline forward indefinitely. A new generation gets its own
+      // row and therefore its own budget.
+      //
+      // An unresolved submission needs no write at all — the pre-submit claim
+      // already recorded `submissionUnknownAt`, and rewriting it here would
+      // move the very anchor that bounds the ambiguity.
+      if (outcome === "CONFIRMED_ACCEPTED") {
+        await this.prisma.binanceOrder.update({
+          where: { id: order.id },
+          data: { submittedAt: order.submittedAt ?? evaluatedAt },
+        });
+        order = { ...order, submittedAt: order.submittedAt ?? evaluatedAt };
+      }
+
       // Bounded reconciliation on the SAME clientAlgoId â€” never a new id.
       for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
         existing = await this.queryProtection(execution.symbol, order.clientAlgoId!);
@@ -1400,6 +1557,11 @@ export class ProtectionLifecycleService {
         });
       }
       if (existing.outcome !== "CONFIRMED_ACCEPTED" || !existing.order) {
+        // An accepted submission that is merely not visible yet is deferred;
+        // everything else keeps the reviewed unresolved-submission semantics.
+        if (outcome === "CONFIRMED_ACCEPTED" && existing.outcome === "NOT_FOUND_CONFIRMED") {
+          return this.unresolvedAcceptedSubmission(order, role, evaluatedAt);
+        }
         return { verified: false, reasonCode: unknownCode, message: "Protection state could not be resolved." };
       }
     }
@@ -1444,6 +1606,61 @@ export class ProtectionLifecycleService {
       return { verified: false, reasonCode: notVerifiedCode, message: `Protection is ${status}, not active.` };
     }
     return { verified: true, reasonCode: "PROTECTION_VERIFIED", message: "Protection is verified active." };
+  }
+
+  /**
+   * What an ACCEPTED submission that the exchange cannot yet show us means.
+   *
+   * Inside the configured re-query budget it is a read-after-write visibility
+   * gap: unresolved, but nothing is known to be wrong, so it defers without an
+   * alert and without touching protection state. Past the budget the benefit of
+   * the doubt runs out and it becomes the ordinary unresolved-submission
+   * failure — the SAME reason code the reviewed path already uses, so the
+   * existing alerting, emergency-close consideration and reason-aware recovery
+   * all continue to apply unchanged.
+   *
+   * Either way it never authorizes a second POST of the same identity.
+   */
+  private unresolvedAcceptedSubmission(
+    order: BinanceOrder,
+    role: "STOP_LOSS" | "TAKE_PROFIT",
+    evaluatedAt: Date
+  ): { verified: boolean; reasonCode: ProtectionReasonCode; message: string } {
+    const pendingCode: ProtectionReasonCode =
+      role === "STOP_LOSS" ? "STOP_SUBMISSION_PROPAGATION_PENDING" : "TAKE_PROFIT_SUBMISSION_PROPAGATION_PENDING";
+    const unknownCode: ProtectionReasonCode =
+      role === "STOP_LOSS" ? "STOP_SUBMISSION_RESULT_UNKNOWN" : "TAKE_PROFIT_SUBMISSION_RESULT_UNKNOWN";
+
+    // Either timestamp bounds the ambiguity, because either one means this
+    // identity may already be live. `submittedAt` is preferred when present:
+    // it is the instant the exchange actually took the order.
+    const anchor = order.submittedAt ?? order.submissionUnknownAt;
+    if (anchor && evaluatedAt.getTime() < this.propagationDeadline(anchor)) {
+      logger.warn(
+        {
+          executionId: order.tradeExecutionId,
+          role,
+          generation: order.generation,
+          clientAlgoId: order.clientAlgoId,
+          anchor: anchor.toISOString(),
+          accepted: order.submittedAt !== null,
+        },
+        "Protection submission is not visible yet; deferring inside the propagation budget"
+      );
+      return {
+        verified: false,
+        reasonCode: pendingCode,
+        message: order.submittedAt
+          ? "The accepted protection submission is not visible yet; verification is deferred to the next tick."
+          : "A claimed protection submission is not visible yet; verification is deferred to the next tick.",
+      };
+    }
+
+    return {
+      verified: false,
+      reasonCode: unknownCode,
+      message: "An accepted protection submission could not be verified within the bounded budget; it was not resubmitted.",
+    };
   }
 
   /** Re-measures aggregate coverage from the exchange and records the result. */

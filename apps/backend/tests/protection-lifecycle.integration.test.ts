@@ -77,6 +77,8 @@ interface Scenario {
   algoOrders: Map<string, AlgoOrderRow>;
   /** clientAlgoId values whose query must fail. */
   queryFailures: Set<string>;
+  /** clientAlgoId -> how many further reads still answer -2013 despite existing. */
+  invisibleReads: Map<string, number>;
   submitFailure: Error | null;
   submitLands: boolean;
   cancelFailure: Error | null;
@@ -111,6 +113,7 @@ function resetScenario() {
     positionMissing: false,
     algoOrders: new Map<string, AlgoOrderRow>(),
     queryFailures: new Set<string>(),
+    invisibleReads: new Map<string, number>(),
     submitFailure: null,
     submitLands: true,
     cancelFailure: null,
@@ -183,6 +186,19 @@ const readOnlyStub = {
   },
   async queryAlgoOrderByClientAlgoId(_symbol: string, clientAlgoId: string) {
     if (scenario.queryFailures.has(clientAlgoId)) throw timeoutError("algoOrder");
+    // Read-after-write lag: the POST was accepted and the order exists, but the
+    // exchange still answers -2013 for the first N reads. Counted per id so a
+    // STOP and a TAKE_PROFIT lag independently.
+    const remainingLag = scenario.invisibleReads.get(clientAlgoId);
+    if (remainingLag !== undefined && remainingLag > 0) {
+      scenario.invisibleReads.set(clientAlgoId, remainingLag - 1);
+      throw new BinanceError({
+        kind: "MALFORMED_RESPONSE",
+        message: "Algo order does not exist",
+        binanceCode: -2013,
+        endpoint: "algoOrder",
+      });
+    }
     const row = scenario.algoOrders.get(clientAlgoId);
     if (!row) {
       throw new BinanceError({
@@ -1625,7 +1641,22 @@ describe("look-before-submit existence safety", () => {
     }
   });
 
-  maybe()("9. a POST that never reached the exchange is eventually retried, not deadlocked", async () => {
+  maybe()("9. an ATTEMPTED submission is never re-POSTed, even once it reads as absent", async () => {
+    // SUPERSEDES an earlier liveness expectation, deliberately.
+    //
+    // This test previously asserted that a POST which "never reached the
+    // exchange" was eventually retried under the same clientAlgoId, so a live
+    // position could not be left unprotected by a deadlock. That property
+    // cannot coexist with at-most-once external mutation: once the request has
+    // been claimed, the persisted state cannot distinguish "it never left" from
+    // "it landed and is not visible yet", so retrying necessarily risks a
+    // SECOND live STOP against the same exposure. A duplicated economic
+    // mutation is the worse outcome, so the ambiguity is now fail-closed and
+    // an operator resolves it.
+    //
+    // The anti-deadlock concern is answered differently: the execution does not
+    // wait forever, it converges on the truthful manual path once the bounded
+    // budget expires.
     const execution = await filledExecution();
     const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
 
@@ -1634,21 +1665,31 @@ describe("look-before-submit existence safety", () => {
     scenario.submitLands = false;
     await protect(execution);
     expect(submittedRoles()).toEqual(["STOP_LOSS"]);
+    // The attempt is durably claimed even though nothing was confirmed.
+    const claimed = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id, role: "STOP_LOSS" },
+    });
+    expect(claimed.submissionUnknownAt).not.toBeNull();
+    expect(claimed.submittedAt).toBeNull();
 
     scenario.queryFailures.add(stopId);
     await protect(await reload(execution.id));
-    // Still exactly one attempt — the unreadable tick added none.
     expect(submittedRoles().filter((role) => role === "STOP_LOSS")).toHaveLength(1);
 
-    // Tick N+2: readable, conclusively absent, and the submit now works.
+    // Tick N+2: readable and conclusively absent, and the submit would now
+    // succeed — but the claim means absence cannot prove it was never sent.
     scenario.queryFailures.delete(stopId);
     scenario.submitFailure = null;
     scenario.submitLands = true;
     await protect(await reload(execution.id));
 
-    // No deadlock: the protection is finally placed under the SAME identity.
-    expect(scenario.algoOrders.get(stopId)?.algoStatus).toBe("NEW");
-    expect((await protectionOf(execution.id)).state).toBe("PROTECTED");
+    // At most once: no second mutation, and no order exists under that id.
+    expect(submittedRoles().filter((role) => role === "STOP_LOSS")).toHaveLength(1);
+    expect(scenario.algoOrders.has(stopId)).toBe(false);
+    expect((await protectionOf(execution.id)).state).not.toBe("PROTECTED");
+    // No deadlock either: it has reached the truthful manual path.
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(true);
     await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
   });
 });
@@ -3072,29 +3113,28 @@ describe("MANUAL_INTERVENTION protection recovery", () => {
 
   maybe()("16. a crash mid-recovery converges through the existing restart path", async () => {
     const parked = await parkedByStopIdentity();
-    // Un-park, then "crash" before protection could be completed: the TP
-    // submission is dispatched but its result never becomes readable, leaving
-    // the row at PLACING_PROTECTION exactly as a killed worker would.
+    // Un-park, then interrupt before protection could be completed: the TP is
+    // accepted by the exchange but stays invisible for the rest of this tick,
+    // so verification defers and the row is left at PLACING_PROTECTION exactly
+    // as a killed worker would leave it.
+    //
+    // The interruption is a visibility gap rather than a failed submission on
+    // purpose. A dispatched-but-unresolved POST is now a claimed, ambiguous
+    // mutation that may never be repeated (see "at most one external mutation
+    // per protection intent"), so using one here would test the fail-closed
+    // rule instead of restart convergence.
     const takeProfitId = buildClientOrderId(parked.id, "TAKE_PROFIT", 1);
-    const originalSubmit = mutationStub.submitProtectionOrder;
-    mutationStub.submitProtectionOrder = async (context: Record<string, string>) => {
-      if (context.role === "TAKE_PROFIT") {
-        dispatched += 1;
-        scenario.mutations.push("POST /fapi/v1/algoOrder TAKE_PROFIT");
-        scenario.submitted.push({ ...context });
-        scenario.queryFailures.add(takeProfitId);
-        throw timeoutError("newAlgoOrder");
-      }
-      return originalSubmit.call(mutationStub, context);
-    };
+    scenario.invisibleReads.set(takeProfitId, 999);
     await recover(parked);
-    mutationStub.submitProtectionOrder = originalSubmit;
+    // Exactly one take-profit mutation was dispatched, and it stays claimed.
+    expect(scenario.submitted.filter((entry) => entry.role === "TAKE_PROFIT")).toHaveLength(1);
     const crashed = await reload(parked.id);
     expect(crashed.status).toBe("PLACING_PROTECTION");
     expect(crashed.requiresManualIntervention).toBe(true);
 
-    // Restart: the orchestrator routes PLACING_PROTECTION here.
-    scenario.queryFailures.delete(takeProfitId);
+    // Restart: the orchestrator routes PLACING_PROTECTION here, and by now the
+    // accepted take profit has become observable.
+    scenario.invisibleReads.delete(takeProfitId);
     const resumed = await protectionService.resumeProtectionLifecycle({
       executionId: parked.id,
       expectedVersion: crashed.version,
@@ -3105,8 +3145,10 @@ describe("MANUAL_INTERVENTION protection recovery", () => {
     const healed = await reload(parked.id);
     expect(healed.status).toBe("PROTECTED");
     expect(healed.requiresManualIntervention).toBe(false);
-    // The resumed tranche reused its own deterministic id.
+    // The resumed tranche reused its own deterministic id, and the take profit
+    // was submitted exactly once — only after its state became readable.
     expect((await ordersOf(parked.id)).every((order) => order.generation === 1)).toBe(true);
+    expect(scenario.submitted.filter((entry) => entry.role === "TAKE_PROFIT")).toHaveLength(1);
     expect(await recoveryEventsOf(parked.id)).toHaveLength(1);
   });
 
@@ -3710,5 +3752,649 @@ describe("escalation state consistency", () => {
     expect(afterProtection.state).toBe("PROTECTED");
     expect(afterProtection.version).toBe(healthyProtection.version);
     expect(await parkEventsOf(execution.id)).toHaveLength(parksBefore);
+  });
+});
+
+// ===========================================================================
+// READ-AFTER-WRITE PROPAGATION.
+//
+// An accepted POST followed by an immediate -2013 used to be indistinguishable
+// from an order that never existed: the post-submit loop re-queried with NO
+// delay at all, exhausted its budget in milliseconds, and returned
+// *_SUBMISSION_RESULT_UNKNOWN — which raised two critical alerts, parked the
+// execution at MANUAL_INTERVENTION, blocked all new work through
+// recoveryRequiredCount, and (with EXECUTION_EMERGENCY_CLOSE_MODE enabled)
+// satisfied every emergency-close eligibility condition. The next tick would
+// then read -2013 again and POST a SECOND order for the same identity.
+//
+// The budget is now the configured re-query schedule
+// (EXECUTION_PROTECTION_RECONCILE_DELAY_MS x attempts), anchored to the FIRST
+// accepted submission, and an accepted identity is never re-POSTed.
+// ===========================================================================
+
+describe("accepted-submission propagation budget", () => {
+  const eventsOf = async (id: string) =>
+    prisma!.executionEvent.findMany({ where: { tradeExecutionId: id }, orderBy: { sequenceNumber: "asc" } });
+
+  const stopOrderOf = async (id: string) =>
+    prisma!.binanceOrder.findFirstOrThrow({ where: { tradeExecutionId: id, role: "STOP_LOSS" } });
+
+  const posts = (role: string) => scenario.submitted.filter((entry) => entry.role === role).length;
+
+  /** A service whose propagation budget is long enough to span a test tick. */
+  const lagTolerant = () =>
+    new ProtectionLifecycleService(
+      prisma!,
+      readOnlyStub as never,
+      mutationStub as never,
+      alertService,
+      { reconcileMaxAttempts: 2, reconcileDelayMs: 60_000 }
+    );
+
+  /** A service whose budget has effectively already expired. */
+  const lagIntolerant = () =>
+    new ProtectionLifecycleService(
+      prisma!,
+      readOnlyStub as never,
+      mutationStub as never,
+      alertService,
+      { reconcileMaxAttempts: 1, reconcileDelayMs: 60_000 } // (1 - 1) x delay = no grace
+    );
+
+  maybe()("1. the configured reconcile delay and attempts define the budget", async () => {
+    // A single configured attempt means no re-query schedule at all, so an
+    // invisible accepted submission gets no grace; more attempts do.
+    const service = lagIntolerant();
+    const execution = await filledExecution();
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 1), 99);
+
+    const outcome = await service.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.reasonCode).toBe("STOP_SUBMISSION_RESULT_UNKNOWN");
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+  });
+
+  maybe()("2. an accepted STOP that is briefly invisible raises no alert and parks nothing", async () => {
+    const service = lagTolerant();
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    scenario.invisibleReads.set(stopId, 99); // never visible during this tick
+
+    const outcome = await service.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.reasonCode).toBe("STOP_SUBMISSION_PROPAGATION_PENDING");
+    const after = await reload(execution.id);
+    expect(after.status).not.toBe("MANUAL_INTERVENTION");
+    expect(after.requiresManualIntervention).toBe(false);
+    // No critical alert, no protection park, no emergency close.
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+    expect((await protectionOf(execution.id)).state).not.toBe("MANUAL_INTERVENTION");
+    expect(scenario.mutations.filter((call) => call.includes("order"))).toHaveLength(0);
+    // Exactly one POST, and no PROTECTED claim.
+    expect(posts("STOP_LOSS")).toBe(1);
+    expect(after.status).not.toBe("PROTECTED");
+    expect((await protectionOf(execution.id)).state).not.toBe("PROTECTED");
+  });
+
+  maybe()("3. it converges on the next tick with a single POST", async () => {
+    const service = lagTolerant();
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    // Invisible for this tick's reads only.
+    scenario.invisibleReads.set(stopId, 3);
+
+    await service.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+    const outcome = await service.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: (await reload(execution.id)).version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.ok).toBe(true);
+    // A PARTIALLY_FILLED entry is deliberately never promoted (its remainder
+    // still holds pending-entry capacity), so protection verification is what
+    // convergence means here.
+    expect((await protectionOf(execution.id)).state).toBe("PROTECTED");
+    expect((await reload(execution.id)).status).not.toBe("MANUAL_INTERVENTION");
+    // The STOP was submitted exactly once across both ticks.
+    expect(posts("STOP_LOSS")).toBe(1);
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+  });
+
+  maybe()("4. repeated ticks inside the budget cause no alert or mutation churn", async () => {
+    const service = lagTolerant();
+    const execution = await filledExecution();
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 1), 999);
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      const outcome = await service.ensureProtectionForExposure({
+        executionId: execution.id,
+        expectedVersion: (await reload(execution.id)).version,
+        evaluatedAt: at(),
+      });
+      expect(outcome.reasonCode, `tick ${tick}`).toBe("STOP_SUBMISSION_PROPAGATION_PENDING");
+    }
+
+    expect(posts("STOP_LOSS")).toBe(1);
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+    expect((await reload(execution.id)).status).not.toBe("MANUAL_INTERVENTION");
+    // No replacement generation was minted while waiting.
+    expect((await ordersOf(execution.id)).every((order) => order.generation === 1)).toBe(true);
+  });
+
+  maybe()("5. the deadline is anchored to the FIRST accepted submission and never resets", async () => {
+    const service = lagTolerant();
+    const execution = await filledExecution();
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 1), 999);
+
+    await service.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+    const firstSubmittedAt = (await stopOrderOf(execution.id)).submittedAt;
+    expect(firstSubmittedAt).not.toBeNull();
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      await service.ensureProtectionForExposure({
+        executionId: execution.id,
+        expectedVersion: (await reload(execution.id)).version,
+        evaluatedAt: at(),
+      });
+    }
+
+    // Same instant after every later tick — the window cannot be pushed forward.
+    expect((await stopOrderOf(execution.id)).submittedAt?.toISOString()).toBe(firstSubmittedAt?.toISOString());
+    expect(posts("STOP_LOSS")).toBe(1);
+  });
+
+  maybe()("6. past the budget the accepted intent is NOT re-POSTed and normal failure resumes", async () => {
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    scenario.invisibleReads.set(stopId, 999);
+
+    // Tick 1 inside a generous budget: deferred, one POST, timestamp anchored.
+    await lagTolerant().ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+    expect(posts("STOP_LOSS")).toBe(1);
+    const anchored = (await stopOrderOf(execution.id)).submittedAt;
+
+    // Tick 2 with the budget already expired.
+    const outcome = await lagIntolerant().ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: (await reload(execution.id)).version,
+      evaluatedAt: at(),
+    });
+
+    // Genuine failure handling resumes...
+    expect(outcome.reasonCode).toBe("STOP_SUBMISSION_RESULT_UNKNOWN");
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBeGreaterThan(0);
+    // ...but the accepted identity was never submitted a second time, and the
+    // anchor never moved.
+    expect(posts("STOP_LOSS")).toBe(1);
+    expect((await stopOrderOf(execution.id)).submittedAt?.toISOString()).toBe(anchored?.toISOString());
+  });
+
+  maybe()("7. repeated ticks after expiry never restart the window", async () => {
+    const service = lagIntolerant();
+    const execution = await filledExecution();
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 1), 999);
+
+    await service.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+    const anchored = (await stopOrderOf(execution.id)).submittedAt;
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      const outcome = await service.ensureProtectionForExposure({
+        executionId: execution.id,
+        expectedVersion: (await reload(execution.id)).version,
+        evaluatedAt: at(),
+      });
+      expect(outcome.reasonCode, `tick ${tick}`).not.toBe("STOP_SUBMISSION_PROPAGATION_PENDING");
+    }
+
+    expect((await stopOrderOf(execution.id)).submittedAt?.toISOString()).toBe(anchored?.toISOString());
+    expect(posts("STOP_LOSS")).toBe(1);
+  });
+
+  maybe()("8. a restart inside the budget reuses the persisted anchor", async () => {
+    const execution = await filledExecution();
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 1), 999);
+
+    await lagTolerant().ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+    const anchored = (await stopOrderOf(execution.id)).submittedAt;
+
+    // A brand-new service instance holds no in-memory state whatsoever.
+    const outcome = await lagTolerant().resumeProtectionLifecycle({
+      executionId: execution.id,
+      expectedVersion: (await reload(execution.id)).version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.reasonCode).toBe("STOP_SUBMISSION_PROPAGATION_PENDING");
+    expect((await stopOrderOf(execution.id)).submittedAt?.toISOString()).toBe(anchored?.toISOString());
+    expect(posts("STOP_LOSS")).toBe(1);
+  });
+
+  maybe()("9. two concurrent workers make the same decision and POST once", async () => {
+    const execution = await filledExecution();
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 1), 999);
+    const current = await reload(execution.id);
+
+    const outcomes = await Promise.all([
+      lagTolerant().ensureProtectionForExposure({
+        executionId: execution.id,
+        expectedVersion: current.version,
+        evaluatedAt: at(),
+      }),
+      lagTolerant().ensureProtectionForExposure({
+        executionId: execution.id,
+        expectedVersion: current.version,
+        evaluatedAt: at(),
+      }),
+    ]);
+
+    // Neither escalated, and only one reservation could win the version CAS.
+    for (const outcome of outcomes) expect(outcome.ok).toBe(false);
+    expect((await reload(execution.id)).status).not.toBe("MANUAL_INTERVENTION");
+    expect(posts("STOP_LOSS")).toBeLessThanOrEqual(1);
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+  });
+
+  maybe()("10. a genuinely new generation gets its own independent budget", async () => {
+    const service = lagTolerant();
+    const execution = await filledExecution();
+    await protect(execution); // generation 1 verifies normally
+    expect((await reload(execution.id)).status).not.toBe("MANUAL_INTERVENTION");
+
+    // The exchange loses generation 1 and the position grows, so a second
+    // tranche is reserved — and its own STOP is briefly invisible.
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "STOP_LOSS", 1));
+    scenario.algoOrders.delete(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 2), 999);
+
+    const outcome = await service.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: (await reload(execution.id)).version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.reasonCode).toBe("STOP_SUBMISSION_PROPAGATION_PENDING");
+    const generation2 = (await ordersOf(execution.id)).find(
+      (order) => order.role === "STOP_LOSS" && order.generation === 2
+    )!;
+    // A fresh identity with its own anchor, not the first generation's.
+    expect(generation2.submittedAt).not.toBeNull();
+    expect(posts("STOP_LOSS")).toBe(2);
+  });
+
+  maybe()("11. an identity mismatch is never hidden by the propagation budget", async () => {
+    const service = lagTolerant();
+    const execution = await filledExecution();
+    scenario.closePositionOnReadback = true; // visible, but contradictory
+
+    const outcome = await service.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+    scenario.closePositionOnReadback = false;
+
+    expect(outcome.reasonCode).toBe("STOP_IDENTITY_MISMATCH");
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+  });
+
+  maybe()("12. a confirmed rejection is never hidden by the propagation budget", async () => {
+    const service = lagTolerant();
+    const execution = await filledExecution();
+    scenario.submitFailure = new BinanceError({
+      kind: "REQUEST_INVALID",
+      message: "rejected",
+      binanceCode: -2021,
+      endpoint: "algoOrder",
+    });
+    scenario.submitLands = false;
+
+    const outcome = await service.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.reasonCode).toBe("STOP_SUBMISSION_REJECTED");
+    // A rejected submission records no accepted anchor.
+    expect((await stopOrderOf(execution.id)).submittedAt).toBeNull();
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+  });
+
+  maybe()("13. RESULT_UNKNOWN submission semantics are unchanged and earn no grace", async () => {
+    const service = lagTolerant();
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    // The POST itself never resolves, and the order never lands.
+    scenario.submitFailure = timeoutError("newAlgoOrder");
+    scenario.submitLands = false;
+    scenario.invisibleReads.set(stopId, 999);
+
+    const outcome = await service.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    // UNKNOWN stays UNKNOWN: no propagation grace, existing handling applies.
+    expect(outcome.reasonCode).toBe("STOP_SUBMISSION_RESULT_UNKNOWN");
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+    const stop = await stopOrderOf(execution.id);
+    expect(stop.submittedAt).toBeNull();
+    expect(stop.submissionUnknownAt).not.toBeNull();
+  });
+
+  maybe()("14. a never-submitted protection order gets no grace", async () => {
+    // Pre-existing missing protection with no accepted POST behind it must be
+    // reserved and submitted exactly as before.
+    const service = lagTolerant();
+    const execution = await filledExecution();
+
+    const outcome = await service.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.ok).toBe(true);
+    expect((await protectionOf(execution.id)).state).toBe("PROTECTED");
+    expect(posts("STOP_LOSS")).toBe(1);
+  });
+});
+
+// ===========================================================================
+// AT-MOST-ONCE EXTERNAL PROTECTION MUTATION.
+//
+// The POST and the local record of it can never be one transaction, so a crash
+// between them is unavoidable — only WHICH SIDE holds the durable evidence is a
+// choice. Recording after the response left `submittedAt` null on rows whose
+// order may already be live, and the next worker read -2013, concluded
+// "never submitted", and POSTed a SECOND protection order against the same
+// exposure. SUBMIT_ALGO duplicates are explicitly NOT treated as proven
+// idempotent here, so that is a real second mutation.
+//
+// `submissionUnknownAt` is now CLAIMED before the request leaves, with a
+// conditional update so exactly one worker can win it. From that moment the
+// identity is fail-closed: -2013 proves it is not observable, never that our
+// mutation failed to create it.
+// ===========================================================================
+
+describe("at-most-once external protection mutation", () => {
+  const stopOrderOf = async (id: string) =>
+    prisma!.binanceOrder.findFirstOrThrow({ where: { tradeExecutionId: id, role: "STOP_LOSS" } });
+
+  const posts = (role: string) => scenario.submitted.filter((entry) => entry.role === role).length;
+
+  /** Budget long enough that a test tick always lands inside it. */
+  const tolerant = () =>
+    new ProtectionLifecycleService(prisma!, readOnlyStub as never, mutationStub as never, alertService, {
+      reconcileMaxAttempts: 2,
+      reconcileDelayMs: 60_000,
+    });
+
+  /** Budget of zero: (1 - 1) x delay, so ambiguity has already expired. */
+  const expired = () =>
+    new ProtectionLifecycleService(prisma!, readOnlyStub as never, mutationStub as never, alertService, {
+      reconcileMaxAttempts: 1,
+      reconcileDelayMs: 60_000,
+    });
+
+  const run = async (
+    instance: ReturnType<typeof tolerant>,
+    execution: { id: string; version: number }
+  ) =>
+    instance.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+  /** A prisma whose protection-order claim write always fails. */
+  const claimFailingPrisma = () =>
+    new Proxy(prisma! as object, {
+      get(target, property) {
+        if (property !== "binanceOrder") return Reflect.get(target, property);
+        const model = Reflect.get(target, property) as object;
+        return new Proxy(model, {
+          get(modelTarget, modelProperty) {
+            if (modelProperty === "updateMany") {
+              return async () => {
+                throw new Error("claim write failed");
+              };
+            }
+            const value = Reflect.get(modelTarget, modelProperty);
+            return typeof value === "function" ? value.bind(modelTarget) : value;
+          },
+        });
+      },
+    }) as typeof prisma;
+
+  maybe()("1. the claim write failing dispatches ZERO external mutations", async () => {
+    const execution = await filledExecution();
+    const service = new ProtectionLifecycleService(
+      claimFailingPrisma()!,
+      readOnlyStub as never,
+      mutationStub as never,
+      alertService,
+      { reconcileMaxAttempts: 2, reconcileDelayMs: 60_000 }
+    );
+
+    await expect(run(service, execution)).rejects.toThrow(/claim write failed/);
+
+    // Fail-closed: the marker could not be persisted, so nothing was sent.
+    expect(posts("STOP_LOSS")).toBe(0);
+    expect(scenario.mutations).toHaveLength(0);
+    expect((await stopOrderOf(execution.id)).submissionUnknownAt).toBeNull();
+  });
+
+  maybe()("2. two workers racing an unattempted intent produce at most one POST", async () => {
+    const execution = await filledExecution();
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 1), 999);
+    const current = await reload(execution.id);
+
+    await Promise.all([run(tolerant(), current), run(tolerant(), current)]);
+
+    // Only one conditional update can match submissionUnknownAt: null.
+    expect(posts("STOP_LOSS")).toBe(1);
+    expect((await stopOrderOf(execution.id)).submissionUnknownAt).not.toBeNull();
+    // The loser reconciled like a restarted worker: no alert, no park.
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+  });
+
+  maybe()("3. CASE D/E: accepted POST whose anchor never persisted is never re-POSTed", async () => {
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    scenario.invisibleReads.set(stopId, 999);
+    await run(tolerant(), execution);
+    expect(posts("STOP_LOSS")).toBe(1);
+
+    // The exact state a crash between the accepted response and the anchor
+    // write leaves behind: the claim survived, the acceptance did not.
+    const stop = await stopOrderOf(execution.id);
+    await prisma!.binanceOrder.update({ where: { id: stop.id }, data: { submittedAt: null } });
+    expect((await stopOrderOf(execution.id)).submissionUnknownAt).not.toBeNull();
+
+    // Restart, still invisible — the shape that used to duplicate.
+    const outcome = await run(tolerant(), await reload(execution.id));
+
+    expect(outcome.reasonCode).toBe("STOP_SUBMISSION_PROPAGATION_PENDING");
+    expect(posts("STOP_LOSS")).toBe(1);
+    expect(scenario.algoOrders.has(stopId)).toBe(true); // the original is live
+  });
+
+  maybe()("4. CASE B: a claim with no POST behind it still refuses to submit", async () => {
+    // The marker commits, then the process dies before the HTTP call. Whether
+    // the request ever left is unprovable, so the conservative reading wins.
+    const execution = await filledExecution();
+    const service = new ProtectionLifecycleService(
+      claimFailingPrisma()!,
+      readOnlyStub as never,
+      mutationStub as never,
+      alertService,
+      { reconcileMaxAttempts: 2, reconcileDelayMs: 60_000 }
+    );
+    // Reserves the tranche, then dies at the claim — no POST.
+    await expect(run(service, execution)).rejects.toThrow(/claim write failed/);
+    expect(posts("STOP_LOSS")).toBe(0);
+
+    // Simulate the claim having committed just before the crash.
+    const stop = await stopOrderOf(execution.id);
+    await prisma!.binanceOrder.update({ where: { id: stop.id }, data: { submissionUnknownAt: at() } });
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 1), 999);
+
+    const deferred = await run(tolerant(), await reload(execution.id));
+    expect(deferred.reasonCode).toBe("STOP_SUBMISSION_PROPAGATION_PENDING");
+    expect(posts("STOP_LOSS")).toBe(0);
+
+    // NO SILENT DEADLOCK: past the budget it becomes the truthful manual path,
+    // still without a second mutation.
+    const resolved = await run(expired(), await reload(execution.id));
+    expect(resolved.reasonCode).toBe("STOP_SUBMISSION_RESULT_UNKNOWN");
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(true);
+    expect(posts("STOP_LOSS")).toBe(0);
+  });
+
+  maybe()("5. CASE G: RESULT_UNKNOWN is never re-POSTed on a later tick", async () => {
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    scenario.submitFailure = timeoutError("newAlgoOrder");
+    scenario.submitLands = false;
+    scenario.invisibleReads.set(stopId, 999);
+
+    const first = await run(tolerant(), execution);
+    // In-call RESULT_UNKNOWN semantics are untouched.
+    expect(first.reasonCode).toBe("STOP_SUBMISSION_RESULT_UNKNOWN");
+    expect((await stopOrderOf(execution.id)).submissionUnknownAt).not.toBeNull();
+    expect(posts("STOP_LOSS")).toBe(1);
+
+    // A later tick must not read the timeout as "nothing was sent".
+    const second = await run(tolerant(), await reload(execution.id));
+
+    expect(second.reasonCode).toBe("STOP_SUBMISSION_PROPAGATION_PENDING");
+    expect(posts("STOP_LOSS")).toBe(1);
+  });
+
+  maybe()("6. the claim timestamp is never refreshed by later ticks", async () => {
+    const execution = await filledExecution();
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 1), 999);
+
+    await run(tolerant(), execution);
+    const claimed = (await stopOrderOf(execution.id)).submissionUnknownAt;
+    expect(claimed).not.toBeNull();
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      await run(tolerant(), await reload(execution.id));
+    }
+
+    expect((await stopOrderOf(execution.id)).submissionUnknownAt?.toISOString()).toBe(claimed?.toISOString());
+    expect(posts("STOP_LOSS")).toBe(1);
+  });
+
+  maybe()("7. CONFIRMED_REJECTED stays conclusive and is not masked by the claim", async () => {
+    const execution = await filledExecution();
+    scenario.submitFailure = new BinanceError({
+      kind: "REQUEST_INVALID",
+      message: "rejected",
+      binanceCode: -2021,
+      endpoint: "algoOrder",
+    });
+    scenario.submitLands = false;
+
+    const outcome = await run(tolerant(), execution);
+
+    expect(outcome.reasonCode).toBe("STOP_SUBMISSION_REJECTED");
+    const rejected = await stopOrderOf(execution.id);
+    // The claim exists, but a rejected order is conclusively not live, so
+    // rejection semantics stay authoritative rather than propagation-pending.
+    expect(rejected.status).toBe("REJECTED");
+    expect(rejected.submissionUnknownAt).not.toBeNull();
+    expect(rejected.submittedAt).toBeNull();
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+  });
+
+  maybe()("8. a rejected identity is never stranded by the at-most-once ban", async () => {
+    // The ban covers AMBIGUOUS attempts, not proven rejections. A REJECTED
+    // order is conclusively not live, so it keeps the pre-existing semantics:
+    // the lifecycle may act on that identity again rather than deferring on a
+    // claim marker it can no longer win.
+    const execution = await filledExecution();
+    scenario.submitFailure = new BinanceError({
+      kind: "REQUEST_INVALID",
+      message: "rejected",
+      binanceCode: -2021,
+      endpoint: "algoOrder",
+    });
+    scenario.submitLands = false;
+    await run(tolerant(), execution);
+    const rejected = await stopOrderOf(execution.id);
+    expect(rejected.status).toBe("REJECTED");
+    expect(rejected.submissionUnknownAt).not.toBeNull();
+    expect(posts("STOP_LOSS")).toBe(1);
+
+    // A later tick is NOT deferred as propagation-pending: the rejection is
+    // authoritative, so the lifecycle proceeds instead of stalling.
+    await prisma!.executionProtectionState.update({
+      where: { tradeExecutionId: execution.id },
+      data: { state: "MANUAL_INTERVENTION", reasonCode: "STOP_NOT_VERIFIED" },
+    });
+    const outcome = await tolerant().attemptProtectionRecovery({
+      executionId: execution.id,
+      expectedVersion: (await reload(execution.id)).version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.reasonCode).not.toBe("STOP_SUBMISSION_PROPAGATION_PENDING");
+    expect(posts("STOP_LOSS")).toBeGreaterThan(1);
+    // No generation rollover: gen 1 is still the incomplete tranche, so no new
+    // identity was minted on the strength of an unobserved attempt.
+    expect((await ordersOf(execution.id)).every((order) => order.generation === 1)).toBe(true);
+  });
+
+  maybe()("9. no new generation is minted merely because an attempt is unobserved", async () => {
+    // The ambiguous identity keeps the tranche incomplete, so the generation
+    // machinery never rolls over on the strength of "we could not see it".
+    const execution = await filledExecution();
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 1), 999);
+
+    await run(tolerant(), execution);
+    for (let tick = 0; tick < 3; tick += 1) {
+      await run(expired(), await reload(execution.id));
+    }
+
+    const orders = await ordersOf(execution.id);
+    expect(orders.every((order) => order.generation === 1)).toBe(true);
+    expect(posts("STOP_LOSS")).toBe(1);
+    // And it did not wait forever: it is parked for an operator.
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
   });
 });
