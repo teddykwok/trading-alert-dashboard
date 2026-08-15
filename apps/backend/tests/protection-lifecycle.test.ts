@@ -484,10 +484,46 @@ describe("emergency close eligibility", () => {
     stopVerified: false,
     positionIdentityKnown: true,
     reconciliationAttemptsExhausted: true,
+    conclusiveStopFailure: false,
   };
 
   it("is eligible when every condition holds", () => {
     expect(evaluateEmergencyCloseEligibility(base).eligible).toBe(true);
+  });
+
+  it("accepts a conclusive stop failure without pretending attempts were spent", () => {
+    // A rejection or a contradictory identity is authoritative immediately; no
+    // reconciliation attempt was made, and the input must not claim otherwise.
+    const result = evaluateEmergencyCloseEligibility({
+      ...base,
+      reconciliationAttemptsExhausted: false,
+      conclusiveStopFailure: true,
+    });
+    expect(result.eligible).toBe(true);
+  });
+
+  it("refuses when neither the budget ran out nor the failure was conclusive", () => {
+    // "We could not tell" — the only honest answer for an unreadable stop — can
+    // never authorize a market close.
+    const result = evaluateEmergencyCloseEligibility({
+      ...base,
+      reconciliationAttemptsExhausted: false,
+      conclusiveStopFailure: false,
+    });
+    expect(result.eligible).toBe(false);
+    expect(result.reasonCode).toBe("STOP_SUBMISSION_RESULT_UNKNOWN");
+  });
+
+  it("stays fail-closed in DISABLED mode however strong the evidence", () => {
+    for (const evidence of [
+      { reconciliationAttemptsExhausted: true, conclusiveStopFailure: false },
+      { reconciliationAttemptsExhausted: false, conclusiveStopFailure: true },
+      { reconciliationAttemptsExhausted: true, conclusiveStopFailure: true },
+    ]) {
+      const result = evaluateEmergencyCloseEligibility({ ...base, ...evidence, mode: "DISABLED" });
+      expect(result.eligible).toBe(false);
+      expect(result.reasonCode).toBe("EMERGENCY_CLOSE_DISABLED");
+    }
   });
 
   it("is never eligible in DISABLED mode", () => {

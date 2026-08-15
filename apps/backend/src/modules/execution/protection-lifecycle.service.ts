@@ -42,6 +42,7 @@ import {
   evaluateLiquidationSafety,
   findProtectionIdentityMismatches,
   isCriticalReason,
+  isExecutingProtection,
   isWithinMarginCap,
   normalizeAlgoStatus,
   normalizeOpenQuantity,
@@ -152,12 +153,29 @@ const PROPAGATION_PENDING_REASON_CODES: readonly ProtectionReasonCode[] = [
 ];
 
 /**
+ * Reason codes meaning "the owned order is executing right now".
+ *
+ * Deferred for the opposite reason to the codes above: there the exchange
+ * could not tell us anything, here it told us the protection is working. The
+ * lifecycle simply has nothing to do until the next tick can observe the
+ * authoritative result — which closure reconciliation then attributes.
+ */
+const EXECUTING_PROTECTION_REASON_CODES: readonly ProtectionReasonCode[] = [
+  "STOP_EXECUTION_IN_PROGRESS",
+  "TAKE_PROFIT_EXECUTION_IN_PROGRESS",
+];
+
+/**
  * Outcomes submitTranche must DEFER rather than escalate: nothing is known to
  * be wrong, so the reserved tranche is left incomplete and the next tick asks
  * again.
  */
 function isDeferredProtectionState(reasonCode: ProtectionReasonCode): boolean {
-  return isUnreadableProtectionState(reasonCode) || PROPAGATION_PENDING_REASON_CODES.includes(reasonCode);
+  return (
+    isUnreadableProtectionState(reasonCode) ||
+    PROPAGATION_PENDING_REASON_CODES.includes(reasonCode) ||
+    EXECUTING_PROTECTION_REASON_CODES.includes(reasonCode)
+  );
 }
 
 /**
@@ -214,6 +232,53 @@ const RECOVERABLE_INTERVENTION_REASON_CODES: readonly ProtectionReasonCode[] = [
 
 function isRecoverableInterventionReason(reasonCode: string | null): boolean {
   return reasonCode !== null && RECOVERABLE_INTERVENTION_REASON_CODES.includes(reasonCode as ProtectionReasonCode);
+}
+
+/**
+ * How strong the evidence behind a failed STOP actually is.
+ *
+ * EXHAUSTED   the bounded re-query schedule genuinely ran out
+ * CONCLUSIVE  no further reconciliation could change the answer
+ * INSUFFICIENT we could not determine the state at all — fail closed
+ */
+type StopFailureEvidence = "EXHAUSTED" | "CONCLUSIVE" | "INSUFFICIENT";
+
+/**
+ * Classifies why a stop is unverified, so emergency-close eligibility rests on
+ * evidence instead of an assertion.
+ *
+ * `STOP_NOT_VERIFIED` is deliberately split by the OBSERVATION that produced
+ * it. `countsAsActiveCoverage` is true only for ACTIVE, so that one reason code
+ * covers both "observed CANCELED/EXPIRED/REJECTED/FILLED" — conclusive — and
+ * "the algo status did not parse", which `normalizeAlgoStatus` reports as
+ * UNKNOWN precisely because it refuses to guess. Treating the second as
+ * conclusive would market-close a position on an unreadable field.
+ */
+function classifyStopFailureEvidence(
+  reasonCode: ProtectionReasonCode,
+  observedStatus: NormalizedProtectionStatus | null
+): StopFailureEvidence {
+  switch (reasonCode) {
+    // The attempt budget or the propagation deadline actually ran out.
+    case "STOP_SUBMISSION_RESULT_UNKNOWN":
+      return "EXHAUSTED";
+    // Binance refused it, or returned an order contradicting our intent.
+    // Retrying reconciliation cannot make either of those go away.
+    case "STOP_SUBMISSION_REJECTED":
+    case "STOP_IDENTITY_MISMATCH":
+      return "CONCLUSIVE";
+    case "STOP_NOT_VERIFIED":
+      // An executing stop should have been intercepted as a deferral long
+      // before this, but it fails closed here too: a TRIGGERED or
+      // PARTIALLY_FILLED order may still close the position, so it can never
+      // justify a competing market close.
+      if (observedStatus === null || observedStatus === "UNKNOWN" || isExecutingProtection(observedStatus)) {
+        return "INSUFFICIENT";
+      }
+      return "CONCLUSIVE";
+    default:
+      return "INSUFFICIENT";
+  }
 }
 
 /**
@@ -1309,7 +1374,13 @@ export class ProtectionLifecycleService {
       });
 
       // The stop could not be verified â€” consider the last-resort close.
-      return this.considerEmergencyClose(execution, protection, stopResult.reasonCode, owned);
+      return this.considerEmergencyClose(
+        execution,
+        protection,
+        stopResult.reasonCode,
+        stopResult.observedStatus ?? null,
+        owned
+      );
     }
 
     await this.setProtectionState(protection.id, "STOP_VERIFIED", "PROTECTION_VERIFIED", "Stop is verified active.");
@@ -1361,11 +1432,19 @@ export class ProtectionLifecycleService {
     execution: TradeExecution,
     order: BinanceOrder,
     evaluatedAt: Date
-  ): Promise<{ verified: boolean; reasonCode: ProtectionReasonCode; message: string }> {
+  ): Promise<{
+    verified: boolean;
+    reasonCode: ProtectionReasonCode;
+    message: string;
+    /** Present only when the exchange actually returned a state to normalize. */
+    observedStatus?: NormalizedProtectionStatus;
+  }> {
     const role = order.role as "STOP_LOSS" | "TAKE_PROFIT";
     const unknownCode: ProtectionReasonCode =
       role === "STOP_LOSS" ? "STOP_SUBMISSION_RESULT_UNKNOWN" : "TAKE_PROFIT_SUBMISSION_RESULT_UNKNOWN";
     const notVerifiedCode: ProtectionReasonCode = role === "STOP_LOSS" ? "STOP_NOT_VERIFIED" : "TAKE_PROFIT_NOT_VERIFIED";
+    const executingCode: ProtectionReasonCode =
+      role === "STOP_LOSS" ? "STOP_EXECUTION_IN_PROGRESS" : "TAKE_PROFIT_EXECUTION_IN_PROGRESS";
     const mismatchCode: ProtectionReasonCode = role === "STOP_LOSS" ? "STOP_IDENTITY_MISMATCH" : "TAKE_PROFIT_IDENTITY_MISMATCH";
 
     const queryUnavailableCode: ProtectionReasonCode =
@@ -1603,7 +1682,34 @@ export class ProtectionLifecycleService {
     await this.applyProtectionObservation(order, observedOrder, status, evaluatedAt);
 
     if (!countsAsActiveCoverage(status)) {
-      return { verified: false, reasonCode: notVerifiedCode, message: `Protection is ${status}, not active.` };
+      // AN EXECUTING ORDER IS NOT A FAILED ONE.
+      //
+      // TRIGGERED and PARTIALLY_FILLED both mean the protection fired and is
+      // working through the book. Reporting that as "not verified" put it on
+      // the same footing as a CANCELED stop: a critical alert, a park, and —
+      // under ON_UNVERIFIED_STOP — a competing MARKET close racing our own
+      // stop, which `classifyClosure` would then attribute to EMERGENCY.
+      //
+      // There is nothing to do but look again: the next tick runs closure
+      // reconciliation first and records the authoritative result.
+      if (isExecutingProtection(status)) {
+        return {
+          verified: false,
+          reasonCode: executingCode,
+          message: `Protection is ${status}; the owned order is executing.`,
+          observedStatus: status,
+        };
+      }
+
+      // The observed state travels with the verdict: "not active" spans both a
+      // conclusive CANCELED and an algo status that did not parse, and only the
+      // caller knows how much weight each deserves.
+      return {
+        verified: false,
+        reasonCode: notVerifiedCode,
+        message: `Protection is ${status}, not active.`,
+        observedStatus: status,
+      };
     }
     return { verified: true, reasonCode: "PROTECTION_VERIFIED", message: "Protection is verified active." };
   }
@@ -2000,11 +2106,34 @@ export class ProtectionLifecycleService {
     execution: TradeExecution,
     protection: ExecutionProtectionState,
     stopReason: ProtectionReasonCode,
+    /** The stop's observed state, when one was actually obtained. */
+    observedStopStatus: NormalizedProtectionStatus | null,
     input: ProtectionLifecycleInput
   ): Promise<ProtectionOutcome> {
     const direction = execution.direction as DirectionName;
     const positionSide = protectionPositionSide(direction);
     const measured = await this.measureVerifiedCoverage(execution);
+
+    // A ZERO STOP QUANTITY IS NOT PROOF OF AN UNPROTECTED POSITION.
+    //
+    // `measureVerifiedCoverage` counts an unreadable leg as zero and names its
+    // ROLE in `unresolved` — the whole point of that field. So when the STOP
+    // side is unresolved, `measured.stop === "0"` may mean "no stop exists" or
+    // "a live stop could not be read just now", and a market close on the
+    // second reading would liquidate a fully protected position on the strength
+    // of a transient query failure. That is the same absence-of-evidence
+    // mistake `advanceProtection` already refuses to make.
+    //
+    // The guard is deliberately ROLE-SPECIFIC. An unreadable TAKE_PROFIT tells
+    // us nothing about whether the stop is live, and none of the eligibility
+    // inputs below depend on take-profit coverage, so suppressing a genuinely
+    // needed last-resort close for it would trade a real risk for an unrelated
+    // unknown. `advanceProtection` blocks on ANY unresolved role because a
+    // tranche reserves BOTH; this decision is about the stop alone.
+    const stopCoverageUnresolved = measured.unresolved.includes("STOP_LOSS");
+    const evidence: StopFailureEvidence = stopCoverageUnresolved
+      ? "INSUFFICIENT"
+      : classifyStopFailureEvidence(stopReason, observedStopStatus);
 
     const eligibility = evaluateEmergencyCloseEligibility({
       mode: env.EXECUTION_EMERGENCY_CLOSE_MODE,
@@ -2012,7 +2141,8 @@ export class ProtectionLifecycleService {
       activeStopQuantity: measured.stop,
       stopVerified: new D(measured.stop).greaterThan(0),
       positionIdentityKnown: true,
-      reconciliationAttemptsExhausted: true,
+      reconciliationAttemptsExhausted: evidence === "EXHAUSTED",
+      conclusiveStopFailure: evidence === "CONCLUSIVE",
     });
 
     if (!eligibility.eligible) {

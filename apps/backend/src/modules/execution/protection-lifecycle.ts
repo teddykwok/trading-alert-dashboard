@@ -50,6 +50,12 @@ export const PROTECTION_REASON_CODES = [
   // its visibility has not caught up. Bounded — see propagationDeadline.
   "STOP_SUBMISSION_PROPAGATION_PENDING",
   "TAKE_PROFIT_SUBMISSION_PROPAGATION_PENDING",
+  // The owned order is EXECUTING — TRIGGERED, or PARTIALLY_FILLED and still
+  // working. Deliberately not a submission-propagation code: nothing is
+  // pending about the submission, the exchange has told us exactly what is
+  // happening. Also not a failure: the protection is doing its job.
+  "STOP_EXECUTION_IN_PROGRESS",
+  "TAKE_PROFIT_EXECUTION_IN_PROGRESS",
   "TAKE_PROFIT_INTENT_CONFLICT",
   "TAKE_PROFIT_SUBMISSION_REJECTED",
   "TAKE_PROFIT_SUBMISSION_RESULT_UNKNOWN",
@@ -456,6 +462,26 @@ export function isCancellableProtection(status: NormalizedProtectionStatus): boo
   return status === "ACTIVE" || status === "TRIGGERED";
 }
 
+/**
+ * The order has fired and is working through the book right now.
+ *
+ * Neither state counts as ACTIVE coverage — a triggered conditional is no
+ * longer a resting guard — but neither is a FAILURE: TRIGGERED means the
+ * trigger fired and the resulting order is executing, and PARTIALLY_FILLED
+ * means it is executing and has already closed part of the position. Both may
+ * still close some or all of the remaining exposure, which is why
+ * `isCancellableProtection` treats TRIGGERED as on-book and
+ * `toLocalOrderStatus` maps both back to a live local status.
+ *
+ * The distinction matters most at the last resort: sending a competing MARKET
+ * close against an executing stop races our own protection, pays taker fees
+ * twice and lets `classifyClosure` attribute the exit to EMERGENCY when the
+ * stop is what actually closed it.
+ */
+export function isExecutingProtection(status: NormalizedProtectionStatus): boolean {
+  return status === "TRIGGERED" || status === "PARTIALLY_FILLED";
+}
+
 // ---------------------------------------------------------------------------
 // Protection order identity
 // ---------------------------------------------------------------------------
@@ -639,7 +665,24 @@ export interface EmergencyEligibilityInput {
   activeStopQuantity: string;
   stopVerified: boolean;
   positionIdentityKnown: boolean;
+  /**
+   * The bounded re-query schedule for this stop genuinely ran out. Only
+   * *_SUBMISSION_RESULT_UNKNOWN earns this: the attempt budget completed, or
+   * the propagation deadline passed without the order becoming observable.
+   */
   reconciliationAttemptsExhausted: boolean;
+  /**
+   * The stop failed in a way no further reconciliation could change — an
+   * authoritative rejection, a contradictory identity, or an order observed in
+   * a known INACTIVE state.
+   *
+   * Kept separate from the attempt budget rather than folded into it, because
+   * calling a one-shot conclusive failure "attempts exhausted" would encode a
+   * fiction: no attempts were spent. An observation that merely could not be
+   * interpreted — an unrecognised algo status — is neither, and must leave both
+   * flags false so eligibility fails closed.
+   */
+  conclusiveStopFailure: boolean;
 }
 
 export interface EmergencyEligibilityResult {
@@ -667,7 +710,9 @@ export function evaluateEmergencyCloseEligibility(input: EmergencyEligibilityInp
   if (input.stopVerified && stop.greaterThanOrEqualTo(open)) {
     return { eligible: false, reasonCode: "EMERGENCY_CLOSE_NOT_ELIGIBLE" };
   }
-  if (!input.reconciliationAttemptsExhausted) {
+  // Either kind of authoritative evidence will do, but one of them is
+  // required: a last-resort market close may never rest on "we could not tell".
+  if (!input.reconciliationAttemptsExhausted && !input.conclusiveStopFailure) {
     return { eligible: false, reasonCode: "STOP_SUBMISSION_RESULT_UNKNOWN" };
   }
   if (input.mode === "DISABLED") {
