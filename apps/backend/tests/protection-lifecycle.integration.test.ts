@@ -3443,3 +3443,272 @@ describe("STOP_SUBMISSION_REJECTED is never automatically recovered", () => {
     }
   });
 });
+﻿
+// ===========================================================================
+// ESCALATION STATE CONSISTENCY.
+//
+// An escalation makes a claim about a TradeExecution transition. Everything
+// that ASSERTS that claim â€” the parked protection row, the human alert, the
+// event â€” must therefore live or die with the transition's CAS.
+//
+// It used to park `ExecutionProtectionState.state = MANUAL_INTERVENTION` and
+// queue a critical alert BEFORE the CAS, so a stale tick whose park correctly
+// lost still left the protection row claiming MANUAL_INTERVENTION on top of an
+// execution another tick had just verified as PROTECTED, and still woke a
+// human for an intervention that never happened.
+// ===========================================================================
+
+describe("escalation state consistency", () => {
+  const eventsOf = async (id: string) =>
+    prisma!.executionEvent.findMany({ where: { tradeExecutionId: id }, orderBy: { sequenceNumber: "asc" } });
+
+  const parkEventsOf = async (id: string) =>
+    prisma!.executionEvent.findMany({
+      where: { tradeExecutionId: id, toStatus: "MANUAL_INTERVENTION" },
+      orderBy: { sequenceNumber: "asc" },
+    });
+
+  /** Alerts raised BY escalate itself, as opposed to observation alerts. */
+  const escalationAlertsOf = async (id: string) =>
+    prisma!.criticalAlert.findMany({
+      where: { tradeExecutionId: id, alertType: { in: ["STOP_NOT_VERIFIED", "POSITION_IDENTITY_CONFLICT"] } },
+    });
+
+  const entryFilled = async () => {
+    const execution = await filledExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { status: "ENTRY_FILLED", version: { increment: 1 } },
+    });
+    return reload(execution.id);
+  };
+
+  /** Drives the private escalation exactly as production does. */
+  const escalate = async (
+    execution: Awaited<ReturnType<typeof reload>>,
+    reasonCode: string,
+    expectedVersion: number
+  ) =>
+    (
+      protectionService as unknown as {
+        escalate: (
+          execution: unknown,
+          reasonCode: string,
+          message: string,
+          input: { executionId: string; expectedVersion: number; evaluatedAt: Date }
+        ) => Promise<{ ok: boolean; reasonCode: string }>;
+      }
+    ).escalate(execution, reasonCode, `Synthetic ${reasonCode}.`, {
+      executionId: execution.id,
+      expectedVersion,
+      evaluatedAt: at(),
+    });
+
+  maybe()("1. a stale escalation leaves the protection row healthy, not parked", async () => {
+    const execution = await entryFilled();
+    const staleVersion = execution.version;
+
+    // Tick A verifies protection: both rows healthy.
+    await protect(execution);
+    const healthy = await reload(execution.id);
+    const healthyProtection = await protectionOf(execution.id);
+    expect(healthy.status).toBe("PROTECTED");
+    expect(healthyProtection.state).toBe("PROTECTED");
+
+    // Tick B escalates on older evidence with its stale version.
+    const outcome = await escalate(execution, "STOP_NOT_VERIFIED", staleVersion);
+
+    expect(outcome.ok).toBe(false);
+    const afterExecution = await reload(execution.id);
+    const afterProtection = await protectionOf(execution.id);
+    // Neither authoritative row moved.
+    expect(afterExecution.status).toBe("PROTECTED");
+    expect(afterExecution.requiresManualIntervention).toBe(false);
+    expect(afterExecution.version).toBe(healthy.version);
+    expect(afterProtection.state).toBe("PROTECTED");
+    expect(afterProtection.reasonCode).toBe(healthyProtection.reasonCode);
+    expect(afterProtection.version).toBe(healthyProtection.version);
+    // No event, so nothing downstream can materialize a false notification.
+    expect(await parkEventsOf(execution.id)).toHaveLength(0);
+    // And no human was woken for an intervention that never happened.
+    expect(await escalationAlertsOf(execution.id)).toHaveLength(0);
+  });
+
+  maybe()("2. a stale escalation cannot overwrite a newer PLACING_PROTECTION state", async () => {
+    const execution = await entryFilled();
+    const staleVersion = execution.version;
+
+    // Another tick advances the execution into placement.
+    const takeProfitId = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+    scenario.queryFailures.add(takeProfitId);
+    await protect(execution);
+    scenario.queryFailures.delete(takeProfitId);
+    const placing = await reload(execution.id);
+    const placingProtection = await protectionOf(execution.id);
+    expect(placing.status).toBe("PLACING_PROTECTION");
+
+    const outcome = await escalate(execution, "STOP_NOT_VERIFIED", staleVersion);
+
+    expect(outcome.ok).toBe(false);
+    expect((await reload(execution.id)).status).toBe("PLACING_PROTECTION");
+    expect((await reload(execution.id)).version).toBe(placing.version);
+    const afterProtection = await protectionOf(execution.id);
+    expect(afterProtection.state).toBe(placingProtection.state);
+    expect(afterProtection.version).toBe(placingProtection.version);
+    expect(await parkEventsOf(execution.id)).toHaveLength(0);
+  });
+
+  maybe()("3. a legitimate escalation parks BOTH rows together", async () => {
+    const execution = await entryFilled();
+    const current = await reload(execution.id);
+
+    const outcome = await escalate(current, "STOP_NOT_VERIFIED", current.version);
+
+    expect(outcome.ok).toBe(false); // an escalation never reports success
+    const parked = await reload(execution.id);
+    const protection = await protectionOf(execution.id);
+    expect(parked.status).toBe("MANUAL_INTERVENTION");
+    expect(parked.requiresManualIntervention).toBe(true);
+    expect(parked.decisionReasonCode).toBe("STOP_NOT_VERIFIED");
+    expect(protection.state).toBe("MANUAL_INTERVENTION");
+    expect(protection.reasonCode).toBe("STOP_NOT_VERIFIED");
+    // Exactly one truthful event, and the alert that goes with it.
+    const parks = await parkEventsOf(execution.id);
+    expect(parks).toHaveLength(1);
+    expect(parks[0].eventType).toBe("MANUAL_INTERVENTION_REQUIRED");
+    expect(parks[0].fromStatus).toBe("ENTRY_FILLED");
+    expect(await escalationAlertsOf(execution.id)).toHaveLength(1);
+  });
+
+  maybe()("4. a same-call version bump still parks both rows", async () => {
+    // The full production path: reserve (bumps), promote (bumps), then the stop
+    // fails identity verification and escalates on the threaded version.
+    const execution = await entryFilled();
+    scenario.closePositionOnReadback = true;
+
+    const outcome = await protectionService.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+    scenario.closePositionOnReadback = false;
+
+    expect(outcome.reasonCode).toBe("STOP_IDENTITY_MISMATCH");
+    const parked = await reload(execution.id);
+    expect(parked.status).toBe("MANUAL_INTERVENTION");
+    expect(parked.requiresManualIntervention).toBe(true);
+    expect((await protectionOf(execution.id)).state).toBe("MANUAL_INTERVENTION");
+    expect((await protectionOf(execution.id)).reasonCode).toBe("STOP_IDENTITY_MISMATCH");
+    expect(await parkEventsOf(execution.id)).toHaveLength(1);
+  });
+
+  maybe()("5. two concurrent escalations produce exactly one park", async () => {
+    const execution = await entryFilled();
+    const current = await reload(execution.id);
+
+    const results = await Promise.all([
+      escalate(current, "STOP_NOT_VERIFIED", current.version),
+      escalate(current, "STOP_NOT_VERIFIED", current.version),
+    ]);
+
+    expect(results).toHaveLength(2);
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+    expect((await protectionOf(execution.id)).state).toBe("MANUAL_INTERVENTION");
+    // One logical winner: one transition, one event.
+    expect(await parkEventsOf(execution.id)).toHaveLength(1);
+    expect((await reload(execution.id)).version).toBe(current.version + 1);
+  });
+
+  maybe()("6. a terminal execution is never parked, and neither is its protection row", async () => {
+    const execution = await entryFilled();
+    await protect(execution);
+    const protectedRow = await reload(execution.id);
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { status: "CLOSED_TP", version: { increment: 1 } },
+    });
+    const terminal = await reload(execution.id);
+    const protectionBefore = await protectionOf(execution.id);
+    const eventsBefore = (await eventsOf(execution.id)).length;
+    void protectedRow;
+
+    // A terminal source is a modelling error, and it stays loud â€” but it must
+    // not leave a half-written escalation behind.
+    await expect(escalate(terminal, "STOP_NOT_VERIFIED", terminal.version)).rejects.toThrow();
+
+    const after = await reload(execution.id);
+    expect(after.status).toBe("CLOSED_TP");
+    expect(after.version).toBe(terminal.version);
+    const protectionAfter = await protectionOf(execution.id);
+    expect(protectionAfter.state).toBe(protectionBefore.state);
+    expect(protectionAfter.version).toBe(protectionBefore.version);
+    expect(await eventsOf(execution.id)).toHaveLength(eventsBefore);
+    expect(await escalationAlertsOf(execution.id)).toHaveLength(0);
+  });
+
+  maybe()("7. re-escalating an already parked execution stays consistent", async () => {
+    const execution = await entryFilled();
+    const first = await reload(execution.id);
+    await escalate(first, "STOP_NOT_VERIFIED", first.version);
+    const parked = await reload(execution.id);
+
+    // A later tick records fresher evidence while it stays parked.
+    const outcome = await escalate(parked, "STOP_IDENTITY_MISMATCH", parked.version);
+
+    expect(outcome.ok).toBe(false);
+    const after = await reload(execution.id);
+    const protection = await protectionOf(execution.id);
+    expect(after.status).toBe("MANUAL_INTERVENTION");
+    expect(after.requiresManualIntervention).toBe(true);
+    // Both rows carry the NEWER reason â€” they never disagree.
+    expect(after.decisionReasonCode).toBe("STOP_IDENTITY_MISMATCH");
+    expect(protection.state).toBe("MANUAL_INTERVENTION");
+    expect(protection.reasonCode).toBe("STOP_IDENTITY_MISMATCH");
+    // The self-stamp is recorded truthfully and cannot look like a new episode.
+    const parks = await parkEventsOf(execution.id);
+    expect(parks).toHaveLength(2);
+    expect(parks[1].fromStatus).toBe("MANUAL_INTERVENTION");
+    expect(parks[1].toStatus).toBe("MANUAL_INTERVENTION");
+    // No recovery attempt was consumed or reset by the self-stamp.
+    expect(
+      await prisma!.executionEvent.count({
+        where: { tradeExecutionId: execution.id, fromStatus: "MANUAL_INTERVENTION", toStatus: "PLACING_PROTECTION" },
+      })
+    ).toBe(0);
+  });
+
+  maybe()("8. after a successful recovery a stale escalation cannot re-park either row", async () => {
+    // Park through the real machinery, recover, then replay the stale tick.
+    const execution = await filledExecution();
+    scenario.closePositionOnReadback = true;
+    await protect(execution);
+    scenario.closePositionOnReadback = false;
+    const parked = await reload(execution.id);
+    expect(parked.status).toBe("MANUAL_INTERVENTION");
+
+    const recovered = await protectionService.attemptProtectionRecovery({
+      executionId: parked.id,
+      expectedVersion: parked.version,
+      evaluatedAt: at(),
+    });
+    expect(recovered.ok).toBe(true);
+    const healthy = await reload(execution.id);
+    const healthyProtection = await protectionOf(execution.id);
+    expect(healthy.status).toBe("PROTECTED");
+    expect(healthy.requiresManualIntervention).toBe(false);
+    expect(healthyProtection.state).toBe("PROTECTED");
+    const parksBefore = (await parkEventsOf(execution.id)).length;
+
+    // The tick that originally parked it replays with its old version.
+    const outcome = await escalate(parked, "STOP_IDENTITY_MISMATCH", parked.version);
+
+    expect(outcome.ok).toBe(false);
+    const after = await reload(execution.id);
+    const afterProtection = await protectionOf(execution.id);
+    expect(after.status).toBe("PROTECTED");
+    expect(after.requiresManualIntervention).toBe(false);
+    expect(afterProtection.state).toBe("PROTECTED");
+    expect(afterProtection.version).toBe(healthyProtection.version);
+    expect(await parkEventsOf(execution.id)).toHaveLength(parksBefore);
+  });
+});
