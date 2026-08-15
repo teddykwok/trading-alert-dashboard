@@ -74,7 +74,17 @@ describe("execution state machine", () => {
     // close on its own. The orchestrator routes MANUAL_INTERVENTION into
     // closure reconciliation, which attributes a fill to an owned STOP or TP —
     // recording that as CLOSED_EXTERNAL would discard attribution we have.
-    ["MANUAL_INTERVENTION", ["CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "CLOSED_TP", "CLOSED_SL"]],
+    //
+    // PLACING_PROTECTION is the one non-terminal exit: a parked execution with
+    // live exposure that current exchange evidence proves is safe to re-protect
+    // rejoins the lifecycle there. It is the WEAKEST available claim — work in
+    // flight, not protection verified — so coverage must still be proven before
+    // PROTECTED. Only attemptProtectionRecovery may take it, and only for an
+    // allowlisted protection-lifecycle reason.
+    [
+      "MANUAL_INTERVENTION",
+      ["CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "CLOSED_TP", "CLOSED_SL", "PLACING_PROTECTION"],
+    ],
   ];
 
   it("permits exactly the documented transitions", () => {

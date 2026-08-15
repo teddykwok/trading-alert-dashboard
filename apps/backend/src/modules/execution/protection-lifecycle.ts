@@ -64,6 +64,10 @@ export const PROTECTION_REASON_CODES = [
   "CAPACITY_OR_VERSION_CONFLICT",
   "MANUAL_REVIEW_REQUIRED",
   "PROTECTION_VERIFIED",
+  // The one code that means "a parked execution was re-admitted to the
+  // protection lifecycle". Never an alert: it reports a recovery starting, not
+  // a problem, and the recovery still has to prove full coverage afterwards.
+  "PROTECTION_RECOVERY_RESUMED",
   // --- Entry-remainder cleanup before terminal closure ---------------------
   "ENTRY_REMAINDER_CLEANUP_FAILED",
   "ENTRY_REFILLED_DURING_CLOSURE",
