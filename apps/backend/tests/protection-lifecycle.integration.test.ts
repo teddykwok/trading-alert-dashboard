@@ -40,6 +40,8 @@ const { ProtectionLifecycleService } = await import("../src/modules/execution/pr
 const { CriticalAlertService } = await import("../src/modules/execution/critical-alert.service");
 const { BinanceError } = await import("../src/modules/binance/binance.errors");
 const { buildClientOrderId } = await import("../src/modules/execution/execution-safety");
+// Mutated per test to exercise the emergency-close policy, always restored.
+const { env: runtimeEnv } = await import("../src/config/env");
 
 type ExecutionServiceType = InstanceType<typeof ExecutionService>;
 type ProtectionServiceType = InstanceType<typeof ProtectionLifecycleService>;
@@ -4395,6 +4397,386 @@ describe("at-most-once external protection mutation", () => {
     expect(orders.every((order) => order.generation === 1)).toBe(true);
     expect(posts("STOP_LOSS")).toBe(1);
     // And it did not wait forever: it is parked for an operator.
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+  });
+});
+
+// ===========================================================================
+// EMERGENCY CLOSE RESTS ON EVIDENCE, NOT ON ABSENCE OF IT.
+//
+// `measureVerifiedCoverage` counts an UNREADABLE leg as zero and names its role
+// in `unresolved`. considerEmergencyClose used to consume only the number, so a
+// transient query failure on a live covering STOP produced stop = "0",
+// stopVerified = false, and — under ON_UNVERIFIED_STOP — a MARKET close of a
+// fully protected position. It also asserted `reconciliationAttemptsExhausted:
+// true` as a literal, which happened to be true only because of the call graph.
+// ===========================================================================
+
+describe("emergency close reconciliation evidence", () => {
+  const withEmergencyMode = async <T>(mode: string, run: () => Promise<T>): Promise<T> => {
+    const previous = runtimeEnv.EXECUTION_EMERGENCY_CLOSE_MODE;
+    (runtimeEnv as { EXECUTION_EMERGENCY_CLOSE_MODE: string }).EXECUTION_EMERGENCY_CLOSE_MODE = mode;
+    try {
+      return await run();
+    } finally {
+      (runtimeEnv as { EXECUTION_EMERGENCY_CLOSE_MODE: string }).EXECUTION_EMERGENCY_CLOSE_MODE = previous;
+    }
+  };
+
+  /**
+   * A second tranche whose STOP is conclusively inactive, while generation 1's
+   * STOP is still live and covering the whole position.
+   */
+  const twoGenerationsWithLiveStop = async () => {
+    const execution = await filledExecution();
+    await protect(execution); // generation 1: STOP + TP verified active
+    const stop1 = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    const takeProfit1 = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+    expect(scenario.algoOrders.get(stop1)?.algoStatus).toBe("NEW");
+    return { execution, stop1, takeProfit1 };
+  };
+
+  maybe()("1. an UNREADABLE stop leg never authorizes a market close", async () => {
+    // The dangerous shape, reached all the way into eligibility:
+    //
+    //   generation 1's STOP is LIVE and covers the position
+    //   generation 2 is reserved because exposure grew
+    //   generation 2's STOP lands CANCELED  -> STOP_NOT_VERIFIED, conclusive
+    //   generation 1's STOP becomes unreadable at that instant
+    //   -> measured.stop collapses to "0" while a stop is actually working
+    //
+    // Deciding on the number alone would market-close a protected position.
+    const { execution, stop1 } = await twoGenerationsWithLiveStop();
+    scenario.positionAmt = "0.200";
+
+    // The failure is injected AT SUBMISSION so the reservation still happens:
+    // advanceProtection's own unresolved guard would otherwise defer earlier
+    // and this path would never be exercised.
+    const originalSubmit = mutationStub.submitProtectionOrder;
+    mutationStub.submitProtectionOrder = async (context: Record<string, string>) => {
+      const result = await originalSubmit.call(mutationStub, context);
+      if (context.role === "STOP_LOSS" && Number(context.generation) === 2) {
+        const row = scenario.algoOrders.get(context.clientAlgoId);
+        if (row) row.algoStatus = "CANCELED";
+        scenario.queryFailures.add(stop1);
+      }
+      return result;
+    };
+
+    const outcome = await withEmergencyMode("ON_UNVERIFIED_STOP", async () =>
+      protectionService.ensureProtectionForExposure({
+        executionId: execution.id,
+        expectedVersion: (await reload(execution.id)).version,
+        evaluatedAt: at(),
+      })
+    );
+    mutationStub.submitProtectionOrder = originalSubmit;
+
+    // Zero market closes: unreadable is not proof of an unprotected position.
+    expect(scenario.mutations.filter((call) => call.includes("MARKET"))).toHaveLength(0);
+    expect(await emergencyOrdersOf(execution.id)).toBe(0);
+    expect((await reload(execution.id)).status).not.toBe("CLOSED_EMERGENCY");
+    // It fails closed onto the existing manual path instead.
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+    expect(outcome.ok).toBe(false);
+  });
+
+  /** Makes the submitted STOP land already in the given algo status. */
+  const landStopWith = (algoStatus: string) => {
+    const original = mutationStub.submitProtectionOrder;
+    mutationStub.submitProtectionOrder = async (context: Record<string, string>) => {
+      const result = await original.call(mutationStub, context);
+      if (context.role === "STOP_LOSS") {
+        const row = scenario.algoOrders.get(context.clientAlgoId);
+        if (row) row.algoStatus = algoStatus;
+      }
+      return result;
+    };
+    return () => {
+      mutationStub.submitProtectionOrder = original;
+    };
+  };
+
+  const emergencyOrdersOf = async (id: string) =>
+    prisma!.binanceOrder.count({ where: { tradeExecutionId: id, role: "EMERGENCY_CLOSE" } });
+
+  maybe()("2. a conclusively inactive stop with readable coverage stays eligible", async () => {
+    // The opposite proof: emergency close must not become impossible.
+    const execution = await filledExecution();
+    const restore = landStopWith("CANCELED"); // authoritative, and readable
+
+    await withEmergencyMode("ON_UNVERIFIED_STOP", async () =>
+      protectionService.ensureProtectionForExposure({
+        executionId: execution.id,
+        expectedVersion: execution.version,
+        evaluatedAt: at(),
+      })
+    );
+    restore();
+
+    // The last resort remains available on authoritative evidence, even though
+    // no reconciliation attempt was ever spent.
+    expect(await emergencyOrdersOf(execution.id)).toBe(1);
+  });
+
+  maybe()("3. DISABLED mode never mutates however conclusive the failure", async () => {
+    const execution = await filledExecution();
+    const restore = landStopWith("CANCELED");
+
+    await withEmergencyMode("DISABLED", async () =>
+      protectionService.ensureProtectionForExposure({
+        executionId: execution.id,
+        expectedVersion: execution.version,
+        evaluatedAt: at(),
+      })
+    );
+    restore();
+
+    expect(await emergencyOrdersOf(execution.id)).toBe(0);
+    expect(scenario.mutations.filter((call) => call.includes("MARKET"))).toHaveLength(0);
+    // Parked for a human instead.
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+  });
+
+  maybe()("4. an UNPARSEABLE stop status is not conclusive evidence", async () => {
+    // `normalizeAlgoStatus` reports an unrecognised token as UNKNOWN precisely
+    // because it refuses to guess. That reaches the same STOP_NOT_VERIFIED
+    // reason code as a conclusive CANCELED, so the observation itself — not the
+    // reason code — has to decide.
+    const execution = await filledExecution();
+    const restore = landStopWith("SOMETHING_NEW");
+
+    await withEmergencyMode("ON_UNVERIFIED_STOP", async () =>
+      protectionService.ensureProtectionForExposure({
+        executionId: execution.id,
+        expectedVersion: execution.version,
+        evaluatedAt: at(),
+      })
+    );
+    restore();
+
+    expect(await emergencyOrdersOf(execution.id)).toBe(0);
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+  });
+
+  maybe()("5. a temporary post-submit visibility gap can never emergency close", async () => {
+    // The propagation fix stays load-bearing: an accepted STOP that is briefly
+    // invisible defers before emergency close is even considered.
+    const execution = await filledExecution();
+    const service = new ProtectionLifecycleService(
+      prisma!,
+      readOnlyStub as never,
+      mutationStub as never,
+      alertService,
+      { reconcileMaxAttempts: 2, reconcileDelayMs: 60_000 }
+    );
+    scenario.invisibleReads.set(buildClientOrderId(execution.id, "STOP_LOSS", 1), 999);
+
+    const outcome = await withEmergencyMode("ON_UNVERIFIED_STOP", async () =>
+      service.ensureProtectionForExposure({
+        executionId: execution.id,
+        expectedVersion: execution.version,
+        evaluatedAt: at(),
+      })
+    );
+
+    expect(outcome.reasonCode).toBe("STOP_SUBMISSION_PROPAGATION_PENDING");
+    expect(await prisma!.binanceOrder.count({
+      where: { tradeExecutionId: execution.id, role: "EMERGENCY_CLOSE" },
+    })).toBe(0);
+    expect((await reload(execution.id)).status).not.toBe("MANUAL_INTERVENTION");
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+  });
+});
+
+// ===========================================================================
+// AN EXECUTING STOP IS NOT A FAILED STOP.
+//
+// TRIGGERED means the trigger fired and the resulting order is working the
+// book; PARTIALLY_FILLED means it is working and has already closed part of
+// the position. Neither counts as ACTIVE coverage, so both used to arrive as
+// STOP_NOT_VERIFIED — the same verdict as a CANCELED stop. Under
+// ON_UNVERIFIED_STOP that authorized a competing MARKET close against our own
+// executing protection, and `classifyClosure` checks emergencyFilled BEFORE
+// stopFired, so the exit would have been recorded CLOSED_EMERGENCY when the
+// STOP is what actually closed it.
+//
+// Both states are now deferred: there is nothing to do but look again.
+// ===========================================================================
+
+describe("executing stop deferral", () => {
+  const emergencyOrders = async (id: string) =>
+    prisma!.binanceOrder.count({ where: { tradeExecutionId: id, role: "EMERGENCY_CLOSE" } });
+
+  const stopOrdersOf = async (id: string) =>
+    prisma!.binanceOrder.findMany({ where: { tradeExecutionId: id, role: "STOP_LOSS" } });
+
+  const withEmergencyOn = async <T>(run: () => Promise<T>): Promise<T> => {
+    const previous = runtimeEnv.EXECUTION_EMERGENCY_CLOSE_MODE;
+    (runtimeEnv as { EXECUTION_EMERGENCY_CLOSE_MODE: string }).EXECUTION_EMERGENCY_CLOSE_MODE = "ON_UNVERIFIED_STOP";
+    try {
+      return await run();
+    } finally {
+      (runtimeEnv as { EXECUTION_EMERGENCY_CLOSE_MODE: string }).EXECUTION_EMERGENCY_CLOSE_MODE = previous;
+    }
+  };
+
+  /**
+   * A protected execution whose STOP is then observed in `algoStatus`, with the
+   * take profit left unresolved so the tranche stays incomplete and the STOP is
+   * re-verified on the next tick — the reachable shape from the audit.
+   */
+  const stopObservedAs = async (algoStatus: string) => {
+    const execution = await filledExecution();
+    const takeProfitId = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+    // The TP never resolves, so generation 1 stays incomplete and the STOP is
+    // looked at again rather than a new generation being minted.
+    scenario.queryFailures.add(takeProfitId);
+    await protect(execution);
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    scenario.algoOrders.get(stopId)!.algoStatus = algoStatus;
+    return { execution, stopId, takeProfitId };
+  };
+
+  const tick = async (id: string) =>
+    protectionService.ensureProtectionForExposure({
+      executionId: id,
+      expectedVersion: (await reload(id)).version,
+      evaluatedAt: at(),
+    });
+
+  maybe()("1. a TRIGGERED stop defers instead of emergency closing", async () => {
+    const { execution, stopId } = await stopObservedAs("TRIGGERED");
+    const stopsBefore = (await stopOrdersOf(execution.id)).length;
+
+    const outcome = await withEmergencyOn(() => tick(execution.id));
+
+    expect(outcome.reasonCode).toBe("STOP_EXECUTION_IN_PROGRESS");
+    expect(await emergencyOrders(execution.id)).toBe(0);
+    expect(scenario.mutations.filter((call) => call.includes("MARKET"))).toHaveLength(0);
+    const after = await reload(execution.id);
+    expect(after.status).not.toBe("MANUAL_INTERVENTION");
+    expect(after.status).not.toBe("CLOSED_EMERGENCY");
+    expect(after.requiresManualIntervention).toBe(false);
+    // The owned identity is untouched: no replacement, no new generation.
+    const stops = await stopOrdersOf(execution.id);
+    expect(stops).toHaveLength(stopsBefore);
+    expect(stops[0].clientAlgoId).toBe(stopId);
+    // Nothing was cancelled to simplify the lifecycle either.
+    expect(scenario.mutations.filter((call) => call.startsWith("DELETE"))).toHaveLength(0);
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+  });
+
+  maybe()("2. a PARTIALLY_FILLED stop defers instead of emergency closing", async () => {
+    const { execution, stopId } = await stopObservedAs("PARTIALLY_FILLED");
+
+    const outcome = await withEmergencyOn(() => tick(execution.id));
+
+    expect(outcome.reasonCode).toBe("STOP_EXECUTION_IN_PROGRESS");
+    expect(await emergencyOrders(execution.id)).toBe(0);
+    const after = await reload(execution.id);
+    expect(after.status).not.toBe("MANUAL_INTERVENTION");
+    expect(after.requiresManualIntervention).toBe(false);
+    // No replacement stop for the coverage that PARTIALLY_FILLED does not count.
+    const stops = await stopOrdersOf(execution.id);
+    expect(stops).toHaveLength(1);
+    expect(stops[0].clientAlgoId).toBe(stopId);
+  });
+
+  maybe()("3. ATTRIBUTION: TRIGGERED then FILLED and flat closes as CLOSED_SL", async () => {
+    // The race that motivated this branch, end to end.
+    const { execution, stopId } = await stopObservedAs("TRIGGERED");
+    await withEmergencyOn(() => tick(execution.id));
+    expect(await emergencyOrders(execution.id)).toBe(0);
+
+    // The stop completes and the position is flat.
+    scenario.algoOrders.get(stopId)!.algoStatus = "FILLED";
+    scenario.algoOrders.get(stopId)!.executedQty = "0.100";
+    scenario.algoOrders.get(stopId)!.avgPrice = "96";
+    // Flat as a zero-quantity row: a MISSING row is the closure-first path's
+    // business, and calling the health entry point directly would hit the
+    // documented POSITION_NOT_FOUND_AFTER_FILL escalation instead.
+    scenario.positionAmt = "0";
+    scenario.queryFailures.clear();
+
+    await withEmergencyOn(() => tick(execution.id));
+
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_SL");
+    expect(closed.status).not.toBe("CLOSED_EMERGENCY");
+    // The exit was never stolen by an emergency order, because none exists.
+    expect(await emergencyOrders(execution.id)).toBe(0);
+    expect(closed.exitReason).toBe("STOP_LOSS");
+  });
+
+  maybe()("4. PARTIALLY_FILLED then FILLED and flat also closes as CLOSED_SL", async () => {
+    const { execution, stopId } = await stopObservedAs("PARTIALLY_FILLED");
+    await withEmergencyOn(() => tick(execution.id));
+
+    scenario.algoOrders.get(stopId)!.algoStatus = "FILLED";
+    // Flat as a zero-quantity row: a MISSING row is the closure-first path's
+    // business, and calling the health entry point directly would hit the
+    // documented POSITION_NOT_FOUND_AFTER_FILL escalation instead.
+    scenario.positionAmt = "0";
+    scenario.queryFailures.clear();
+
+    await withEmergencyOn(() => tick(execution.id));
+
+    expect((await reload(execution.id)).status).toBe("CLOSED_SL");
+    expect(await emergencyOrders(execution.id)).toBe(0);
+  });
+
+  maybe()("5. TRIGGERED then CANCELED with exposure remaining resumes real failure handling", async () => {
+    // The deferral is not a trap: it lasts exactly as long as the exchange
+    // keeps reporting an executing order.
+    const { execution, stopId } = await stopObservedAs("TRIGGERED");
+    const deferred = await withEmergencyOn(() => tick(execution.id));
+    expect(deferred.reasonCode).toBe("STOP_EXECUTION_IN_PROGRESS");
+    expect(await emergencyOrders(execution.id)).toBe(0);
+
+    // It ends up cancelled while the position is still open.
+    scenario.algoOrders.get(stopId)!.algoStatus = "CANCELED";
+
+    await withEmergencyOn(() => tick(execution.id));
+
+    // Authoritative failure: the last resort becomes available again.
+    expect(await emergencyOrders(execution.id)).toBe(1);
+  });
+
+  maybe()("6. an executing stop whose query turns UNKNOWN still fails closed", async () => {
+    const { execution, stopId } = await stopObservedAs("TRIGGERED");
+    await withEmergencyOn(() => tick(execution.id));
+
+    // The leg becomes unreadable: absence of evidence, not evidence of failure.
+    scenario.queryFailures.add(stopId);
+
+    const outcome = await withEmergencyOn(() => tick(execution.id));
+
+    expect(outcome.reasonCode).toBe("STOP_QUERY_UNAVAILABLE");
+    expect(await emergencyOrders(execution.id)).toBe(0);
+    expect((await reload(execution.id)).status).not.toBe("CLOSED_EMERGENCY");
+  });
+
+  maybe()("7. a TRIGGERED stop decides the tick even while the take profit is UNKNOWN", async () => {
+    // The TP is already unreadable in this fixture; the STOP's executing state
+    // is what the outcome reports, and no emergency close occurs.
+    const { execution } = await stopObservedAs("TRIGGERED");
+
+    const outcome = await withEmergencyOn(() => tick(execution.id));
+
+    expect(outcome.reasonCode).toBe("STOP_EXECUTION_IN_PROGRESS");
+    expect(await emergencyOrders(execution.id)).toBe(0);
+  });
+
+  maybe()("8. an unparseable algo status is still not treated as executing", async () => {
+    const { execution } = await stopObservedAs("SOMETHING_NEW");
+
+    const outcome = await withEmergencyOn(() => tick(execution.id));
+
+    // UNKNOWN keeps its own fail-closed semantics rather than borrowing the
+    // executing deferral.
+    expect(outcome.reasonCode).not.toBe("STOP_EXECUTION_IN_PROGRESS");
+    expect(await emergencyOrders(execution.id)).toBe(0);
     expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
   });
 });
