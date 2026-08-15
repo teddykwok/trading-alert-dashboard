@@ -2135,12 +2135,24 @@ export class ProtectionLifecycleService {
       ? "INSUFFICIENT"
       : classifyStopFailureEvidence(stopReason, observedStopStatus);
 
+    // IDENTITY IS PROVEN HERE, NOT REMEMBERED.
+    //
+    // ensureProtectionForExposure does validate the position — symbol, sign
+    // against direction, non-zero — but that happens at the TOP of the call,
+    // before a coverage measurement, possibly a tranche reservation, the
+    // protection POST and its bounded re-query loop. Asserting
+    // `positionIdentityKnown: true` here reported that opening observation as
+    // though it were still current, and `confirmedOpenQuantity` carried its
+    // now-stale number. A stop that filled during that window would leave both
+    // saying "0.1 LONG is open" while the position was already flat.
+    const identity = await this.proveCurrentPositionIdentity(execution);
+
     const eligibility = evaluateEmergencyCloseEligibility({
       mode: env.EXECUTION_EMERGENCY_CLOSE_MODE,
-      confirmedOpenQuantity: protection.confirmedOpenQuantity.toString(),
+      confirmedOpenQuantity: identity.quantity,
       activeStopQuantity: measured.stop,
       stopVerified: new D(measured.stop).greaterThan(0),
-      positionIdentityKnown: true,
+      positionIdentityKnown: identity.known,
       reconciliationAttemptsExhausted: evidence === "EXHAUSTED",
       conclusiveStopFailure: evidence === "CONCLUSIVE",
     });
@@ -2154,7 +2166,7 @@ export class ProtectionLifecycleService {
         details: {
           symbol: execution.symbol,
           positionSide,
-          confirmedOpenQuantity: protection.confirmedOpenQuantity.toString(),
+          confirmedOpenQuantity: identity.quantity,
           protectedStopQuantity: measured.stop,
           protectionState: "PROTECTION_INCOMPLETE",
           requiredAction: "Stop is unverified and emergency close is not eligible; intervene manually.",
@@ -2166,6 +2178,68 @@ export class ProtectionLifecycleService {
     return this.executeEmergencyClose(execution, protection, input);
   }
 
+  /**
+   * Proves, from a FRESH exchange read, which exposure we would be closing.
+   *
+   * Identity and existence are deliberately not one boolean. A missing row, a
+   * zero quantity, an opposite sign and an unreadable query are four different
+   * facts, and only one of them — a positive quantity on the expected side —
+   * means "we know what we are about to close".
+   *
+   * Every caller uses this at a decision point, never as a remembered fact:
+   * `confirmedOpenQuantity` on the protection row is written once near the top
+   * of ensureProtectionForExposure and is stale by the time a submission
+   * sequence has completed.
+   */
+  private async proveCurrentPositionIdentity(
+    execution: TradeExecution
+  ): Promise<
+    | { known: true; quantity: string }
+    | { known: false; quantity: "0"; reasonCode: ProtectionReasonCode; message: string }
+  > {
+    const direction = execution.direction as DirectionName;
+    const position = await this.readPosition(execution.symbol, protectionPositionSide(direction));
+
+    if (position === "UNAVAILABLE") {
+      return {
+        known: false,
+        quantity: "0",
+        reasonCode: "POSITION_STATE_UNAVAILABLE",
+        message: "The current position could not be read; identity is unproven.",
+      };
+    }
+    if (position === null) {
+      // A missing row is how a real exchange reports flat. Either way there is
+      // nothing to close, and closure reconciliation owns the attribution.
+      return {
+        known: false,
+        quantity: "0",
+        reasonCode: "EMERGENCY_CLOSE_NOT_ELIGIBLE",
+        message: "No position row exists; there is no exposure to close.",
+      };
+    }
+
+    const normalized = normalizeOpenQuantity(position.quantity, direction);
+    if (!normalized.valid) {
+      return {
+        known: false,
+        quantity: "0",
+        reasonCode: "POSITION_IDENTITY_MISMATCH",
+        message: "The reported position contradicts the expected direction.",
+      };
+    }
+    if (new D(normalized.quantity).lessThanOrEqualTo(0)) {
+      return {
+        known: false,
+        quantity: "0",
+        reasonCode: "EMERGENCY_CLOSE_NOT_ELIGIBLE",
+        message: "The position is flat; there is no exposure to close.",
+      };
+    }
+
+    return { known: true, quantity: normalized.quantity };
+  }
+
   /** Reserves the emergency intent, then submits the one branded MARKET close. */
   private async executeEmergencyClose(
     execution: TradeExecution,
@@ -2174,10 +2248,49 @@ export class ProtectionLifecycleService {
   ): Promise<ProtectionOutcome> {
     const direction = execution.direction as DirectionName;
     const positionSide = protectionPositionSide(direction);
-    const quantity = protection.confirmedOpenQuantity.toString();
     const clientOrderId = buildClientOrderId(execution.id, "EMERGENCY_CLOSE", 1);
 
+    // THE LAST RESPONSIBLE MOMENT.
+    //
+    // Eligibility proved identity, but the owned STOP can fill in the interval
+    // between that proof and this mutation — the very stop whose failure sent
+    // us here. So the position is read once more, as late as the architecture
+    // allows, and THIS read supplies the close quantity. Using the eligibility
+    // number instead would market-close a size the position no longer has.
+    //
+    // Ordered ahead of the durable intent deliberately: a reservation is a
+    // record that an external mutation MAY have escaped, and creating one for
+    // a call that then refuses to submit would be a lie about a live account.
+    // Only a local insert separates this read from the POST.
+    const identity = await this.proveCurrentPositionIdentity(execution);
     let order = await this.loadOrder(execution.id, "EMERGENCY_CLOSE", 1);
+
+    if (!identity.known) {
+      logger.warn(
+        {
+          executionId: execution.id,
+          symbol: execution.symbol,
+          positionSide,
+          reasonCode: identity.reasonCode,
+        },
+        "Emergency close abandoned at the final position check; no market order was sent"
+      );
+      // An intent from an EARLIER attempt is resolved by the reconciler, which
+      // queries both the order and the position rather than assuming either.
+      if (order) return this.reconcileEmergencyClose(execution, order, input);
+      return this.outcome(false, identity.reasonCode, identity.message, execution, protection);
+    }
+
+    const quantity = identity.quantity;
+
+    if (order && !order.originalQuantity.equals(new D(quantity))) {
+      // Keep the reservation truthful about what is actually being sent.
+      order = await this.prisma.binanceOrder.update({
+        where: { id: order.id },
+        data: { originalQuantity: new D(quantity) },
+      });
+    }
+
     if (!order) {
       // Durable intent before the mutation. Generation 2 is never created.
       order = await this.prisma.binanceOrder.create({

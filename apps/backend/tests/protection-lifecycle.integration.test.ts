@@ -68,6 +68,8 @@ interface AlgoOrderRow {
 
 interface Scenario {
   positionAmt: string | null;
+  /** Consumed one entry per position read, then falls back to positionAmt. */
+  positionAmtSequence: string[];
   markPrice: string;
   liquidationPrice: string | null;
   isolatedMargin: string | null;
@@ -105,6 +107,7 @@ const scenario: Scenario = {} as Scenario;
 function resetScenario() {
   Object.assign(scenario, {
     positionAmt: "0.100",
+    positionAmtSequence: [],
     markPrice: "100",
     liquidationPrice: "90",
     isolatedMargin: "3.00",
@@ -174,7 +177,13 @@ const readOnlyStub = {
     return {
       symbol: SYMBOL,
       positionSide,
-      positionAmt: scenario.positionAmt,
+      // A scripted sequence lets a test change the position BETWEEN reads, which
+      // is the only way to exercise a race that opens after one observation and
+      // closes before the next.
+      positionAmt:
+        scenario.positionAmtSequence.length > 0
+          ? (scenario.positionAmtSequence.shift() as string)
+          : scenario.positionAmt,
       entryPrice: "100",
       markPrice: scenario.markPrice,
       liquidationPrice: scenario.liquidationPrice,
@@ -4776,6 +4785,249 @@ describe("executing stop deferral", () => {
     // UNKNOWN keeps its own fail-closed semantics rather than borrowing the
     // executing deferral.
     expect(outcome.reasonCode).not.toBe("STOP_EXECUTION_IN_PROGRESS");
+    expect(await emergencyOrders(execution.id)).toBe(0);
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+  });
+});
+
+// ===========================================================================
+// EMERGENCY CLOSE KNOWS WHAT IT IS CLOSING.
+//
+// `positionIdentityKnown: true` and `confirmedOpenQuantity` both came from an
+// observation taken at the TOP of ensureProtectionForExposure — before a
+// coverage measurement, a tranche reservation, the protection POST and its
+// bounded re-query loop. Seconds and many round-trips later that number was
+// presented as current. If the owned STOP filled in that window, the position
+// was already flat while eligibility still read "0.1 LONG is open".
+//
+// Identity is now proven from a fresh read at eligibility, and proven AGAIN
+// immediately before the market order — which is also where the close quantity
+// comes from.
+// ===========================================================================
+
+describe("emergency close position identity", () => {
+  const emergencyOrders = async (id: string) =>
+    prisma!.binanceOrder.count({ where: { tradeExecutionId: id, role: "EMERGENCY_CLOSE" } });
+
+  const marketCloses = () => scenario.mutations.filter((call) => call.includes("MARKET"));
+
+  const withEmergencyOn = async <T>(run: () => Promise<T>): Promise<T> => {
+    const previous = runtimeEnv.EXECUTION_EMERGENCY_CLOSE_MODE;
+    (runtimeEnv as { EXECUTION_EMERGENCY_CLOSE_MODE: string }).EXECUTION_EMERGENCY_CLOSE_MODE = "ON_UNVERIFIED_STOP";
+    try {
+      return await run();
+    } finally {
+      (runtimeEnv as { EXECUTION_EMERGENCY_CLOSE_MODE: string }).EXECUTION_EMERGENCY_CLOSE_MODE = previous;
+    }
+  };
+
+  /**
+   * Drives a conclusively CANCELED stop, which is the one shape that reaches
+   * emergency-close eligibility with authoritative failure evidence.
+   */
+  const conclusivelyFailedStop = async (direction: "LONG" | "SHORT" = "LONG") => {
+    const execution = await filledExecution({ direction });
+    const original = mutationStub.submitProtectionOrder;
+    mutationStub.submitProtectionOrder = async (context: Record<string, string>) => {
+      const result = await original.call(mutationStub, context);
+      if (context.role === "STOP_LOSS") {
+        const row = scenario.algoOrders.get(context.clientAlgoId);
+        if (row) row.algoStatus = "CANCELED";
+      }
+      return result;
+    };
+    return {
+      execution,
+      restore: () => {
+        mutationStub.submitProtectionOrder = original;
+      },
+    };
+  };
+
+  const run = async (id: string, version: number) =>
+    protectionService.ensureProtectionForExposure({
+      executionId: id,
+      expectedVersion: version,
+      evaluatedAt: at(),
+    });
+
+  maybe()("1. a valid LONG identity still reaches the market close", async () => {
+    const { execution, restore } = await conclusivelyFailedStop("LONG");
+
+    await withEmergencyOn(() => run(execution.id, execution.version));
+    restore();
+
+    expect(await emergencyOrders(execution.id)).toBe(1);
+    expect(marketCloses()).toHaveLength(1);
+    // SELL against the LONG hedge leg, sized from the live position.
+    expect(marketCloses()[0]).toContain("0.1");
+    const order = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id, role: "EMERGENCY_CLOSE" },
+    });
+    expect(order.side).toBe("SELL");
+    expect(order.positionSide).toBe("LONG");
+  });
+
+  maybe()("2. a valid SHORT identity still reaches the market close", async () => {
+    scenario.positionAmt = "-0.100"; // Binance reports a SHORT as negative
+    const { execution, restore } = await conclusivelyFailedStop("SHORT");
+
+    await withEmergencyOn(() => run(execution.id, execution.version));
+    restore();
+
+    expect(await emergencyOrders(execution.id)).toBe(1);
+    const order = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id, role: "EMERGENCY_CLOSE" },
+    });
+    expect(order.side).toBe("BUY");
+    expect(order.positionSide).toBe("SHORT");
+    expect(order.originalQuantity.toString()).toBe("0.1");
+  });
+
+  maybe()("3. the position going FLAT after eligibility sends nothing", async () => {
+    // THE LOAD-BEARING RACE. Reads: (1) ensureProtectionForExposure,
+    // (2) eligibility, (3) the final pre-mutation check. The stop fills between
+    // 2 and 3, so only a revalidation at the mutation boundary can catch it —
+    // this fails if eligibility is the only fresh read.
+    const { execution, restore } = await conclusivelyFailedStop("LONG");
+    scenario.positionAmtSequence = ["0.100", "0.100", "0"];
+    scenario.positionAmt = "0";
+
+    await withEmergencyOn(() => run(execution.id, execution.version));
+    restore();
+
+    expect(marketCloses()).toHaveLength(0);
+    // No durable intent either: nothing was ever reserved for a call that
+    // refused to submit.
+    expect(await emergencyOrders(execution.id)).toBe(0);
+    expect((await reload(execution.id)).status).not.toBe("CLOSED_EMERGENCY");
+  });
+
+  maybe()("4. the position SHRINKING after eligibility closes the smaller size", async () => {
+    const { execution, restore } = await conclusivelyFailedStop("LONG");
+    scenario.positionAmtSequence = ["0.100", "0.100", "0.040"];
+    scenario.positionAmt = "0.040";
+
+    await withEmergencyOn(() => run(execution.id, execution.version));
+    restore();
+
+    expect(marketCloses()).toHaveLength(1);
+    // The CURRENT size, never the remembered 0.1.
+    expect(marketCloses()[0]).toContain("0.04");
+    expect(marketCloses()[0]).not.toContain("0.1");
+    const order = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id, role: "EMERGENCY_CLOSE" },
+    });
+    expect(order.originalQuantity.toString()).toBe("0.04");
+  });
+
+  maybe()("5. a SHORT position shrinking also closes the smaller size", async () => {
+    scenario.positionAmt = "-0.100";
+    const { execution, restore } = await conclusivelyFailedStop("SHORT");
+    scenario.positionAmtSequence = ["-0.100", "-0.100", "-0.030"];
+    scenario.positionAmt = "-0.030";
+
+    await withEmergencyOn(() => run(execution.id, execution.version));
+    restore();
+
+    expect(marketCloses()).toHaveLength(1);
+    expect(marketCloses()[0]).toContain("0.03");
+  });
+
+  maybe()("6. an identity that turns CONTRADICTORY before the mutation sends nothing", async () => {
+    // The sign flips to the opposite hedge leg between eligibility and the
+    // mutation: we must never close someone else's side.
+    const { execution, restore } = await conclusivelyFailedStop("LONG");
+    scenario.positionAmtSequence = ["0.100", "0.100", "-0.100"];
+    scenario.positionAmt = "-0.100";
+
+    await withEmergencyOn(() => run(execution.id, execution.version));
+    restore();
+
+    expect(marketCloses()).toHaveLength(0);
+    expect(await emergencyOrders(execution.id)).toBe(0);
+  });
+
+  maybe()("7. an UNREADABLE final position read sends nothing", async () => {
+    const { execution, restore } = await conclusivelyFailedStop("LONG");
+    const originalRead = readOnlyStub.getPositionForSide;
+    let reads = 0;
+    readOnlyStub.getPositionForSide = async (symbol: string, positionSide: string) => {
+      reads += 1;
+      if (reads >= 3) throw timeoutError("positionRisk");
+      return originalRead.call(readOnlyStub, symbol, positionSide);
+    };
+
+    await withEmergencyOn(() => run(execution.id, execution.version));
+    readOnlyStub.getPositionForSide = originalRead;
+    restore();
+
+    // Absence of position evidence is never permission to close.
+    expect(marketCloses()).toHaveLength(0);
+    expect(await emergencyOrders(execution.id)).toBe(0);
+  });
+
+  maybe()("8. a MISSING position row before eligibility sends nothing", async () => {
+    const { execution, restore } = await conclusivelyFailedStop("LONG");
+    const originalRead = readOnlyStub.getPositionForSide;
+    let reads = 0;
+    readOnlyStub.getPositionForSide = async (symbol: string, positionSide: string) => {
+      reads += 1;
+      if (reads >= 2) return null; // a real exchange reports flat as no row
+      return originalRead.call(readOnlyStub, symbol, positionSide);
+    };
+
+    await withEmergencyOn(() => run(execution.id, execution.version));
+    readOnlyStub.getPositionForSide = originalRead;
+    restore();
+
+    expect(marketCloses()).toHaveLength(0);
+    expect(await emergencyOrders(execution.id)).toBe(0);
+  });
+
+  maybe()("9. ATTRIBUTION: the stop that filled during the window still wins", async () => {
+    // The whole point of refusing the stale close: the owned STOP closed this
+    // position, so closure must record CLOSED_SL rather than CLOSED_EMERGENCY.
+    const execution = await filledExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    const original = mutationStub.submitProtectionOrder;
+    mutationStub.submitProtectionOrder = async (context: Record<string, string>) => {
+      const result = await original.call(mutationStub, context);
+      if (context.role === "STOP_LOSS") {
+        const row = scenario.algoOrders.get(context.clientAlgoId);
+        if (row) row.algoStatus = "CANCELED";
+      }
+      return result;
+    };
+    scenario.positionAmtSequence = ["0.100", "0.100", "0"];
+    scenario.positionAmt = "0";
+
+    await withEmergencyOn(() => run(execution.id, execution.version));
+    mutationStub.submitProtectionOrder = original;
+    expect(await emergencyOrders(execution.id)).toBe(0);
+
+    // The stop is now reported filled and the position stays flat.
+    scenario.algoOrders.get(stopId)!.algoStatus = "FILLED";
+    scenario.algoOrders.get(stopId)!.avgPrice = "96";
+    const nextVersion = (await reload(execution.id)).version;
+    await withEmergencyOn(() => run(execution.id, nextVersion));
+
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_SL");
+    expect(closed.status).not.toBe("CLOSED_EMERGENCY");
+    expect(await emergencyOrders(execution.id)).toBe(0);
+  });
+
+  maybe()("10. DISABLED mode still sends nothing with a perfectly valid identity", async () => {
+    const { execution, restore } = await conclusivelyFailedStop("LONG");
+
+    const previous = runtimeEnv.EXECUTION_EMERGENCY_CLOSE_MODE;
+    (runtimeEnv as { EXECUTION_EMERGENCY_CLOSE_MODE: string }).EXECUTION_EMERGENCY_CLOSE_MODE = "DISABLED";
+    await run(execution.id, execution.version);
+    (runtimeEnv as { EXECUTION_EMERGENCY_CLOSE_MODE: string }).EXECUTION_EMERGENCY_CLOSE_MODE = previous;
+    restore();
+
+    expect(marketCloses()).toHaveLength(0);
     expect(await emergencyOrders(execution.id)).toBe(0);
     expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
   });
