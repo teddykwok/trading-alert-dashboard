@@ -353,10 +353,30 @@ export class ExecutionOrchestrator {
           return closure.mutationsDispatched + health.mutationsDispatched;
         }
 
-        // Parked for a human. Reconciliation still observes the exchange so the
-        // journal stays truthful, but nothing is auto-unwound.
-        case "MANUAL_INTERVENTION":
-          return (await this.deps.protection.reconcileProtectionAndClosure(input)).mutationsDispatched;
+        // Parked for a human. Nothing is ever auto-unwound here — but a parked
+        // execution with LIVE exposure must not be abandoned either.
+        //
+        // The ordering mirrors PROTECTED and is load-bearing for the same
+        // reason: closure runs FIRST, because a flat position appears on a real
+        // exchange as a MISSING position row, and only closure reads that as
+        // flat. Recovery would have to interpret the same absence as "no
+        // exposure data" — so it never sees it. If closure terminalizes or
+        // otherwise moves the execution on, recovery is skipped entirely.
+        //
+        // Recovery itself is an allowlist: it un-parks only an execution the
+        // PROTECTION lifecycle parked, for one of four re-decidable STOP
+        // reasons, with fresh exchange proof. Every other parked reason falls
+        // straight through and stays exactly where it is.
+        case "MANUAL_INTERVENTION": {
+          const closure = await this.deps.protection.reconcileProtectionAndClosure(input);
+          if (closure.execution.status !== "MANUAL_INTERVENTION") return closure.mutationsDispatched;
+
+          const recovery = await this.deps.protection.attemptProtectionRecovery({
+            ...input,
+            expectedVersion: closure.execution.version,
+          });
+          return closure.mutationsDispatched + recovery.mutationsDispatched;
+        }
 
         default:
           return 0;

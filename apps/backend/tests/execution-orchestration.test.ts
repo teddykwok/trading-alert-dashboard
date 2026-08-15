@@ -109,6 +109,7 @@ function harness(options: {
       ensureProtectionForExposure: record("protection", "ensureProtectionForExposure"),
       resumeProtectionLifecycle: record("protection", "resumeProtectionLifecycle"),
       reconcileProtectionAndClosure: record("protection", "reconcileProtectionAndClosure"),
+      attemptProtectionRecovery: record("protection", "attemptProtectionRecovery"),
     } as never,
     profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
   });
@@ -298,8 +299,38 @@ describe("reconciliation routing", () => {
     expect(health.expectedVersion).toBe(6);
   });
 
-  it("observes a parked execution without auto-unwinding it", async () => {
-    expect(await route("MANUAL_INTERVENTION")).toEqual(["protection.reconcileProtectionAndClosure"]);
+  it("reconciles closure BEFORE considering recovery for a parked execution", async () => {
+    // Same load-bearing order as PROTECTED: a flat position appears as a
+    // MISSING position row, and only closure reads that as flat. Recovery must
+    // never be the one to interpret that absence.
+    expect(await route("MANUAL_INTERVENTION")).toEqual([
+      "protection.reconcileProtectionAndClosure",
+      "protection.attemptProtectionRecovery",
+    ]);
+  });
+
+  it("never attempts recovery once closure has terminalized a parked execution", async () => {
+    for (const terminal of ["CLOSED_TP", "CLOSED_SL", "CLOSED_EXTERNAL", "CLOSED_EMERGENCY"]) {
+      const { orchestrator, calls } = harness({
+        executions: [execution({ status: "MANUAL_INTERVENTION", version: 5 })],
+        closureResultStatus: terminal,
+      });
+      await orchestrator.runExecutionReconciliationTick();
+      expect(calls.map((c) => `${c.service}.${c.method}`), terminal).toEqual([
+        "protection.reconcileProtectionAndClosure",
+      ]);
+    }
+  });
+
+  it("threads the post-closure version into the recovery attempt", async () => {
+    const { orchestrator, calls } = harness({
+      executions: [execution({ status: "MANUAL_INTERVENTION", version: 5 })],
+    });
+    await orchestrator.runExecutionReconciliationTick();
+
+    expect(calls.find((c) => c.method === "reconcileProtectionAndClosure")!.expectedVersion).toBe(5);
+    // Recovery must not CAS against a version closure already consumed.
+    expect(calls.find((c) => c.method === "attemptProtectionRecovery")!.expectedVersion).toBe(6);
   });
 
   it("discovers a PREFLIGHT execution and routes it through the existing entry recovery", async () => {

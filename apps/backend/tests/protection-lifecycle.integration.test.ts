@@ -1381,8 +1381,16 @@ describe("execution transition enforcement", () => {
       "../src/modules/execution/execution-status"
     );
     const allowed = allowedTransitionsFrom("MANUAL_INTERVENTION");
-    // Its protection is still live, so an attributable fill is legal.
-    expect([...allowed].sort()).toEqual(["CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "CLOSED_SL", "CLOSED_TP"]);
+    // Its protection is still live, so an attributable fill is legal — and
+    // PLACING_PROTECTION is the one non-terminal exit, reserved for a proven
+    // protection recovery.
+    expect([...allowed].sort()).toEqual([
+      "CLOSED_EMERGENCY",
+      "CLOSED_EXTERNAL",
+      "CLOSED_SL",
+      "CLOSED_TP",
+      "PLACING_PROTECTION",
+    ]);
 
     // Every other target is refused at the persistence boundary.
     for (const target of TRADE_EXECUTION_STATUSES) {
@@ -2697,5 +2705,741 @@ describe("external flat recovery", () => {
     const after = await reload(execution.id);
     expect(after.status).not.toBe("CLOSED_EXTERNAL");
     expect((await protectionOf(execution.id)).state).not.toBe("CLOSED");
+  });
+});
+
+// ===========================================================================
+// MANUAL_INTERVENTION PROTECTION RECOVERY.
+//
+// A parked execution with LIVE exposure used to be a dead end: the orchestrator
+// ran only closure reconciliation, which returns "Position is still open" and
+// touches no protection at all. Nothing could ever notice that the reason for
+// the intervention had stopped being true — Mainnet Canary #2 sat parked with a
+// perfectly good STOP on Binance and no TAKE_PROFIT until an operator closed
+// the position by hand.
+//
+// Recovery is an ALLOWLIST, not an escape hatch: only an intervention the
+// PROTECTION lifecycle raised, for one of four re-decidable STOP reasons, with
+// current exchange evidence proving the position open, every leg readable and
+// coverage not excessive.
+// ===========================================================================
+
+describe("MANUAL_INTERVENTION protection recovery", () => {
+  const recover = async (execution: { id: string; version: number }) =>
+    protectionService.attemptProtectionRecovery({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+  const eventsOf = async (id: string) =>
+    prisma!.executionEvent.findMany({ where: { tradeExecutionId: id }, orderBy: { sequenceNumber: "asc" } });
+
+  const recoveryEventsOf = async (id: string) =>
+    prisma!.executionEvent.findMany({
+      where: { tradeExecutionId: id, fromStatus: "MANUAL_INTERVENTION", toStatus: "PLACING_PROTECTION" },
+      orderBy: { sequenceNumber: "asc" },
+    });
+
+  /**
+   * The Mainnet Canary #2 shape, built by the REAL machinery rather than by
+   * fixture writes: the STOP reaches the exchange, local verification rejects
+   * its identity, the TAKE_PROFIT is never submitted, and the execution parks.
+   * Clearing the flag afterwards models the comparator defect being fixed.
+   */
+  const parkedByStopIdentity = async () => {
+    const execution = await filledExecution();
+    scenario.closePositionOnReadback = true;
+    await protect(execution);
+    scenario.closePositionOnReadback = false;
+
+    const parked = await reload(execution.id);
+    expect(parked.status).toBe("MANUAL_INTERVENTION");
+    expect(parked.requiresManualIntervention).toBe(true);
+    expect((await protectionOf(execution.id)).reasonCode).toBe("STOP_IDENTITY_MISMATCH");
+    // The stop landed; the take profit never did.
+    expect(scenario.submitted.map((entry) => entry.role)).toEqual(["STOP_LOSS"]);
+    return parked;
+  };
+
+  /** Parks a HEALTHY protected execution through the validated public API. */
+  const parkProtected = async (id: string, reasonCode: string) => {
+    const current = await reload(id);
+    await executions.transition({
+      executionId: id,
+      expectedVersion: current.version,
+      targetStatus: "MANUAL_INTERVENTION",
+      eventType: "MANUAL_INTERVENTION_REQUIRED",
+      reasonCode,
+      message: `Synthetic intervention: ${reasonCode}.`,
+      requiresManualIntervention: true,
+    });
+    await prisma!.executionProtectionState.update({
+      where: { tradeExecutionId: id },
+      data: { state: "MANUAL_INTERVENTION", reasonCode },
+    });
+    return reload(id);
+  };
+
+  // -------------------------------------------------------------------------
+  // 1-3. Recovery that must happen
+  // -------------------------------------------------------------------------
+
+  maybe()("1. MAINNET CANARY #2: repairs the missing take profit and returns to PROTECTED", async () => {
+    const parked = await parkedByStopIdentity();
+    const stopId = buildClientOrderId(parked.id, "STOP_LOSS", 1);
+
+    const outcome = await recover(parked);
+
+    expect(outcome.ok).toBe(true);
+    const healed = await reload(parked.id);
+    expect(healed.status).toBe("PROTECTED");
+    // The flag is released only once coverage is proven.
+    expect(healed.requiresManualIntervention).toBe(false);
+    expect((await protectionOf(parked.id)).state).toBe("PROTECTED");
+
+    // The existing STOP was reused: look-before-submit found it, so exactly one
+    // STOP was ever sent and no second identity was minted.
+    expect(scenario.submitted.filter((entry) => entry.role === "STOP_LOSS")).toHaveLength(1);
+    expect(scenario.submitted.filter((entry) => entry.role === "TAKE_PROFIT")).toHaveLength(1);
+    const orders = await ordersOf(parked.id);
+    expect(orders.filter((order) => order.role === "STOP_LOSS")).toHaveLength(1);
+    expect(orders.every((order) => order.generation === 1)).toBe(true);
+    expect(scenario.algoOrders.has(stopId)).toBe(true);
+
+    // Exactly one logical recovery transition, and it is auditable.
+    const recoveries = await recoveryEventsOf(parked.id);
+    expect(recoveries).toHaveLength(1);
+    expect(recoveries[0].reasonCode).toBe("PROTECTION_RECOVERY_RESUMED");
+    const metadata = recoveries[0].metadata as Record<string, unknown>;
+    expect(metadata.interventionReason).toBe("STOP_IDENTITY_MISMATCH");
+    expect(metadata.recoveryAttempt).toBe(1);
+    expect(metadata.alreadyFullyCovered).toBe(false);
+
+    // The path taken is the documented one, and every hop is legal.
+    const { canTransition } = await import("../src/modules/execution/execution-status");
+    for (const event of await eventsOf(parked.id)) {
+      if (!event.fromStatus || !event.toStatus || event.fromStatus === event.toStatus) continue;
+      expect(canTransition(event.fromStatus as never, event.toStatus as never).allowed, `${event.fromStatus} -> ${event.toStatus}`).toBe(true);
+    }
+  });
+
+  maybe()("2. recovers an execution whose protection is ALREADY fully valid, sending nothing", async () => {
+    const execution = await filledExecution();
+    await protect(execution); // fully protected
+    const parked = await parkProtected(execution.id, "STOP_NOT_VERIFIED");
+    const mutationsBefore = scenario.mutations.length;
+
+    const outcome = await recover(parked);
+
+    expect(outcome.ok).toBe(true);
+    const healed = await reload(parked.id);
+    expect(healed.status).toBe("PROTECTED");
+    expect(healed.requiresManualIntervention).toBe(false);
+    // Already covered: no POST, no DELETE, no new generation.
+    expect(scenario.mutations).toHaveLength(mutationsBefore);
+    expect((await ordersOf(parked.id)).every((order) => order.generation === 1)).toBe(true);
+    const metadata = (await recoveryEventsOf(parked.id))[0].metadata as Record<string, unknown>;
+    expect(metadata.alreadyFullyCovered).toBe(true);
+  });
+
+  maybe()("3. repairs a conclusively ABSENT stop under the existing stop-first rules", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    const takeProfitId = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+    // Both legs vanish from the exchange — conclusively absent, not unreadable.
+    scenario.algoOrders.delete(stopId);
+    scenario.algoOrders.delete(takeProfitId);
+    const parked = await parkProtected(execution.id, "STOP_NOT_VERIFIED");
+
+    const outcome = await recover(parked);
+
+    expect(outcome.ok).toBe(true);
+    expect((await reload(parked.id)).status).toBe("PROTECTED");
+    // A replacement tranche was reserved, and the STOP went first.
+    const roles = scenario.submitted.slice(2).map((entry) => entry.role);
+    expect(roles).toEqual(["STOP_LOSS", "TAKE_PROFIT"]);
+    expect((await ordersOf(parked.id)).some((order) => order.generation === 2)).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // 4-9. Recovery that must NOT happen
+  // -------------------------------------------------------------------------
+
+  maybe()("4-6. an UNKNOWN protection leg keeps the execution parked and mutates nothing", async () => {
+    for (const unreadable of ["STOP_LOSS", "TAKE_PROFIT", "BOTH"] as const) {
+      const execution = await filledExecution();
+      await protect(execution);
+      const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+      const takeProfitId = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+      if (unreadable !== "TAKE_PROFIT") scenario.queryFailures.add(stopId);
+      if (unreadable !== "STOP_LOSS") scenario.queryFailures.add(takeProfitId);
+      const parked = await parkProtected(execution.id, "STOP_NOT_VERIFIED");
+      const mutationsBefore = scenario.mutations.length;
+
+      const outcome = await recover(parked);
+
+      expect(outcome.ok, unreadable).toBe(false);
+      expect(outcome.reasonCode, unreadable).toBe(
+        unreadable === "TAKE_PROFIT" ? "TAKE_PROFIT_QUERY_UNAVAILABLE" : "STOP_QUERY_UNAVAILABLE"
+      );
+      const after = await reload(parked.id);
+      expect(after.status, unreadable).toBe("MANUAL_INTERVENTION");
+      expect(after.requiresManualIntervention, unreadable).toBe(true);
+      expect(after.version, unreadable).toBe(parked.version);
+      expect(scenario.mutations.length, unreadable).toBe(mutationsBefore);
+      expect(await recoveryEventsOf(parked.id), unreadable).toHaveLength(0);
+      scenario.queryFailures.clear();
+    }
+  });
+
+  maybe()("7. an unrecoverable reason stays parked even with perfectly healthy protection", async () => {
+    // Healthy STOP+TP must never erase an unrelated manual reason.
+    for (const reasonCode of [
+      "PARTIAL_PROTECTION_EXIT",
+      "PROTECTION_COVERAGE_INCOMPLETE",
+      "POSITION_IDENTITY_MISMATCH",
+      "STOP_TRIGGER_INVALID",
+      "EMERGENCY_CLOSE_VERIFICATION_FAILED",
+      "POSITION_NOT_FOUND_AFTER_FILL",
+      "MANUAL_REVIEW_REQUIRED",
+    ]) {
+      const execution = await filledExecution();
+      await protect(execution);
+      const parked = await parkProtected(execution.id, reasonCode);
+      const mutationsBefore = scenario.mutations.length;
+
+      const outcome = await recover(parked);
+
+      expect(outcome.ok, reasonCode).toBe(false);
+      expect(outcome.reasonCode, reasonCode).toBe("MANUAL_REVIEW_REQUIRED");
+      const after = await reload(parked.id);
+      expect(after.status, reasonCode).toBe("MANUAL_INTERVENTION");
+      expect(after.requiresManualIntervention, reasonCode).toBe(true);
+      expect(after.version, reasonCode).toBe(parked.version);
+      expect(scenario.mutations.length, reasonCode).toBe(mutationsBefore);
+    }
+  });
+
+  maybe()("7b. an intervention the protection lifecycle never raised is excluded by construction", async () => {
+    // The entry lifecycle parks without ever writing the protection row's
+    // state, so no entry-class or operator intervention can be un-parked.
+    const execution = await filledExecution();
+    await protect(execution);
+    const current = await reload(execution.id);
+    await executions.transition({
+      executionId: execution.id,
+      expectedVersion: current.version,
+      targetStatus: "MANUAL_INTERVENTION",
+      eventType: "MANUAL_INTERVENTION_REQUIRED",
+      reasonCode: "STOP_NOT_VERIFIED", // a RECOVERABLE code…
+      message: "Parked without a protection-lifecycle escalation.",
+      requiresManualIntervention: true,
+    });
+    // …but the protection row still says PROTECTED, so it was not our doing.
+    const parked = await reload(execution.id);
+
+    const outcome = await recover(parked);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.message).toMatch(/did not come from the protection lifecycle/i);
+    expect((await reload(parked.id)).status).toBe("MANUAL_INTERVENTION");
+  });
+
+  maybe()("8. an unreadable or contradictory position keeps the execution parked", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    const parked = await parkProtected(execution.id, "STOP_NOT_VERIFIED");
+
+    // Contradictory: the position sign opposes the recorded direction.
+    scenario.positionAmt = "-0.100";
+    let outcome = await recover(parked);
+    expect(outcome.reasonCode).toBe("POSITION_IDENTITY_MISMATCH");
+    expect((await reload(parked.id)).status).toBe("MANUAL_INTERVENTION");
+
+    // Unreadable: the position query itself fails.
+    scenario.positionAmt = "0.100";
+    const originalRead = readOnlyStub.getPositionForSide;
+    readOnlyStub.getPositionForSide = async () => {
+      throw timeoutError("positionRisk");
+    };
+    outcome = await recover(await reload(parked.id));
+    readOnlyStub.getPositionForSide = originalRead;
+
+    expect(outcome.reasonCode).toBe("POSITION_STATE_UNAVAILABLE");
+    expect((await reload(parked.id)).status).toBe("MANUAL_INTERVENTION");
+    expect(await recoveryEventsOf(parked.id)).toHaveLength(0);
+  });
+
+  maybe()("9. a flat position is closure's business — recovery never runs on it", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    const parked = await parkProtected(execution.id, "STOP_NOT_VERIFIED");
+    // A real exchange reports a closed position as a MISSING row.
+    scenario.positionMissing = true;
+
+    const outcome = await recover(parked);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect((await reload(parked.id)).status).toBe("MANUAL_INTERVENTION");
+    expect(await recoveryEventsOf(parked.id)).toHaveLength(0);
+  });
+
+  maybe()("9b. over-protection keeps the execution parked", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    scenario.algoOrders.get(stopId)!.quantity = "0.999";
+    const parked = await parkProtected(execution.id, "STOP_NOT_VERIFIED");
+
+    const outcome = await recover(parked);
+
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect((await reload(parked.id)).status).toBe("MANUAL_INTERVENTION");
+  });
+
+  // -------------------------------------------------------------------------
+  // 13-16. Partial repair, churn, concurrency, restart
+  // -------------------------------------------------------------------------
+
+  maybe()("13. an incomplete repair does NOT clear the manual-intervention flag", async () => {
+    const parked = await parkedByStopIdentity();
+    const takeProfitId = buildClientOrderId(parked.id, "TAKE_PROFIT", 1);
+    // The take profit submission is lost and its state cannot be resolved.
+    const originalSubmit = mutationStub.submitProtectionOrder;
+    mutationStub.submitProtectionOrder = async (context: Record<string, string>) => {
+      if (context.role === "TAKE_PROFIT") {
+        dispatched += 1;
+        scenario.mutations.push("POST /fapi/v1/algoOrder TAKE_PROFIT");
+        scenario.submitted.push({ ...context });
+        scenario.queryFailures.add(takeProfitId);
+        throw timeoutError("newAlgoOrder");
+      }
+      return originalSubmit.call(mutationStub, context);
+    };
+
+    const outcome = await recover(parked);
+    mutationStub.submitProtectionOrder = originalSubmit;
+
+    expect(outcome.ok).toBe(false);
+    const after = await reload(parked.id);
+    // Un-parked to do the work, but never declared healthy.
+    expect(after.status).not.toBe("PROTECTED");
+    expect(after.requiresManualIntervention).toBe(true);
+    expect((await protectionOf(parked.id)).state).not.toBe("PROTECTED");
+  });
+
+  maybe()("14. repeated ticks after a recovery cause no version, event or mutation churn", async () => {
+    const parked = await parkedByStopIdentity();
+    await recover(parked);
+    const settled = await reload(parked.id);
+    expect(settled.status).toBe("PROTECTED");
+    const mutationsAfter = scenario.mutations.length;
+    const eventsAfter = (await eventsOf(parked.id)).length;
+
+    // The orchestrator would now route PROTECTED, but even a direct re-entry
+    // must be inert.
+    for (let tick = 0; tick < 3; tick += 1) {
+      await protectionService.ensureProtectionForExposure({
+        executionId: parked.id,
+        expectedVersion: (await reload(parked.id)).version,
+        evaluatedAt: at(),
+      });
+      await recover(await reload(parked.id));
+    }
+
+    const final = await reload(parked.id);
+    expect(final.status).toBe("PROTECTED");
+    expect(final.version).toBe(settled.version);
+    expect(scenario.mutations).toHaveLength(mutationsAfter);
+    expect(await eventsOf(parked.id)).toHaveLength(eventsAfter);
+    expect(await recoveryEventsOf(parked.id)).toHaveLength(1);
+  });
+
+  maybe()("15. concurrent recovery attempts produce exactly one winner", async () => {
+    const parked = await parkedByStopIdentity();
+
+    const results = await Promise.all([recover(parked), recover(parked)]);
+
+    // One un-parked; the loser saw the version move and did nothing.
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(await recoveryEventsOf(parked.id)).toHaveLength(1);
+    expect((await reload(parked.id)).status).toBe("PROTECTED");
+    expect(scenario.submitted.filter((entry) => entry.role === "STOP_LOSS")).toHaveLength(1);
+  });
+
+  maybe()("16. a crash mid-recovery converges through the existing restart path", async () => {
+    const parked = await parkedByStopIdentity();
+    // Un-park, then "crash" before protection could be completed: the TP
+    // submission is dispatched but its result never becomes readable, leaving
+    // the row at PLACING_PROTECTION exactly as a killed worker would.
+    const takeProfitId = buildClientOrderId(parked.id, "TAKE_PROFIT", 1);
+    const originalSubmit = mutationStub.submitProtectionOrder;
+    mutationStub.submitProtectionOrder = async (context: Record<string, string>) => {
+      if (context.role === "TAKE_PROFIT") {
+        dispatched += 1;
+        scenario.mutations.push("POST /fapi/v1/algoOrder TAKE_PROFIT");
+        scenario.submitted.push({ ...context });
+        scenario.queryFailures.add(takeProfitId);
+        throw timeoutError("newAlgoOrder");
+      }
+      return originalSubmit.call(mutationStub, context);
+    };
+    await recover(parked);
+    mutationStub.submitProtectionOrder = originalSubmit;
+    const crashed = await reload(parked.id);
+    expect(crashed.status).toBe("PLACING_PROTECTION");
+    expect(crashed.requiresManualIntervention).toBe(true);
+
+    // Restart: the orchestrator routes PLACING_PROTECTION here.
+    scenario.queryFailures.delete(takeProfitId);
+    const resumed = await protectionService.resumeProtectionLifecycle({
+      executionId: parked.id,
+      expectedVersion: crashed.version,
+      evaluatedAt: at(),
+    });
+
+    expect(resumed.ok).toBe(true);
+    const healed = await reload(parked.id);
+    expect(healed.status).toBe("PROTECTED");
+    expect(healed.requiresManualIntervention).toBe(false);
+    // The resumed tranche reused its own deterministic id.
+    expect((await ordersOf(parked.id)).every((order) => order.generation === 1)).toBe(true);
+    expect(await recoveryEventsOf(parked.id)).toHaveLength(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Episode-scoped retry budget
+  // -------------------------------------------------------------------------
+
+  maybe()("17. a failed recovery keeps spending the SAME episode's budget", async () => {
+    // The whole point of the cap: a recovery that fails re-parks from
+    // PLACING_PROTECTION, and that re-park must NOT hand out a fresh budget.
+    const parked = await parkedByStopIdentity();
+    // The comparator defect was NOT actually fixed, so every recovery un-parks,
+    // fails identity verification again and re-parks from PLACING_PROTECTION.
+    // That re-park is a transition INTO MANUAL_INTERVENTION, and it must not
+    // hand the next attempt a fresh budget — otherwise the cap never binds.
+    scenario.closePositionOnReadback = true;
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const current = await reload(parked.id);
+      expect(current.status, `attempt ${attempt}`).toBe("MANUAL_INTERVENTION");
+      await protectionService.attemptProtectionRecovery({
+        executionId: parked.id,
+        expectedVersion: current.version,
+        evaluatedAt: at(),
+      });
+    }
+
+    const attempts = await recoveryEventsOf(parked.id);
+    expect(attempts).toHaveLength(3);
+    expect((attempts[2].metadata as Record<string, unknown>).recoveryAttempt).toBe(3);
+
+    // Budget exhausted: the fourth attempt is refused outright.
+    const outcome = await recover(await reload(parked.id));
+    expect(outcome.ok).toBe(false);
+    expect(outcome.message).toMatch(/already ran 3 time\(s\)/i);
+    expect(await recoveryEventsOf(parked.id)).toHaveLength(3);
+  });
+
+  maybe()("18. a NEW intervention episode receives a fresh recovery budget", async () => {
+    // Episode 1: parked, recovered, PROTECTED.
+    const parked = await parkedByStopIdentity();
+    await recover(parked);
+    expect((await reload(parked.id)).status).toBe("PROTECTED");
+    expect(await recoveryEventsOf(parked.id)).toHaveLength(1);
+
+    // Later in the SAME trade, a new protection incident parks it again.
+    const reparked = await parkProtected(parked.id, "STOP_NOT_VERIFIED");
+
+    const outcome = await recover(reparked);
+
+    expect(outcome.ok).toBe(true);
+    expect((await reload(parked.id)).status).toBe("PROTECTED");
+    const recoveries = await recoveryEventsOf(parked.id);
+    expect(recoveries).toHaveLength(2);
+    // The second episode counted from ITS own start, not the trade's.
+    expect((recoveries[1].metadata as Record<string, unknown>).recoveryAttempt).toBe(1);
+  });
+
+  maybe()("19. repeated ticks inside one episode do not reset the budget", async () => {
+    const parked = await parkedByStopIdentity();
+    scenario.closePositionOnReadback = true; // the first attempt will fail
+
+    await recover(parked);
+    expect(await recoveryEventsOf(parked.id)).toHaveLength(1);
+    expect((await reload(parked.id)).status).toBe("MANUAL_INTERVENTION");
+
+    // An ordinary tick now re-stamps the already-parked row, writing a
+    // MANUAL_INTERVENTION -> MANUAL_INTERVENTION self-transition. That must not
+    // look like a new episode either.
+    await protectionService.ensureProtectionForExposure({
+      executionId: parked.id,
+      expectedVersion: (await reload(parked.id)).version,
+      evaluatedAt: at(),
+    });
+    const selfStamps = (await eventsOf(parked.id)).filter(
+      (event) => event.fromStatus === "MANUAL_INTERVENTION" && event.toStatus === "MANUAL_INTERVENTION"
+    );
+    expect(selfStamps.length).toBeGreaterThan(0);
+
+    scenario.closePositionOnReadback = false; // now it can succeed
+    await recover(await reload(parked.id));
+    const recoveries = await recoveryEventsOf(parked.id);
+    expect(recoveries).toHaveLength(2);
+    // Still counting from the same episode: this is attempt 2, not attempt 1.
+    expect((recoveries[1].metadata as Record<string, unknown>).recoveryAttempt).toBe(2);
+  });
+});
+
+// ===========================================================================
+// ESCALATION EVIDENCE/VERSION COUPLING.
+//
+// escalate() CASes on the version its CALLER observed, because that version is
+// what ties the escalation to the exchange evidence that justified it. Two
+// opposite failures are possible and both are covered here:
+//
+//   - Adopting the CURRENT row's version (reload-then-CAS) lets a slow tick
+//     park an execution a faster one has just verified as PROTECTED. The state
+//     machine cannot catch it: PROTECTED -> MANUAL_INTERVENTION is perfectly
+//     legal. Legality and freshness are separate requirements.
+//
+//   - Keeping the caller's ORIGINAL version after this same call has already
+//     committed one — reserveNextTranche and recordProtectionStatus both do —
+//     silently drops the park: the protection row said MANUAL_INTERVENTION
+//     while the execution stayed PARTIALLY_FILLED with the manual flag false,
+//     invisible to recoveryRequiredCount.
+//
+// The rule that satisfies both: thread forward the version THIS call produced,
+// never one another tick produced.
+// ===========================================================================
+
+describe("escalation evidence and version stay coupled", () => {
+  const eventsOf = async (id: string) =>
+    prisma!.executionEvent.findMany({ where: { tradeExecutionId: id }, orderBy: { sequenceNumber: "asc" } });
+
+  const parkEventsOf = async (id: string) =>
+    prisma!.executionEvent.findMany({
+      where: { tradeExecutionId: id, toStatus: "MANUAL_INTERVENTION" },
+      orderBy: { sequenceNumber: "asc" },
+    });
+
+  /** ENTRY_FILLED, because only that status may be promoted to PROTECTED. */
+  const entryFilled = async () => {
+    const execution = await filledExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { status: "ENTRY_FILLED", version: { increment: 1 } },
+    });
+    return reload(execution.id);
+  };
+
+  maybe()("1. a stale tick cannot park an execution another tick just PROTECTED", async () => {
+    // Tick B's snapshot: taken before tick A did anything.
+    const execution = await entryFilled();
+    const staleVersion = execution.version;
+
+    // Tick A runs to completion and reaches PROTECTED.
+    await protect(execution);
+    const healthy = await reload(execution.id);
+    expect(healthy.status).toBe("PROTECTED");
+    expect(healthy.requiresManualIntervention).toBe(false);
+    const parksBefore = (await parkEventsOf(execution.id)).length;
+
+    // Tick B now reaches the production escalation path carrying its OLD
+    // version: the exchange reports more protection than exposure, which is a
+    // genuine escalation trigger — but its evidence is older than tick A's.
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    scenario.algoOrders.get(stopId)!.quantity = "0.999";
+
+    const outcome = await protectionService.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: staleVersion, // deliberately stale
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.ok).toBe(false);
+    const after = await reload(execution.id);
+    // The healthy winner survives untouched.
+    expect(after.status).toBe("PROTECTED");
+    expect(after.requiresManualIntervention).toBe(false);
+    expect(after.version).toBe(healthy.version);
+    // And no event claims a parking that never happened.
+    expect(await parkEventsOf(execution.id)).toHaveLength(parksBefore);
+  });
+
+  maybe()("2. two overlapping paths: the newer healthy winner is never overwritten", async () => {
+    // The realistic shape: startup recovery and a periodic tick both pick up
+    // the same execution from the same snapshot (the scheduler fires the
+    // interval without awaiting runStartupRecovery, so this genuinely races).
+    const execution = await entryFilled();
+    const sharedSnapshot = execution.version;
+
+    const first = await protect(execution); // tick A wins the reservation
+    expect(first.ok).toBe(true);
+    const healthy = await reload(execution.id);
+    expect(healthy.status).toBe("PROTECTED");
+
+    // Tick B, still holding the shared snapshot, reads a contradictory
+    // position. This escalates from a DIFFERENT call site than test 1 — one
+    // that performs no same-call version bump at all — so it proves the
+    // coupling holds for the un-threaded escalations too.
+    scenario.positionAmt = "-0.100";
+    const second = await protectionService.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: sharedSnapshot,
+      evaluatedAt: at(),
+    });
+    scenario.positionAmt = "0.100";
+
+    expect(second.reasonCode).toBe("POSITION_IDENTITY_MISMATCH");
+    const after = await reload(execution.id);
+    expect(after.status).toBe("PROTECTED");
+    expect(after.requiresManualIntervention).toBe(false);
+    expect(after.version).toBe(healthy.version);
+  });
+
+  maybe()("3. an escalation AFTER this call's own reservation still parks", async () => {
+    // The intra-call control. The reservation commits a version bump, then the
+    // stop fails identity verification in the SAME call — the Mainnet Canary #2
+    // shape. Keeping the caller's original version here is what used to swallow
+    // the park entirely.
+    const execution = await filledExecution();
+    scenario.closePositionOnReadback = true;
+
+    const outcome = await protectionService.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.reasonCode).toBe("STOP_IDENTITY_MISMATCH");
+    const parked = await reload(execution.id);
+    // The park landed on the EXECUTION row, not just the protection row.
+    expect(parked.status).toBe("MANUAL_INTERVENTION");
+    expect(parked.requiresManualIntervention).toBe(true);
+    expect((await protectionOf(execution.id)).state).toBe("MANUAL_INTERVENTION");
+
+    // Proof the version really did move inside this one call before the park:
+    // the reservation event sits between the caller's snapshot and the park.
+    const events = await eventsOf(execution.id);
+    const reserved = events.find((event) => event.eventType === "PROTECTION_RESERVED")!;
+    const park = events.find((event) => event.toStatus === "MANUAL_INTERVENTION")!;
+    expect(reserved.sequenceNumber).toBeGreaterThan(execution.version);
+    expect(park.sequenceNumber).toBeGreaterThan(reserved.sequenceNumber);
+  });
+
+  maybe()("4. an escalation after a same-call PLACING_PROTECTION promotion still parks", async () => {
+    // The second in-call writer: recordProtectionStatus promotes ENTRY_FILLED
+    // -> PLACING_PROTECTION inside submitTranche, bumping the version before
+    // the stop is even submitted.
+    const execution = await filledExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { status: "ENTRY_FILLED", version: { increment: 1 } },
+    });
+    const filled = await reload(execution.id);
+    scenario.closePositionOnReadback = true;
+
+    const outcome = await protectionService.ensureProtectionForExposure({
+      executionId: execution.id,
+      expectedVersion: filled.version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.reasonCode).toBe("STOP_IDENTITY_MISMATCH");
+    const parked = await reload(execution.id);
+    expect(parked.status).toBe("MANUAL_INTERVENTION");
+    expect(parked.requiresManualIntervention).toBe(true);
+    // Both same-call writes happened before the park, and it still landed.
+    const events = await eventsOf(execution.id);
+    expect(events.some((event) => event.toStatus === "PLACING_PROTECTION")).toBe(true);
+    expect(events.some((event) => event.toStatus === "MANUAL_INTERVENTION")).toBe(true);
+  });
+});
+
+describe("STOP_SUBMISSION_REJECTED is never automatically recovered", () => {
+  maybe()("stays parked: the reason collapses permanent operator conditions", async () => {
+    const execution = await filledExecution();
+    await protect(execution); // healthy protection, so only the REASON blocks it
+    const current = await reload(execution.id);
+    await executions.transition({
+      executionId: execution.id,
+      expectedVersion: current.version,
+      targetStatus: "MANUAL_INTERVENTION",
+      eventType: "MANUAL_INTERVENTION_REQUIRED",
+      reasonCode: "STOP_SUBMISSION_REJECTED",
+      message: "Protection submission was rejected.",
+      requiresManualIntervention: true,
+    });
+    await prisma!.executionProtectionState.update({
+      where: { tradeExecutionId: execution.id },
+      data: { state: "MANUAL_INTERVENTION", reasonCode: "STOP_SUBMISSION_REJECTED" },
+    });
+    const parked = await reload(execution.id);
+    const mutationsBefore = scenario.mutations.length;
+
+    const outcome = await protectionService.attemptProtectionRecovery({
+      executionId: parked.id,
+      expectedVersion: parked.version,
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("MANUAL_REVIEW_REQUIRED");
+    expect(outcome.message).toMatch(/not automatically recoverable/i);
+    const after = await reload(parked.id);
+    expect(after.status).toBe("MANUAL_INTERVENTION");
+    expect(after.requiresManualIntervention).toBe(true);
+    expect(after.version).toBe(parked.version);
+    // No recovery event, no protection mutation.
+    expect(
+      await prisma!.executionEvent.count({
+        where: { tradeExecutionId: parked.id, fromStatus: "MANUAL_INTERVENTION", toStatus: "PLACING_PROTECTION" },
+      })
+    ).toBe(0);
+    expect(scenario.mutations).toHaveLength(mutationsBefore);
+  });
+
+  maybe()("the allowlist is exactly the three re-decidable STOP observations", async () => {
+    // A behavioural check of the whole set, so widening it silently is not
+    // possible: each recoverable reason recovers, the rejected one does not.
+    for (const reasonCode of [
+      "STOP_NOT_VERIFIED",
+      "STOP_IDENTITY_MISMATCH",
+      "STOP_SUBMISSION_RESULT_UNKNOWN",
+      "STOP_SUBMISSION_REJECTED",
+    ] as const) {
+      const execution = await filledExecution();
+      await protect(execution);
+      const current = await reload(execution.id);
+      await executions.transition({
+        executionId: execution.id,
+        expectedVersion: current.version,
+        targetStatus: "MANUAL_INTERVENTION",
+        eventType: "MANUAL_INTERVENTION_REQUIRED",
+        reasonCode,
+        message: `Synthetic ${reasonCode}.`,
+        requiresManualIntervention: true,
+      });
+      await prisma!.executionProtectionState.update({
+        where: { tradeExecutionId: execution.id },
+        data: { state: "MANUAL_INTERVENTION", reasonCode },
+      });
+      const parked = await reload(execution.id);
+
+      const outcome = await protectionService.attemptProtectionRecovery({
+        executionId: parked.id,
+        expectedVersion: parked.version,
+        evaluatedAt: at(),
+      });
+
+      const expected = reasonCode !== "STOP_SUBMISSION_REJECTED";
+      expect(outcome.ok, reasonCode).toBe(expected);
+      expect((await reload(parked.id)).status, reasonCode).toBe(expected ? "PROTECTED" : "MANUAL_INTERVENTION");
+    }
   });
 });

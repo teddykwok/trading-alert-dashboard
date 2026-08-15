@@ -158,7 +158,34 @@ const TRANSITIONS: Record<TradeExecutionStatusName, readonly TradeExecutionStatu
   // enforced the graph — it only meant the write bypassed the state machine.
   // Recording such a closure as CLOSED_EXTERNAL would discard attribution we
   // demonstrably have.
-  MANUAL_INTERVENTION: ["CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "CLOSED_TP", "CLOSED_SL"],
+  //
+  // PLACING_PROTECTION is the ONLY non-terminal exit, and it is deliberately
+  // the weakest one available: it claims exposure exists and protection work is
+  // in flight — nothing more. It does NOT claim protection is verified, so the
+  // existing verifyAggregateCoverage funnel must still prove full coverage
+  // before PROTECTED, and an escalation from there re-parks by a legal edge.
+  //
+  // Taking it requires far more than "the graph allows it". Only
+  // attemptProtectionRecovery may, and only for an execution parked by an
+  // ALLOWLISTED protection-lifecycle reason, with current exchange evidence
+  // proving the position open, its identity valid, every protection leg
+  // readable (no UNKNOWN) and no over-protection — within a bounded per-episode
+  // retry budget. Every other parked reason, including every entry-lifecycle
+  // and operator intervention, is excluded by construction because it never
+  // writes ExecutionProtectionState.state = MANUAL_INTERVENTION.
+  //
+  // Without this edge a parked execution with live exposure could never rejoin
+  // the protected lifecycle: recordProtectionStatus only admits
+  // ENTRY_FILLED -> PLACING_PROTECTION -> PROTECTED, so repairing protection on
+  // the exchange still left the row parked forever, holding recoveryRequiredCount
+  // at 1 and blocking all new work until an operator closed the position by hand.
+  MANUAL_INTERVENTION: [
+    "CLOSED_EMERGENCY",
+    "CLOSED_EXTERNAL",
+    "CLOSED_TP",
+    "CLOSED_SL",
+    "PLACING_PROTECTION",
+  ],
 };
 
 /**

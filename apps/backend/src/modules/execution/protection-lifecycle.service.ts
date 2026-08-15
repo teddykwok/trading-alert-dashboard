@@ -137,6 +137,97 @@ function isUnreadableProtectionState(reasonCode: ProtectionReasonCode): boolean 
   return UNREADABLE_PROTECTION_REASON_CODES.includes(reasonCode);
 }
 
+/**
+ * The ONLY reasons an execution may be automatically un-parked, as an explicit
+ * allowlist rather than "everything not forbidden".
+ *
+ * Each one means the same thing: the STOP leg of a tranche could not be proven
+ * active at the time, so the lifecycle stopped. None of them asserts anything
+ * about the position itself, and all four are re-decidable from a fresh
+ * exchange read — which is exactly what makes them recoverable. Mainnet Canary
+ * #2 was parked by STOP_IDENTITY_MISMATCH from a comparator defect that has
+ * since been fixed; nothing in the architecture could ever notice that the
+ * reason had stopped being true.
+ *
+ * Everything else stays parked, and mostly by construction rather than by this
+ * list: an intervention only becomes a candidate at all if it also wrote
+ * ExecutionProtectionState.state = MANUAL_INTERVENTION, which ONLY the
+ * protection service's escalate() does. Every entry-lifecycle escalation, every
+ * mapping-driven park and every operator transition is therefore excluded
+ * before this list is even consulted.
+ *
+ * Deliberately absent, with reasons:
+ *  - PARTIAL_PROTECTION_EXIT / PROTECTION_COVERAGE_INCOMPLETE (over-protection)
+ *    / POSITION_IDENTITY_MISMATCH: each asserts a contradiction about the
+ *    POSITION or about orders we may not own. Re-running protection cannot
+ *    resolve a contradiction; it would build on top of one.
+ *  - STOP_TRIGGER_INVALID / TAKE_PROFIT_TRIGGER_INVALID /
+ *    PROTECTION_QUANTITY_UNSUPPORTED / PROTECTION_FILTER_MISMATCH: the FROZEN
+ *    plan is incompatible with the live symbol. Nothing here may recompute a
+ *    trigger, so a retry can only fail identically.
+ *  - EMERGENCY_CLOSE_*: the last resort itself failed. Automatic mutation after
+ *    that is precisely what must not happen.
+ *  - POSITION_NOT_FOUND_AFTER_FILL: a position row that contradicts a recorded
+ *    fill. A later open position on the same symbol/side is not provably the
+ *    same position, so re-protecting could protect someone else's trade.
+ *  - STOP_SUBMISSION_REJECTED: it looks re-decidable and is not. It is written
+ *    for EVERY classifyMutationOutcome CONFIRMED_REJECTED, which collapses nine
+ *    distinct error kinds — AUTH, MISSING_CREDENTIALS, PERMISSION,
+ *    READ_ONLY_VIOLATION, IP_RESTRICTED, FUTURES_NOT_ENABLED, DISABLED,
+ *    UNSUPPORTED_SYMBOL and REQUEST_INVALID — into one string. All but a
+ *    minority of REQUEST_INVALID cases are permanent until a human changes
+ *    something outside this system, and the underlying kind/binanceCode is not
+ *    persisted (only binanceOrder.status = REJECTED), so recovery cannot tell
+ *    them apart even in principle. Auto-retrying a credential or permission
+ *    rejection is not merely useless: repeated rejected submissions risk
+ *    Binance error-rate penalties. Recovering the transient subset needs that
+ *    classification persisted first, which is a separate design.
+ */
+const RECOVERABLE_INTERVENTION_REASON_CODES: readonly ProtectionReasonCode[] = [
+  "STOP_NOT_VERIFIED",
+  "STOP_IDENTITY_MISMATCH",
+  "STOP_SUBMISSION_RESULT_UNKNOWN",
+];
+
+function isRecoverableInterventionReason(reasonCode: string | null): boolean {
+  return reasonCode !== null && RECOVERABLE_INTERVENTION_REASON_CODES.includes(reasonCode as ProtectionReasonCode);
+}
+
+/**
+ * Recovery attempts allowed within ONE intervention episode.
+ *
+ * Bounded because an attempt that fails re-parks the execution, and an
+ * unbounded loop would mint a fresh protection generation every tick. Scoped
+ * per episode because a later, unrelated incident in the same trade deserves
+ * its own budget — see countRecoveryAttemptsInEpisode.
+ */
+const MAX_RECOVERY_ATTEMPTS_PER_EPISODE = 3;
+
+/**
+ * A tranche to submit, plus the execution version THIS call now owns.
+ *
+ * Reserving commits a version bump, so everything after it in the same
+ * lifecycle call — an escalation especially — must CAS against the version the
+ * reservation produced rather than the one the caller arrived with. A resumed
+ * tranche reserves nothing and keeps the incoming version.
+ */
+interface ReservedTranche {
+  generation: number;
+  expectedVersion: number;
+}
+
+/**
+ * The outcome of a protection status promotion.
+ *
+ * `committedVersion` is non-null ONLY when this call actually advanced the row.
+ * Callers thread it forward so a later escalation CASes against a version this
+ * call produced — never against one a concurrent tick produced.
+ */
+interface RecordedProtectionStatus {
+  execution: TradeExecution;
+  committedVersion: number | null;
+}
+
 interface PositionSnapshot {
   quantity: string;
   entryPrice: string | null;
@@ -302,6 +393,211 @@ export class ProtectionLifecycleService {
     // Everything else is driven by the current exposure, which also resolves
     // any half-submitted protection tranche via its own clientAlgoId.
     return this.ensureProtectionForExposure(input);
+  }
+
+  // ==========================================================================
+  // 2b. attemptProtectionRecovery — re-admit a parked execution
+  // ==========================================================================
+
+  /**
+   * Returns a MANUAL_INTERVENTION execution to the protected lifecycle when —
+   * and only when — current exchange evidence proves that is safe.
+   *
+   * MANUAL_INTERVENTION stays a safety boundary. This does not "resume
+   * everything": it is an allowlist of protection-lifecycle reasons plus a
+   * fresh proof, and it re-parks itself the moment either fails. Callers MUST
+   * run reconcileProtectionAndClosure first — a flat position is closure's
+   * business, and on a real exchange flat looks like a missing position row.
+   *
+   * Nothing here submits, cancels or reserves anything. Its entire job is to
+   * decide whether the EXISTING machinery may run, then hand over to
+   * ensureProtectionForExposure, which owns tranche reservation, STOP-first
+   * sequencing, deterministic clientAlgoIds, generation semantics,
+   * over-protection detection and coverage verification exactly as it does for
+   * a never-parked execution.
+   */
+  async attemptProtectionRecovery(input: ProtectionLifecycleInput): Promise<ProtectionOutcome> {
+    const execution = await this.loadExecution(input.executionId);
+
+    // Gate 1: still parked. A closure pass in the same tick may already have
+    // terminalized it, and a terminal execution is never re-opened.
+    if (execution.status !== "MANUAL_INTERVENTION") {
+      return this.outcome(false, "MANUAL_REVIEW_REQUIRED", `Execution is ${execution.status}; no recovery applies.`, execution);
+    }
+
+    const protection = await this.loadProtection(execution.id);
+
+    // Gate 2: THE ALLOWLIST, in two parts.
+    //
+    // The protection row must itself say MANUAL_INTERVENTION — which only this
+    // service's escalate() ever writes — and its reason must be one of the four
+    // recoverable ones. An execution parked by the entry lifecycle, by a
+    // refused mapping or by an operator never satisfies the first half, so a
+    // healthy-looking STOP/TP can never erase an unrelated manual reason.
+    if (!protection || protection.state !== "MANUAL_INTERVENTION") {
+      return this.outcome(
+        false,
+        "MANUAL_REVIEW_REQUIRED",
+        "The intervention did not come from the protection lifecycle; it stays parked for a human.",
+        execution,
+        protection
+      );
+    }
+    if (!isRecoverableInterventionReason(protection.reasonCode)) {
+      return this.outcome(
+        false,
+        "MANUAL_REVIEW_REQUIRED",
+        `Intervention reason ${protection.reasonCode ?? "(none)"} is not automatically recoverable.`,
+        execution,
+        protection
+      );
+    }
+
+    // Gate 3: a bounded budget for THIS episode.
+    const attempts = await this.countRecoveryAttemptsInEpisode(execution.id);
+    if (attempts >= MAX_RECOVERY_ATTEMPTS_PER_EPISODE) {
+      return this.outcome(
+        false,
+        "MANUAL_REVIEW_REQUIRED",
+        `Protection recovery already ran ${attempts} time(s) for this intervention; a human must intervene.`,
+        execution,
+        protection
+      );
+    }
+
+    // Gate 4: the position must be conclusively OPEN and ours.
+    const direction = execution.direction as DirectionName;
+    const positionSide = protectionPositionSide(direction);
+    const position = await this.readPosition(execution.symbol, positionSide);
+    if (position === "UNAVAILABLE") {
+      return this.outcome(false, "POSITION_STATE_UNAVAILABLE", "Position state could not be read; staying parked.", execution, protection);
+    }
+    if (position === null) {
+      // Flat, or unreadable as flat. Either way closure owns this, not recovery.
+      return this.outcome(false, "PROTECTION_COVERAGE_INCOMPLETE", "No open position to protect; staying parked.", execution, protection);
+    }
+    const normalized = normalizeOpenQuantity(position.quantity, direction);
+    if (!normalized.valid) {
+      // A contradiction, not a gap. Never escalate from here: it is already
+      // parked, and re-stamping would only churn the version and the journal.
+      return this.outcome(false, "POSITION_IDENTITY_MISMATCH", "Position sign contradicts the expected direction; staying parked.", execution, protection);
+    }
+    const openQuantity = normalized.quantity;
+    if (new D(openQuantity).lessThanOrEqualTo(0)) {
+      return this.outcome(false, "PROTECTION_COVERAGE_INCOMPLETE", "Position is flat; closure owns this execution.", execution, protection);
+    }
+
+    // Gate 5: EVERY protection leg must be readable. An UNKNOWN leg is not a
+    // gap, it is an absence of evidence — and un-parking on it would hand
+    // ensureProtectionForExposure a coverage number it cannot trust.
+    const measured = await this.measureVerifiedCoverage(execution);
+    if (measured.unresolved.length > 0) {
+      return this.outcome(
+        false,
+        measured.unresolved.includes("STOP_LOSS") ? "STOP_QUERY_UNAVAILABLE" : "TAKE_PROFIT_QUERY_UNAVAILABLE",
+        `Protection state is unreadable for ${measured.unresolved.join(" and ")}; staying parked until it can be seen.`,
+        execution,
+        protection
+      );
+    }
+
+    // Gate 6: never build on top of protection we cannot explain.
+    const coverage = calculateCoverage({
+      confirmedOpenQuantity: openQuantity,
+      activeStopQuantity: measured.stop,
+      activeTakeProfitQuantity: measured.takeProfit,
+    });
+    if (coverage.overProtected) {
+      return this.outcome(
+        false,
+        "PROTECTION_COVERAGE_INCOMPLETE",
+        `Protection exceeds exposure (stop ${measured.stop}, take profit ${measured.takeProfit}, exposure ${openQuantity}); staying parked.`,
+        execution,
+        protection
+      );
+    }
+
+    // Every gate passed: re-admit the execution. requiresManualIntervention is
+    // deliberately LEFT SET — the execution is not healthy yet, it is merely
+    // allowed to try, so it keeps counting towards recoveryRequiredCount until
+    // full coverage is verified.
+    const resumed = await this.commitExecutionChange(execution, input.expectedVersion, {
+      status: "PLACING_PROTECTION",
+      reasonCode: "PROTECTION_RECOVERY_RESUMED",
+      message:
+        `Re-admitted to the protection lifecycle after ${protection.reasonCode}: position is open ` +
+        `(${openQuantity}), every protection leg is readable and coverage is not excessive.`,
+      eventType: "PROTECTION_RECONCILED",
+      metadata: {
+        interventionReason: protection.reasonCode,
+        recoveryAttempt: attempts + 1,
+        maxRecoveryAttempts: MAX_RECOVERY_ATTEMPTS_PER_EPISODE,
+        confirmedOpenQuantity: openQuantity,
+        measuredStopQuantity: measured.stop,
+        measuredTakeProfitQuantity: measured.takeProfit,
+        // Distinguishes "protection was already valid" from "a gap was repaired"
+        // without having to re-derive it from later events.
+        alreadyFullyCovered: coverage.fullyCovered,
+      },
+    });
+    if (!resumed) {
+      // A concurrent tick won. It either recovered this execution or moved it
+      // on; either way exactly one winner un-parks and this one does nothing.
+      return this.outcome(false, "CAPACITY_OR_VERSION_CONFLICT", "Version changed during protection recovery.", execution, protection);
+    }
+
+    // The existing lifecycle takes over from here — no parallel mechanism.
+    return this.ensureProtectionForExposure({ ...input, expectedVersion: resumed.version });
+  }
+
+  /**
+   * Recovery attempts made during the CURRENT intervention episode.
+   *
+   * An execution can be parked, recovered and parked again within one trade,
+   * and a later incident must not inherit the earlier one's spent budget. The
+   * episode boundary is read from the append-only event log, which already
+   * records it precisely — no schema is needed.
+   *
+   * The boundary is the newest event that reached PROTECTED — the execution's
+   * last provably healthy moment.
+   *
+   * The tempting rule, "count attempts after the most recent transition INTO
+   * MANUAL_INTERVENTION", is UNSAFE here, and the event semantics are what
+   * prove it: a recovery moves the row to PLACING_PROTECTION, so a recovery
+   * that then fails re-parks it by the legal PLACING_PROTECTION ->
+   * MANUAL_INTERVENTION edge. That re-park IS a transition into
+   * MANUAL_INTERVENTION, so every failed attempt would hand itself a fresh
+   * budget and the cap could never bind — an unbounded loop, each iteration
+   * potentially minting another protection generation.
+   *
+   * Reaching PROTECTED is the only event that proves an episode actually ENDED:
+   * it is written solely by recordProtectionStatus after aggregate coverage has
+   * been re-measured against the exchange. So a later, unrelated incident in
+   * the same trade starts with a full budget, while a failing recovery keeps
+   * spending the one it has. `sequenceNumber` is the execution's version at
+   * commit time — strictly increasing and unique per execution — so it orders
+   * events exactly.
+   *
+   * With no PROTECTED marker (the execution was parked before it was ever
+   * healthy — the Mainnet Canary #2 shape) every recovery attempt ever made is
+   * counted, which is the single-episode reading and the conservative one.
+   */
+  private async countRecoveryAttemptsInEpisode(executionId: string): Promise<number> {
+    const episodeStart = await this.prisma.executionEvent.findFirst({
+      where: { tradeExecutionId: executionId, toStatus: "PROTECTED" },
+      orderBy: { sequenceNumber: "desc" },
+      select: { sequenceNumber: true },
+    });
+
+    return this.prisma.executionEvent.count({
+      where: {
+        tradeExecutionId: executionId,
+        // The signature of a recovery: no other path writes this pair.
+        fromStatus: "MANUAL_INTERVENTION",
+        toStatus: "PLACING_PROTECTION",
+        ...(episodeStart ? { sequenceNumber: { gt: episodeStart.sequenceNumber } } : {}),
+      },
+    });
   }
 
   // ==========================================================================
@@ -716,11 +1012,19 @@ export class ProtectionLifecycleService {
       return this.outcome(false, reasonCode, message, execution, await this.loadProtection(execution.id));
     }
 
-    const generation = pending ?? (await this.reserveNextTranche(execution, coverage.missingQuantity, position, input));
+    // A resumed tranche writes nothing, so it keeps this call's incoming
+    // version; a fresh reservation reports the version it committed.
+    const reserved: ReservedTranche | ProtectionOutcome =
+      pending === null
+        ? await this.reserveNextTranche(execution, coverage.missingQuantity, position, input)
+        : { generation: pending, expectedVersion: input.expectedVersion };
 
-    if (typeof generation === "object") return generation; // a failure outcome
+    if (!("generation" in reserved)) return reserved; // a failure outcome
 
-    return this.submitTranche(execution, generation, position, input);
+    return this.submitTranche(execution, reserved.generation, position, {
+      ...input,
+      expectedVersion: reserved.expectedVersion,
+    });
   }
 
   /** The lowest generation whose STOP or TP is not yet verified active. */
@@ -749,7 +1053,7 @@ export class ProtectionLifecycleService {
     missingQuantity: string,
     position: PositionSnapshot,
     input: ProtectionLifecycleInput
-  ): Promise<number | ProtectionOutcome> {
+  ): Promise<ReservedTranche | ProtectionOutcome> {
     const direction = execution.direction as DirectionName;
     const positionSide = protectionPositionSide(direction);
     const side = closingSide(direction);
@@ -881,15 +1185,20 @@ export class ProtectionLifecycleService {
     });
 
     if (committed === "CONFLICT") {
+      // Another tick reserved first. THIS call wrote nothing, so it still owns
+      // the version it came in with — adopting a newer one would inherit the
+      // other tick's evidence along with it.
       const existing = await this.findIncompleteTranche(execution);
-      if (existing) return existing;
+      if (existing) return { generation: existing, expectedVersion: input.expectedVersion };
       return this.outcome(false, "PROTECTION_GENERATION_CONFLICT", "A concurrent tranche was created.", execution);
     }
     if (!committed) {
       return this.outcome(false, "CAPACITY_OR_VERSION_CONFLICT", "Version changed; nothing was reserved.", execution);
     }
 
-    return generation;
+    // The reservation advanced the row, so everything later in THIS call — an
+    // escalation above all — must CAS against the version it produced.
+    return { generation, expectedVersion: committed.version };
   }
 
   /** Submits STOP first, verifies it, and only then submits TP. */
@@ -909,7 +1218,18 @@ export class ProtectionLifecycleService {
     // Protection placement is starting. This is the single funnel for BOTH a
     // freshly reserved tranche and a resumed incomplete one, so recording it
     // here covers every path that submits.
-    await this.recordProtectionStatus(execution.id, "PLACING_PROTECTION", "Placing protection for the confirmed fill.");
+    //
+    // It commits a version bump when it actually promotes the execution, so the
+    // rest of this call — the escalation below in particular — must CAS against
+    // that new version. When it promotes nothing, `committedVersion` is null and
+    // the incoming version still stands.
+    const placing = await this.recordProtectionStatus(
+      execution.id,
+      "PLACING_PROTECTION",
+      "Placing protection for the confirmed fill."
+    );
+    const owned: ProtectionLifecycleInput =
+      placing.committedVersion === null ? input : { ...input, expectedVersion: placing.committedVersion };
 
     const stopResult = await this.submitAndVerifyProtection(execution, stop, input.evaluatedAt);
     if (!stopResult.verified) {
@@ -939,7 +1259,7 @@ export class ProtectionLifecycleService {
       });
 
       // The stop could not be verified — consider the last-resort close.
-      return this.considerEmergencyClose(execution, protection, stopResult.reasonCode, input);
+      return this.considerEmergencyClose(execution, protection, stopResult.reasonCode, owned);
     }
 
     await this.setProtectionState(protection.id, "STOP_VERIFIED", "PROTECTION_VERIFIED", "Stop is verified active.");
@@ -947,7 +1267,7 @@ export class ProtectionLifecycleService {
     const takeProfit = await this.loadOrder(execution.id, "TAKE_PROFIT", generation);
     if (!takeProfit) {
       // A plan with no take profit: a verified stop is the whole protection.
-      return this.verifyAggregateCoverage(execution, input);
+      return this.verifyAggregateCoverage(execution, owned);
     }
 
     await this.setProtectionState(protection.id, "PLACING_TAKE_PROFIT", null, null);
@@ -980,7 +1300,7 @@ export class ProtectionLifecycleService {
       return this.outcome(false, takeProfitResult.reasonCode, "Take profit is not verified; the stop remains active.", execution, await this.loadProtection(execution.id));
     }
 
-    return this.verifyAggregateCoverage(execution, input);
+    return this.verifyAggregateCoverage(execution, owned);
   }
 
   /**
@@ -1228,26 +1548,36 @@ export class ProtectionLifecycleService {
     executionId: string,
     target: "PLACING_PROTECTION" | "PROTECTED",
     message: string
-  ): Promise<TradeExecution> {
+  ): Promise<RecordedProtectionStatus> {
     const current = await this.loadExecution(executionId);
     const status = current.status as TradeExecutionStatusName;
 
-    if (status === target) return current;
+    if (status === target) return { execution: current, committedVersion: null };
 
     // Only the documented predecessor may advance, which is what keeps
     // PARTIALLY_FILLED (and every terminal state) untouched.
     const requiredFrom = target === "PLACING_PROTECTION" ? "ENTRY_FILLED" : "PLACING_PROTECTION";
-    if (status !== requiredFrom) return current;
-    if (!canTransition(status, target).allowed) return current;
+    if (status !== requiredFrom) return { execution: current, committedVersion: null };
+    if (!canTransition(status, target).allowed) return { execution: current, committedVersion: null };
 
     const committed = await this.commitExecutionChange(current, current.version, {
       status: target,
       reasonCode: "PROTECTION_VERIFIED",
       message,
       eventType: target === "PLACING_PROTECTION" ? "PROTECTION_SUBMITTED" : "PROTECTION_VERIFIED",
+      // PROTECTED is the first moment a recovered execution is provably healthy:
+      // aggregate coverage has been re-measured against the exchange and matches
+      // exposure. A recovery deliberately carries requiresManualIntervention
+      // through PLACING_PROTECTION, so this is where it is finally released —
+      // never earlier, and never on a partial repair. On the ordinary path the
+      // flag is already false and this writes the same value.
+      ...(target === "PROTECTED" ? { clearManualIntervention: true } : {}),
     });
 
-    return committed ?? current;
+    // `committedVersion` is non-null ONLY when this call itself advanced the
+    // row, so a caller can thread it forward without ever inheriting another
+    // tick's version.
+    return { execution: committed ?? current, committedVersion: committed?.version ?? null };
   }
 
   /**
@@ -1260,7 +1590,7 @@ export class ProtectionLifecycleService {
    */
   private async markExecutionProtected(executionId: string, message: string): Promise<TradeExecution> {
     await this.recordProtectionStatus(executionId, "PLACING_PROTECTION", message);
-    return this.recordProtectionStatus(executionId, "PROTECTED", message);
+    return (await this.recordProtectionStatus(executionId, "PROTECTED", message)).execution;
   }
 
   /**
@@ -1883,6 +2213,8 @@ export class ProtectionLifecycleService {
        */
       clearManualIntervention?: boolean;
       actuals?: Prisma.TradeExecutionUpdateManyMutationInput;
+      /** Structured evidence for the event journal. Never read back as state. */
+      metadata?: Prisma.InputJsonValue;
     }
   ): Promise<TradeExecution | null> {
     return this.prisma.$transaction(async (tx) => {
@@ -1941,6 +2273,7 @@ export class ProtectionLifecycleService {
           toStatus: next.status,
           reasonCode: change.reasonCode,
           message: change.message.slice(0, 1000),
+          ...(change.metadata === undefined ? {} : { metadata: change.metadata }),
         },
       });
       return next;
@@ -1970,6 +2303,27 @@ export class ProtectionLifecycleService {
       });
     }
 
+    // EVIDENCE AND VERSION STAY COUPLED.
+    //
+    // `input.expectedVersion` is not merely a concurrency detail here — it is
+    // what ties this escalation to the exchange evidence that justified it. A
+    // tick that observed a failure at version N must LOSE the CAS once another
+    // tick has advanced the row, because that other tick acted on newer
+    // evidence. Reloading the row and adopting whatever version it now holds
+    // breaks the coupling: a slow tick could park an execution a faster one had
+    // just verified as PROTECTED, and PROTECTED -> MANUAL_INTERVENTION being a
+    // LEGAL transition is precisely why the state machine cannot catch it.
+    // Legality and freshness are separate requirements.
+    //
+    // The other half of the problem is real too: THIS call may legitimately
+    // advance the version before escalating — reserveNextTranche and
+    // recordProtectionStatus both commit — and an escalation that follows one
+    // of its OWN writes must still land. That is solved by THREADING the new
+    // version forward from the writer that produced it (see advanceProtection
+    // and submitTranche), never by re-reading the row here.
+    //
+    // So: a version this call caused is threaded in and the park succeeds; a
+    // version another tick caused is not, and the park correctly loses.
     const committed = await this.commitExecutionChange(execution, input.expectedVersion, {
       status: execution.status === "MANUAL_INTERVENTION" ? undefined : "MANUAL_INTERVENTION",
       reasonCode,
