@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+﻿import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import type {
   BinanceOrder,
@@ -56,7 +56,7 @@ import {
 } from "./protection-lifecycle";
 
 /**
- * Phase 7 — SL/TP protection, liquidation safety, margin top-up and emergency
+ * Phase 7 â€” SL/TP protection, liquidation safety, margin top-up and emergency
  * close orchestration.
  *
  * Internal methods only: no worker, no queue, no polling daemon, no user-data
@@ -78,13 +78,13 @@ const PROTECTION_LOCK_NAMESPACE = 0x7afe;
 export interface ProtectionLifecycleInput {
   executionId: string;
   expectedVersion: number;
-  /** Explicit evaluation instant — the pure layer never reads a clock. */
+  /** Explicit evaluation instant â€” the pure layer never reads a clock. */
   evaluatedAt: Date;
 }
 
 /**
  * The exact coverage that was proven at one verification moment. Decimal
- * STRINGS only — nothing here is ever routed through a JS number.
+ * STRINGS only â€” nothing here is ever routed through a JS number.
  */
 export interface VerifiedCoverageSnapshot {
   confirmedOpenQuantity: string;
@@ -106,7 +106,7 @@ export interface ProtectionOutcome {
  * Aggregate protection coverage, WITH the confidence of the observation.
  *
  * `stop` / `takeProfit` are the quantities proven active. `unresolved` names
- * the roles whose exchange state could be proven neither present nor absent —
+ * the roles whose exchange state could be proven neither present nor absent â€”
  * the distinction that separates "there is a real gap to repair" from "we
  * could not look". Only the former may drive a mutation.
  */
@@ -125,7 +125,7 @@ const LOCALLY_RESOLVED_ORDER_STATUSES: readonly string[] = ["FILLED", "CANCELED"
 /**
  * Reason codes meaning "the exchange state could not be read", as opposed to
  * "the exchange told us something bad". They are DEFERRALS: nothing is known
- * to be wrong, so they must not alert, escalate or rewrite protection state —
+ * to be wrong, so they must not alert, escalate or rewrite protection state â€”
  * only cause the next reconciliation tick to ask again.
  */
 const UNREADABLE_PROTECTION_REASON_CODES: readonly ProtectionReasonCode[] = [
@@ -144,7 +144,7 @@ function isUnreadableProtectionState(reasonCode: ProtectionReasonCode): boolean 
  * Each one means the same thing: the STOP leg of a tranche could not be proven
  * active at the time, so the lifecycle stopped. None of them asserts anything
  * about the position itself, and all four are re-decidable from a fresh
- * exchange read — which is exactly what makes them recoverable. Mainnet Canary
+ * exchange read â€” which is exactly what makes them recoverable. Mainnet Canary
  * #2 was parked by STOP_IDENTITY_MISMATCH from a comparator defect that has
  * since been fixed; nothing in the architecture could ever notice that the
  * reason had stopped being true.
@@ -172,9 +172,9 @@ function isUnreadableProtectionState(reasonCode: ProtectionReasonCode): boolean 
  *    same position, so re-protecting could protect someone else's trade.
  *  - STOP_SUBMISSION_REJECTED: it looks re-decidable and is not. It is written
  *    for EVERY classifyMutationOutcome CONFIRMED_REJECTED, which collapses nine
- *    distinct error kinds — AUTH, MISSING_CREDENTIALS, PERMISSION,
+ *    distinct error kinds â€” AUTH, MISSING_CREDENTIALS, PERMISSION,
  *    READ_ONLY_VIOLATION, IP_RESTRICTED, FUTURES_NOT_ENABLED, DISABLED,
- *    UNSUPPORTED_SYMBOL and REQUEST_INVALID — into one string. All but a
+ *    UNSUPPORTED_SYMBOL and REQUEST_INVALID â€” into one string. All but a
  *    minority of REQUEST_INVALID cases are permanent until a human changes
  *    something outside this system, and the underlying kind/binanceCode is not
  *    persisted (only binanceOrder.status = REJECTED), so recovery cannot tell
@@ -199,7 +199,7 @@ function isRecoverableInterventionReason(reasonCode: string | null): boolean {
  * Bounded because an attempt that fails re-parks the execution, and an
  * unbounded loop would mint a fresh protection generation every tick. Scoped
  * per episode because a later, unrelated incident in the same trade deserves
- * its own budget — see countRecoveryAttemptsInEpisode.
+ * its own budget â€” see countRecoveryAttemptsInEpisode.
  */
 const MAX_RECOVERY_ATTEMPTS_PER_EPISODE = 3;
 
@@ -207,7 +207,7 @@ const MAX_RECOVERY_ATTEMPTS_PER_EPISODE = 3;
  * A tranche to submit, plus the execution version THIS call now owns.
  *
  * Reserving commits a version bump, so everything after it in the same
- * lifecycle call — an escalation especially — must CAS against the version the
+ * lifecycle call â€” an escalation especially â€” must CAS against the version the
  * reservation produced rather than the one the caller arrived with. A resumed
  * tranche reserves nothing and keeps the incoming version.
  */
@@ -221,7 +221,7 @@ interface ReservedTranche {
  *
  * `committedVersion` is non-null ONLY when this call actually advanced the row.
  * Callers thread it forward so a later escalation CASes against a version this
- * call produced — never against one a concurrent tick produced.
+ * call produced â€” never against one a concurrent tick produced.
  */
 interface RecordedProtectionStatus {
   execution: TradeExecution;
@@ -261,11 +261,11 @@ export class ProtectionLifecycleService {
   }
 
   // ==========================================================================
-  // 1. ensureProtectionForExposure — the main entry point
+  // 1. ensureProtectionForExposure â€” the main entry point
   // ==========================================================================
 
   /**
-   * Protects confirmed exposure. Runs on the FIRST confirmed non-zero fill —
+   * Protects confirmed exposure. Runs on the FIRST confirmed non-zero fill â€”
    * it never waits for ENTRY_FILLED, because a partial position is just as
    * exposed as a full one.
    */
@@ -299,7 +299,7 @@ export class ProtectionLifecycleService {
       );
     }
     if (new D(normalized.quantity).lessThanOrEqualTo(0)) {
-      // The exchange says flat while we recorded a fill — reconcile closure.
+      // The exchange says flat while we recorded a fill â€” reconcile closure.
       return this.reconcileProtectionAndClosure(input);
     }
 
@@ -347,7 +347,7 @@ export class ProtectionLifecycleService {
   }
 
   // ==========================================================================
-  // 2. resumeProtectionLifecycle — crash recovery
+  // 2. resumeProtectionLifecycle â€” crash recovery
   // ==========================================================================
 
   /**
@@ -359,8 +359,8 @@ export class ProtectionLifecycleService {
     const execution = await this.loadExecution(input.executionId);
 
     // The shared state machine is the single source of truth. The literal list
-    // this replaced silently omitted every status added after it was written —
-    // CLOSED_EXTERNAL among them — which would have made a terminally closed
+    // this replaced silently omitted every status added after it was written â€”
+    // CLOSED_EXTERNAL among them â€” which would have made a terminally closed
     // execution look like a resumable protection lifecycle.
     if (isTerminalStatus(execution.status as TradeExecutionStatusName)) {
       return this.outcome(false, "MANUAL_REVIEW_REQUIRED", `Execution is terminal (${execution.status}).`, execution);
@@ -396,17 +396,17 @@ export class ProtectionLifecycleService {
   }
 
   // ==========================================================================
-  // 2b. attemptProtectionRecovery — re-admit a parked execution
+  // 2b. attemptProtectionRecovery â€” re-admit a parked execution
   // ==========================================================================
 
   /**
-   * Returns a MANUAL_INTERVENTION execution to the protected lifecycle when —
-   * and only when — current exchange evidence proves that is safe.
+   * Returns a MANUAL_INTERVENTION execution to the protected lifecycle when â€”
+   * and only when â€” current exchange evidence proves that is safe.
    *
    * MANUAL_INTERVENTION stays a safety boundary. This does not "resume
    * everything": it is an allowlist of protection-lifecycle reasons plus a
    * fresh proof, and it re-parks itself the moment either fails. Callers MUST
-   * run reconcileProtectionAndClosure first — a flat position is closure's
+   * run reconcileProtectionAndClosure first â€” a flat position is closure's
    * business, and on a real exchange flat looks like a missing position row.
    *
    * Nothing here submits, cancels or reserves anything. Its entire job is to
@@ -429,8 +429,8 @@ export class ProtectionLifecycleService {
 
     // Gate 2: THE ALLOWLIST, in two parts.
     //
-    // The protection row must itself say MANUAL_INTERVENTION — which only this
-    // service's escalate() ever writes — and its reason must be one of the four
+    // The protection row must itself say MANUAL_INTERVENTION â€” which only this
+    // service's escalate() ever writes â€” and its reason must be one of the four
     // recoverable ones. An execution parked by the entry lifecycle, by a
     // refused mapping or by an operator never satisfies the first half, so a
     // healthy-looking STOP/TP can never erase an unrelated manual reason.
@@ -488,7 +488,7 @@ export class ProtectionLifecycleService {
     }
 
     // Gate 5: EVERY protection leg must be readable. An UNKNOWN leg is not a
-    // gap, it is an absence of evidence — and un-parking on it would hand
+    // gap, it is an absence of evidence â€” and un-parking on it would hand
     // ensureProtectionForExposure a coverage number it cannot trust.
     const measured = await this.measureVerifiedCoverage(execution);
     if (measured.unresolved.length > 0) {
@@ -518,7 +518,7 @@ export class ProtectionLifecycleService {
     }
 
     // Every gate passed: re-admit the execution. requiresManualIntervention is
-    // deliberately LEFT SET — the execution is not healthy yet, it is merely
+    // deliberately LEFT SET â€” the execution is not healthy yet, it is merely
     // allowed to try, so it keeps counting towards recoveryRequiredCount until
     // full coverage is verified.
     const resumed = await this.commitExecutionChange(execution, input.expectedVersion, {
@@ -546,7 +546,7 @@ export class ProtectionLifecycleService {
       return this.outcome(false, "CAPACITY_OR_VERSION_CONFLICT", "Version changed during protection recovery.", execution, protection);
     }
 
-    // The existing lifecycle takes over from here — no parallel mechanism.
+    // The existing lifecycle takes over from here â€” no parallel mechanism.
     return this.ensureProtectionForExposure({ ...input, expectedVersion: resumed.version });
   }
 
@@ -556,9 +556,9 @@ export class ProtectionLifecycleService {
    * An execution can be parked, recovered and parked again within one trade,
    * and a later incident must not inherit the earlier one's spent budget. The
    * episode boundary is read from the append-only event log, which already
-   * records it precisely — no schema is needed.
+   * records it precisely â€” no schema is needed.
    *
-   * The boundary is the newest event that reached PROTECTED — the execution's
+   * The boundary is the newest event that reached PROTECTED â€” the execution's
    * last provably healthy moment.
    *
    * The tempting rule, "count attempts after the most recent transition INTO
@@ -567,7 +567,7 @@ export class ProtectionLifecycleService {
    * that then fails re-parks it by the legal PLACING_PROTECTION ->
    * MANUAL_INTERVENTION edge. That re-park IS a transition into
    * MANUAL_INTERVENTION, so every failed attempt would hand itself a fresh
-   * budget and the cap could never bind — an unbounded loop, each iteration
+   * budget and the cap could never bind â€” an unbounded loop, each iteration
    * potentially minting another protection generation.
    *
    * Reaching PROTECTED is the only event that proves an episode actually ENDED:
@@ -575,11 +575,11 @@ export class ProtectionLifecycleService {
    * been re-measured against the exchange. So a later, unrelated incident in
    * the same trade starts with a full budget, while a failing recovery keeps
    * spending the one it has. `sequenceNumber` is the execution's version at
-   * commit time — strictly increasing and unique per execution — so it orders
+   * commit time â€” strictly increasing and unique per execution â€” so it orders
    * events exactly.
    *
    * With no PROTECTED marker (the execution was parked before it was ever
-   * healthy — the Mainnet Canary #2 shape) every recovery attempt ever made is
+   * healthy â€” the Mainnet Canary #2 shape) every recovery attempt ever made is
    * counted, which is the single-episode reading and the conservative one.
    */
   private async countRecoveryAttemptsInEpisode(executionId: string): Promise<number> {
@@ -636,7 +636,7 @@ export class ProtectionLifecycleService {
         observed.push({ order, status, dto: query.order });
       } else if (query.outcome === "NOT_FOUND_CONFIRMED") {
         // Binance PROVED this exact id does not exist. There is nothing left
-        // for this sibling to cancel, which is a resolved state — collapsing it
+        // for this sibling to cancel, which is a resolved state â€” collapsing it
         // into UNKNOWN is what left the first real canary stuck forever.
         observed.push({ order, status: "ABSENT", dto: null });
       } else {
@@ -752,7 +752,7 @@ export class ProtectionLifecycleService {
     const plan = planSiblingCancellation({ siblings, positionClosed: true });
 
     // An order whose state could not be read is NOT proof that there is
-    // nothing left to cancel — cleanup stays incomplete until we can see it.
+    // nothing left to cancel â€” cleanup stays incomplete until we can see it.
     // A CONFIRMED-ABSENT sibling is different: Binance proved that exact id
     // does not exist, so there is provably nothing to cancel.
     let cleanupComplete = !observed.some((entry) => entry.status === "UNKNOWN");
@@ -795,14 +795,14 @@ export class ProtectionLifecycleService {
 
     if (!targetStatus) {
       // The position is PROVEN flat, the entry can no longer refill and every
-      // owned sibling is absent, terminal or verifiably cancelled — but no
+      // owned sibling is absent, terminal or verifiably cancelled â€” but no
       // owned order filled, so we cannot say what closed it. A manual operator
       // close, another client, a liquidation and ADL are indistinguishable from
       // here, so the execution is terminalized as an unattributed EXTERNAL
       // close rather than mislabelled as one of ours.
       //
       // Without this the execution stayed MANUAL_INTERVENTION forever and kept
-      // recoveryRequiredCount at 1, blocking all new work — exactly what the
+      // recoveryRequiredCount at 1, blocking all new work â€” exactly what the
       // first real canary left behind after the operator closed it by hand.
       //
       // ORDERING IS LOAD-BEARING, and mirrors the SL/TP/emergency path below:
@@ -810,7 +810,7 @@ export class ProtectionLifecycleService {
       // marked CLOSED only after that commit succeeds. Closing protection first
       // can produce protection=CLOSED with a non-terminal execution, and
       // resumeProtectionLifecycle then returns early on that CLOSED row forever
-      // — a half-terminal durable state that strands the execution for good.
+      // â€” a half-terminal durable state that strands the execution for good.
       const current = await this.loadExecution(execution.id);
       const currentStatus = current.status as TradeExecutionStatusName;
 
@@ -922,7 +922,7 @@ export class ProtectionLifecycleService {
 
     if (coverage.overProtected) {
       // More protection than exposure means the exchange is reporting
-      // something we did not intend — an identity contradiction or an order we
+      // something we did not intend â€” an identity contradiction or an order we
       // do not own. It is never silently accepted as "protected".
       await this.alerts.raise({
         tradeExecutionId: execution.id,
@@ -981,8 +981,8 @@ export class ProtectionLifecycleService {
     // Reaching here means coverage looks short. But a leg whose exchange state
     // could not be read contributes zero, so "short" may simply mean "we could
     // not look". Minting a REPLACEMENT generation on that evidence submits a
-    // fresh STOP *and* TAKE_PROFIT under new ids — the tranche model always
-    // reserves the pair — while the originals may still be live on Binance.
+    // fresh STOP *and* TAKE_PROFIT under new ids â€” the tranche model always
+    // reserves the pair â€” while the originals may still be live on Binance.
     //
     // So a new generation requires the gap to be PROVEN: every leg either
     // observed active or conclusively absent. Resuming an already-reserved
@@ -1062,7 +1062,7 @@ export class ProtectionLifecycleService {
       return this.outcome(true, "PROTECTION_VERIFIED", "No missing coverage.", execution, await this.loadProtection(execution.id));
     }
 
-    // Frozen triggers only — never recalculated, never rounded here.
+    // Frozen triggers only â€” never recalculated, never rounded here.
     const stopTrigger = execution.executableStopLoss.toString();
     const takeProfitTrigger = execution.takeProfit?.toString() ?? null;
 
@@ -1186,7 +1186,7 @@ export class ProtectionLifecycleService {
 
     if (committed === "CONFLICT") {
       // Another tick reserved first. THIS call wrote nothing, so it still owns
-      // the version it came in with — adopting a newer one would inherit the
+      // the version it came in with â€” adopting a newer one would inherit the
       // other tick's evidence along with it.
       const existing = await this.findIncompleteTranche(execution);
       if (existing) return { generation: existing, expectedVersion: input.expectedVersion };
@@ -1196,8 +1196,8 @@ export class ProtectionLifecycleService {
       return this.outcome(false, "CAPACITY_OR_VERSION_CONFLICT", "Version changed; nothing was reserved.", execution);
     }
 
-    // The reservation advanced the row, so everything later in THIS call — an
-    // escalation above all — must CAS against the version it produced.
+    // The reservation advanced the row, so everything later in THIS call â€” an
+    // escalation above all â€” must CAS against the version it produced.
     return { generation, expectedVersion: committed.version };
   }
 
@@ -1220,7 +1220,7 @@ export class ProtectionLifecycleService {
     // here covers every path that submits.
     //
     // It commits a version bump when it actually promotes the execution, so the
-    // rest of this call — the escalation below in particular — must CAS against
+    // rest of this call â€” the escalation below in particular â€” must CAS against
     // that new version. When it promotes nothing, `committedVersion` is null and
     // the incoming version still stands.
     const placing = await this.recordProtectionStatus(
@@ -1234,7 +1234,7 @@ export class ProtectionLifecycleService {
     const stopResult = await this.submitAndVerifyProtection(execution, stop, input.evaluatedAt);
     if (!stopResult.verified) {
       // DEFERRED, NOT FAILED. An unreadable existence query says nothing is
-      // wrong — only that we could not look. Escalating here would park the
+      // wrong â€” only that we could not look. Escalating here would park the
       // execution at MANUAL_INTERVENTION, which today has no automatic
       // protection-restoration path, so a transient query blip would strand a
       // live position permanently. The reserved tranche stays incomplete and
@@ -1258,7 +1258,7 @@ export class ProtectionLifecycleService {
         },
       });
 
-      // The stop could not be verified — consider the last-resort close.
+      // The stop could not be verified â€” consider the last-resort close.
       return this.considerEmergencyClose(execution, protection, stopResult.reasonCode, owned);
     }
 
@@ -1280,7 +1280,7 @@ export class ProtectionLifecycleService {
         return this.outcome(false, takeProfitResult.reasonCode, takeProfitResult.message, execution, protection);
       }
 
-      // The verified STOP is retained — never cancelled because TP failed.
+      // The verified STOP is retained â€” never cancelled because TP failed.
       await this.setProtectionState(
         protection.id,
         "PROTECTION_INCOMPLETE",
@@ -1328,7 +1328,7 @@ export class ProtectionLifecycleService {
     //
     // Only two answers settle it: the exchange returned the order, or it
     // PROVED this exact id does not exist (-2013). A timeout, 5xx, rate limit
-    // or auth failure settles nothing — and this branch used to submit on all
+    // or auth failure settles nothing â€” and this branch used to submit on all
     // of them alike, firing a fresh POST every tick for as long as the query
     // stayed unreadable.
     //
@@ -1336,7 +1336,7 @@ export class ProtectionLifecycleService {
     // idempotent here. This codebase deliberately restricts the -4116
     // duplicate semantic to SUBMIT_ORDER (DUPLICATE_PROVING_OPERATIONS), so a
     // duplicate clientAlgoId on the Algo endpoint classifies as RESULT_UNKNOWN
-    // — the architecture's own position is that a duplicate response proves
+    // â€” the architecture's own position is that a duplicate response proves
     // nothing for algo orders. Submitting on unreadable evidence therefore
     // risks a real second mutation, not a harmless replay.
     //
@@ -1390,7 +1390,7 @@ export class ProtectionLifecycleService {
         }
       }
 
-      // Bounded reconciliation on the SAME clientAlgoId — never a new id.
+      // Bounded reconciliation on the SAME clientAlgoId â€” never a new id.
       for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
         existing = await this.queryProtection(execution.symbol, order.clientAlgoId!);
         if (existing.outcome === "CONFIRMED_ACCEPTED") break;
@@ -1497,7 +1497,7 @@ export class ProtectionLifecycleService {
     });
 
     if (state !== "PROTECTED") {
-      // A remaining gap means another tranche is required — say so plainly.
+      // A remaining gap means another tranche is required â€” say so plainly.
       return this.outcome(
         false,
         "PROTECTION_COVERAGE_INCOMPLETE",
@@ -1524,7 +1524,7 @@ export class ProtectionLifecycleService {
    * Records the SUCCESS half of the protection lifecycle on the execution ROW.
    *
    * Until this existed the service could commit every way protection goes
-   * WRONG — MANUAL_INTERVENTION, CLOSED_TP/SL/EMERGENCY, CLOSED_EXTERNAL — and
+   * WRONG â€” MANUAL_INTERVENTION, CLOSED_TP/SL/EMERGENCY, CLOSED_EXTERNAL â€” and
    * no way it goes right. `ExecutionProtectionState` reached PROTECTED while
    * `TradeExecution.status` stayed ENTRY_FILLED forever, which is exactly what
    * Mainnet Canary #3 showed: full verified coverage on both legs, 70
@@ -1534,7 +1534,7 @@ export class ProtectionLifecycleService {
    * Deliberately narrow:
    *
    *  - IDEMPOTENT. Already at the target means no commit, no event, no version
-   *    churn — the reconciliation tick repeats indefinitely.
+   *    churn â€” the reconciliation tick repeats indefinitely.
    *  - ONE legal hop only, and only along the documented path
    *    ENTRY_FILLED -> PLACING_PROTECTION -> PROTECTED. The caller walks the
    *    two hops in order, so no new state-machine edge is needed.
@@ -1568,7 +1568,7 @@ export class ProtectionLifecycleService {
       // PROTECTED is the first moment a recovered execution is provably healthy:
       // aggregate coverage has been re-measured against the exchange and matches
       // exposure. A recovery deliberately carries requiresManualIntervention
-      // through PLACING_PROTECTION, so this is where it is finally released —
+      // through PLACING_PROTECTION, so this is where it is finally released â€”
       // never earlier, and never on a partial repair. On the ordinary path the
       // flag is already false and this writes the same value.
       ...(target === "PROTECTED" ? { clearManualIntervention: true } : {}),
@@ -1584,8 +1584,8 @@ export class ProtectionLifecycleService {
    * Walks ENTRY_FILLED -> PLACING_PROTECTION -> PROTECTED in order.
    *
    * Both hops are attempted because protection can legitimately be discovered
-   * already complete — after a restart, or on a tick where the tranche was
-   * placed by a previous run — in which case the execution has never been
+   * already complete â€” after a restart, or on a tick where the tranche was
+   * placed by a previous run â€” in which case the execution has never been
    * moved off ENTRY_FILLED and must still end up PROTECTED.
    */
   private async markExecutionProtected(executionId: string, message: string): Promise<TradeExecution> {
@@ -1617,8 +1617,8 @@ export class ProtectionLifecycleService {
       // THE ABSENT-VS-UNKNOWN BOUNDARY.
       //
       // Only two answers are conclusive: the exchange returned the order, or
-      // it PROVED the exact id does not exist (-2013). Everything else — a
-      // timeout, a 5xx, a rate limit, an auth failure, an unparseable body —
+      // it PROVED the exact id does not exist (-2013). Everything else â€” a
+      // timeout, a 5xx, a rate limit, an auth failure, an unparseable body â€”
       // means we could not determine the state at all.
       //
       // This used to `continue` on all of them alike, so an unreadable leg was
@@ -1877,7 +1877,7 @@ export class ProtectionLifecycleService {
         });
         return this.escalate(execution, "EMERGENCY_CLOSE_SUBMISSION_REJECTED", "Emergency close was rejected.", input);
       }
-      // Unknown: never a second client id — reconcile the same one.
+      // Unknown: never a second client id â€” reconcile the same one.
     }
 
     return this.reconcileEmergencyClose(execution, await this.loadOrder(execution.id, "EMERGENCY_CLOSE", 1), input);
@@ -1907,7 +1907,7 @@ export class ProtectionLifecycleService {
           },
         });
       } catch {
-        // Query unavailable — the position check below is the real proof.
+        // Query unavailable â€” the position check below is the real proof.
       }
     }
 
@@ -1927,7 +1927,7 @@ export class ProtectionLifecycleService {
       return this.escalate(execution, "EMERGENCY_CLOSE_VERIFICATION_FAILED", "Exposure remains after the emergency close.", input);
     }
 
-    // Confirmed flat — clean up siblings and record the terminal state.
+    // Confirmed flat â€” clean up siblings and record the terminal state.
     return this.reconcileProtectionAndClosure(input);
   }
 
@@ -2194,8 +2194,19 @@ export class ProtectionLifecycleService {
   }
 
   /**
-   * One transaction: execution status, actual fields, version increment and
-   * one event. A failing event rolls all of it back.
+   * One transaction: execution status, actual fields, version increment, the
+   * protection state, any critical alert, and one event. A failing event rolls
+   * all of it back â€” and so does a lost CAS.
+   *
+   * The protection row and the alert are OPTIONAL participants rather than
+   * separate writes because they are claims ABOUT the execution transition. A
+   * write that happens whether or not the transition commits is a claim the
+   * execution never made: escalation used to park
+   * `ExecutionProtectionState.state = MANUAL_INTERVENTION` and raise a critical
+   * alert BEFORE this CAS, so a stale tick whose park correctly lost still left
+   * the protection row asserting MANUAL_INTERVENTION over a healthy PROTECTED
+   * execution, and still alerted a human about an intervention that never
+   * happened. Both now live or die with the CAS.
    */
   private async commitExecutionChange(
     execution: TradeExecution,
@@ -2208,19 +2219,32 @@ export class ProtectionLifecycleService {
       requiresManualIntervention?: boolean;
       /**
        * Clears the manual-intervention flag. Only a terminal transition backed
-       * by exchange proof may set this — it is what releases the execution from
+       * by exchange proof may set this â€” it is what releases the execution from
        * the recovery-required count.
        */
       clearManualIntervention?: boolean;
       actuals?: Prisma.TradeExecutionUpdateManyMutationInput;
       /** Structured evidence for the event journal. Never read back as state. */
       metadata?: Prisma.InputJsonValue;
+      /**
+       * Protection state to write ATOMICALLY with the transition. Applied only
+       * once the CAS has been won, so it can never describe a transition that
+       * did not happen.
+       */
+      protectionState?: {
+        id: string;
+        state: ProtectionState;
+        reasonCode: ProtectionReasonCode | null;
+        message: string | null;
+      };
+      /** Critical alert raised only if the transition actually commits. */
+      criticalAlert?: Parameters<CriticalAlertService["raiseInTransaction"]>[1];
     }
   ): Promise<TradeExecution | null> {
     return this.prisma.$transaction(async (tx) => {
       // The AUTHORITATIVE source status, read inside the transaction. The
-      // caller's `execution` may be older than `expectedVersion` — several
-      // paths load it before an intervening reservation bumps the version —
+      // caller's `execution` may be older than `expectedVersion` â€” several
+      // paths load it before an intervening reservation bumps the version â€”
       // so validating against it could judge a transition that is not the one
       // about to be written.
       const current = await tx.tradeExecution.findUnique({ where: { id: execution.id } });
@@ -2229,7 +2253,7 @@ export class ProtectionLifecycleService {
       // CAS FIRST, then legality. Order matters: if the row has already moved
       // on, this write is an ordinary lost race and must stay one. Validating
       // before the version check would turn a benign concurrent update into a
-      // hard invariant failure — e.g. a row already CLOSED_TP while this
+      // hard invariant failure â€” e.g. a row already CLOSED_TP while this
       // caller still holds an older version.
       if (current.version !== expectedVersion) return null;
 
@@ -2262,6 +2286,20 @@ export class ProtectionLifecycleService {
       });
       if (updated.count === 0) return null;
 
+      // Past the CAS: this transition is happening, so its claims may be made.
+      if (change.protectionState) {
+        await tx.executionProtectionState.update({
+          where: { id: change.protectionState.id },
+          data: {
+            state: change.protectionState.state,
+            reasonCode: change.protectionState.reasonCode ?? undefined,
+            sanitizedMessage: change.protectionState.message?.slice(0, 1000) ?? undefined,
+            version: { increment: 1 },
+          },
+        });
+      }
+      if (change.criticalAlert) await this.alerts.raiseInTransaction(tx, change.criticalAlert);
+
       const next = await tx.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
       await tx.executionEvent.create({
         data: {
@@ -2287,25 +2325,22 @@ export class ProtectionLifecycleService {
     input: ProtectionLifecycleInput
   ): Promise<ProtectionOutcome> {
     const protection = await this.ensureProtectionRow(execution.id);
-    await this.setProtectionState(protection.id, "MANUAL_INTERVENTION", reasonCode, message);
 
-    if (isCriticalReason(reasonCode)) {
-      await this.alerts.raise({
-        tradeExecutionId: execution.id,
-        alertType: reasonCode === "POSITION_IDENTITY_MISMATCH" ? "POSITION_IDENTITY_CONFLICT" : "STOP_NOT_VERIFIED",
-        reasonCode,
-        details: {
-          symbol: execution.symbol,
-          positionSide: protectionPositionSide(execution.direction as DirectionName),
-          protectionState: "MANUAL_INTERVENTION",
-          requiredAction: message,
-        },
-      });
-    }
+    // NOTHING ESCALATION-SPECIFIC IS WRITTEN BEFORE THE CAS.
+    //
+    // The protection park and the critical alert used to be issued here, ahead
+    // of the transition they describe. Both then survived a lost CAS, so a
+    // stale tick left `ExecutionProtectionState.state = MANUAL_INTERVENTION`
+    // and a queued human alert sitting on top of an execution another tick had
+    // just verified as PROTECTED with the manual flag cleared. Correctness
+    // cannot depend on a later healthy tick tidying that up.
+    //
+    // They are now passed INTO the transition and applied only after its CAS
+    // wins, so the two authoritative rows move together or not at all.
 
     // EVIDENCE AND VERSION STAY COUPLED.
     //
-    // `input.expectedVersion` is not merely a concurrency detail here — it is
+    // `input.expectedVersion` is not merely a concurrency detail here â€” it is
     // what ties this escalation to the exchange evidence that justified it. A
     // tick that observed a failure at version N must LOSE the CAS once another
     // tick has advanced the row, because that other tick acted on newer
@@ -2316,8 +2351,8 @@ export class ProtectionLifecycleService {
     // Legality and freshness are separate requirements.
     //
     // The other half of the problem is real too: THIS call may legitimately
-    // advance the version before escalating — reserveNextTranche and
-    // recordProtectionStatus both commit — and an escalation that follows one
+    // advance the version before escalating â€” reserveNextTranche and
+    // recordProtectionStatus both commit â€” and an escalation that follows one
     // of its OWN writes must still land. That is solved by THREADING the new
     // version forward from the writer that produced it (see advanceProtection
     // and submitTranche), never by re-reading the row here.
@@ -2330,6 +2365,20 @@ export class ProtectionLifecycleService {
       message,
       eventType: "MANUAL_INTERVENTION_REQUIRED",
       requiresManualIntervention: true,
+      protectionState: { id: protection.id, state: "MANUAL_INTERVENTION", reasonCode, message },
+      criticalAlert: isCriticalReason(reasonCode)
+        ? {
+            tradeExecutionId: execution.id,
+            alertType: reasonCode === "POSITION_IDENTITY_MISMATCH" ? "POSITION_IDENTITY_CONFLICT" : "STOP_NOT_VERIFIED",
+            reasonCode,
+            details: {
+              symbol: execution.symbol,
+              positionSide: protectionPositionSide(execution.direction as DirectionName),
+              protectionState: "MANUAL_INTERVENTION",
+              requiredAction: message,
+            },
+          }
+        : undefined,
     });
 
     return this.outcome(false, reasonCode, message, committed ?? execution, await this.loadProtection(execution.id));
@@ -2365,9 +2414,9 @@ export class ProtectionLifecycleService {
    *
    * Three outcomes matter to the caller and must never be conflated:
    *
-   *   CONFIRMED_ACCEPTED  — the order exists; `order` carries its state;
-   *   NOT_FOUND_CONFIRMED — Binance proved this exact id does not exist;
-   *   anything else       — we do not know, and absence must not be inferred.
+   *   CONFIRMED_ACCEPTED  â€” the order exists; `order` carries its state;
+   *   NOT_FOUND_CONFIRMED â€” Binance proved this exact id does not exist;
+   *   anything else       â€” we do not know, and absence must not be inferred.
    *
    * For a QUERY, absence is proven by -2013 (NO_SUCH_ORDER) and by nothing
    * else. -2011 is CANCEL_REJECTED, documented only in the cancel context, so
@@ -2454,7 +2503,7 @@ export class ProtectionLifecycleService {
    * "protected 0.25" could never learn the first happened. This append-only row
    * is that history.
    *
-   * Written inside the caller's transaction — it is history, not a side effect,
+   * Written inside the caller's transaction â€” it is history, not a side effect,
    * and it involves no network call, no Telegram and no notification table.
    * `upsert` rather than `create` so this bookkeeping can never be the thing
    * that fails a protection transaction.
@@ -2530,7 +2579,7 @@ export class ProtectionLifecycleService {
    * The first real canary failed with nothing but a reason code to go on. Every
    * field here is safe: the Binance error KIND, the HTTP status, the numeric
    * Binance code, the endpoint NAME, and identifiers we minted ourselves. Never
-   * the API key, secret, signature, signed URL or query string — the URL
+   * the API key, secret, signature, signed URL or query string â€” the URL
    * carries the signature, so it is never logged.
    */
   private logProtectionFailure(input: {
