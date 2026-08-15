@@ -44,6 +44,12 @@ export const PROTECTION_REASON_CODES = [
   "STOP_QUERY_UNAVAILABLE",
   "STOP_IDENTITY_MISMATCH",
   "STOP_NOT_VERIFIED",
+  // Our own POST was ACCEPTED and the exchange proved this exact id does not
+  // exist yet. Distinct from *_SUBMISSION_RESULT_UNKNOWN, which means the
+  // submission itself never resolved: here the submission DID resolve and only
+  // its visibility has not caught up. Bounded — see propagationDeadline.
+  "STOP_SUBMISSION_PROPAGATION_PENDING",
+  "TAKE_PROFIT_SUBMISSION_PROPAGATION_PENDING",
   "TAKE_PROFIT_INTENT_CONFLICT",
   "TAKE_PROFIT_SUBMISSION_REJECTED",
   "TAKE_PROFIT_SUBMISSION_RESULT_UNKNOWN",
