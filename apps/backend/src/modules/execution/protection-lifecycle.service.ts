@@ -996,6 +996,20 @@ export class ProtectionLifecycleService {
         closedAt: input.evaluatedAt,
         lastReconciledAt: input.evaluatedAt,
       },
+      // An OWNED, attributed closure is the strongest terminal evidence there
+      // is — strictly stronger than the CLOSED_EXTERNAL branch above, which
+      // already clears the flag on the weaker "flat but unattributable" proof.
+      // Reaching here required: position proven flat, no partial protection
+      // exit, the entry remainder neutralized and re-checked for refill, every
+      // owned sibling observed (no UNKNOWN) and cancelled, and one of OUR
+      // orders confirmed FILLED.
+      //
+      // Leaving a stale flag set kept a finished trade in recoveryRequiredCount
+      // forever: the real COWUSDT canary closed correctly as CLOSED_SL with
+      // exitReason STOP_LOSS and still reported recoveryRequiredCount 1,
+      // blocking every later canary. Nothing is left to recover once the
+      // exchange has proven the position is closed by our own order.
+      clearManualIntervention: true,
     });
     if (!committed) {
       return this.outcome(false, "CAPACITY_OR_VERSION_CONFLICT", "Version changed during closure.", execution, protection);

@@ -5032,3 +5032,175 @@ describe("emergency close position identity", () => {
     expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
   });
 });
+
+// ===========================================================================
+// A VERIFIED OWNED CLOSURE RELEASES THE MANUAL-INTERVENTION FLAG.
+//
+// The owned-attribution branch committed the terminal status, the exit reason
+// and the exit price but never cleared `requiresManualIntervention`, while the
+// WEAKER CLOSED_EXTERNAL branch beside it always has. A trade that had been
+// parked at any point therefore stayed in recoveryRequiredCount forever after
+// closing perfectly.
+//
+// The real COWUSDT Mainnet canary ended exactly there: CLOSED_SL, exitReason
+// STOP_LOSS, Binance flat and clean — and recoveryRequiredCount 1, which
+// blocks every later canary.
+// ===========================================================================
+
+describe("terminal owned closure clears manual intervention", () => {
+  /** A protected execution carrying a stale flag from an earlier incident. */
+  const flaggedProtected = async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { requiresManualIntervention: true, version: { increment: 1 } },
+    });
+    return reload(execution.id);
+  };
+
+  const fillOwned = (executionId: string, role: "STOP_LOSS" | "TAKE_PROFIT") => {
+    const id = buildClientOrderId(executionId, role, 1);
+    const row = scenario.algoOrders.get(id)!;
+    row.algoStatus = "FILLED";
+    row.executedQty = "0.100";
+    row.avgPrice = role === "STOP_LOSS" ? "96" : "108";
+    scenario.positionAmt = "0";
+  };
+
+  const reconcile = async (execution: { id: string; version: number }) =>
+    protectionService.reconcileProtectionAndClosure({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: at(),
+    });
+
+  maybe()("1. an owned STOP fill closes as CLOSED_SL and clears the flag", async () => {
+    const parked = await flaggedProtected();
+    expect(parked.requiresManualIntervention).toBe(true);
+    fillOwned(parked.id, "STOP_LOSS");
+
+    const outcome = await reconcile(parked);
+
+    expect(outcome.ok).toBe(true);
+    const closed = await reload(parked.id);
+    expect(closed.status).toBe("CLOSED_SL");
+    expect(closed.exitReason).toBe("STOP_LOSS");
+    // The canary's exact defect.
+    expect(closed.requiresManualIntervention).toBe(false);
+    expect((await protectionOf(parked.id)).state).toBe("CLOSED");
+  });
+
+  maybe()("2. an owned TP fill closes as CLOSED_TP and clears the flag", async () => {
+    const parked = await flaggedProtected();
+    fillOwned(parked.id, "TAKE_PROFIT");
+
+    const outcome = await reconcile(parked);
+
+    expect(outcome.ok).toBe(true);
+    const closed = await reload(parked.id);
+    expect(closed.status).toBe("CLOSED_TP");
+    expect(closed.exitReason).toBe("TAKE_PROFIT");
+    expect(closed.requiresManualIntervention).toBe(false);
+  });
+
+  maybe()("3. an owned emergency fill closes as CLOSED_EMERGENCY and clears the flag", async () => {
+    // Emergency shares the same conclusively-verified terminal commit, so it
+    // clears the flag on the same evidence.
+    const parked = await flaggedProtected();
+    await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: parked.id,
+        role: "EMERGENCY_CLOSE",
+        generation: 1,
+        clientOrderId: buildClientOrderId(parked.id, "EMERGENCY_CLOSE", 1),
+        side: "SELL",
+        positionSide: "LONG",
+        orderType: "MARKET",
+        originalQuantity: "0.100",
+        executedQuantity: "0.100",
+        status: "FILLED",
+      },
+    });
+    scenario.positionAmt = "0";
+
+    const outcome = await reconcile(parked);
+
+    expect(outcome.ok).toBe(true);
+    const closed = await reload(parked.id);
+    expect(closed.status).toBe("CLOSED_EMERGENCY");
+    expect(closed.exitReason).toBe("EMERGENCY");
+    expect(closed.requiresManualIntervention).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // Fail-closed: the flag survives anything short of a proven terminal closure
+  // -------------------------------------------------------------------------
+
+  maybe()("4. exposure still open keeps the flag set and terminalizes nothing", async () => {
+    const parked = await flaggedProtected();
+    // The stop fired but the position is NOT flat: a partial protection exit.
+    const stopId = buildClientOrderId(parked.id, "STOP_LOSS", 1);
+    scenario.algoOrders.get(stopId)!.algoStatus = "FILLED";
+    scenario.positionAmt = "0.100";
+
+    const outcome = await reconcile(parked);
+
+    expect(outcome.ok).toBe(false);
+    const after = await reload(parked.id);
+    expect(after.status).not.toBe("CLOSED_SL");
+    expect(after.requiresManualIntervention).toBe(true);
+  });
+
+  maybe()("5. an UNKNOWN sibling observation keeps the flag set", async () => {
+    const parked = await flaggedProtected();
+    fillOwned(parked.id, "STOP_LOSS");
+    // The take profit cannot be read, so cleanup is unresolved: absence of
+    // evidence must not terminalize or release the flag.
+    scenario.queryFailures.add(buildClientOrderId(parked.id, "TAKE_PROFIT", 1));
+
+    const outcome = await reconcile(parked);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("SIBLING_CLEANUP_INCOMPLETE");
+    const after = await reload(parked.id);
+    expect(after.status).not.toBe("CLOSED_SL");
+    expect(after.requiresManualIntervention).toBe(true);
+  });
+
+  maybe()("6. a lost version CAS keeps the flag set and writes nothing", async () => {
+    const parked = await flaggedProtected();
+    fillOwned(parked.id, "STOP_LOSS");
+
+    const outcome = await protectionService.reconcileProtectionAndClosure({
+      executionId: parked.id,
+      expectedVersion: parked.version - 1, // deliberately stale
+      evaluatedAt: at(),
+    });
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("CAPACITY_OR_VERSION_CONFLICT");
+    const after = await reload(parked.id);
+    expect(after.status).not.toBe("CLOSED_SL");
+    expect(after.requiresManualIntervention).toBe(true);
+  });
+
+  maybe()("7. an unattributable flat close still terminalizes as CLOSED_EXTERNAL", async () => {
+    // Documents the neighbouring branch that already cleared the flag: flat
+    // with no owned fill is weaker evidence, yet still terminal.
+    const parked = await flaggedProtected();
+    scenario.algoOrders.delete(buildClientOrderId(parked.id, "STOP_LOSS", 1));
+    scenario.algoOrders.delete(buildClientOrderId(parked.id, "TAKE_PROFIT", 1));
+    scenario.positionAmt = "0";
+
+    const outcome = await reconcile(parked);
+
+    expect(outcome.ok).toBe(true);
+    const closed = await reload(parked.id);
+    expect(closed.status).toBe("CLOSED_EXTERNAL");
+    expect(closed.requiresManualIntervention).toBe(false);
+    // No fabricated attribution.
+    expect(closed.exitReason).toBe("EXTERNAL");
+    expect(closed.actualExitPrice).toBeNull();
+  });
+});
