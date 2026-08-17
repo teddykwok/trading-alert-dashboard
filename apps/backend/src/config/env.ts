@@ -214,10 +214,10 @@ const envSchema = z.object({
   EXECUTION_EMERGENCY_CLOSE_MODE: z.enum(["DISABLED", "ON_UNVERIFIED_STOP"]).default("DISABLED"),
   EXECUTION_PROTECTION_RECONCILE_MAX_ATTEMPTS: z.coerce.number().int().positive().max(20).default(5),
   EXECUTION_PROTECTION_RECONCILE_DELAY_MS: z.coerce.number().int().positive().max(60_000).default(1000),
-  // Stops trigger on MARK_PRICE so a thin-book wick cannot fire them; take
-  // profits trigger on the traded CONTRACT_PRICE. The names and defaults come
-  // from modules/execution/protection-policy so the schema and the shared
-  // resolver used by the testnet verifier cannot drift apart.
+  // Both legs trigger on the traded CONTRACT_PRICE, so protection fires against
+  // the same feed the chart levels came from. The names and defaults come from
+  // modules/execution/protection-policy so the schema and the shared resolver
+  // used by the testnet verifier cannot drift apart.
   EXECUTION_SL_WORKING_TYPE: z.enum(PROTECTION_WORKING_TYPES).default(DEFAULT_STOP_WORKING_TYPE),
   EXECUTION_TP_WORKING_TYPE: z.enum(PROTECTION_WORKING_TYPES).default(DEFAULT_TAKE_PROFIT_WORKING_TYPE),
   EXECUTION_PROTECTION_PRICE_PROTECT: z

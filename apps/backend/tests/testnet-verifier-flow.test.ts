@@ -675,7 +675,7 @@ describe("mutation flow", () => {
   // -------------------------------------------------------------------------
   // Production working-type parity.
   //
-  // Production sends a STOP on EXECUTION_SL_WORKING_TYPE (MARK_PRICE) and a
+  // Production sends a STOP on EXECUTION_SL_WORKING_TYPE and a
   // TAKE_PROFIT on EXECUTION_TP_WORKING_TYPE (CONTRACT_PRICE). The verifier
   // used to send MARK_PRICE for both, so the demo run never exercised the real
   // TAKE_PROFIT identity — and `workingType` is a field the production
@@ -692,10 +692,11 @@ describe("mutation flow", () => {
     expect(stop?.params.workingType).toBe(protectionWorkingType("STOP_LOSS", OPTIONS.protectionPolicy));
     expect(takeProfit?.params.workingType).toBe(protectionWorkingType("TAKE_PROFIT", OPTIONS.protectionPolicy));
     // With the shipped configuration, concretely:
-    expect(stop?.params.workingType).toBe("MARK_PRICE");
+    expect(stop?.params.workingType).toBe("CONTRACT_PRICE");
     expect(takeProfit?.params.workingType).toBe("CONTRACT_PRICE");
-    // The two roles genuinely differ — the old bug was that they did not.
-    expect(stop?.params.workingType).not.toBe(takeProfit?.params.workingType);
+    // Both roles now resolve to CONTRACT_PRICE by policy. What must hold is
+    // that each is resolved through the SHARED resolver above — the old bug was
+    // the verifier hard-coding a value rather than asking the policy.
   });
 
   it("C. hands the same per-role working type to the production comparator", async () => {
@@ -703,7 +704,7 @@ describe("mutation flow", () => {
 
     expect(report.verdict).toBe("PASS");
     // The comparator accepted, and what it compared is what was submitted.
-    expect(report.stop?.workingType).toBe("MARK_PRICE");
+    expect(report.stop?.workingType).toBe("CONTRACT_PRICE");
     expect(report.takeProfit?.workingType).toBe("CONTRACT_PRICE");
     expect(report.stop?.identityMismatches).toEqual([]);
     expect(report.takeProfit?.identityMismatches).toEqual([]);
@@ -746,7 +747,7 @@ describe("mutation flow", () => {
     expect(stop.side).toBe("SELL");
     expect(stop.positionSide).toBe("LONG");
     expect(stop.type).toBe("STOP_MARKET");
-    expect(stop.workingType).toBe("MARK_PRICE");
+    expect(stop.workingType).toBe("CONTRACT_PRICE");
     expect(stop.priceProtect).toBe("false");
     expect(stop.closePosition).toBe("false");
     expect(stop.newOrderRespType).toBe("ACK");
@@ -1304,7 +1305,9 @@ describe("crash recovery", () => {
       side: "SELL",
       quantity: "0.002",
       triggerPrice: "45000.0",
-      workingType: "MARK_PRICE",
+      // Our OWN previously submitted stop, so it carries the production policy
+      // working type — a MARK_PRICE stop would no longer be ours.
+      workingType: "CONTRACT_PRICE",
       priceProtect: false,
       closePosition: false,
       // Binance sets this itself on hedge-mode closing conditionals.

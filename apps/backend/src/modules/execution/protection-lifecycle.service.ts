@@ -1236,11 +1236,7 @@ export class ProtectionLifecycleService {
     const generation = (await this.highestGeneration(execution.id)) + 1;
     // The role -> workingType rule lives in ONE place, shared with the demo
     // verifier so the two cannot disagree about what a TAKE_PROFIT sends.
-    const policy: ProtectionPolicy = {
-      stopWorkingType: env.EXECUTION_SL_WORKING_TYPE,
-      takeProfitWorkingType: env.EXECUTION_TP_WORKING_TYPE,
-      priceProtect: env.EXECUTION_PROTECTION_PRICE_PROTECT,
-    };
+    const policy: ProtectionPolicy = this.protectionPolicy();
     const workingTypeStop = protectionWorkingType("STOP_LOSS", policy);
     const workingTypeTakeProfit = protectionWorkingType("TAKE_PROFIT", policy);
     const priceProtect = policy.priceProtect;
@@ -1459,6 +1455,7 @@ export class ProtectionLifecycleService {
     const notVerifiedCode: ProtectionReasonCode = role === "STOP_LOSS" ? "STOP_NOT_VERIFIED" : "TAKE_PROFIT_NOT_VERIFIED";
     const executingCode: ProtectionReasonCode =
       role === "STOP_LOSS" ? "STOP_EXECUTION_IN_PROGRESS" : "TAKE_PROFIT_EXECUTION_IN_PROGRESS";
+    const policyWorkingType = protectionWorkingType(role, this.protectionPolicy());
     const mismatchCode: ProtectionReasonCode = role === "STOP_LOSS" ? "STOP_IDENTITY_MISMATCH" : "TAKE_PROFIT_IDENTITY_MISMATCH";
 
     const queryUnavailableCode: ProtectionReasonCode =
@@ -1605,7 +1602,10 @@ export class ProtectionLifecycleService {
           positionSide: order.positionSide as "LONG" | "SHORT",
           quantity: order.originalQuantity.toString(),
           triggerPrice: order.triggerPrice!.toString(),
-          workingType: (order.workingType ?? "MARK_PRICE") as WorkingTypeName,
+          // The frozen intent decides; the configured policy is only a fallback
+          // for a row that somehow carries no working type. Naming a literal
+          // here would let a repaired stop diverge from the placed one.
+          workingType: (order.workingType ?? policyWorkingType) as WorkingTypeName,
           priceProtect: order.priceProtect ?? false,
         });
         await this.mutations.submitProtectionOrder(context);
@@ -1669,7 +1669,7 @@ export class ProtectionLifecycleService {
         positionSide: order.positionSide as "LONG" | "SHORT",
         quantity: order.originalQuantity.toString(),
         triggerPrice: order.triggerPrice!.toString(),
-        workingType: order.workingType ?? "MARK_PRICE",
+        workingType: order.workingType ?? policyWorkingType,
         priceProtect: order.priceProtect ?? false,
       },
       {
@@ -2190,6 +2190,21 @@ export class ProtectionLifecycleService {
     }
 
     return this.executeEmergencyClose(execution, protection, input);
+  }
+
+  /**
+   * The configured role -> workingType policy, resolved in one place.
+   *
+   * Reserving an intent and submitting it are separated by a persistence hop,
+   * so both ends must agree about what a role sends. Naming a literal at either
+   * end is what let the stop and the take profit drift apart historically.
+   */
+  private protectionPolicy(): ProtectionPolicy {
+    return {
+      stopWorkingType: env.EXECUTION_SL_WORKING_TYPE,
+      takeProfitWorkingType: env.EXECUTION_TP_WORKING_TYPE,
+      priceProtect: env.EXECUTION_PROTECTION_PRICE_PROTECT,
+    };
   }
 
   /**

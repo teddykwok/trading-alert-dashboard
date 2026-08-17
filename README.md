@@ -404,7 +404,7 @@ opposite of safe.
 | `EXECUTION_EMERGENCY_CLOSE_MODE` | `DISABLED` (park for a human) or `ON_UNVERIFIED_STOP` (last-resort MARKET close). | `DISABLED` |
 | `EXECUTION_PROTECTION_RECONCILE_MAX_ATTEMPTS` | Bounded budget for resolving an ambiguous protection result. | `5` |
 | `EXECUTION_PROTECTION_RECONCILE_DELAY_MS` | Delay between bounded reconciliation attempts. | `1000` |
-| `EXECUTION_SL_WORKING_TYPE` | Stop trigger reference. | `MARK_PRICE` |
+| `EXECUTION_SL_WORKING_TYPE` | Stop trigger reference. | `CONTRACT_PRICE` |
 | `EXECUTION_TP_WORKING_TYPE` | Take-profit trigger reference. | `CONTRACT_PRICE` |
 | `EXECUTION_PROTECTION_PRICE_PROTECT` | Binance price-protection flag on protection orders. | `false` |
 
