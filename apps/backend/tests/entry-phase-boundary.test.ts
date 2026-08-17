@@ -245,6 +245,11 @@ describe("locked configuration", () => {
   });
 
   it("validates the TTL and retry settings as positive integers", () => {
+    // The SCHEMA FALLBACK, used only when the variable is absent entirely. It
+    // stays deliberately short: an unconfigured deployment should give up on an
+    // unfilled entry quickly rather than inherit the 24h operator setting by
+    // accident. The recommended deployment value is a separate contract — see
+    // the .env.example test below.
     expect(envSource).toMatch(/EXECUTION_ENTRY_TTL_SECONDS: z\.coerce\.number\(\)\.int\(\)\.positive\(\)\.default\(300\)/);
     expect(envSource).toMatch(/EXECUTION_ENTRY_RECONCILE_MAX_ATTEMPTS: z\.coerce\.number\(\)\.int\(\)\.positive\(\)/);
     expect(envSource).toMatch(/EXECUTION_ENTRY_RECONCILE_DELAY_MS: z\.coerce\.number\(\)\.int\(\)\.positive\(\)/);
@@ -255,7 +260,11 @@ describe("locked configuration", () => {
       const source = read(file);
       expect(source).toContain("EXECUTION_LIVE_ENTRY_ENABLED=false");
       expect(source).toContain("EXECUTION_PROTECTION_READY=false");
-      expect(source).toContain("EXECUTION_ENTRY_TTL_SECONDS=300");
+      // The RECOMMENDED OPERATOR VALUE, deliberately different from the schema
+      // fallback above: the selected strategy lets a LIMIT entry rest for up to
+      // 24 hours. Both example files must agree — one at 300 and the other at
+      // 86400 is how this drifted in the first place.
+      expect(source).toContain("EXECUTION_ENTRY_TTL_SECONDS=86400");
       expect(source).toMatch(/BOTH gates below/i);
     }
   });
