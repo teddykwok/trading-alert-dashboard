@@ -25,7 +25,10 @@ process.env.EXECUTION_PROTECTION_READY = "false";
 process.env.EXECUTION_AUTO_ADD_MARGIN_ENABLED = "false";
 process.env.EXECUTION_EMERGENCY_CLOSE_MODE = "DISABLED";
 process.env.EXECUTION_PROTECTION_RECONCILE_MAX_ATTEMPTS = "2";
-process.env.EXECUTION_SL_WORKING_TYPE = "MARK_PRICE";
+// The production policy: both legs trigger on the traded contract price. Pinned
+// explicitly so the suite exercises the shipped values rather than whatever a
+// developer's environment happens to hold.
+process.env.EXECUTION_SL_WORKING_TYPE = "CONTRACT_PRICE";
 process.env.EXECUTION_TP_WORKING_TYPE = "CONTRACT_PRICE";
 process.env.BINANCE_FUTURES_REST_BASE_URL = "https://testnet.binancefuture.example";
 
@@ -1165,7 +1168,9 @@ describe("protection parameters", () => {
     const orders = await ordersOf(execution.id);
     const stop = orders.find((order) => order.role === "STOP_LOSS")!;
     const takeProfit = orders.find((order) => order.role === "TAKE_PROFIT")!;
-    expect(stop.workingType).toBe("MARK_PRICE");
+    // Both legs trigger on the traded contract price, and the resolved value is
+    // FROZEN onto the intent so a later policy change cannot rewrite it.
+    expect(stop.workingType).toBe("CONTRACT_PRICE");
     expect(takeProfit.workingType).toBe("CONTRACT_PRICE");
     expect(stop.priceProtect).toBe(false);
   });
@@ -1590,7 +1595,8 @@ describe("look-before-submit existence safety", () => {
       orderType: "STOP_MARKET",
       quantity: "0.100",
       triggerPrice: "96",
-      workingType: "MARK_PRICE",
+      // Our OWN order, so it carries the policy working type.
+      workingType: "CONTRACT_PRICE",
       priceProtect: false,
     });
     scenario.queryFailures.add(stopId);
@@ -5202,5 +5208,87 @@ describe("terminal owned closure clears manual intervention", () => {
     // No fabricated attribution.
     expect(closed.exitReason).toBe("EXTERNAL");
     expect(closed.actualExitPrice).toBeNull();
+  });
+});
+
+// ===========================================================================
+// A WORKING-TYPE POLICY CHANGE IS NOT RETROACTIVE.
+//
+// `reserveNextTranche` FREEZES the resolved working type onto each protection
+// intent, and both the submission and the identity comparator read that
+// persisted value — never the current default. So flipping the stop policy from
+// MARK_PRICE to CONTRACT_PRICE governs new generations only: a generation
+// created before the change keeps its own identity and stays ours.
+//
+// The demo verifier is deliberately different — it re-resolves from the current
+// policy on every run and persists no working type — which is why its fixtures
+// track the policy while these do not.
+// ===========================================================================
+
+describe("working-type policy is not retroactive", () => {
+  const stopOf = async (id: string) =>
+    prisma!.binanceOrder.findFirstOrThrow({ where: { tradeExecutionId: id, role: "STOP_LOSS" } });
+
+  const stopPosts = () => scenario.submitted.filter((entry) => entry.role === "STOP_LOSS");
+
+  /**
+   * A protected execution whose take profit stays unreadable, so generation 1
+   * remains incomplete and its STOP is re-verified on the next tick — which is
+   * where the identity comparator runs.
+   */
+  const protectedWithUnreadableTakeProfit = async () => {
+    const execution = await filledExecution();
+    scenario.queryFailures.add(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+    await protect(execution);
+    return { execution, stopId: buildClientOrderId(execution.id, "STOP_LOSS", 1) };
+  };
+
+  const tick = async (id: string) =>
+    protectionService.ensureProtectionForExposure({
+      executionId: id,
+      expectedVersion: (await reload(id)).version,
+      evaluatedAt: at(),
+    });
+
+  // "A NEW generation uses the current policy" is already proven by
+  // `protection parameters > freezes the working types into the local intent`.
+
+  maybe()("2. a STOP persisted under the OLD policy is still recognized as ours", async () => {
+    const { execution, stopId } = await protectedWithUnreadableTakeProfit();
+
+    // Rewrite generation 1 to look like a pre-deployment order: the intent was
+    // frozen as MARK_PRICE and Binance echoes MARK_PRICE, while the current
+    // default is now CONTRACT_PRICE.
+    await prisma!.binanceOrder.update({
+      where: { id: (await stopOf(execution.id)).id },
+      data: { workingType: "MARK_PRICE" },
+    });
+    scenario.algoOrders.get(stopId)!.workingType = "MARK_PRICE";
+    const postsBefore = stopPosts().length;
+
+    const outcome = await tick(execution.id);
+
+    // The comparator judged it against its OWN frozen value, so there is no
+    // mismatch and no escalation.
+    expect(outcome.reasonCode).not.toBe("STOP_IDENTITY_MISMATCH");
+    const after = await reload(execution.id);
+    expect(after.status).not.toBe("MANUAL_INTERVENTION");
+    expect(after.requiresManualIntervention).toBe(false);
+    // Still ours: adopted, never replaced or re-submitted.
+    expect(stopPosts()).toHaveLength(postsBefore);
+    expect((await stopOf(execution.id)).workingType).toBe("MARK_PRICE");
+    expect((await ordersOf(execution.id)).every((order) => order.generation === 1)).toBe(true);
+  });
+
+  maybe()("3. verification is NOT weakened: a readback that contradicts the frozen intent still fails", async () => {
+    // Same shape, but only the EXCHANGE is rewritten. The frozen intent still
+    // says CONTRACT_PRICE, so the observed MARK_PRICE is a genuine mismatch.
+    const { execution, stopId } = await protectedWithUnreadableTakeProfit();
+    scenario.algoOrders.get(stopId)!.workingType = "MARK_PRICE";
+
+    const outcome = await tick(execution.id);
+
+    expect(outcome.reasonCode).toBe("STOP_IDENTITY_MISMATCH");
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
   });
 });

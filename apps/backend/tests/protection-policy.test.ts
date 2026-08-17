@@ -21,8 +21,8 @@ import {
  */
 
 describe("protection working-type policy", () => {
-  it("defaults the stop to MARK_PRICE and the take profit to CONTRACT_PRICE", () => {
-    expect(DEFAULT_STOP_WORKING_TYPE).toBe("MARK_PRICE");
+  it("defaults both roles to CONTRACT_PRICE so protection matches the chart feed", () => {
+    expect(DEFAULT_STOP_WORKING_TYPE).toBe("CONTRACT_PRICE");
     expect(DEFAULT_TAKE_PROFIT_WORKING_TYPE).toBe("CONTRACT_PRICE");
     expect(DEFAULT_PROTECTION_PRICE_PROTECT).toBe(false);
     expect(PROTECTION_WORKING_TYPES).toEqual(["MARK_PRICE", "CONTRACT_PRICE"]);
@@ -31,19 +31,19 @@ describe("protection working-type policy", () => {
   it("resolves the documented defaults from an empty environment", () => {
     const policy = resolveProtectionPolicy({});
     expect(policy).toEqual({
-      stopWorkingType: "MARK_PRICE",
+      stopWorkingType: "CONTRACT_PRICE",
       takeProfitWorkingType: "CONTRACT_PRICE",
       priceProtect: false,
     });
   });
 
-  it("maps each role to its own configured working type", () => {
+  it("maps each role through the same resolver, defaults included", () => {
     const policy = resolveProtectionPolicy({});
-    // The rule the verifier and the production service now share.
-    expect(protectionWorkingType("STOP_LOSS", policy)).toBe("MARK_PRICE");
+    // The rule the verifier and the production service share. Both roles now
+    // resolve to CONTRACT_PRICE by policy — the resolver stays per-role so an
+    // override can still separate them (see the next test).
+    expect(protectionWorkingType("STOP_LOSS", policy)).toBe("CONTRACT_PRICE");
     expect(protectionWorkingType("TAKE_PROFIT", policy)).toBe("CONTRACT_PRICE");
-    // The two roles must NOT resolve to the same value under the defaults.
-    expect(protectionWorkingType("STOP_LOSS", policy)).not.toBe(protectionWorkingType("TAKE_PROFIT", policy));
   });
 
   it("honours an explicit override for either role", () => {

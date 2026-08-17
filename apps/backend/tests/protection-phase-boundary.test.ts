@@ -285,7 +285,9 @@ describe("locked Phase 7 configuration", () => {
     // And the values behind those names are still exactly the locked ones.
     expect(PROTECTION_WORKING_TYPES).toEqual(["MARK_PRICE", "CONTRACT_PRICE"]);
     expect(resolveProtectionPolicy({})).toEqual({
-      stopWorkingType: "MARK_PRICE",
+      // Both legs trigger on the traded price, so protection fires against the
+      // same feed the chart levels were drawn from.
+      stopWorkingType: "CONTRACT_PRICE",
       takeProfitWorkingType: "CONTRACT_PRICE",
       priceProtect: false,
     });
@@ -308,7 +310,7 @@ describe("locked Phase 7 configuration", () => {
       expect(source).toContain("EXECUTION_PROTECTION_READY=false");
       expect(source).toContain("EXECUTION_AUTO_ADD_MARGIN_ENABLED=false");
       expect(source).toContain("EXECUTION_EMERGENCY_CLOSE_MODE=DISABLED");
-      expect(source).toContain("EXECUTION_SL_WORKING_TYPE=MARK_PRICE");
+      expect(source).toContain("EXECUTION_SL_WORKING_TYPE=CONTRACT_PRICE");
       expect(source).toContain("EXECUTION_TP_WORKING_TYPE=CONTRACT_PRICE");
       expect(source).toContain("EXECUTION_PROTECTION_PRICE_PROTECT=false");
     }
