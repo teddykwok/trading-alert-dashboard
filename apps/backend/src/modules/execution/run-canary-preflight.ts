@@ -1,4 +1,4 @@
-import { Prisma, PrismaClient } from "@prisma/client";
+import { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { CanaryPreflightService } from "./canary-preflight.service";
 import { CANARY_PINNED_LIMITS, CANARY_POLICY, effectiveCanaryLimits } from "./canary-readiness";
@@ -86,15 +86,20 @@ async function main(): Promise<void> {
         : `${env.BINANCE_MIN_MARGIN_USD} (smallest margin at or above the floor)`
     );
 
-    // The multipliers are the configuration; DOLLARS are what the policy is
-    // actually reasoned about in. Derived at the EFFECTIVE planned-risk cap,
-    // which is the whole budget while maxTotalActiveTrades is 1. Display only —
-    // the engine derives its own envelope from each plan's own risk budget.
-    const referenceRisk = new Prisma.Decimal(
-      (effective ?? policy.global).maxTotalPlannedRiskUsd
-    );
-    line("  → target margin at that risk", referenceRisk.times(env.BINANCE_TARGET_MARGIN_MULTIPLIER).toFixed());
-    line("  → maximum per-plan margin", referenceRisk.times(env.BINANCE_MAX_MARGIN_MULTIPLIER).toFixed());
+    // No dollar envelope is printed here, deliberately. This section knows the
+    // MULTIPLIERS but not the per-plan RISK they multiply: that is
+    // plan.template.riskAmount, frozen onto each Extreme RR plan from whichever
+    // risk template was active when the plan was generated, and it can differ
+    // between two plans that exist at the same time.
+    //
+    // This once multiplied maxTotalPlannedRiskUsd instead, which was only ever
+    // right by coincidence: at a one-trade policy the AGGREGATE cap equalled the
+    // per-trade budget. Raising the portfolio cap to 7.50 made the same line
+    // report a 30.00 "per-plan" target on an activation screen. An inferred
+    // figure (cap ÷ maxTotalActiveTrades, or a lookup of today's active
+    // template) would be just as wrong the moment a plan froze a different
+    // template, so the honest thing is to name the source and print nothing.
+    line("  → per-plan dollar envelope", "plan.riskAmount × the multipliers above, resolved per plan");
 
     section("Safety posture");
     line("globalKillSwitch", gates.globalKillSwitch);

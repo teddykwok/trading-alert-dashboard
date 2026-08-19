@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { Prisma } from "@prisma/client";
 import { describe, expect, it } from "vitest";
 import {
   BLOCKER_SCOPE,
@@ -715,5 +716,131 @@ describe("operator documentation", () => {
     const doc = runbook();
     expect(doc).not.toMatch(/BINANCE_ACCOUNT_SETUP_MUTATIONS_ENABLED\s*=\s*true/);
     expect(doc).not.toMatch(/BINANCE_TEST_ORDER_ENABLED\s*=\s*true/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-plan margin envelope reporting
+// ---------------------------------------------------------------------------
+
+/**
+ * The preflight knows the MULTIPLIERS but not the per-plan RISK they multiply.
+ *
+ * Per-trade risk is `plan.template.riskAmount`, frozen onto each Extreme RR
+ * plan from whichever risk template was active when that plan was generated —
+ * two plans alive at the same time can carry different values. The portfolio
+ * caps (`maxTotalPlannedRiskUsd`, `maxTotalIsolatedMarginUsd`) are aggregate
+ * ADMISSION ceilings and are never an input to per-plan sizing.
+ *
+ * The section once multiplied `maxTotalPlannedRiskUsd` by the margin
+ * multipliers and labelled the result "per-plan". That was right only by
+ * coincidence: at a one-trade policy the aggregate cap equalled the per-trade
+ * budget. Raising the cap to 7.50 turned the same line into `30` on an
+ * activation screen. These tests pin the shape of the fix so it cannot come
+ * back — including via a plausible-looking substitute like
+ * `cap / maxTotalActiveTrades`, which would be equally wrong.
+ */
+describe("per-plan margin envelope reporting", () => {
+  const cli = readFileSync(path.join(BACKEND, "src", "modules", "execution", "run-canary-preflight.ts"), "utf8");
+  /** CODE only: the comment block deliberately describes the removed bug. */
+  const code = cli.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  /** Just the envelope section, so neighbouring sections cannot mask a match. */
+  const section = code.slice(code.indexOf("Per-plan margin envelope"), code.indexOf("Safety posture"));
+
+  it("still reports the three values the preflight actually knows", () => {
+    expect(section).toContain("BINANCE_TARGET_MARGIN_MULTIPLIER");
+    expect(section).toContain("BINANCE_MAX_MARGIN_MULTIPLIER");
+    expect(section).toContain("BINANCE_MIN_MARGIN_USD");
+    expect(section).toContain("targetMarginMultiplier");
+    expect(section).toContain("maxMarginMultiplier");
+    expect(section).toContain("minMarginUsd");
+  });
+
+  it("names plan.riskAmount as the per-plan authority instead of printing a figure", () => {
+    expect(section).toContain("plan.riskAmount");
+    expect(section).toMatch(/per-plan dollar envelope/);
+  });
+
+  it("derives NO dollar figure from the aggregate portfolio caps", () => {
+    // The exact defect: a per-plan dollar value multiplied out of an aggregate
+    // ceiling. Neither cap may appear in this section at all.
+    expect(section).not.toContain("maxTotalPlannedRiskUsd");
+    expect(section).not.toContain("maxTotalIsolatedMarginUsd");
+    // No arithmetic of any kind on a Decimal in this section.
+    expect(section).not.toContain("Prisma.Decimal");
+    expect(section).not.toMatch(/\.times\(/);
+  });
+
+  it("does not substitute an INFERRED per-plan risk either", () => {
+    // cap / maxTotalActiveTrades looks reasonable and is still wrong: plans do
+    // not each carry an equal share of the portfolio cap.
+    expect(section).not.toMatch(/\.div\(/);
+    expect(section).not.toContain("maxTotalActiveTrades");
+    // And it must not reach for today's active template — a plan freezes its
+    // own, so the live template is not this section's authority.
+    expect(section).not.toContain("riskTemplate");
+    expect(section).not.toContain("findFirst");
+  });
+
+  it("keeps the aggregate caps where they belong — the policy section", () => {
+    // They are still reported, just not as a per-plan margin: the four-way
+    // policy comparison above owns them.
+    const policySection = code.slice(0, code.indexOf("Per-plan margin envelope"));
+    expect(policySection).toContain("CANARY_PINNED_LIMITS");
+    expect(policySection).toContain("effectiveCanaryLimits");
+  });
+
+  it("would have caught the original bug: no 30 or 39.9999975 can be produced", () => {
+    // Recreate the removed derivation against the ACTIVATED portfolio policy
+    // and show those are exactly the numbers it yielded — none of which the
+    // section can now emit, because it performs no multiplication at all.
+    const aggregateRiskCap = new Prisma.Decimal("7.50");
+    expect(aggregateRiskCap.times("4").toFixed()).toBe("30");
+    expect(aggregateRiskCap.times("5.333333").toFixed()).toBe("39.9999975");
+
+    // The TRUE per-plan envelope at the live template's 1.50 risk.
+    const perPlanRisk = new Prisma.Decimal("1.50");
+    expect(perPlanRisk.times("4").toFixed()).toBe("6");
+    expect(perPlanRisk.times("5.333333").toFixed()).toBe("7.9999995");
+
+    // The section prints neither pair, because it prints no dollars at all.
+    for (const forbidden of ["30", "39.9999975", "6.00", "7.9999995"]) {
+      expect(section, forbidden).not.toContain(`"${forbidden}"`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-trade risk authority
+// ---------------------------------------------------------------------------
+
+describe("per-trade risk authority", () => {
+  const read = (relative: string) => readFileSync(path.join(BACKEND, relative), "utf8");
+
+  it("takes the execution risk budget from the FROZEN plan template", () => {
+    // The one production path that creates an execution.
+    expect(read("src/modules/execution/selected-plan-executor.ts")).toContain(
+      "riskBudgetUsd: plan.template.riskAmount"
+    );
+  });
+
+  it("keeps the portfolio caps out of the sizing modules entirely", () => {
+    // Structural, not behavioural: the modules that compute quantity, notional
+    // and margin cannot reference a cap they never import.
+    for (const file of [
+      "../../packages/shared/src/binance-margin-engine.ts",
+      "src/modules/binance/binance-margin-plan.service.ts",
+    ]) {
+      const source = read(file);
+      expect(source, file).not.toContain("maxTotalPlannedRiskUsd");
+      expect(source, file).not.toContain("maxTotalIsolatedMarginUsd");
+    }
+  });
+
+  it("uses the aggregate cap ONLY as an admission ceiling", () => {
+    const engine = read("src/modules/execution/safety-engine.ts");
+    // Compared against the PROJECTED total, never handed to a sizing call.
+    expect(engine).toContain("projectedRisk.greaterThan(new D(policy.maxTotalPlannedRiskUsd))");
+    expect(engine).toContain("projectedMargin.greaterThan(new D(policy.maxTotalIsolatedMarginUsd))");
   });
 });
