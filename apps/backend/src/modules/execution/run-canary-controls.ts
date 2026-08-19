@@ -6,7 +6,9 @@ import {
   CanaryAuthorizationService,
   DEFAULT_AUTHORIZATION_TTL_MINUTES,
   MINIMUM_REMAINING_LIFETIME_MS,
+  describeAuthorizationSubject,
   describeAuthorizationWindow,
+  type PrepareResult,
 } from "./canary-authorization.service";
 import { validateCanarySymbol } from "./canary-symbol-validation";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
@@ -138,7 +140,10 @@ export async function prepareCanary(): Promise<void> {
       return;
     }
 
-    let prepared: { authorization: { allowedSymbol: string; allowedDirection: string; expiresAt: Date }; token: string };
+    // The service's own result type, rather than a hand-written structural
+    // one: `prepare` creates an EXACT_SIGNAL row, and restating its shape here
+    // would silently drift the moment the model gains a mode.
+    let prepared: PrepareResult;
     try {
       prepared = await new CanaryAuthorizationService(prisma).prepare(
         {
@@ -243,7 +248,7 @@ export async function armCanary(): Promise<void> {
 
     console.log("Preconditions");
     line("profile", `${profile.accountIdentifier} (${profile.environment})`);
-    line("authorization", active ? `${active.allowedSymbol} ${active.allowedDirection}` : "none");
+    line("authorization", active ? describeAuthorizationSubject(active) : "none");
     line("active authorization count", activeCount);
     line("expiresAt", active ? active.expiresAt.toISOString() : null);
     line("env gates armed", environmentIsArmed());

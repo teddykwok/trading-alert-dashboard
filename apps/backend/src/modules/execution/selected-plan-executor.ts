@@ -3,6 +3,7 @@ import type { PrismaClient } from "@prisma/client";
 import type { ExtremeRRPlanDto } from "@trading-alert-dashboard/shared";
 import { logger } from "../../config/logger";
 import type { BinanceMarginPlanService } from "../binance/binance-margin-plan.service";
+import { isExactAuthorization } from "./canary-authorization.service";
 import type { ExecutionService } from "./execution.service";
 import type { ExecutionOrchestrator } from "./execution-orchestrator";
 import { resolveExecutionProfile, type ProfileIdentity } from "./execution-profile.service";
@@ -136,6 +137,23 @@ export class SelectedPlanExecutor {
           handled: false,
           reasonCode: "CANARY_AUTHORIZATION_REQUIRED",
           message: "This profile is in canary mode and this signal carries no valid authorization.",
+        };
+      }
+      // The binding must be a usable EXACT_SIGNAL row before its identity can
+      // mean anything. Since Phase 12.1 the symbol and direction columns are
+      // nullable — so `bound.allowedSymbol !== symbol` would compare against a
+      // null and report a symbol mismatch, describing a corrupt row as a
+      // merely-wrong one. A row that cannot prove what it authorizes is
+      // treated as no authorization at all, which is the existing reason code.
+      //
+      // Nothing creates a NATURAL_WINDOW yet, and this check is NOT the
+      // natural-window path: it is the exact path refusing everything that is
+      // not exact.
+      if (!isExactAuthorization(bound)) {
+        return {
+          handled: false,
+          reasonCode: "CANARY_AUTHORIZATION_REQUIRED",
+          message: "The bound authorization is not a usable exact-signal authorization.",
         };
       }
       // Identity is re-asserted here too: the binding proves WHICH alert, and

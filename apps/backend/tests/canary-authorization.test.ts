@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
@@ -26,8 +26,10 @@ const {
   CanaryAuthorizationService,
   hashCanaryToken,
   describeAuthorization,
+  describeAuthorizationSubject,
   describeAuthorizationWindow,
   isAuthorizationActive,
+  isExactAuthorization,
 } = await import("../src/modules/execution/canary-authorization.service");
 
 const profileIds: string[] = [];
@@ -650,5 +652,313 @@ describe("canary control boundary", () => {
     // against the dedicated test database, so the real profile is not reachable
     // from it at all.
     expect(await prisma!.executionProfile.count({ where: { accountIdentifier: "mainnet-canary-usdm" } })).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 12.1 — the authorization-type discriminator (SCHEMA ONLY)
+// ---------------------------------------------------------------------------
+
+/**
+ * `ExecutionCanaryAuthorization` can now describe two shapes. Phase 12.1 adds
+ * only the representation: nothing creates, reads or admits a NATURAL_WINDOW.
+ *
+ * The property these tests defend is backward compatibility. Real authorization
+ * rows exist on MAINNET and every one of them must keep meaning exactly what it
+ * meant before the column existed — which is a claim about a DEFAULT, so it is
+ * tested against a real database rather than a mock.
+ */
+describeDb("authorization type: exact-mode compatibility", () => {
+  it("A. prepare still creates an EXACT_SIGNAL authorization", async () => {
+    const profileId = await newProfile();
+    const { authorization } = await service().prepare({
+      executionProfileId: profileId,
+      symbol: "BTCUSDT",
+      direction: "LONG",
+    });
+
+    expect(authorization.authorizationType).toBe("EXACT_SIGNAL");
+    // The three fields that mode requires are all present and unchanged.
+    expect(authorization.allowedSymbol).toBe("BTCUSDT");
+    expect(authorization.allowedDirection).toBe("LONG");
+    expect(authorization.tokenHash).not.toBeNull();
+    // ...and none of the natural-window fields carry anything.
+    expect(authorization.allowedDirections).toEqual([]);
+    expect(authorization.maxClaims).toBeNull();
+    expect(authorization.claimedCount).toBe(0);
+    expect(authorization.version).toBe(1);
+  });
+
+  it("F. defaults to EXACT_SIGNAL for a row that never named a mode", async () => {
+    // The historical case, reproduced exactly: an INSERT listing only the
+    // columns that existed before this phase. Without the default this write
+    // would fail outright; with a different default the assertion below
+    // catches it. That is the whole point of the test.
+    const profileId = await newProfile();
+    const id = `legacy-${Date.now().toString(36)}`;
+    await prisma!.$executeRawUnsafe(`
+      INSERT INTO "ExecutionCanaryAuthorization"
+        ("id","executionProfileId","allowedSymbol","allowedDirection","tokenHash","expiresAt","createdAt")
+      VALUES ('${id}','${profileId}','ETHUSDT','SHORT','${id}-hash', NOW() + interval '1 hour', NOW())`);
+
+    const row = await prisma!.executionCanaryAuthorization.findUniqueOrThrow({ where: { id } });
+    expect(row.authorizationType).toBe("EXACT_SIGNAL");
+    // Nothing about the historical row was rewritten...
+    expect(row.allowedSymbol).toBe("ETHUSDT");
+    expect(row.allowedDirection).toBe("SHORT");
+    expect(row.tokenHash).toBe(`${id}-hash`);
+    // ...and it acquired the inert defaults, not a usable window.
+    expect(row.allowedDirections).toEqual([]);
+    expect(row.maxClaims).toBeNull();
+    expect(row.claimedCount).toBe(0);
+    expect(row.version).toBe(1);
+    // Such a row is a fully usable exact authorization, exactly as before.
+    expect(isExactAuthorization(row)).toBe(true);
+  });
+
+  it("G. exposes the natural-window fields without populating them", async () => {
+    const profileId = await newProfile();
+    const { authorization } = await service().prepare({
+      executionProfileId: profileId,
+      symbol: "BTCUSDT",
+      direction: "LONG",
+    });
+
+    // Representable at the Prisma level — the schema really did change...
+    for (const field of ["allowedDirections", "maxClaims", "claimedCount", "version"]) {
+      expect(Object.keys(authorization)).toContain(field);
+    }
+    // ...while an empty direction set and an absent budget admit nothing.
+    expect(authorization.allowedDirections).toHaveLength(0);
+    expect(authorization.maxClaims).toBeNull();
+  });
+
+  it("H. can persist a NATURAL_WINDOW row that no production code can use", async () => {
+    // Proves the schema is capable and the runtime is not. Written directly
+    // through Prisma because NO service method creates one.
+    const profileId = await newProfile();
+    const window = await prisma!.executionCanaryAuthorization.create({
+      data: {
+        executionProfileId: profileId,
+        authorizationType: "NATURAL_WINDOW",
+        allowedDirections: ["LONG", "SHORT"],
+        maxClaims: 5,
+        expiresAt: new Date(Date.now() + 3_600_000),
+      },
+    });
+
+    expect(window.tokenHash).toBeNull();
+    expect(window.allowedSymbol).toBeNull();
+    expect(window.allowedDirection).toBeNull();
+    expect(window.allowedDirections).toEqual(["LONG", "SHORT"]);
+    expect(window.maxClaims).toBe(5);
+    expect(window.claimedCount).toBe(0);
+    expect(window.version).toBe(1);
+
+    // The exact reader refuses it — it is not a usable exact authorization...
+    expect(isExactAuthorization(window)).toBe(false);
+    // ...and no token can reach it, because it has no hash to look up.
+    const byToken = await service().consume({
+      token: "anything-at-all",
+      executionProfileId: profileId,
+      symbol: "BTCUSDT",
+      direction: "LONG",
+      alertId: await newAlert(),
+    });
+    expect(byToken.ok).toBe(false);
+    if (!byToken.ok) expect(byToken.reasonCode).toBe("CANARY_AUTHORIZATION_UNKNOWN");
+  });
+
+  it("H. lets many tokenless windows coexist under the UNIQUE tokenHash index", async () => {
+    // PostgreSQL treats NULLs as distinct, so relaxing the column did not cost
+    // the one-token-one-row guarantee exact mode depends on.
+    const profileId = await newProfile();
+    const make = () =>
+      prisma!.executionCanaryAuthorization.create({
+        data: {
+          executionProfileId: profileId,
+          authorizationType: "NATURAL_WINDOW",
+          allowedDirections: ["LONG"],
+          maxClaims: 1,
+          expiresAt: new Date(Date.now() + 3_600_000),
+        },
+      });
+
+    await expect(Promise.all([make(), make(), make()])).resolves.toHaveLength(3);
+
+    // The uniqueness that DOES still bite: two rows cannot share a real hash.
+    const hash = `dup-${Date.now().toString(36)}`;
+    const exact = () =>
+      prisma!.executionCanaryAuthorization.create({
+        data: {
+          executionProfileId: profileId,
+          allowedSymbol: "BTCUSDT",
+          allowedDirection: "LONG",
+          tokenHash: hash,
+          expiresAt: new Date(Date.now() + 3_600_000),
+        },
+      });
+    await exact();
+    await expect(exact()).rejects.toThrow();
+  });
+
+  it("D. refuses a token whose row declares EXACT_SIGNAL but is missing a field", async () => {
+    // Synthetic and impossible through any service call: the row claims a mode
+    // it does not honour. Reaching it needs a real tokenHash, which is what
+    // makes the structural check observable here.
+    const profileId = await newProfile();
+    const token = `broken-${Date.now().toString(36)}`;
+    const id = `broken-row-${Date.now().toString(36)}`;
+    await prisma!.executionCanaryAuthorization.create({
+      data: {
+        id,
+        executionProfileId: profileId,
+        authorizationType: "EXACT_SIGNAL",
+        // allowedSymbol deliberately absent.
+        allowedDirection: "LONG",
+        tokenHash: hashCanaryToken(token),
+        expiresAt: new Date(Date.now() + 3_600_000),
+      },
+    });
+
+    const outcome = await service().consume({
+      token,
+      executionProfileId: profileId,
+      symbol: "BTCUSDT",
+      direction: "LONG",
+      alertId: await newAlert(),
+    });
+
+    expect(outcome.ok).toBe(false);
+    // Reported as structurally invalid, NOT as a symbol mismatch: a null is
+    // not "some other symbol", and an operator needs to be told which it is.
+    if (!outcome.ok) expect(outcome.reasonCode).toBe("CANARY_AUTHORIZATION_NOT_EXACT");
+    // Nothing was bound, so the row cannot become usable by having been tried.
+    expect((await prisma!.executionCanaryAuthorization.findUniqueOrThrow({ where: { id } })).consumedAt).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 12.1 — exact-row assertion, and runtime inertness
+// ---------------------------------------------------------------------------
+
+describe("exact-row assertion", () => {
+  const base = {
+    id: "a",
+    executionProfileId: "p",
+    authorizationType: "EXACT_SIGNAL",
+    allowedSymbol: "BTCUSDT",
+    allowedDirection: "LONG",
+    tokenHash: "hash",
+    allowedDirections: [],
+    maxClaims: null,
+    claimedCount: 0,
+    version: 1,
+    expiresAt: new Date(Date.now() + 60_000),
+    createdAt: new Date(),
+    consumedAt: null,
+    consumedAlertId: null,
+    consumedExecutionId: null,
+    revokedAt: null,
+  } as never;
+
+  it("accepts a complete EXACT_SIGNAL row", () => {
+    expect(isExactAuthorization(base)).toBe(true);
+  });
+
+  it.each([
+    ["symbol", { allowedSymbol: null }],
+    ["direction", { allowedDirection: null }],
+    ["token hash", { tokenHash: null }],
+  ])("fails closed when an EXACT_SIGNAL row is missing its %s", (_label, override) => {
+    expect(isExactAuthorization({ ...(base as object), ...override } as never)).toBe(false);
+  });
+
+  it("reads the discriminator, never the populated columns", () => {
+    // A row carrying every exact field is STILL not exact if it says it is not.
+    // The alternative — inferring the mode from which columns happen to be
+    // filled in — is what would let a malformed window pass as authorization.
+    expect(isExactAuthorization({ ...(base as object), authorizationType: "NATURAL_WINDOW" } as never)).toBe(false);
+    // And a natural-shaped row is not rescued by its natural fields.
+    expect(
+      isExactAuthorization({
+        ...(base as object),
+        authorizationType: "NATURAL_WINDOW",
+        allowedSymbol: null,
+        allowedDirection: null,
+        tokenHash: null,
+        allowedDirections: ["LONG", "SHORT"],
+        maxClaims: 5,
+      } as never)
+    ).toBe(false);
+  });
+
+  it("describes a non-exact row by its mode rather than as 'null null'", () => {
+    expect(describeAuthorizationSubject(base)).toBe("BTCUSDT LONG");
+    expect(
+      describeAuthorizationSubject({
+        ...(base as object),
+        authorizationType: "NATURAL_WINDOW",
+        allowedSymbol: null,
+      } as never)
+    ).toBe("NATURAL_WINDOW");
+  });
+});
+
+describe("natural window is inert", () => {
+  const BACKEND = process.cwd();
+  const SRC = path.join(BACKEND, "src");
+
+  const walk = (dir: string): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+      entry.isDirectory()
+        ? walk(path.join(dir, entry.name))
+        : entry.name.endsWith(".ts")
+          ? [path.join(dir, entry.name)]
+          : []
+    );
+
+  /** Production source with comments removed — intent lives in code, not prose. */
+  const productionCode = walk(SRC).map((file) => ({
+    file: path.relative(BACKEND, file).replace(/\\/g, "/"),
+    code: readFileSync(file, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, ""),
+  }));
+
+  it("names NATURAL_WINDOW nowhere in production code", () => {
+    // The strongest inertness statement available: no runtime branch can
+    // depend on a value no runtime file mentions. Comments describing the
+    // future shape are stripped above and are deliberately allowed.
+    const offenders = productionCode.filter((entry) => entry.code.includes("NATURAL_WINDOW"));
+    expect(offenders.map((entry) => entry.file)).toEqual([]);
+  });
+
+  it("reads none of the natural-window columns in production code", () => {
+    for (const field of ["allowedDirections", "maxClaims", "claimedCount"]) {
+      const offenders = productionCode.filter((entry) => entry.code.includes(field));
+      expect(`${field}: ${offenders.map((entry) => entry.file).join(", ")}`).toBe(`${field}: `);
+    }
+  });
+
+  it("leaves the canary-mode predicate exactly as it was", () => {
+    // The line that keeps natural tokenless alerts blocked on MAINNET today.
+    // Changing it belongs to the admission-integration phase, not this one.
+    const executor = productionCode.find((entry) => entry.file.endsWith("selected-plan-executor.ts"))!.code;
+    expect(executor).toContain("executionCanaryAuthorization.count({");
+    expect(executor).toContain("where: { executionProfileId: profile.profile.id },");
+    expect(executor).toContain("if (canaryMode > 0) {");
+    // Still unfiltered by type, state or expiry — ANY row means canary mode.
+    const predicate = executor.slice(executor.indexOf("const canaryMode"), executor.indexOf("if (canaryMode > 0)"));
+    for (const forbidden of ["authorizationType", "revokedAt", "expiresAt", "consumedAt"]) {
+      expect(`${forbidden}:${predicate.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+  });
+
+  it("keeps safety admission free of authorization entirely", () => {
+    for (const name of ["safety-engine.ts", "safety-admission.service.ts", "execution-orchestrator.ts"]) {
+      const entry = productionCode.find((source) => source.file.endsWith(name))!;
+      for (const forbidden of ["CanaryAuthorization", "canaryAuthorization", "authorizationType", "isExactAuthorization"]) {
+        expect(`${name}:${forbidden}:${entry.code.includes(forbidden)}`).toBe(`${name}:${forbidden}:false`);
+      }
+    }
   });
 });

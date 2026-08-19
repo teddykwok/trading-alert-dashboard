@@ -147,7 +147,16 @@ function harness(options: {
 // ---------------------------------------------------------------------------
 
 describe("canary authorization gate", () => {
-  const BOUND = { id: "auth-1", allowedSymbol: "FRAXUSDT", allowedDirection: "LONG", consumedExecutionId: null };
+  // Shaped like a real row: `authorizationType` is NOT NULL with a database
+  // default, so every persisted authorization carries one. A fixture that
+  // omitted it would be testing a row the database cannot produce.
+  const BOUND = {
+    id: "auth-1",
+    authorizationType: "EXACT_SIGNAL",
+    allowedSymbol: "FRAXUSDT",
+    allowedDirection: "LONG",
+    consumedExecutionId: null,
+  };
 
   it("is inert when no authorization has ever been prepared", async () => {
     const { executor, creates, canaryBindings } = harness({ canaryCount: 0 });
@@ -224,6 +233,49 @@ describe("canary authorization gate", () => {
     expect(result.handled).toBe(true);
     expect(admissions).toEqual(["exec-1"]);
     expect(creates).toHaveLength(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 12.1 — the durable binding must be a USABLE exact authorization
+  // -------------------------------------------------------------------------
+
+  /**
+   * The symbol, direction and token columns became nullable so the same table
+   * can also describe a natural window. That must not turn this reader into
+   * something that copes with absent identity: without the structural check,
+   * `bound.allowedSymbol !== "FRAXUSDT"` compares against a null, reports
+   * WRONG_SYMBOL, and describes a corrupt row as a merely-mismatched one.
+   *
+   * Every case below still ends in a refusal and an execution that was never
+   * created — the fail-closed property is what is being pinned, not the wording.
+   */
+  it.each([
+    ["a missing symbol", { allowedSymbol: null }],
+    ["a missing direction", { allowedDirection: null }],
+    ["a mode this reader does not implement", { authorizationType: "NATURAL_WINDOW" }],
+    // The pre-discriminator shape: a row that does not say what it is.
+    ["no declared mode at all", { authorizationType: undefined }],
+  ])("refuses a bound authorization with %s", async (_label, override) => {
+    const { executor, creates, admissions } = harness({
+      canaryCount: 1,
+      canaryBound: { ...BOUND, ...override },
+    });
+    const result = await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect(result.handled).toBe(false);
+    expect((result as { reasonCode: string }).reasonCode).toBe("CANARY_AUTHORIZATION_REQUIRED");
+    expect(creates).toHaveLength(0);
+    expect(admissions).toHaveLength(0);
+  });
+
+  it("still admits a well-formed EXACT_SIGNAL binding unchanged", async () => {
+    // The other half of the guard: it refuses only what it should.
+    const { executor, creates, admissions } = harness({ canaryCount: 1, canaryBound: BOUND });
+    const result = await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect(result.handled).toBe(true);
+    expect(creates).toHaveLength(1);
+    expect(admissions).toEqual(["exec-1"]);
   });
 });
 

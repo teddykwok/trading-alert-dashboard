@@ -1036,6 +1036,33 @@ enum CanaryDirection {
   SHORT
 }
 
+/// Which KIND of authorization a row is.
+///
+/// The discriminator is AUTHORITATIVE. Nothing infers the mode from which
+/// columns happen to be null: a row means what this column says it means, and
+/// a null field is then a structural defect in that row rather than a hint
+/// about another mode. That is what lets the exact-signal flow keep its
+/// existing behaviour byte for byte while the natural window is still only a
+/// shape in the schema.
+enum CanaryAuthorizationType {
+  /// Phase 11B.0, unchanged: one operator token, one symbol, one direction,
+  /// one use, short-lived. Every row written before this column existed is
+  /// this, by DEFAULT — see the migration.
+  EXACT_SIGNAL
+
+  /// Phase 12 — SCHEMA ONLY so far. A server-side window carrying no token,
+  /// admitting any signal whose direction is in `allowedDirections`, bounded by
+  /// a cumulative `maxClaims`. No production code creates, reads or admits one
+  /// yet.
+  ///
+  /// It names no symbols. Which symbols can fire at all is decided by the
+  /// operator's TradingView watchlist, and whether one can be traded is decided
+  /// by the checks that already exist — Binance listing, contract type, margin
+  /// and filter eligibility, a valid deterministic plan, then safety admission.
+  /// The backend keeps no second copy of that watchlist.
+  NATURAL_WINDOW
+}
+
 /// Durable proof that ONE specific signal is the intended live canary.
 ///
 /// Capacity limits protect the account from over-trading; they do not identify
@@ -1050,19 +1077,98 @@ enum CanaryDirection {
 ///
 /// Restrict on the profile: this is operator-authorization history and must not
 /// vanish implicitly.
+///
+/// ## Two modes, one table (Phase 12 — schema only)
+///
+/// `authorizationType` splits this row into two shapes that share expiry,
+/// revocation, profile scope and history. Prisma cannot express cross-field
+/// constraints, so these invariants are the DOMAIN's to enforce — they are
+/// written here because the schema is where a reader looks for them:
+///
+///   EXACT_SIGNAL (every row that exists today)
+///     allowedSymbol      REQUIRED
+///     allowedDirection   REQUIRED
+///     tokenHash          REQUIRED
+///     allowedDirections  unused (empty)
+///     maxClaims          unused (null) — the budget is one, held by consumedAt
+///
+///   NATURAL_WINDOW (nothing creates one yet)
+///     allowedSymbol      null   — a window names no symbol at all
+///     allowedDirection   null
+///     tokenHash          null   — authorized server-side, no secret exists
+///     allowedDirections  NON-EMPTY
+///     maxClaims          >= 1
+///     claimedCount       >= 0 and <= maxClaims
+///     expiresAt          REQUIRED (as for every mode)
+///
+/// A window carries no symbol list, and no field here is a symbol list. Which
+/// symbols may fire is the operator's TradingView watchlist; which of those can
+/// actually be traded is settled by the eligibility the execution stack already
+/// enforces. `ExecutionSafetyPolicy.allowedSymbols` keeps its own independent
+/// meaning and is not this model's business.
+///
+/// A row failing its own mode's invariants is a defect, never a hint that it
+/// meant the other mode. Exact-mode readers assert the three required fields
+/// and refuse the row otherwise — see `isExactAuthorization`.
 model ExecutionCanaryAuthorization {
   id                 String           @id @default(cuid())
   executionProfileId String
   executionProfile   ExecutionProfile @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)
 
-  /// Normalized uppercase symbol this authorization admits.
-  allowedSymbol   String
-  allowedDirection CanaryDirection
+  /// The authoritative mode. DEFAULT EXACT_SIGNAL is what makes this column
+  /// additive: every historical row keeps exactly the meaning it already had,
+  /// and no row can become a NATURAL_WINDOW by accident or by inference.
+  authorizationType CanaryAuthorizationType @default(EXACT_SIGNAL)
+
+  /// EXACT_SIGNAL only — the one normalized uppercase symbol it admits.
+  ///
+  /// Nullable because a NATURAL_WINDOW names no symbol: it authorizes a
+  /// direction and a claim budget, never a ticker. Null is the honest
+  /// representation of "this row does not restrict the symbol"; a placeholder
+  /// or a `"*"` sentinel would be a wildcard wearing a symbol's clothes.
+  allowedSymbol   String?
+
+  /// EXACT_SIGNAL only. A NATURAL_WINDOW uses `allowedDirections` instead, so
+  /// this stays null rather than defaulting to a direction nobody chose.
+  allowedDirection CanaryDirection?
 
   /// SHA-256 of the one-time operator token. The raw token is shown once at
   /// prepare time and never persisted, logged or returned anywhere.
-  tokenHash String @unique
+  ///
+  /// EXACT_SIGNAL only. A NATURAL_WINDOW is authorized entirely server-side
+  /// and has no secret, so this is null — fabricating a hash would put a
+  /// credential-shaped value in the audit trail that unlocks nothing.
+  /// Still UNIQUE: PostgreSQL admits many NULLs under a unique index, so the
+  /// one-token-one-row guarantee is untouched.
+  tokenHash String? @unique
 
+  /// NATURAL_WINDOW only — the directions the window admits.
+  ///
+  /// Empty admits NOTHING. That is the point of the default: a window that has
+  /// not had directions chosen for it cannot widen anything.
+  allowedDirections CanaryDirection[] @default([])
+
+  /// NATURAL_WINDOW only — the CUMULATIVE number of admitted executions this
+  /// window may ever produce, across its whole lifetime.
+  ///
+  /// Null for EXACT_SIGNAL, whose budget is structurally one (`consumedAt`).
+  /// There is deliberately NO representation for "unlimited": a window with no
+  /// number is a window with no ceiling, and every other limit in this system
+  /// fails closed.
+  maxClaims Int?
+
+  /// How many claims have been spent. NEVER decremented — a claim is not
+  /// refunded when its execution later expires unfilled, so this stays a
+  /// durable audit fact instead of a mutable counter that could be raced.
+  claimedCount Int @default(0)
+
+  /// Optimistic-lock counter, matching `ExecutionSafetyPolicy.version`. The
+  /// future claim is a conditional update guarded on it; nothing increments it
+  /// yet.
+  version Int @default(1)
+
+  /// Required for BOTH modes. There is no "never expires" authorization and no
+  /// infinite sentinel: an unused window should shut on its own.
   expiresAt DateTime
   createdAt DateTime @default(now())
 

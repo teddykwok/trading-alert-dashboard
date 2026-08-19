@@ -303,10 +303,17 @@ describe("phase 4 safety boundary", () => {
       .filter((match) => !modelNames.has(match[2]))
       .map((match) => match[1]);
 
-    // The single deliberate exception, and why it is not a credential: it is a
-    // SHA-256 digest of a one-shot, minutes-long canary authorization. The raw
-    // value is shown to the operator once and never written anywhere.
-    const allowed = new Set(["tokenHash"]);
+    // Deliberate exceptions, each with the reason it cannot hold a credential:
+    //
+    //   tokenHash          a SHA-256 digest of a one-shot, minutes-long canary
+    //                      authorization. The raw value is shown to the
+    //                      operator once and never written anywhere.
+    //   authorizationType  an ENUM column whose domain is exactly
+    //                      EXACT_SIGNAL | NATURAL_WINDOW. It matches only
+    //                      because its NAME contains "authorization"; the
+    //                      database will not accept any other value into it,
+    //                      so it is structurally incapable of holding a secret.
+    const allowed = new Set(["tokenHash", "authorizationType"]);
 
     for (const forbidden of ["apiKey", "apiSecret", "secret", "signature", "authorization", "token", "password"]) {
       const offenders = fieldNames.filter(

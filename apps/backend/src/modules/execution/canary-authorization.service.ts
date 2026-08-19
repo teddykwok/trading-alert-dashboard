@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Prisma } from "@prisma/client";
-import type { ExecutionCanaryAuthorization, PrismaClient } from "@prisma/client";
+import type { CanaryDirection, ExecutionCanaryAuthorization, PrismaClient } from "@prisma/client";
 import { profileLockKey } from "./safety-admission.service";
 
 /**
@@ -42,8 +42,8 @@ export class CanaryAuthorizationAlreadyActiveError extends Error {
 
   constructor(readonly existing: ExecutionCanaryAuthorization) {
     super(
-      `An active canary authorization already exists for ${existing.allowedSymbol} ${existing.allowedDirection} ` +
-        `(expires ${existing.expiresAt.toISOString()}). Run execution:disarm-canary first.`
+      `An active canary authorization already exists (${describeAuthorizationSubject(existing)}, ` +
+        `expires ${existing.expiresAt.toISOString()}). Run execution:disarm-canary first.`
     );
     this.name = "CanaryAuthorizationAlreadyActiveError";
   }
@@ -58,6 +58,16 @@ export const AUTHORIZATION_FAILURES = [
   "CANARY_AUTHORIZATION_WRONG_PROFILE",
   "CANARY_AUTHORIZATION_WRONG_SYMBOL",
   "CANARY_AUTHORIZATION_WRONG_DIRECTION",
+  /**
+   * The row is not a usable EXACT_SIGNAL authorization: either it declares a
+   * different mode, or it declares EXACT_SIGNAL while missing one of the three
+   * fields that mode requires.
+   *
+   * Additive, and reachable only by a row that should not exist. It is a
+   * distinct code rather than a reused one because "structurally invalid" and
+   * "wrong symbol" call for completely different operator responses.
+   */
+  "CANARY_AUTHORIZATION_NOT_EXACT",
 ] as const;
 
 export type AuthorizationFailure = (typeof AUTHORIZATION_FAILURES)[number];
@@ -65,6 +75,69 @@ export type AuthorizationFailure = (typeof AUTHORIZATION_FAILURES)[number];
 export type ConsumeResult =
   | { ok: true; authorization: ExecutionCanaryAuthorization; replay: boolean }
   | { ok: false; reasonCode: AuthorizationFailure; message: string };
+
+// ---------------------------------------------------------------------------
+// EXACT_SIGNAL row integrity
+// ---------------------------------------------------------------------------
+
+/**
+ * An `ExecutionCanaryAuthorization` PROVEN to be a usable exact-signal
+ * authorization: it declares EXACT_SIGNAL and carries all three fields that
+ * mode requires.
+ *
+ * Phase 12.1 relaxed `allowedSymbol`, `allowedDirection` and `tokenHash` to
+ * nullable so the same table can also hold a NATURAL_WINDOW. That is a schema
+ * change, not a licence for exact-mode code to start coping with absent
+ * identity — an exact row missing its symbol is a corrupt row, and the only
+ * safe reading of a corrupt authorization is "no authorization".
+ *
+ * This type is how that stays honest: exact-mode code narrows to it FIRST and
+ * then dereferences without a null check, so the compiler refuses any path
+ * that treats a null as merely a different value to compare against.
+ */
+export type ExactCanaryAuthorization = ExecutionCanaryAuthorization & {
+  authorizationType: "EXACT_SIGNAL";
+  allowedSymbol: string;
+  allowedDirection: CanaryDirection;
+  tokenHash: string;
+};
+
+/**
+ * Whether a row is a usable exact-signal authorization. FAIL CLOSED: anything
+ * that is not provably one — a natural window, or an exact row with a missing
+ * field — returns false and is refused by every exact-mode caller.
+ *
+ * The discriminator is authoritative. This never infers the mode from which
+ * columns are populated; it reads `authorizationType` and then checks that the
+ * row honours what it claims to be.
+ *
+ * Deliberately NOT a general dispatcher: it says nothing about natural windows
+ * beyond "this is not an exact one". Nothing in this phase admits one.
+ */
+export function isExactAuthorization(
+  authorization: ExecutionCanaryAuthorization
+): authorization is ExactCanaryAuthorization {
+  return (
+    authorization.authorizationType === "EXACT_SIGNAL" &&
+    authorization.allowedSymbol !== null &&
+    authorization.allowedDirection !== null &&
+    authorization.tokenHash !== null
+  );
+}
+
+/**
+ * A short, non-secret description of what an authorization admits, for operator
+ * messages. Never includes the token or its hash.
+ *
+ * A row that is not a valid exact authorization is described as exactly that
+ * rather than being rendered as "null null", which reads like a defect in the
+ * message instead of a defect in the row.
+ */
+export function describeAuthorizationSubject(authorization: ExecutionCanaryAuthorization): string {
+  return isExactAuthorization(authorization)
+    ? `${authorization.allowedSymbol} ${authorization.allowedDirection}`
+    : `${authorization.authorizationType}`;
+}
 
 /** SHA-256. The raw token is never stored, logged or returned after prepare. */
 export function hashCanaryToken(token: string): string {
@@ -146,6 +219,11 @@ export class CanaryAuthorizationService {
       const created = await tx.executionCanaryAuthorization.create({
         data: {
           executionProfileId: input.executionProfileId,
+          // Stated, not inherited. The column defaults to EXACT_SIGNAL, but a
+          // default is what historical rows get; a row this code writes should
+          // say which mode it meant. `prepare` creates exact authorizations and
+          // only exact authorizations.
+          authorizationType: "EXACT_SIGNAL",
           allowedSymbol: symbol,
           allowedDirection: input.direction,
           tokenHash: hashCanaryToken(token),
@@ -227,6 +305,21 @@ export class CanaryAuthorizationService {
         ok: false,
         reasonCode: "CANARY_AUTHORIZATION_UNKNOWN",
         message: "The supplied canary authorization does not exist.",
+      };
+    }
+
+    // STRUCTURE before identity before state. A row that is not a usable exact
+    // authorization cannot be compared against a symbol at all, so asking
+    // "wrong symbol?" of it would report a mismatch and hide the real problem.
+    //
+    // Unreachable through the normal path — a natural window has a null
+    // tokenHash and can never be found by this lookup — and that is the point:
+    // it holds if the row is ever reached another way.
+    if (!isExactAuthorization(existing)) {
+      return {
+        ok: false,
+        reasonCode: "CANARY_AUTHORIZATION_NOT_EXACT",
+        message: "The authorization is not a usable exact-signal authorization.",
       };
     }
 
