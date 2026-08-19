@@ -19,6 +19,8 @@ export interface SafetyPolicyValues {
   maxOpenPositions?: number;
   maxPendingEntries?: number;
   maxTotalActiveTrades?: number;
+  /** SOFT admission target; must stay <= maxOpenPositions. */
+  softOpenPositionTarget?: number;
   maxTotalPlannedRiskUsd?: string;
   maxTotalIsolatedMarginUsd?: string;
   maxActivePerSymbolSide?: number;
@@ -116,12 +118,21 @@ export class SafetyPolicyService {
       maxOpenPositions: (data.maxOpenPositions as number | undefined) ?? existing.maxOpenPositions,
       maxPendingEntries: (data.maxPendingEntries as number | undefined) ?? existing.maxPendingEntries,
       maxTotalActiveTrades: (data.maxTotalActiveTrades as number | undefined) ?? existing.maxTotalActiveTrades,
+      softOpenPositionTarget:
+        (data.softOpenPositionTarget as number | undefined) ?? existing.softOpenPositionTarget,
     };
     if (merged.maxTotalActiveTrades < merged.maxOpenPositions) {
       throw new ValidationError("maxTotalActiveTrades must be >= maxOpenPositions.");
     }
     if (merged.maxTotalActiveTrades < merged.maxPendingEntries) {
       throw new ValidationError("maxTotalActiveTrades must be >= maxPendingEntries.");
+    }
+    // A soft target above the hard cap is unreachable: the hard limit would
+    // reject first and the soft gate would never fire, so the row would claim
+    // a policy it does not implement. Checked on the MERGED result, so lowering
+    // maxOpenPositions alone cannot strand an existing soft target above it.
+    if (merged.softOpenPositionTarget > merged.maxOpenPositions) {
+      throw new ValidationError("softOpenPositionTarget must be <= maxOpenPositions.");
     }
 
     const updated = await this.prisma.executionSafetyPolicy.updateMany({
@@ -172,6 +183,9 @@ export class SafetyPolicyService {
     }
     if (values.maxActivePerSymbolSide !== undefined) {
       data.maxActivePerSymbolSide = assertPositiveInt(values.maxActivePerSymbolSide, "maxActivePerSymbolSide");
+    }
+    if (values.softOpenPositionTarget !== undefined) {
+      data.softOpenPositionTarget = assertPositiveInt(values.softOpenPositionTarget, "softOpenPositionTarget");
     }
     if (values.maxAlertAgeSeconds !== undefined) {
       data.maxAlertAgeSeconds = assertPositiveInt(values.maxAlertAgeSeconds, "maxAlertAgeSeconds");

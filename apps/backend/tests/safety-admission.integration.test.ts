@@ -1055,6 +1055,55 @@ describe("safety policy administration", () => {
     ).rejects.toThrow(/maxTotalActiveTrades must be >= maxOpenPositions/);
   });
 
+  maybe()("rejects a soft open target above the hard cap", async () => {
+    // Unreachable by construction: the hard limit would reject first, so the
+    // row would claim a policy it does not implement.
+    const policy = await policies.getByProfileId(profileId);
+    await expect(
+      policies.updateForProfile(profileId, policy!.version, { softOpenPositionTarget: 5 })
+    ).rejects.toThrow(/softOpenPositionTarget must be <= maxOpenPositions/);
+  });
+
+  maybe()("rejects a soft open target below 1", async () => {
+    const policy = await policies.getByProfileId(profileId);
+    for (const invalid of [0, -1, 1.5]) {
+      await expect(
+        policies.updateForProfile(profileId, policy!.version, { softOpenPositionTarget: invalid })
+      ).rejects.toThrow(/softOpenPositionTarget must be a positive safe integer/);
+    }
+  });
+
+  maybe()("checks the soft target against the MERGED row, not just this call", async () => {
+    // Raising both together is legal; the invariant is evaluated on the result.
+    const policy = await policies.getByProfileId(profileId);
+    const updated = await policies.updateForProfile(profileId, policy!.version, {
+      maxOpenPositions: 3,
+      maxPendingEntries: 3,
+      maxTotalActiveTrades: 3,
+      softOpenPositionTarget: 2,
+    });
+    expect(updated.softOpenPositionTarget).toBe(2);
+    expect(updated.maxOpenPositions).toBe(3);
+
+    // Now lowering the hard cap ALONE would strand the soft target above it.
+    await expect(
+      policies.updateForProfile(profileId, updated.version, { maxOpenPositions: 1 })
+    ).rejects.toThrow(/softOpenPositionTarget must be <= maxOpenPositions/);
+
+    // Put the row back so later tests see the fixture they expect.
+    await policies.updateForProfile(profileId, updated.version, {
+      maxOpenPositions: 1,
+      maxPendingEntries: 1,
+      maxTotalActiveTrades: 1,
+      softOpenPositionTarget: 1,
+    });
+  });
+
+  maybe()("defaults an existing row to a soft target of 1", async () => {
+    const policy = await policies.getByProfileId(profileId);
+    expect(policy!.softOpenPositionTarget).toBe(1);
+  });
+
   maybe()("normalizes and validates the symbol allowlist", async () => {
     const policy = await policies.getByProfileId(profileId);
     const updated = await policies.updateForProfile(profileId, policy!.version, {

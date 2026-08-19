@@ -484,9 +484,13 @@ export class EntryLifecycleService {
       data: { cancelConfirmedAt: input.evaluatedAt },
     });
 
-    // TTL is the known cause, so a zero-fill cancellation is ENTRY_EXPIRED and
-    // a partial fill becomes MANUAL_INTERVENTION (see mapOrderToExecutionStatus).
-    return this.reconcileEntryOrder({ ...input, expectedVersion: current.version }, "TTL");
+    // The cause decides the terminal mapping (see mapOrderToExecutionStatus):
+    // under TTL a zero-fill is ENTRY_EXPIRED and a partial fill escalates,
+    // while a soft-target withdrawal is CANCELED / ENTRY_FILLED respectively.
+    return this.reconcileEntryOrder(
+      { ...input, expectedVersion: current.version },
+      reason === "SOFT_OPEN_TARGET" ? "SOFT_OPEN_TARGET" : "TTL"
+    );
   }
 
   // ==========================================================================

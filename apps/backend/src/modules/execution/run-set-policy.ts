@@ -67,6 +67,7 @@ function globalLimits(): CanaryPolicyLimits {
     maxPendingEntries: env.EXECUTION_MAX_PENDING_ENTRIES,
     maxTotalActiveTrades: env.EXECUTION_MAX_TOTAL_ACTIVE_TRADES,
     maxActivePerSymbolSide: env.EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE,
+    softOpenPositionTarget: env.EXECUTION_SOFT_OPEN_POSITION_TARGET,
     maxTotalPlannedRiskUsd: env.EXECUTION_MAX_TOTAL_PLANNED_RISK_USD,
     maxTotalIsolatedMarginUsd: env.EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD,
   };
@@ -153,6 +154,7 @@ export async function setPolicy(): Promise<void> {
       maxPendingEntries: current.maxPendingEntries,
       maxTotalActiveTrades: current.maxTotalActiveTrades,
       maxActivePerSymbolSide: current.maxActivePerSymbolSide,
+      softOpenPositionTarget: current.softOpenPositionTarget,
       maxTotalPlannedRiskUsd: current.maxTotalPlannedRiskUsd.toFixed(),
       maxTotalIsolatedMarginUsd: current.maxTotalIsolatedMarginUsd.toFixed(),
     };

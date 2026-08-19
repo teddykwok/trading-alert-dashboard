@@ -40,6 +40,11 @@ export const SAFETY_REASON_CODES = [
   "SYMBOL_SIDE_ALREADY_ACTIVE",
   "SYMBOL_HAS_OPEN_POSITION_OR_ORDER",
   "OPEN_POSITION_LIMIT_REACHED",
+  // The SOFT target: open exposure has reached the point where new admissions
+  // stop, even though the hard capacity above still has room. Deliberately a
+  // separate code so an operator can tell "we chose to stop here" from "we ran
+  // out of slots", and so it can never be mistaken for a post-fill defect.
+  "SOFT_OPEN_TARGET_REACHED",
   "PENDING_ENTRY_LIMIT_REACHED",
   "TOTAL_ACTIVE_LIMIT_REACHED",
   "TOTAL_RISK_LIMIT_REACHED",
@@ -131,6 +136,13 @@ export interface EffectiveSafetyPolicy {
   maxTotalIsolatedMarginUsd: string;
   maxActivePerSymbolSide: number;
   maxAlertAgeSeconds: number;
+  /**
+   * SOFT admission target. Once open exposure reaches it, NEW admissions stop
+   * and the orchestrator cancels remaining live ENTRY orders. It is NOT a
+   * post-fill validity rule: a fill that beats the cancellation is real
+   * exposure, stays valid up to maxOpenPositions, and is protected normally.
+   */
+  softOpenPositionTarget: number;
   signalFutureToleranceSeconds: number;
   /** Empty = no extra restriction. */
   allowedSymbols: string[];
@@ -229,6 +241,11 @@ export interface SafetyCapacityLimits {
   maxTotalActiveTrades: number;
   maxActivePerSymbolSide: number;
   maxAlertAgeSeconds: number;
+  /**
+   * SOFT admission target for open positions — never a post-fill validity
+   * rule. See `softOpenPositionTarget` on EffectiveSafetyPolicy.
+   */
+  softOpenPositionTarget: number;
   maxTotalPlannedRiskUsd: string;
   maxTotalIsolatedMarginUsd: string;
 }
@@ -252,6 +269,9 @@ export function mergeCapacityLimits(
     maxTotalActiveTrades: Math.min(global.maxTotalActiveTrades, profile.maxTotalActiveTrades),
     maxActivePerSymbolSide: Math.min(global.maxActivePerSymbolSide, profile.maxActivePerSymbolSide),
     maxAlertAgeSeconds: Math.min(global.maxAlertAgeSeconds, profile.maxAlertAgeSeconds),
+    // Stricter side wins here too: either the env or the profile may lower the
+    // point at which new admissions stop, and neither can raise the other's.
+    softOpenPositionTarget: Math.min(global.softOpenPositionTarget, profile.softOpenPositionTarget),
     maxTotalPlannedRiskUsd: minDecimal(global.maxTotalPlannedRiskUsd, profile.maxTotalPlannedRiskUsd),
     maxTotalIsolatedMarginUsd: minDecimal(global.maxTotalIsolatedMarginUsd, profile.maxTotalIsolatedMarginUsd),
   };
@@ -267,6 +287,7 @@ export function resolveEffectivePolicy(
     maxTotalIsolatedMarginUsd: string;
     maxActivePerSymbolSide: number;
     maxAlertAgeSeconds: number;
+    softOpenPositionTarget: number;
     signalFutureToleranceSeconds: number;
   },
   profile: {
@@ -283,6 +304,7 @@ export function resolveEffectivePolicy(
     maxTotalIsolatedMarginUsd: string;
     maxActivePerSymbolSide: number;
     maxAlertAgeSeconds: number;
+    softOpenPositionTarget: number;
     allowedSymbols: string[];
   }
 ): EffectiveSafetyPolicy {
@@ -479,6 +501,17 @@ export function evaluateSafetyAdmission(input: SafetyEvaluationInput): SafetyDec
   }
   if (local.openPositionCount >= policy.maxOpenPositions) {
     fail("OPEN_POSITION_LIMIT_REACHED", `Open positions ${local.openPositionCount}/${policy.maxOpenPositions}.`);
+  }
+  // The soft gate. Reported IN ADDITION to the hard one when both trip, so the
+  // finding list never hides which limit an operator actually configured. It
+  // governs NEW admission only — nothing downstream of admission reads it, so
+  // an execution that is already filled can never be invalidated by it.
+  if (local.openPositionCount >= policy.softOpenPositionTarget) {
+    fail(
+      "SOFT_OPEN_TARGET_REACHED",
+      `Open positions ${local.openPositionCount} reached the soft target ${policy.softOpenPositionTarget} ` +
+        `(hard capacity ${policy.maxOpenPositions}); no new execution is admitted and remaining entry orders are cancelled.`
+    );
   }
   if (local.pendingEntryCount >= policy.maxPendingEntries) {
     fail("PENDING_ENTRY_LIMIT_REACHED", `Pending entries ${local.pendingEntryCount}/${policy.maxPendingEntries}.`);

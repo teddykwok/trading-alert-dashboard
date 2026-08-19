@@ -166,7 +166,7 @@ export type ExecutionStatusName =
   | "MANUAL_INTERVENTION";
 
 /** Why an order stopped being open, when we know. */
-export type CancelCause = "TTL" | "OPERATOR" | "UNKNOWN";
+export type CancelCause = "TTL" | "OPERATOR" | "UNKNOWN" | "SOFT_OPEN_TARGET";
 
 export interface ExecutionStatusMapping {
   executionStatus: ExecutionStatusName;
@@ -228,9 +228,27 @@ export function mapOrderToExecutionStatus(input: {
 
     case "CANCELED":
       if (filled) {
-        // Partial fill + cancelled remainder: a real position exists and is
-        // unprotected. Releasing it as ENTRY_EXPIRED would claim there is no
-        // exposure and would free open-position capacity that is still in use.
+        // A partial fill with the remainder cancelled. WHY it was cancelled
+        // decides everything, so the two causes are kept apart:
+        //
+        // SOFT_OPEN_TARGET — we withdrew the remainder on purpose because the
+        // profile hit its soft open-position target. The filled quantity is an
+        // ordinary open position: ENTRY_FILLED keeps the open-position slot,
+        // releases the pending slot the (now cancelled) remainder held, and is
+        // the state the orchestrator routes straight into
+        // `ensureProtectionForExposure`. Raising manual intervention here would
+        // page a human for the system doing exactly what it was told.
+        if (cause === "SOFT_OPEN_TARGET") {
+          return {
+            executionStatus: "ENTRY_FILLED",
+            reasonCode: "ENTRY_RECONCILED",
+            requiresManualIntervention: false,
+            exposurePossible: true,
+          };
+        }
+        // Every other cause: a real position exists and is unprotected.
+        // Releasing it as ENTRY_EXPIRED would claim there is no exposure and
+        // would free open-position capacity that is still in use.
         return {
           executionStatus: "MANUAL_INTERVENTION",
           reasonCode: "UNPROTECTED_PARTIAL_FILL",
@@ -238,7 +256,9 @@ export function mapOrderToExecutionStatus(input: {
           exposurePossible: true,
         };
       }
-      return cause === "OPERATOR"
+      // No fill at all. A soft-target withdrawal is a deliberate stop before
+      // any exposure — exactly what CANCELED means — not an expiry.
+      return cause === "OPERATOR" || cause === "SOFT_OPEN_TARGET"
         ? {
             executionStatus: "CANCELED",
             reasonCode: "ENTRY_RECONCILED",

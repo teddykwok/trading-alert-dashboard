@@ -29,6 +29,7 @@ const CANARY_LIMITS: CanaryPolicyLimits = {
   maxPendingEntries: 1,
   maxTotalActiveTrades: 1,
   maxActivePerSymbolSide: 1,
+  softOpenPositionTarget: 1,
   maxTotalPlannedRiskUsd: "1.50",
   maxTotalIsolatedMarginUsd: "8.00",
 };
@@ -236,6 +237,8 @@ describe("canary policy", () => {
       maxPendingEntries: 1,
       maxTotalActiveTrades: 1,
       maxActivePerSymbolSide: 1,
+      // Soft == hard == 1: unchanged canary behaviour in this branch.
+      softOpenPositionTarget: 1,
       maxTotalPlannedRiskUsd: "1.50",
       // 8.00 is the ONE-trade aggregate ceiling, sized so a single plan
       // reserving risk × 5.333333 = 7.9999995 fits. Capacity above is still 1

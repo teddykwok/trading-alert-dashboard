@@ -5,6 +5,10 @@ import type { BinanceReadOnlyService } from "../binance/binance-read-only.servic
 import type { EntryLifecycleService } from "./entry-lifecycle.service";
 import type { ProtectionLifecycleService } from "./protection-lifecycle.service";
 import type { SafetyAdmissionService } from "./safety-admission.service";
+// The SAME open-position classification and min-merge admission uses, so the
+// soft-target decision here cannot drift from the one the safety engine makes.
+import { OPEN_POSITION_STATUSES } from "./capacity-status";
+import { mergeCapacityLimits } from "./safety-engine";
 import {
   configuredProfileIdentity,
   resolveExecutionProfile,
@@ -233,9 +237,20 @@ export class ExecutionOrchestrator {
         take: batchSize,
       });
 
+      // Which profiles have already reached their SOFT open-position target.
+      // Derived from persisted state every tick — no in-memory counter — so it
+      // is identical after a restart and idempotent when a tick repeats.
+      const softTargetReached = await this.profilesAtSoftOpenTarget(
+        [...new Set(executions.map((execution) => execution.executionProfileId))]
+      );
+
       for (const execution of executions) {
         result.inspected += 1;
-        const dispatched = await this.reconcileOne(execution, evaluatedAt);
+        const dispatched = await this.reconcileOne(
+          execution,
+          evaluatedAt,
+          softTargetReached.has(execution.executionProfileId)
+        );
         result.mutationsDispatched += dispatched;
         if (dispatched > 0) result.advanced += 1;
       }
@@ -259,7 +274,82 @@ export class ExecutionOrchestrator {
    * intentionally a lookup rather than logic: what "reconcile" means for each
    * state was decided in Phase 6/7 and is not re-litigated here.
    */
-  private async reconcileOne(execution: TradeExecution, evaluatedAt: Date): Promise<number> {
+  /**
+   * The profiles whose AUTHORITATIVE open-position count has reached their
+   * effective soft target.
+   *
+   * Counted from the same `OPEN_POSITION_STATUSES` set admission uses, over the
+   * whole profile rather than the current batch, and merged through the same
+   * `mergeCapacityLimits` admission applies — so the orchestrator and the
+   * safety engine can never disagree about whether the target is reached.
+   */
+  private async profilesAtSoftOpenTarget(profileIds: string[]): Promise<Set<string>> {
+    const reached = new Set<string>();
+    for (const profileId of profileIds) {
+      // Failing to PROVE the target is reached must never stop the tick. This
+      // probe only ever adds a cancellation; reconciliation, fill handling and
+      // protection must proceed regardless, so an unreadable policy or count
+      // degrades to "cancel nothing" instead of taking the whole pass down.
+      try {
+        reached.add(await this.softTargetProbe(profileId));
+      } catch (error) {
+        logger.warn(
+          { profileId, error: error instanceof Error ? error.message.slice(0, 200) : "unknown" },
+          "Soft open-target check failed; no entry cancellation is initiated this tick"
+        );
+      }
+    }
+    reached.delete("");
+    return reached;
+  }
+
+  /** Returns the profile id when its soft target is reached, else "". */
+  private async softTargetProbe(profileId: string): Promise<string> {
+    const policyRow = await this.deps.prisma.executionSafetyPolicy.findUnique({
+        where: { executionProfileId: profileId },
+      });
+    // No row means the profile fails closed at admission anyway; there is no
+    // authoritative target to compare against, so nothing is cancelled here.
+    if (!policyRow) return "";
+
+    const openCount = await this.deps.prisma.tradeExecution.count({
+        where: {
+          executionProfileId: profileId,
+          status: { in: OPEN_POSITION_STATUSES as unknown as TradeExecution["status"][] },
+        },
+      });
+
+      const effective = mergeCapacityLimits(
+        {
+          maxOpenPositions: env.EXECUTION_MAX_OPEN_POSITIONS,
+          maxPendingEntries: env.EXECUTION_MAX_PENDING_ENTRIES,
+          maxTotalActiveTrades: env.EXECUTION_MAX_TOTAL_ACTIVE_TRADES,
+          maxActivePerSymbolSide: env.EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE,
+          maxAlertAgeSeconds: env.EXECUTION_MAX_ALERT_AGE_SECONDS,
+          softOpenPositionTarget: env.EXECUTION_SOFT_OPEN_POSITION_TARGET,
+          maxTotalPlannedRiskUsd: env.EXECUTION_MAX_TOTAL_PLANNED_RISK_USD,
+          maxTotalIsolatedMarginUsd: env.EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD,
+        },
+        {
+          maxOpenPositions: policyRow.maxOpenPositions,
+          maxPendingEntries: policyRow.maxPendingEntries,
+          maxTotalActiveTrades: policyRow.maxTotalActiveTrades,
+          maxActivePerSymbolSide: policyRow.maxActivePerSymbolSide,
+          maxAlertAgeSeconds: policyRow.maxAlertAgeSeconds,
+          softOpenPositionTarget: policyRow.softOpenPositionTarget,
+          maxTotalPlannedRiskUsd: policyRow.maxTotalPlannedRiskUsd.toString(),
+          maxTotalIsolatedMarginUsd: policyRow.maxTotalIsolatedMarginUsd.toString(),
+        }
+      );
+
+    return openCount >= effective.softOpenPositionTarget ? profileId : "";
+  }
+
+  private async reconcileOne(
+    execution: TradeExecution,
+    evaluatedAt: Date,
+    softOpenTargetReached = false
+  ): Promise<number> {
     const input = { executionId: execution.id, expectedVersion: execution.version, evaluatedAt };
 
     try {
@@ -298,9 +388,15 @@ export class ExecutionOrchestrator {
         // whether the TTL is due. Expiry never bypasses the fill check.
         case "ENTRY_PENDING": {
           const reconciled = await this.deps.entry.reconcileEntryOrder(input);
+          // A resting order is the ONE state that is unambiguously cancellable:
+          // the order is known to exist and no fill is recorded. When the soft
+          // target is reached we withdraw it; otherwise the TTL decides.
+          // `expireEntryOrderIfDue` re-queries first either way, so a fill that
+          // landed since `reconcileEntryOrder` still wins.
           const expired = await this.deps.entry.expireEntryOrderIfDue({
             ...input,
             expectedVersion: reconciled.execution.version,
+            ...(softOpenTargetReached ? { recoveryReason: "SOFT_OPEN_TARGET" as const } : {}),
           });
           return reconciled.mutationsDispatched + expired.mutationsDispatched;
         }
@@ -309,11 +405,25 @@ export class ExecutionOrchestrator {
         // is measured against the latest confirmed fill, then protect it.
         case "PARTIALLY_FILLED": {
           const reconciled = await this.deps.entry.reconcileEntryOrder(input);
+          // PROTECT FIRST, then withdraw the remainder. The filled quantity is
+          // real exposure and its protection must never wait on a cancellation
+          // that can fail, time out or come back UNKNOWN. Only after protection
+          // has been attempted is the unfilled remainder cancelled — and the
+          // SOFT_OPEN_TARGET cause is what keeps that from being mistaken for
+          // an unprotected partial fill.
           const protection = await this.deps.protection.ensureProtectionForExposure({
             ...input,
             expectedVersion: reconciled.execution.version,
           });
-          return reconciled.mutationsDispatched + protection.mutationsDispatched;
+          if (!softOpenTargetReached) {
+            return reconciled.mutationsDispatched + protection.mutationsDispatched;
+          }
+          const withdrawn = await this.deps.entry.expireEntryOrderIfDue({
+            ...input,
+            expectedVersion: protection.execution.version,
+            recoveryReason: "SOFT_OPEN_TARGET",
+          });
+          return reconciled.mutationsDispatched + protection.mutationsDispatched + withdrawn.mutationsDispatched;
         }
 
         case "ENTRY_FILLED":

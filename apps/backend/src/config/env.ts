@@ -187,6 +187,12 @@ const envSchema = z.object({
   EXECUTION_MAX_OPEN_POSITIONS: z.coerce.number().int().positive().default(1),
   EXECUTION_MAX_PENDING_ENTRIES: z.coerce.number().int().positive().default(1),
   EXECUTION_MAX_TOTAL_ACTIVE_TRADES: z.coerce.number().int().positive().default(1),
+  // SOFT admission target, distinct from the HARD cap above. Reaching it stops
+  // NEW admissions and asks the orchestrator to cancel remaining live ENTRY
+  // orders; a fill that wins the race against that cancellation is still valid
+  // exposure and is protected normally, up to EXECUTION_MAX_OPEN_POSITIONS.
+  // Defaulting to 1 makes soft == hard == 1, i.e. exactly today's behaviour.
+  EXECUTION_SOFT_OPEN_POSITION_TARGET: z.coerce.number().int().positive().default(1),
   // Monetary limits stay decimal STRINGS — never parsed through a JS float.
   EXECUTION_MAX_TOTAL_PLANNED_RISK_USD: positiveDecimalString.default("1.50"),
   EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD: positiveDecimalString.default("5.00"),
@@ -319,6 +325,16 @@ const envSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ["EXECUTION_MAX_TOTAL_ACTIVE_TRADES"],
       message: "EXECUTION_MAX_TOTAL_ACTIVE_TRADES must be >= EXECUTION_MAX_PENDING_ENTRIES",
+    });
+  }
+  // A soft target above the hard cap could never be reached before the hard
+  // cap rejected the admission first, so the soft gate would be dead code and
+  // the configuration would silently mean something other than it says.
+  if (value.EXECUTION_SOFT_OPEN_POSITION_TARGET > value.EXECUTION_MAX_OPEN_POSITIONS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["EXECUTION_SOFT_OPEN_POSITION_TARGET"],
+      message: "EXECUTION_SOFT_OPEN_POSITION_TARGET must be <= EXECUTION_MAX_OPEN_POSITIONS",
     });
   }
 

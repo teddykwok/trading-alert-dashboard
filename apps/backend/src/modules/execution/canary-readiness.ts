@@ -92,6 +92,10 @@ export const CANARY_POLICY = {
   maxPendingEntries: 1,
   maxTotalActiveTrades: 1,
   maxActivePerSymbolSide: 1,
+  // Soft == hard == 1 for the canary: exactly one position, and the soft
+  // gate closes admission at the same point the hard cap does. Raising this
+  // to the future 3/5 topology is a separate reviewed step.
+  softOpenPositionTarget: 1,
   maxTotalPlannedRiskUsd: "1.50",
   maxTotalIsolatedMarginUsd: "8.00",
 } as const;
@@ -132,6 +136,7 @@ export interface CanaryPolicyLimits {
   maxPendingEntries: number;
   maxTotalActiveTrades: number;
   maxActivePerSymbolSide: number;
+  softOpenPositionTarget: number;
   maxTotalPlannedRiskUsd: string;
   maxTotalIsolatedMarginUsd: string;
 }
@@ -216,6 +221,7 @@ export const CANARY_PINNED_LIMITS = [
   "maxPendingEntries",
   "maxTotalActiveTrades",
   "maxActivePerSymbolSide",
+  "softOpenPositionTarget",
   "maxTotalPlannedRiskUsd",
   "maxTotalIsolatedMarginUsd",
 ] as const satisfies ReadonlyArray<keyof CanaryPolicyLimits & keyof typeof CANARY_POLICY>;
@@ -246,6 +252,7 @@ export function effectiveCanaryLimits(
     maxPendingEntries: merged.maxPendingEntries,
     maxTotalActiveTrades: merged.maxTotalActiveTrades,
     maxActivePerSymbolSide: merged.maxActivePerSymbolSide,
+    softOpenPositionTarget: merged.softOpenPositionTarget,
     maxTotalPlannedRiskUsd: merged.maxTotalPlannedRiskUsd,
     maxTotalIsolatedMarginUsd: merged.maxTotalIsolatedMarginUsd,
   };

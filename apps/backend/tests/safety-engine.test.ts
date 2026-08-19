@@ -73,6 +73,7 @@ function policy(overrides: Partial<EffectiveSafetyPolicy> = {}): EffectiveSafety
     maxTotalPlannedRiskUsd: "1.50",
     maxTotalIsolatedMarginUsd: "5.00",
     maxActivePerSymbolSide: 1,
+    softOpenPositionTarget: 1,
     maxAlertAgeSeconds: 300,
     signalFutureToleranceSeconds: 5,
     allowedSymbols: [],
@@ -610,7 +611,9 @@ describe("capacity limits", () => {
 
   it("allows the last free slot", () => {
     const result = evaluate({
-      policy: policy({ maxOpenPositions: 2, maxPendingEntries: 2, maxTotalActiveTrades: 2 }),
+      // softOpenPositionTarget is raised with the hard cap: this test is about
+      // the HARD slot, and a soft target left at 1 would close admission first.
+      policy: policy({ maxOpenPositions: 2, maxPendingEntries: 2, maxTotalActiveTrades: 2, softOpenPositionTarget: 2 }),
       local: local({ totalActiveCount: 1, openPositionCount: 1, activeSymbolSideKeys: ["OTHERUSDT:LONG"] }),
     });
     expect(result.decision).toBe("PASS");
@@ -623,7 +626,7 @@ describe("capacity limits", () => {
 
   it("allows the opposite side of the same symbol when slots remain", () => {
     const result = evaluate({
-      policy: policy({ maxOpenPositions: 2, maxPendingEntries: 2, maxTotalActiveTrades: 2 }),
+      policy: policy({ maxOpenPositions: 2, maxPendingEntries: 2, maxTotalActiveTrades: 2, softOpenPositionTarget: 2 }),
       local: local({
         totalActiveCount: 1,
         openPositionCount: 1,
@@ -844,9 +847,12 @@ describe("reason retryability classification", () => {
 });
 
 describe("reason code catalogue", () => {
-  it("exposes exactly the 29 stable reason codes", () => {
-    expect(SAFETY_REASON_CODES).toHaveLength(29);
-    expect(new Set(SAFETY_REASON_CODES).size).toBe(29);
+  it("exposes exactly the 30 stable reason codes", () => {
+    expect(SAFETY_REASON_CODES).toHaveLength(30);
+    expect(new Set(SAFETY_REASON_CODES).size).toBe(30);
+    // The soft target is its OWN code, never folded into the hard one.
+    expect(SAFETY_REASON_CODES).toContain("SOFT_OPEN_TARGET_REACHED");
+    expect(SAFETY_REASON_CODES).toContain("OPEN_POSITION_LIMIT_REACHED");
   });
 
   it("keeps a distinct code for each configuration mismatch", () => {

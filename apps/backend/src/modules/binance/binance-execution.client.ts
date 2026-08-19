@@ -135,7 +135,19 @@ export interface EntryCancellationContext {
   readonly reason: EntryCancellationReason;
 }
 
-export type EntryCancellationReason = "TTL_DUE" | "OPERATOR_RECOVERY";
+/**
+ * Why an entry order is being cancelled. NOT interchangeable: each reason has
+ * its own terminal mapping in `mapOrderToExecutionStatus`.
+ *
+ *  - TTL_DUE            the plan's own deadline passed; a partial fill is an
+ *                       UNPROTECTED surprise and escalates.
+ *  - OPERATOR_RECOVERY  a human is driving.
+ *  - SOFT_OPEN_TARGET   the profile reached its soft open-position target, so
+ *                       remaining entry work is withdrawn ON PURPOSE. A partial
+ *                       fill here is an expected outcome, not an incident: the
+ *                       filled quantity continues into normal protection.
+ */
+export type EntryCancellationReason = "TTL_DUE" | "OPERATOR_RECOVERY" | "SOFT_OPEN_TARGET";
 
 export interface AuthorizeEntryCancellationInput {
   executionId: string;

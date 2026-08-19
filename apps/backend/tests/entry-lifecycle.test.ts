@@ -175,6 +175,116 @@ describe("partial fill safety rule", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Soft-target cancellation: the SAME order state, a different meaning
+// ---------------------------------------------------------------------------
+
+/**
+ * A partial fill whose remainder we cancelled ON PURPOSE, because the profile
+ * reached its soft open-position target, is not the same event as a partial
+ * fill discovered when a plan's TTL ran out.
+ *
+ * Under TTL the remainder disappeared unexpectedly and the filled quantity is
+ * an unprotected surprise, so a human is paged. Under the soft target we chose
+ * to stop, protection is already being placed by the orchestrator on the same
+ * tick, and paging a human would mean alerting on the system obeying its own
+ * policy. The exchange evidence is identical; only the cause differs, so the
+ * cause is what the mapping keys on.
+ */
+describe("soft-target cancellation semantics", () => {
+  it("continues a soft-target partial fill into normal protection, with no manual intervention", () => {
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "CANCELED",
+      executedQuantity: "0.100",
+      cancelCause: "SOFT_OPEN_TARGET",
+    });
+    // ENTRY_FILLED is the state the orchestrator routes straight into
+    // ensureProtectionForExposure. It keeps the open-position slot and releases
+    // the pending slot the now-cancelled remainder held.
+    expect(result.executionStatus).toBe("ENTRY_FILLED");
+    expect(result.reasonCode).toBe("ENTRY_RECONCILED");
+    expect(result.requiresManualIntervention).toBe(false);
+    expect(result.exposurePossible).toBe(true);
+  });
+
+  it("does NOT weaken the TTL mapping it sits beside", () => {
+    // The same exchange evidence under the TTL cause still escalates.
+    const ttl = mapOrderToExecutionStatus({
+      localOrderStatus: "CANCELED",
+      executedQuantity: "0.100",
+      cancelCause: "TTL",
+    });
+    expect(ttl.executionStatus).toBe("MANUAL_INTERVENTION");
+    expect(ttl.requiresManualIntervention).toBe(true);
+
+    // An unspecified cause is still treated as the dangerous one.
+    const unknown = mapOrderToExecutionStatus({ localOrderStatus: "CANCELED", executedQuantity: "0.100" });
+    expect(unknown.executionStatus).toBe("MANUAL_INTERVENTION");
+  });
+
+  it("terminalizes a zero-fill soft-target cancellation as CANCELED, not ENTRY_EXPIRED", () => {
+    // Nothing ever filled and nothing expired: we withdrew it deliberately.
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "CANCELED",
+      executedQuantity: "0",
+      cancelCause: "SOFT_OPEN_TARGET",
+    });
+    expect(result.executionStatus).toBe("CANCELED");
+    expect(result.requiresManualIntervention).toBe(false);
+    expect(result.exposurePossible).toBe(false);
+  });
+
+  it("lets a FILLED order win the cancellation race, whatever the cause", () => {
+    // The cancel lost: Binance says FILLED. That is authoritative exchange
+    // reality and must become an ordinary open position, never a fabricated
+    // CANCELED.
+    for (const cause of ["SOFT_OPEN_TARGET", "TTL", "OPERATOR", undefined] as const) {
+      const result = mapOrderToExecutionStatus({
+        localOrderStatus: "FILLED",
+        executedQuantity: "0.300",
+        cancelCause: cause,
+      });
+      expect(result.executionStatus, String(cause)).toBe("ENTRY_FILLED");
+      expect(result.requiresManualIntervention, String(cause)).toBe(false);
+      expect(result.exposurePossible, String(cause)).toBe(true);
+    }
+  });
+
+  it("leaves a still-working PARTIALLY_FILLED order alone until the cancel proves out", () => {
+    // Before the cancellation is confirmed the order is still PARTIALLY_FILLED
+    // on the exchange, and the execution stays in that state — protection runs
+    // against the confirmed fill in the meantime.
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "PARTIALLY_FILLED",
+      executedQuantity: "0.100",
+      cancelCause: "SOFT_OPEN_TARGET",
+    });
+    expect(result.executionStatus).toBe("PARTIALLY_FILLED");
+    expect(result.requiresManualIntervention).toBe(false);
+  });
+
+  it("is a distinct cause, not a rename of an existing one", () => {
+    const causes: Array<Parameters<typeof mapOrderToExecutionStatus>[0]["cancelCause"]> = [
+      "TTL",
+      "OPERATOR",
+      "UNKNOWN",
+      "SOFT_OPEN_TARGET",
+    ];
+    const outcomes = causes.map(
+      (cancelCause) =>
+        mapOrderToExecutionStatus({ localOrderStatus: "CANCELED", executedQuantity: "0.100", cancelCause })
+          .executionStatus
+    );
+    // Only the soft-target cause avoids escalation.
+    expect(outcomes).toEqual([
+      "MANUAL_INTERVENTION",
+      "MANUAL_INTERVENTION",
+      "MANUAL_INTERVENTION",
+      "ENTRY_FILLED",
+    ]);
+  });
+});
+
 describe("TTL evaluation", () => {
   const base = new Date("2026-01-01T12:00:00.000Z");
 

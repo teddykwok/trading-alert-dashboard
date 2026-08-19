@@ -130,6 +130,7 @@ export class SafetyAdmissionService {
         maxTotalIsolatedMarginUsd: env.EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD,
         maxActivePerSymbolSide: env.EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE,
         maxAlertAgeSeconds: env.EXECUTION_MAX_ALERT_AGE_SECONDS,
+        softOpenPositionTarget: env.EXECUTION_SOFT_OPEN_POSITION_TARGET,
         signalFutureToleranceSeconds: env.EXECUTION_SIGNAL_FUTURE_TOLERANCE_SECONDS,
       },
       {
@@ -148,6 +149,7 @@ export class SafetyAdmissionService {
         maxTotalIsolatedMarginUsd: policyRow ? policyRow.maxTotalIsolatedMarginUsd.toString() : "0.00000001",
         maxActivePerSymbolSide: policyRow?.maxActivePerSymbolSide ?? 1,
         maxAlertAgeSeconds: policyRow?.maxAlertAgeSeconds ?? 1,
+        softOpenPositionTarget: policyRow?.softOpenPositionTarget ?? 1,
         allowedSymbols: policyRow?.allowedSymbols ?? [],
       }
     );

@@ -471,6 +471,15 @@ model ExecutionSafetyPolicy {
   maxActivePerSymbolSide Int @default(1)
   maxAlertAgeSeconds    Int @default(300)
 
+  // SOFT admission target for open positions, distinct from the HARD
+  // maxOpenPositions above. Reaching it closes NEW admission and asks the
+  // orchestrator to cancel remaining live ENTRY orders — it is NEVER a
+  // post-fill validity rule. Positions that fill while cancellation is in
+  // flight stay valid up to maxOpenPositions and are protected normally.
+  // Must be <= maxOpenPositions. Defaults to 1 so existing behaviour (soft ==
+  // hard == 1) is unchanged until an operator raises it.
+  softOpenPositionTarget Int @default(1)
+
   maxTotalPlannedRiskUsd    Decimal @default("1.50") @db.Decimal(30, 12)
   maxTotalIsolatedMarginUsd Decimal @default("5.00") @db.Decimal(30, 12)
 
