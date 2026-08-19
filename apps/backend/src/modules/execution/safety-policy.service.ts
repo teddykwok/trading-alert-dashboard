@@ -112,28 +112,9 @@ export class SafetyPolicyService {
     if (Object.keys(data).length === 0) throw new ValidationError("No safety policy values were supplied.");
 
     // A partial update must not create an unreachable combination either, so
-    // the invariant is re-checked against the MERGED result, not just the
+    // the invariants are re-checked against the MERGED result, not just the
     // fields present in this call.
-    const merged = {
-      maxOpenPositions: (data.maxOpenPositions as number | undefined) ?? existing.maxOpenPositions,
-      maxPendingEntries: (data.maxPendingEntries as number | undefined) ?? existing.maxPendingEntries,
-      maxTotalActiveTrades: (data.maxTotalActiveTrades as number | undefined) ?? existing.maxTotalActiveTrades,
-      softOpenPositionTarget:
-        (data.softOpenPositionTarget as number | undefined) ?? existing.softOpenPositionTarget,
-    };
-    if (merged.maxTotalActiveTrades < merged.maxOpenPositions) {
-      throw new ValidationError("maxTotalActiveTrades must be >= maxOpenPositions.");
-    }
-    if (merged.maxTotalActiveTrades < merged.maxPendingEntries) {
-      throw new ValidationError("maxTotalActiveTrades must be >= maxPendingEntries.");
-    }
-    // A soft target above the hard cap is unreachable: the hard limit would
-    // reject first and the soft gate would never fire, so the row would claim
-    // a policy it does not implement. Checked on the MERGED result, so lowering
-    // maxOpenPositions alone cannot strand an existing soft target above it.
-    if (merged.softOpenPositionTarget > merged.maxOpenPositions) {
-      throw new ValidationError("softOpenPositionTarget must be <= maxOpenPositions.");
-    }
+    this.assertMergedInvariants(existing, data);
 
     const updated = await this.prisma.executionSafetyPolicy.updateMany({
       where: { executionProfileId, version: expectedVersion },
@@ -152,15 +133,51 @@ export class SafetyPolicyService {
   /**
    * Runs the SAME validation a write runs, and writes nothing.
    *
-   * Exists so a dry-run operator command can reject a malformed value without
+   * Exists so a dry-run operator command can reject a bad proposal without
    * reimplementing the rules — a second validator that drifted from this one
-   * would be worse than no dry run at all. Throws `ValidationError`; the
-   * cross-field capacity invariant that needs the existing row is still only
-   * checkable at write time, and `updateForProfile` re-checks everything.
+   * would be worse than no dry run at all.
+   *
+   * Pass `existing` (a dry run always has the row in hand) to also evaluate
+   * the cross-field invariants against the FINAL MERGED row. Without it only
+   * the supplied fields can be judged, which would let a dry run report a
+   * proposal as acceptable that the write then rejects — e.g. lowering
+   * maxOpenPositions below a soft target the operator did not mention.
    */
-  assertValidValues(values: SafetyPolicyValues): void {
+  assertValidValues(values: SafetyPolicyValues, existing?: ExecutionSafetyPolicy): void {
     const data = this.validate(values);
     if (Object.keys(data).length === 0) throw new ValidationError("No safety policy values were supplied.");
+    if (existing) this.assertMergedInvariants(existing, data);
+  }
+
+  /**
+   * The cross-field capacity invariants, evaluated on the row that would
+   * RESULT from a partial update.
+   *
+   * One implementation, called by both the write path and the dry run, so the
+   * two can never disagree about whether a proposal is acceptable.
+   */
+  private assertMergedInvariants(existing: ExecutionSafetyPolicy, data: Record<string, unknown>): void {
+    const pick = (key: keyof ExecutionSafetyPolicy) =>
+      (data[key] as number | undefined) ?? (existing[key] as number);
+    const merged = {
+      maxOpenPositions: pick("maxOpenPositions"),
+      maxPendingEntries: pick("maxPendingEntries"),
+      maxTotalActiveTrades: pick("maxTotalActiveTrades"),
+      softOpenPositionTarget: pick("softOpenPositionTarget"),
+    };
+    if (merged.maxTotalActiveTrades < merged.maxOpenPositions) {
+      throw new ValidationError("maxTotalActiveTrades must be >= maxOpenPositions.");
+    }
+    if (merged.maxTotalActiveTrades < merged.maxPendingEntries) {
+      throw new ValidationError("maxTotalActiveTrades must be >= maxPendingEntries.");
+    }
+    // A soft target above the hard cap is unreachable: the hard limit would
+    // reject first and the soft gate would never fire, so the row would claim
+    // a policy it does not implement. Checked on the MERGED result, so lowering
+    // maxOpenPositions alone cannot strand an existing soft target above it.
+    if (merged.softOpenPositionTarget > merged.maxOpenPositions) {
+      throw new ValidationError("softOpenPositionTarget must be <= maxOpenPositions.");
+    }
   }
 
   private validate(values: SafetyPolicyValues): Record<string, unknown> {

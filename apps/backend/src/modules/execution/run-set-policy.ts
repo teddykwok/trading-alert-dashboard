@@ -39,11 +39,44 @@ import { SafetyPolicyService, type SafetyPolicyValues } from "./safety-policy.se
 
 const CONFIRM = "--confirm";
 
-/** Only the fields this CLI is allowed to touch. */
+/**
+ * Only the fields this CLI is allowed to touch.
+ *
+ * `kind` is PARSING only — how the flag text becomes the type
+ * `SafetyPolicyValues` declares. Every rule about what is acceptable still
+ * belongs to SafetyPolicyService; a malformed integer is turned into NaN here
+ * precisely so the service rejects it by name rather than this file inventing
+ * a second opinion.
+ *
+ * Still deliberately absent: killSwitchActive (the arming path has its own
+ * commands), allowedSymbols (owned by execution:prepare-canary, which writes
+ * it in the same transaction as the authorization) and maxAlertAgeSeconds.
+ */
 const SUPPORTED_FIELDS = [
-  { flag: "max-total-isolated-margin-usd", field: "maxTotalIsolatedMarginUsd" },
-  { flag: "max-total-planned-risk-usd", field: "maxTotalPlannedRiskUsd" },
-] as const satisfies ReadonlyArray<{ flag: string; field: keyof SafetyPolicyValues & keyof CanaryPolicyLimits }>;
+  { flag: "soft-open-position-target", field: "softOpenPositionTarget", kind: "integer" },
+  { flag: "max-open-positions", field: "maxOpenPositions", kind: "integer" },
+  { flag: "max-pending-entries", field: "maxPendingEntries", kind: "integer" },
+  { flag: "max-total-active-trades", field: "maxTotalActiveTrades", kind: "integer" },
+  { flag: "max-active-per-symbol-side", field: "maxActivePerSymbolSide", kind: "integer" },
+  { flag: "max-total-planned-risk-usd", field: "maxTotalPlannedRiskUsd", kind: "decimal" },
+  { flag: "max-total-isolated-margin-usd", field: "maxTotalIsolatedMarginUsd", kind: "decimal" },
+] as const satisfies ReadonlyArray<{
+  flag: string;
+  field: keyof SafetyPolicyValues & keyof CanaryPolicyLimits;
+  kind: "integer" | "decimal";
+}>;
+
+/**
+ * Flag text -> the declared type, with NO coercion of anything questionable.
+ *
+ * Only a plain optionally-signed run of digits becomes a number; "2.5", "1e3",
+ * "0x10", " 3 " and "" all become NaN, which `assertPositiveInt` rejects with
+ * the field name. Decimals are passed through verbatim for the service to
+ * judge, exactly as before.
+ */
+function parseFlag(raw: string, kind: "integer" | "decimal"): string | number {
+  return kind === "decimal" ? raw : /^[+-]?\d+$/.test(raw) ? Number(raw) : Number.NaN;
+}
 
 function line(label: string, value: string | number | boolean | null | undefined): void {
   console.log(`  ${label.padEnd(34)} ${value === null || value === undefined ? "—" : String(value)}`);
@@ -90,9 +123,9 @@ export async function setPolicy(): Promise<void> {
   for (const supported of SUPPORTED_FIELDS) {
     const raw = arg(supported.flag);
     if (raw === null) continue;
-    // Passed through verbatim: the service owns validation, and coercing here
-    // would mean two implementations disagreeing about what is acceptable.
-    requested[supported.field] = raw;
+    // The service owns validation; this only turns text into the declared
+    // type. Anything it cannot parse becomes NaN so the service rejects it.
+    (requested[supported.field] as string | number) = parseFlag(raw, supported.kind);
     requestedFields.push(supported);
   }
 
@@ -101,7 +134,9 @@ export async function setPolicy(): Promise<void> {
   if (requestedFields.length === 0) {
     console.log("");
     console.log("No policy value was requested. Supported flags:");
-    for (const supported of SUPPORTED_FIELDS) console.log(`  --${supported.flag}=<decimal>`);
+    for (const supported of SUPPORTED_FIELDS) {
+      console.log(`  --${supported.flag}=<${supported.kind === "integer" ? "positive integer" : "decimal"}>`);
+    }
     console.log(`Add ${CONFIRM} to write; without it this command only reports.`);
     process.exitCode = 1;
     return;
@@ -140,7 +175,9 @@ export async function setPolicy(): Promise<void> {
     // parses them as decimals, and "abc" must be rejected by the service's
     // rules rather than blowing up inside a Decimal constructor.
     try {
-      policies.assertValidValues(requested);
+      // `current` is passed so the cross-field invariants are evaluated on the
+      // FINAL merged row, not just the flags this command happened to supply.
+      policies.assertValidValues(requested, current);
     } catch (error) {
       section("NOT APPLIED");
       console.log(`  Requested values are INVALID: ${error instanceof Error ? error.message : String(error)}`);
@@ -160,7 +197,7 @@ export async function setPolicy(): Promise<void> {
     };
     const proposedLimits: CanaryPolicyLimits = { ...currentLimits };
     for (const supported of requestedFields) {
-      proposedLimits[supported.field] = requested[supported.field] as string;
+      (proposedLimits[supported.field] as string | number) = requested[supported.field] as string | number;
     }
 
     const globals = globalLimits();
@@ -192,12 +229,10 @@ export async function setPolicy(): Promise<void> {
       section("APPLIED");
       line("policy row version", `${current.version} → ${updated.version}`);
       for (const supported of requestedFields) {
-        const field = supported.field;
-        const value =
-          field === "maxTotalIsolatedMarginUsd"
-            ? updated.maxTotalIsolatedMarginUsd.toFixed()
-            : updated.maxTotalPlannedRiskUsd.toFixed();
-        line(field, value);
+        // Read back from the PERSISTED row, never from the request, so the
+        // printed value is what the database actually holds.
+        const persisted = updated[supported.field];
+        line(supported.field, supported.kind === "decimal" ? String(persisted) : (persisted as number));
       }
       console.log("");
       console.log("  Run execution:canary-preflight to confirm the effective policy.");

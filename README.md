@@ -391,6 +391,65 @@ Steps 1–2 and 5 change live behaviour. Nothing here is run by the repository.
    `required`, with no `CANARY_BLOCKED_POLICY`.
 7. **Confirm the posture is still FULL SAFE** — kill switch engaged, live entry
    off, protection-ready off. Policy limits are capacity, never permission.
+
+#### `execution:set-policy` — the operator command for policy limits
+
+Dry run by default; `--confirm` is the only thing that writes. Supported flags:
+
+| Flag | Field |
+| --- | --- |
+| `--soft-open-position-target` | `softOpenPositionTarget` |
+| `--max-open-positions` | `maxOpenPositions` |
+| `--max-pending-entries` | `maxPendingEntries` |
+| `--max-total-active-trades` | `maxTotalActiveTrades` |
+| `--max-active-per-symbol-side` | `maxActivePerSymbolSide` |
+| `--max-total-planned-risk-usd` | `maxTotalPlannedRiskUsd` |
+| `--max-total-isolated-margin-usd` | `maxTotalIsolatedMarginUsd` |
+
+Deliberately **not** exposed: the kill switch (the arming commands own it),
+`allowedSymbols` (`execution:prepare-canary` writes it inside the same
+transaction as the authorization) and `maxAlertAgeSeconds`.
+
+Omitted flags keep their current value, but validation always judges the
+**final merged row** — so lowering `--max-open-positions` below an existing
+`softOpenPositionTarget` is rejected in the dry run, before any write. Moving
+both together in one command is accepted.
+
+**The DB row is min-merged with the env global — the row alone never activates
+anything.** With `EXECUTION_MAX_OPEN_POSITIONS=1` in the environment, writing
+`5` to the profile row still leaves the effective limit at `1`. The command
+prints `global (env)`, `current row`, `proposed row`, `effective now` and
+`effective after` for exactly this reason: read `effective after`, not
+`proposed row`, to know what the runtime will enforce. Changing an env global
+also requires a backend **and** worker restart, because `config/env` is parsed
+once at import.
+
+##### Example only — the future multi-slot topology, NOT ACTIVE BY DEFAULT
+
+Every shipped default remains `1` (soft target, all four capacity counts), with
+the planned-risk cap at `1.50`. The command below is what a future, separately
+reviewed activation would dry-run; it is documented here so the shape is
+reviewable, and **nothing in this repository runs it**:
+
+```
+pnpm --filter @trading-alert-dashboard/backend execution:set-policy -- \
+  --soft-open-position-target=3 \
+  --max-pending-entries=5 \
+  --max-open-positions=5 \
+  --max-total-active-trades=5 \
+  --max-active-per-symbol-side=1 \
+  --max-total-planned-risk-usd=7.50 \
+  --max-total-isolated-margin-usd=40.00
+```
+
+Per-trade economics are unaffected by any of this and stay frozen: risk `1.50`,
+minimum margin `5.50`, target `6.00`, per-plan maximum ≈ `7.9999995`.
+
+Two things that topology would still need, and does not have yet: the matching
+env globals (the row alone is clamped), and an updated `CANARY_POLICY` — which
+this branch deliberately leaves at the conservative one-trade values, so the
+canary preflight **stays blocked** until the later authorization work lands.
+That is the intended fail-closed behaviour, not a defect.
 | `EXECUTION_SIGNAL_FUTURE_TOLERANCE_SECONDS` | Tolerance for a signal timestamp slightly ahead of local time (clock skew). | `5` |
 
 Reaching a limit skips **only the requesting execution** — existing
