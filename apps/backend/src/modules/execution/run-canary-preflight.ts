@@ -68,6 +68,13 @@ async function main(): Promise<void> {
     line("maxTotalIsolatedMarginUsd", `${policy.maxTotalIsolatedMarginUsd} (required ${CANARY_POLICY.maxTotalIsolatedMarginUsd})`);
     line("targetMarginMultiplier", env.BINANCE_TARGET_MARGIN_MULTIPLIER);
     line("maxMarginMultiplier", env.BINANCE_MAX_MARGIN_MULTIPLIER);
+    // Which leverage-selection rule is live, not just the number behind it.
+    line(
+      "minMarginUsd",
+      env.BINANCE_MIN_MARGIN_USD === "0"
+        ? "0 (floor disabled — closest-to-target selection)"
+        : `${env.BINANCE_MIN_MARGIN_USD} (smallest margin at or above the floor)`
+    );
 
     section("Safety posture");
     line("globalKillSwitch", gates.globalKillSwitch);

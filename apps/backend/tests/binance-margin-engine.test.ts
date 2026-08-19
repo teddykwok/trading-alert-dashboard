@@ -294,6 +294,309 @@ describe("candidate selection", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Minimum isolated-margin floor
+// ---------------------------------------------------------------------------
+
+/**
+ * The floor exists because a two-dollar isolated margin sits close to
+ * liquidation and is dominated by fees, however correct its risk sizing is.
+ *
+ * Two properties matter more than the arithmetic and are pinned throughout:
+ *
+ *  1. The floor is OFF by default, and turning the mechanism on by merely
+ *     adding the code would silently re-price every live plan. Every fixture
+ *     below therefore also asserts what the SAME input does with no floor.
+ *  2. The floor is satisfied by changing LEVERAGE only. Quantity, notional and
+ *     planned risk are decided before any leverage is considered and must come
+ *     out byte-identical with and without a floor — inflating size to reach a
+ *     margin target would breach the risk budget, which is the one thing this
+ *     engine exists to protect.
+ *
+ * Candidate margins are notional / integer leverage, never a hand-written
+ * list, so every fixture is a plan the production engine can actually produce.
+ */
+describe("minimum isolated-margin floor", () => {
+  /** Integer quantities, so notional is exactly the entry price. */
+  const WHOLE_LOTS: MarginPlanSymbolFilters = { ...FILTERS, stepSize: "1", minQty: "1", minNotional: "5" };
+
+  /**
+   * Notional 11.4 -> margins 11.4 / 5.70 / 3.80 / 2.85 …
+   * Ceiling 6 (1.50 × 4) excludes 1x; target stays the default 3.75.
+   */
+  const SCENARIO_A: Partial<DynamicLeveragePlanInput> = {
+    entryPrice: "11.4",
+    stopLoss: "9.9",
+    maximumMarginMultiplier: "4",
+    liquidationBufferRatio: "0",
+    filters: WHOLE_LOTS,
+  };
+
+  /** Notional 24 -> margins 24 / 12 / 8 / 6 / 4.80 / 4 …, ceiling 9 (1.50 × 6). */
+  const SCENARIO_B: Partial<DynamicLeveragePlanInput> = {
+    entryPrice: "24",
+    stopLoss: "22.5",
+    maximumMarginMultiplier: "6",
+    liquidationBufferRatio: "0",
+    filters: WHOLE_LOTS,
+  };
+
+  /** Notional 14.8 -> margins 14.8 / 7.40 / 4.93 / 3.70 …, ceiling 9. */
+  const SCENARIO_C: Partial<DynamicLeveragePlanInput> = {
+    entryPrice: "14.8",
+    stopLoss: "13.3",
+    maximumMarginMultiplier: "6",
+    liquidationBufferRatio: "0",
+    filters: WHOLE_LOTS,
+  };
+
+  const marginAt = (plan: ReturnType<typeof calculateDynamicLeveragePlan>, leverage: number) =>
+    plan.candidates.find((candidate) => candidate.leverage === leverage)?.estimatedInitialMargin;
+
+  // --- Default is OFF ------------------------------------------------------
+
+  it("is disabled by default, leaving closest-to-target selection untouched", () => {
+    const plan = calculateDynamicLeveragePlan(input({ stopLoss: "98" }));
+    expect(plan.minimumMarginUsd).toBe("0");
+    expect(plan.minimumIsolatedMargin).toBeNull();
+    expect(plan.marginSelectionMode).toBe("CLOSEST_TO_TARGET");
+    // The long-standing exact-target case still resolves the same way.
+    expect(plan.selectedLeverage).toBe(20);
+    expect(plan.estimatedInitialMargin).toBe("3.75");
+  });
+
+  it("treats an explicit 0 as identical to omitting the floor entirely", () => {
+    // Zero is 'disabled', NOT 'a floor of zero': a floor of zero would still
+    // flip the selector to smallest-margin and quietly change every plan.
+    for (const scenario of [SCENARIO_A, SCENARIO_B, SCENARIO_C, {}]) {
+      const omitted = calculateDynamicLeveragePlan(input(scenario));
+      const explicitZero = calculateDynamicLeveragePlan(input({ ...scenario, minimumMarginUsd: "0" }));
+      expect(explicitZero).toEqual(omitted);
+      expect(explicitZero.marginSelectionMode).toBe("CLOSEST_TO_TARGET");
+    }
+  });
+
+  // --- The three operator scenarios ---------------------------------------
+
+  it("A: 3.80 vs 5.70 — no floor takes 3.80, a 5.5 floor takes 5.70", () => {
+    const withoutFloor = calculateDynamicLeveragePlan(input(SCENARIO_A));
+    expect(withoutFloor.positionNotional).toBe("11.4");
+    expect(marginAt(withoutFloor, 2)).toBe("5.7");
+    expect(marginAt(withoutFloor, 3)).toBe("3.8");
+    // 3.80 is 0.05 from the 3.75 target; 5.70 is 1.95 away.
+    expect(withoutFloor.selectedLeverage).toBe(3);
+    expect(withoutFloor.estimatedInitialMargin).toBe("3.8");
+
+    const withFloor = calculateDynamicLeveragePlan(input({ ...SCENARIO_A, minimumMarginUsd: "5.5" }));
+    expect(withFloor.status).toBe("READY");
+    expect(withFloor.marginSelectionMode).toBe("SMALLEST_ABOVE_FLOOR");
+    expect(withFloor.minimumIsolatedMargin).toBe("5.5");
+    expect(withFloor.selectedLeverage).toBe(2);
+    expect(withFloor.estimatedInitialMargin).toBe("5.7");
+  });
+
+  it("B: 4 / 6 / 8 — no floor takes 4, a 5.5 floor takes 6", () => {
+    const withoutFloor = calculateDynamicLeveragePlan(input(SCENARIO_B));
+    expect(withoutFloor.positionNotional).toBe("24");
+    expect(marginAt(withoutFloor, 3)).toBe("8");
+    expect(marginAt(withoutFloor, 4)).toBe("6");
+    expect(marginAt(withoutFloor, 6)).toBe("4");
+    expect(withoutFloor.estimatedInitialMargin).toBe("4");
+
+    const withFloor = calculateDynamicLeveragePlan(input({ ...SCENARIO_B, minimumMarginUsd: "5.5" }));
+    // 6 is the SMALLEST at or above 5.5 — not 8, which is closer to nothing
+    // in particular, and not 4.80, which is below the floor.
+    expect(withFloor.selectedLeverage).toBe(4);
+    expect(withFloor.estimatedInitialMargin).toBe("6");
+  });
+
+  it("C: only the largest candidate clears the floor, so it is chosen", () => {
+    const withoutFloor = calculateDynamicLeveragePlan(input(SCENARIO_C));
+    expect(withoutFloor.positionNotional).toBe("14.8");
+    expect(marginAt(withoutFloor, 2)).toBe("7.4");
+    expect(withoutFloor.estimatedInitialMargin).toBe("3.7");
+
+    const withFloor = calculateDynamicLeveragePlan(input({ ...SCENARIO_C, minimumMarginUsd: "5.5" }));
+    // 3x is 4.93… — below the floor — so 2x/7.40 is the smallest survivor.
+    expect(marginAt(withFloor, 3)!.startsWith("4.93")).toBe(true);
+    expect(withFloor.selectedLeverage).toBe(2);
+    expect(withFloor.estimatedInitialMargin).toBe("7.4");
+  });
+
+  // --- Fail-closed diagnosis, kept distinct -------------------------------
+
+  it("reports NO_LEVERAGE_MEETS_MARGIN_FLOOR when every candidate is below the floor", () => {
+    // Ceiling 15 (1.50 × 10) admits every candidate; a floor of 12 sits above
+    // even the 1x margin of 11.4, so the band is empty from below only.
+    const plan = calculateDynamicLeveragePlan(
+      input({ ...SCENARIO_A, maximumMarginMultiplier: "10", minimumMarginUsd: "12" })
+    );
+    expect(plan.status).toBe("SKIPPED");
+    expect(plan.reason).toBe("NO_LEVERAGE_MEETS_MARGIN_FLOOR");
+    expect(plan.selectedLeverage).toBeNull();
+    expect(plan.candidates.every((candidate) => !candidate.eligible)).toBe(true);
+    // Never confused with the ceiling case.
+    expect(plan.reason).not.toBe("REQUIRED_MARGIN_EXCEEDS_MAXIMUM");
+  });
+
+  it("still reports NO_LEVERAGE_MEETS_MARGIN_FLOOR when the band is empty from both ends", () => {
+    // 1x/2x exceed the 9 ceiling and 3x downward fall under an 8.5 floor:
+    // candidates exist on both sides but none inside the band.
+    const plan = calculateDynamicLeveragePlan(input({ ...SCENARIO_B, minimumMarginUsd: "8.5" }));
+    expect(plan.status).toBe("SKIPPED");
+    expect(plan.reason).toBe("NO_LEVERAGE_MEETS_MARGIN_FLOOR");
+  });
+
+  it("keeps REQUIRED_MARGIN_EXCEEDS_MAXIMUM for the ceiling-only case", () => {
+    // Same fixture the ceiling test uses, now with a floor configured: the
+    // diagnosis must still name the ceiling, not the floor.
+    const plan = calculateDynamicLeveragePlan(
+      input({
+        entryPrice: "100",
+        stopLoss: "99.99",
+        filters: { ...FILTERS, stepSize: "1", minQty: "1", minNotional: "5" },
+        minimumMarginUsd: "4",
+      })
+    );
+    expect(plan.status).toBe("SKIPPED");
+    expect(plan.reason).toBe("REQUIRED_MARGIN_EXCEEDS_MAXIMUM");
+  });
+
+  it("fails closed when the floor cannot fit under the maximum", () => {
+    // 10 > 1.50 × 4; no margin could ever satisfy both bounds.
+    const impossible = calculateDynamicLeveragePlan(input({ ...SCENARIO_A, minimumMarginUsd: "10" }));
+    expect(impossible.status).toBe("INVALID");
+    expect(impossible.reason).toBe("MARGIN_FLOOR_EXCEEDS_MAXIMUM");
+    expect(impossible.selectedLeverage).toBeNull();
+    // Rejected before any sizing work, so nothing downstream can read a
+    // half-built plan as if it were merely unlucky.
+    expect(impossible.roundedQuantity).toBeNull();
+    expect(impossible.positionNotional).toBeNull();
+
+    // Exactly equal to the maximum is allowed, mirroring maximum >= target.
+    const exact = calculateDynamicLeveragePlan(input({ ...SCENARIO_A, minimumMarginUsd: "6" }));
+    expect(exact.reason).not.toBe("MARGIN_FLOOR_EXCEEDS_MAXIMUM");
+  });
+
+  it("rejects a negative or malformed floor rather than defaulting it away", () => {
+    for (const raw of ["-1", "-0.01", "abc", "NaN"]) {
+      const plan = calculateDynamicLeveragePlan(input({ ...SCENARIO_A, minimumMarginUsd: raw }));
+      expect(plan.status, raw).toBe("INVALID");
+      expect(plan.reason, raw).toBe("INVALID_MULTIPLIERS");
+      expect(plan.reasonMessage, raw).toMatch(/[Mm]inimum isolated margin/);
+    }
+  });
+
+  // --- Liquidation safety stays authoritative ------------------------------
+
+  it("skips a floor-eligible candidate that is not liquidation-safe and takes the next one up", () => {
+    // Buffer ratio 4 -> boundary 16.5. The smallest candidate above the 5.5
+    // floor is 6 at 4x, whose liquidation (18.18) is inside the buffer; 8 at
+    // 3x (liquidation 16.16) is safe. Safety wins over "smallest".
+    const plan = calculateDynamicLeveragePlan(
+      input({ ...SCENARIO_B, liquidationBufferRatio: "4", minimumMarginUsd: "5.5" })
+    );
+    expect(plan.requiredLiquidationBoundary).toBe("16.5");
+
+    const fourX = plan.candidates.find((candidate) => candidate.leverage === 4)!;
+    expect(fourX.estimatedInitialMargin).toBe("6");
+    expect(fourX.eligible).toBe(false);
+    expect(fourX.rejectionReason).toBe("estimated liquidation price is inside the required safety buffer");
+
+    expect(plan.status).toBe("READY");
+    expect(plan.selectedLeverage).toBe(3);
+    expect(plan.estimatedInitialMargin).toBe("8");
+  });
+
+  it("reports the LIQUIDATION reason, not the floor reason, when no safe candidate clears the floor", () => {
+    // Buffer ratio 5 -> boundary 15: both floor-eligible candidates (8 and 6)
+    // reach the liquidation test and fail it. A configured floor must never
+    // disguise a liquidation problem as a margin-band problem.
+    const plan = calculateDynamicLeveragePlan(
+      input({ ...SCENARIO_B, liquidationBufferRatio: "5", minimumMarginUsd: "5.5" })
+    );
+    expect(plan.status).toBe("SKIPPED");
+    expect(plan.reason).toBe("NO_LIQUIDATION_SAFE_LEVERAGE");
+    expect(plan.reason).not.toBe("NO_LEVERAGE_MEETS_MARGIN_FLOOR");
+  });
+
+  // --- The invariant this whole branch is built around ---------------------
+
+  it("NEVER changes quantity, notional or planned risk when the floor is enabled", () => {
+    const sizing = (plan: ReturnType<typeof calculateDynamicLeveragePlan>) => ({
+      quantityRaw: plan.quantityRaw,
+      roundedQuantity: plan.roundedQuantity,
+      positionNotional: plan.positionNotional,
+      actualPlannedLoss: plan.actualPlannedLoss,
+      unusedRiskBudget: plan.unusedRiskBudget,
+      riskBudgetUsd: plan.riskBudgetUsd,
+      stopDistance: plan.stopDistance,
+      stopLoss: plan.stopLoss,
+      executableStopLoss: plan.executableStopLoss,
+    });
+
+    for (const scenario of [SCENARIO_A, SCENARIO_B, SCENARIO_C]) {
+      const withoutFloor = calculateDynamicLeveragePlan(input(scenario));
+      const withFloor = calculateDynamicLeveragePlan(input({ ...scenario, minimumMarginUsd: "5.5" }));
+
+      expect(withFloor.status).toBe("READY");
+      expect(sizing(withFloor)).toEqual(sizing(withoutFloor));
+      // The floor did its job — margin went UP — and the ONLY reason is that a
+      // different leverage was chosen for the same position.
+      expect(withFloor.selectedLeverage).not.toBe(withoutFloor.selectedLeverage);
+      expect(Number(withFloor.estimatedInitialMargin)).toBeGreaterThan(Number(withoutFloor.estimatedInitialMargin));
+      expect(withFloor.positionNotional).toBe(withoutFloor.positionNotional);
+      // notional / leverage, with notional untouched.
+      expect(withFloor.estimatedInitialMargin).toBe(
+        marginAt(withFloor, withFloor.selectedLeverage as number)
+      );
+    }
+  });
+
+  it("fails closed rather than resizing when the floor is unreachable", () => {
+    // The BELOW_MIN_NOTIONAL rule already refuses to grow quantity for the
+    // exchange minimum; the floor must behave the same way. Quantity here is
+    // whatever the risk budget bought — never more.
+    const plan = calculateDynamicLeveragePlan(
+      input({ ...SCENARIO_A, maximumMarginMultiplier: "10", minimumMarginUsd: "12" })
+    );
+    const unfloored = calculateDynamicLeveragePlan(input({ ...SCENARIO_A, maximumMarginMultiplier: "10" }));
+    expect(plan.reason).toBe("NO_LEVERAGE_MEETS_MARGIN_FLOOR");
+    expect(plan.roundedQuantity).toBe(unfloored.roundedQuantity);
+    expect(plan.positionNotional).toBe(unfloored.positionNotional);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Floor configuration: one source, two files
+// ---------------------------------------------------------------------------
+
+describe("minimum-margin floor configuration", () => {
+  const BACKEND = process.cwd();
+  const read = (relative: string) => readFileSync(path.join(BACKEND, relative), "utf8");
+
+  it("defaults the env variable to the shared disabled value", () => {
+    // config/env deliberately does not import the shared package, so the "0"
+    // literal there is pinned to the engine default here instead.
+    expect(MARGIN_ENGINE_DEFAULTS.minimumMarginUsd).toBe("0");
+    expect(read("src/config/env.ts")).toContain('BINANCE_MIN_MARGIN_USD: nonNegativeDecimalString.default("0")');
+  });
+
+  it("documents the floor as disabled in both .env.example files", () => {
+    for (const file of [path.join(BACKEND, ".env.example"), path.join(BACKEND, "..", "..", ".env.example")]) {
+      const source = readFileSync(file, "utf8");
+      expect(source).toContain("BINANCE_MIN_MARGIN_USD=0");
+      // A shipped example must never arm the floor for someone who copies it.
+      expect(source).not.toMatch(/^BINANCE_MIN_MARGIN_USD=(?!0\s*$).+$/m);
+    }
+  });
+
+  it("passes the configured floor through the plan service to the engine", () => {
+    const service = read("src/modules/binance/binance-margin-plan.service.ts");
+    expect(service).toContain("minimumMarginUsd: request.minimumMarginUsd ?? env.BINANCE_MIN_MARGIN_USD");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // User maximum automation leverage
 // ---------------------------------------------------------------------------
 
@@ -991,6 +1294,9 @@ describe("engine purity and safety", () => {
       targetMarginMultiplier: "2.5",
       maximumMarginMultiplier: "3.333333",
       liquidationBufferRatio: "0.5",
+      // "0" = the isolated-margin floor is OFF. Changing this default would
+      // re-price every existing installation on deploy.
+      minimumMarginUsd: "0",
       userMaximumAutomationLeverage: 25,
     });
   });

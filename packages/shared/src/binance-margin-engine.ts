@@ -25,9 +25,38 @@ export const MARGIN_ENGINE_DEFAULTS = {
   targetMarginMultiplier: "2.5",
   maximumMarginMultiplier: "3.333333",
   liquidationBufferRatio: "0.5",
+  /**
+   * Minimum isolated margin in USD. "0" means DISABLED, which is the historical
+   * behaviour: no lower bound and closest-to-target selection. Any positive
+   * value switches the selector into floor mode — see `MARGIN_SELECTION_MODES`.
+   */
+  minimumMarginUsd: "0",
   /** Hard user-side ceiling for automation leverage, independent of Binance. */
   userMaximumAutomationLeverage: 25,
 } as const;
+
+/**
+ * How the winner was picked among liquidation-safe candidates.
+ *
+ * - CLOSEST_TO_TARGET: the historical rule — minimize |margin − targetMargin|.
+ *   Symmetric, so it can and does prefer a margin BELOW the target.
+ * - SMALLEST_ABOVE_FLOOR: with a positive minimum configured, the smallest
+ *   margin that is still at or above the floor.
+ *
+ * Reported on every plan so an operator can tell which rule produced a
+ * leverage without re-deriving it from the configuration.
+ */
+export const MARGIN_SELECTION_MODES = ["CLOSEST_TO_TARGET", "SMALLEST_ABOVE_FLOOR"] as const;
+export type MarginSelectionMode = (typeof MARGIN_SELECTION_MODES)[number];
+
+/**
+ * Candidate rejection strings, named so the post-loop diagnosis classifies on
+ * the same values the loop wrote. These used to be inline literals compared by
+ * hand further down — one edit away from a silent mis-diagnosis.
+ */
+const REJECTED_ABOVE_MAXIMUM = "estimated margin exceeds the maximum isolated margin";
+const REJECTED_BELOW_MINIMUM = "estimated margin is below the minimum isolated margin";
+const REJECTED_LIQUIDATION_UNSAFE = "estimated liquidation price is inside the required safety buffer";
 
 /** Bracket re-resolution passes allowed before the estimate is declared unstable. */
 const MAX_BRACKET_ITERATIONS = 8;
@@ -61,6 +90,8 @@ export const MARGIN_PLAN_REASONS = [
   "LEVERAGE_BRACKET_UNAVAILABLE",
   "NOTIONAL_OUTSIDE_BRACKETS",
   "REQUIRED_MARGIN_EXCEEDS_MAXIMUM",
+  "MARGIN_FLOOR_EXCEEDS_MAXIMUM",
+  "NO_LEVERAGE_MEETS_MARGIN_FLOOR",
   "LIQUIDATION_ESTIMATE_UNAVAILABLE",
   "NO_LIQUIDATION_SAFE_LEVERAGE",
 ] as const;
@@ -130,6 +161,19 @@ export interface DynamicLeveragePlanInput {
   riskBudgetUsd: string;
   targetMarginMultiplier?: string;
   maximumMarginMultiplier?: string;
+  /**
+   * Absolute minimum isolated margin in USD. Zero (the default) DISABLES the
+   * floor and keeps closest-to-target selection; any positive value both
+   * rejects candidates below it and switches the selector to "smallest margin
+   * at or above the floor".
+   *
+   * Absolute dollars rather than a risk multiplier because the reason for a
+   * floor is absolute — a position whose margin is a few dollars sits close to
+   * liquidation and is dominated by fees regardless of what its risk budget
+   * happens to be. It is deliberately NOT expressed against `riskBudgetUsd`,
+   * so raising the risk budget cannot quietly raise the floor with it.
+   */
+  minimumMarginUsd?: string;
   liquidationBufferRatio?: string;
   /**
    * User-side automation leverage ceiling (positive integer, default 25).
@@ -200,8 +244,14 @@ export interface DynamicLeveragePlan {
 
   targetMarginMultiplier: string;
   maximumMarginMultiplier: string;
+  /** The configured floor, echoed back. "0" means the floor is disabled. */
+  minimumMarginUsd: string;
   targetIsolatedMargin: string | null;
   maximumIsolatedMargin: string | null;
+  /** The effective floor, or null when the floor is disabled. */
+  minimumIsolatedMargin: string | null;
+  /** Which rule chose `selectedLeverage`; set from the configuration, always present. */
+  marginSelectionMode: MarginSelectionMode;
 
   applicableBracket: ResolvedBracketSummary | null;
   /** Bracket initialLeverage (kept for compatibility; equals binanceMaximumSupportedLeverage). */
@@ -271,8 +321,11 @@ function baseResult(input: DynamicLeveragePlanInput): DynamicLeveragePlan {
     minimumNotional: input.filters.minNotional,
     targetMarginMultiplier: input.targetMarginMultiplier ?? MARGIN_ENGINE_DEFAULTS.targetMarginMultiplier,
     maximumMarginMultiplier: input.maximumMarginMultiplier ?? MARGIN_ENGINE_DEFAULTS.maximumMarginMultiplier,
+    minimumMarginUsd: input.minimumMarginUsd ?? MARGIN_ENGINE_DEFAULTS.minimumMarginUsd,
     targetIsolatedMargin: null,
     maximumIsolatedMargin: null,
+    minimumIsolatedMargin: null,
+    marginSelectionMode: "CLOSEST_TO_TARGET",
     applicableBracket: null,
     maximumSupportedLeverage: null,
     binanceMaximumSupportedLeverage: null,
@@ -498,6 +551,7 @@ export function calculateDynamicLeveragePlan(input: DynamicLeveragePlanInput): D
   const risk = parse(input.riskBudgetUsd);
   const targetMultiplier = parse(result.targetMarginMultiplier);
   const maxMultiplier = parse(result.maximumMarginMultiplier);
+  const minimumMargin = parse(result.minimumMarginUsd);
   const bufferRatio = parse(result.liquidationBufferRatio);
 
   if (entry === null || entry.lte(0)) {
@@ -522,6 +576,32 @@ export function calculateDynamicLeveragePlan(input: DynamicLeveragePlanInput): D
   }
   if (bufferRatio === null || bufferRatio.lt(0)) {
     return fail(result, "INVALID", "INVALID_MULTIPLIERS", "Liquidation buffer ratio must be zero or greater.");
+  }
+  // Same convention as the buffer ratio: zero is a legitimate "off", anything
+  // negative or unparseable is a misconfiguration and never defaulted away.
+  if (minimumMargin === null || minimumMargin.lt(0)) {
+    return fail(result, "INVALID", "INVALID_MULTIPLIERS", "Minimum isolated margin must be zero or greater.");
+  }
+
+  // A positive floor switches the selector; zero leaves every historical
+  // behaviour exactly as it was. Recorded before any other failure can return,
+  // so even a rejected plan reports which rule was configured.
+  const floorEnabled = minimumMargin.gt(0);
+  result.marginSelectionMode = floorEnabled ? "SMALLEST_ABOVE_FLOOR" : "CLOSEST_TO_TARGET";
+  result.minimumIsolatedMargin = floorEnabled ? out(minimumMargin) : null;
+
+  // An impossible band would otherwise surface as a puzzling "no leverage
+  // works" at trade time. `maximumMargin` is only derived further down, but
+  // both of its inputs are validated by now, so the contradiction is caught
+  // here — before any sizing work and independently of market data.
+  if (floorEnabled && minimumMargin.gt(risk.times(maxMultiplier))) {
+    return fail(
+      result,
+      "INVALID",
+      "MARGIN_FLOOR_EXCEEDS_MAXIMUM",
+      `Minimum isolated margin ${minimumMargin.toString()} exceeds the maximum ${risk.times(maxMultiplier).toString()} ` +
+        `(risk budget ${risk.toString()} × ${maxMultiplier.toString()}); no margin can satisfy both.`
+    );
   }
   if (input.direction === "LONG" && stop.gte(entry)) {
     return fail(result, "INVALID", "INVALID_STOP_RELATION", "LONG requires stopLoss < entryPrice.");
@@ -769,7 +849,22 @@ export function calculateDynamicLeveragePlan(input: DynamicLeveragePlanInput): D
         estimatedLiquidationPrice: null,
         marginDifferenceFromTarget: out(difference) as string,
         eligible: false,
-        rejectionReason: "estimated margin exceeds the maximum isolated margin",
+        rejectionReason: REJECTED_ABOVE_MAXIMUM,
+      });
+      continue;
+    }
+
+    // The floor rejects from below exactly as the ceiling rejects from above.
+    // Quantity and notional were fixed long before this loop and are NEVER
+    // revisited to reach the floor — only the leverage changes.
+    if (floorEnabled && margin.lt(minimumMargin)) {
+      candidates.push({
+        leverage,
+        estimatedInitialMargin: out(margin) as string,
+        estimatedLiquidationPrice: null,
+        marginDifferenceFromTarget: out(difference) as string,
+        eligible: false,
+        rejectionReason: REJECTED_BELOW_MINIMUM,
       });
       continue;
     }
@@ -806,16 +901,27 @@ export function calculateDynamicLeveragePlan(input: DynamicLeveragePlanInput): D
       estimatedLiquidationPrice: out(liquidation),
       marginDifferenceFromTarget: out(difference) as string,
       eligible: safe,
-      rejectionReason: safe ? null : "estimated liquidation price is inside the required safety buffer",
+      rejectionReason: safe ? null : REJECTED_LIQUIDATION_UNSAFE,
     });
 
     if (!safe) continue;
 
-    // Closest to target wins; ascending iteration makes ties keep the LOWER
-    // leverage (strict improvement only).
-    const distance = difference.abs();
-    if (best === null || distance.lt(best.difference)) {
-      best = { leverage, margin, liquidation, difference: distance };
+    // Only liquidation-safe candidates ever reach here, so neither rule can
+    // trade safety away for a nicer margin.
+    if (floorEnabled) {
+      // Smallest margin at or above the floor. Compared on the margin itself
+      // rather than relying on margin descending as leverage ascends, so the
+      // rule stays correct if candidate generation is ever reordered.
+      if (best === null || margin.lt(best.margin)) {
+        best = { leverage, margin, liquidation, difference: difference.abs() };
+      }
+    } else {
+      // Closest to target wins; ascending iteration makes ties keep the LOWER
+      // leverage (strict improvement only).
+      const distance = difference.abs();
+      if (best === null || distance.lt(best.difference)) {
+        best = { leverage, margin, liquidation, difference: distance };
+      }
     }
   }
 
@@ -843,6 +949,10 @@ export function calculateDynamicLeveragePlan(input: DynamicLeveragePlanInput): D
       for (let leverage = usableMaximumLeverage + 1; leverage <= bracket.maxLeverage; leverage += 1) {
         const margin = positionNotional.div(leverage);
         if (margin.gt(maximumMargin)) continue;
+        // Above the cap means MORE leverage and therefore a SMALLER margin, so
+        // the floor must be applied here too. Without it the plan would blame
+        // the user cap for a leverage the floor would have rejected anyway.
+        if (floorEnabled && margin.lt(minimumMargin)) continue;
         const estimate = estimateIsolatedLiquidationPrice({
           direction: input.direction,
           quantity: out(roundedQuantity) as string,
@@ -864,9 +974,7 @@ export function calculateDynamicLeveragePlan(input: DynamicLeveragePlanInput): D
       }
     }
 
-    const allExceedMaximum = candidates.every(
-      (candidate) => candidate.rejectionReason === "estimated margin exceeds the maximum isolated margin"
-    );
+    const allExceedMaximum = candidates.every((candidate) => candidate.rejectionReason === REJECTED_ABOVE_MAXIMUM);
     if (allExceedMaximum) {
       return fail(
         result,
@@ -875,6 +983,29 @@ export function calculateDynamicLeveragePlan(input: DynamicLeveragePlanInput): D
         `Every usable leverage needs more than the maximum isolated margin ${maximumMargin.toString()}.`
       );
     }
+
+    // Third distinct case, deliberately not folded into either neighbour: the
+    // margin BAND excluded every leverage before liquidation was ever
+    // consulted, and since the all-above-maximum case already returned, the
+    // floor is what closed it. A candidate that reached the liquidation test
+    // and failed there is NOT this case — that stays the liquidation reason
+    // below, so enabling a floor can never disguise a liquidation problem.
+    const noneReachedLiquidationTest = candidates.every(
+      (candidate) =>
+        candidate.rejectionReason === REJECTED_ABOVE_MAXIMUM || candidate.rejectionReason === REJECTED_BELOW_MINIMUM
+    );
+    if (floorEnabled && noneReachedLiquidationTest) {
+      const belowFloor = candidates.filter((candidate) => candidate.rejectionReason === REJECTED_BELOW_MINIMUM).length;
+      return fail(
+        result,
+        "SKIPPED",
+        "NO_LEVERAGE_MEETS_MARGIN_FLOOR",
+        `No usable leverage lands in the isolated-margin band ${minimumMargin.toString()}–${maximumMargin.toString()}: ` +
+          `${belowFloor} of ${candidates.length} candidate(s) fall below the minimum. ` +
+          `Quantity was not increased to reach it.`
+      );
+    }
+
     return fail(
       result,
       "SKIPPED",

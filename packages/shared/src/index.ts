@@ -103,6 +103,7 @@ export type {
   MarginPlanReason,
   MarginPlanStatus,
   MarginPlanSymbolFilters,
+  MarginSelectionMode,
   ResolvedBracketSummary,
   StopLossSource,
 } from "./binance-margin-engine";
@@ -110,6 +111,7 @@ export {
   MARGIN_ENGINE_DEFAULTS,
   MARGIN_PLAN_REASONS,
   MARGIN_PLAN_STATUSES,
+  MARGIN_SELECTION_MODES,
   STOP_LOSS_SOURCES,
   STOP_PRICE_NORMALIZED_TO_TICK,
   SUPPORTED_CONTRACT_TYPES,

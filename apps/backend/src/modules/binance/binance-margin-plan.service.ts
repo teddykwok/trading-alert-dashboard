@@ -28,6 +28,8 @@ export interface MarginPlanRequest {
   /** Local overrides; default to the validated env policy. */
   targetMarginMultiplier?: string;
   maximumMarginMultiplier?: string;
+  /** Absolute USD floor; "0" disables it. See BINANCE_MIN_MARGIN_USD. */
+  minimumMarginUsd?: string;
   liquidationBufferRatio?: string;
   userMaximumAutomationLeverage?: number;
 }
@@ -121,6 +123,7 @@ export class BinanceMarginPlanService {
       riskBudgetUsd: request.riskBudgetUsd,
       targetMarginMultiplier: request.targetMarginMultiplier ?? env.BINANCE_TARGET_MARGIN_MULTIPLIER,
       maximumMarginMultiplier: request.maximumMarginMultiplier ?? env.BINANCE_MAX_MARGIN_MULTIPLIER,
+      minimumMarginUsd: request.minimumMarginUsd ?? env.BINANCE_MIN_MARGIN_USD,
       liquidationBufferRatio: request.liquidationBufferRatio ?? env.BINANCE_LIQUIDATION_BUFFER_RATIO,
       userMaximumAutomationLeverage:
         request.userMaximumAutomationLeverage ?? env.BINANCE_MAX_AUTOMATION_LEVERAGE,

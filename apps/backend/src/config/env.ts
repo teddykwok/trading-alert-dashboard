@@ -159,6 +159,14 @@ const envSchema = z.object({
   // (risk × multiplier); maximum is a hard capital ceiling.
   BINANCE_TARGET_MARGIN_MULTIPLIER: positiveDecimalString.default("2.5"),
   BINANCE_MAX_MARGIN_MULTIPLIER: positiveDecimalString.default("3.333333"),
+  // Absolute isolated-margin FLOOR in USD, not a multiplier: a few dollars of
+  // margin sits close to liquidation whatever the risk budget is, so the floor
+  // must not scale with it. "0" DISABLES it and keeps closest-to-target
+  // selection — the default is "0" precisely so that adding this variable
+  // cannot change what an existing installation trades. Kept as a literal like
+  // its neighbours (config/env does not import the shared package); a test
+  // pins it to MARGIN_ENGINE_DEFAULTS.minimumMarginUsd so the two cannot drift.
+  BINANCE_MIN_MARGIN_USD: nonNegativeDecimalString.default("0"),
   // Liquidation must sit at least stopDistance × ratio beyond the stop loss.
   BINANCE_LIQUIDATION_BUFFER_RATIO: nonNegativeDecimalString.default("0.5"),
   // User-side automation leverage ceiling. The engine's usable maximum is

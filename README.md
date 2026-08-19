@@ -284,6 +284,7 @@ database, and is **not** wired into the alert pipeline. See
 | `BINANCE_RECV_WINDOW_MS` | Signed-request validity window. Binance maximum is `60000`. | `5000` |
 | `BINANCE_TARGET_MARGIN_MULTIPLIER` | Preferred isolated margin = risk budget × this. Decimal string. | `2.5` |
 | `BINANCE_MAX_MARGIN_MULTIPLIER` | Hard isolated-margin ceiling = risk budget × this. Must be ≥ the target multiplier. | `3.333333` |
+| `BINANCE_MIN_MARGIN_USD` | Absolute isolated-margin floor in USD (**not** a multiplier). `0` disables it and keeps closest-to-target selection; any positive value rejects candidates below it and selects the **smallest** margin at or above it. Quantity/notional are never increased to reach it. Must not exceed `riskBudget × BINANCE_MAX_MARGIN_MULTIPLIER`. | `0` |
 | `BINANCE_LIQUIDATION_BUFFER_RATIO` | Liquidation must sit at least `stopDistance × ratio` beyond the stop loss. | `0.5` |
 | `BINANCE_MAX_AUTOMATION_LEVERAGE` | User-side automation leverage ceiling (integer, max 125). Usable leverage = min(Binance bracket maximum, this). Recommendation only — never applied to the account. | `25` |
 
