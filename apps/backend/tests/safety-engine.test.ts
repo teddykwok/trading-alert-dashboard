@@ -676,6 +676,87 @@ describe("risk and margin ceilings", () => {
   });
 });
 
+/**
+ * The intended single-trade policy, at the aggregate boundary.
+ *
+ * Admission reserves `maximumIsolatedMargin` (risk × BINANCE_MAX_MARGIN_MULTIPLIER),
+ * never the smaller selected margin, so the aggregate ceiling has to clear the
+ * per-plan ceiling for even ONE trade to be admissible. These pin that the
+ * recommended pair (1.50 × 5.333333 = 7.9999995 against 8.00) actually fits,
+ * and that nothing above it does.
+ */
+describe("intended policy: aggregate isolated-margin ceiling of 8.00", () => {
+  const intended = () => policy({ maxTotalIsolatedMarginUsd: "8.00" });
+
+  it("admits one plan reserving the full per-plan maximum 7.9999995", () => {
+    const result = evaluate({
+      policy: intended(),
+      proposed: proposed({ riskBudgetUsd: "1.50", maximumIsolatedMargin: "7.9999995" }),
+      local: local({ reservedRiskUsd: "0", reservedMaximumMarginUsd: "0" }),
+    });
+    expect(result.decision).toBe("PASS");
+    expect(result.capacityProjected.reservedMarginUsd).toBe("7.9999995");
+  });
+
+  it("admits a plan sitting exactly ON the 8.00 ceiling", () => {
+    const result = evaluate({
+      policy: intended(),
+      proposed: proposed({ riskBudgetUsd: "1.50", maximumIsolatedMargin: "8.00" }),
+      local: local({ reservedRiskUsd: "0", reservedMaximumMarginUsd: "0" }),
+    });
+    expect(result.decision).toBe("PASS");
+  });
+
+  it("rejects one cent over the ceiling", () => {
+    const result = evaluate({
+      policy: intended(),
+      proposed: proposed({ riskBudgetUsd: "1.50", maximumIsolatedMargin: "8.01" }),
+      local: local({ reservedRiskUsd: "0", reservedMaximumMarginUsd: "0" }),
+    });
+    expect(reasonCodes(result)).toContain("TOTAL_MARGIN_LIMIT_REACHED");
+  });
+
+  it("rejects the smallest representable amount over the ceiling", () => {
+    // Decimal(30,12) on the policy column, so 1e-12 is the real granularity.
+    const result = evaluate({
+      policy: intended(),
+      proposed: proposed({ riskBudgetUsd: "1.50", maximumIsolatedMargin: "8.000000000001" }),
+      local: local({ reservedRiskUsd: "0", reservedMaximumMarginUsd: "0" }),
+    });
+    expect(reasonCodes(result)).toContain("TOTAL_MARGIN_LIMIT_REACHED");
+  });
+
+  it("still refuses a SECOND trade — the 8.00 ceiling is for one, and capacity is 1", () => {
+    // Even if margin somehow fit, maxTotalActiveTrades is the binding limit.
+    // This is the guard against reading "8.00" as room for two $4 trades.
+    const result = evaluate({
+      policy: intended(),
+      proposed: proposed({ riskBudgetUsd: "1.50", maximumIsolatedMargin: "4.00" }),
+      local: local({
+        totalActiveCount: 1,
+        pendingEntryCount: 1,
+        reservedRiskUsd: "1.50",
+        reservedMaximumMarginUsd: "4.00",
+      }),
+    });
+    expect(reasonCodes(result)).toContain("TOTAL_ACTIVE_LIMIT_REACHED");
+    expect(reasonCodes(result)).toContain("PENDING_ENTRY_LIMIT_REACHED");
+    // And the risk cap bites independently of margin.
+    expect(reasonCodes(result)).toContain("TOTAL_RISK_LIMIT_REACHED");
+    expect(result.decision).toBe("SKIP");
+  });
+
+  it("leaves the planned-risk ceiling at 1.50 regardless of the margin change", () => {
+    const result = evaluate({
+      policy: intended(),
+      proposed: proposed({ riskBudgetUsd: "1.51", maximumIsolatedMargin: "7.9999995" }),
+      local: local({ reservedRiskUsd: "0", reservedMaximumMarginUsd: "0" }),
+    });
+    expect(intended().maxTotalPlannedRiskUsd).toBe("1.50");
+    expect(reasonCodes(result)).toContain("TOTAL_RISK_LIMIT_REACHED");
+  });
+});
+
 describe("available balance", () => {
   it("rejects when the effective available balance is below the required margin", () => {
     const result = evaluate({ binance: binance({ usdtAvailableBalance: "2.99" }) });

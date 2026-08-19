@@ -334,6 +334,33 @@ and every other limit resolves to the **stricter** of the two.
 | `EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD` | Ceiling on summed reserved **maximum** isolated margins. Decimal string. | `5.00` |
 | `EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE` | Active executions per symbol **and** side. | `1` |
 | `EXECUTION_MAX_ALERT_AGE_SECONDS` | Freshness ceiling, measured from the original signal time. | `300` |
+
+#### Recommended single-trade margin policy
+
+The `Default` column above and in the Phase 3 table is the **code fallback**,
+deliberately unchanged. Both `.env.example` files carry the **recommended**
+policy for this project, the same split `EXECUTION_ENTRY_TTL_SECONDS` uses.
+Copying the example adopts it; an existing `.env` keeps what it had.
+
+| Concept | Value | Where it comes from |
+| --- | --- | --- |
+| Risk per trade | `1.50` | `EXECUTION_MAX_TOTAL_PLANNED_RISK_USD` (unchanged) |
+| Minimum isolated margin | `5.50` | `BINANCE_MIN_MARGIN_USD` (code default `0` = off) |
+| Target diagnostic margin | `6.00` | `1.50 × BINANCE_TARGET_MARGIN_MULTIPLIER` = `1.50 × 4` |
+| Maximum per-plan margin | `7.9999995` | `1.50 × BINANCE_MAX_MARGIN_MULTIPLIER` = `1.50 × 5.333333` |
+| Aggregate isolated margin | `8.00` | `EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD` (code default `5.00`) |
+| Concurrent trades | `1` | `EXECUTION_MAX_TOTAL_ACTIVE_TRADES` (unchanged) |
+
+The max multiplier is **truncated, never rounded up**, so the per-plan ceiling
+lands just under the aggregate ceiling — the same convention `3.333333` uses to
+stay under `5.00`. Admission reserves the **maximum**, not the selected margin,
+which is why the aggregate ceiling must be ≥ the per-plan ceiling for even one
+trade to be admissible. `8.00` is the ceiling for **one** trade, not room for a
+second; `EXECUTION_MAX_TOTAL_ACTIVE_TRADES = 1` is what bounds the count.
+
+The effective limit is `min(env global, ExecutionSafetyPolicy row)`, so raising
+the env alone changes nothing until the profile row is raised too — the canary
+preflight prints both and the resulting effective value.
 | `EXECUTION_SIGNAL_FUTURE_TOLERANCE_SECONDS` | Tolerance for a signal timestamp slightly ahead of local time (clock skew). | `5` |
 
 Reaching a limit skips **only the requesting execution** — existing

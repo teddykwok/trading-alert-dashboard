@@ -31,7 +31,22 @@ export const EXTREME_RR_DEFAULT_LOOKBACK: ExtremeRRLookback = 300;
 export const EXTREME_RR_LEVERAGE_PRESETS = [5, 10, 15, 20, 25] as const;
 export type ExtremeRRLeverage = (typeof EXTREME_RR_LEVERAGE_PRESETS)[number];
 
-/** The user's preferred estimated isolated-margin band, in USD. */
+/**
+ * The user's preferred estimated isolated-margin band, in USD.
+ *
+ * INFORMATIONAL ONLY — this band belongs to the dashboard's preset table
+ * (`buildLeverageAnalysis`) and is deliberately NOT the execution policy. The
+ * execution engine has its own band, configured through BINANCE_MIN_MARGIN_USD
+ * and BINANCE_MAX_MARGIN_MULTIPLIER, and currently recommends 5.50–8.00 at a
+ * 1.50 risk budget. The two do not agree, and that is a known divergence, not
+ * an oversight: this model applies no exchange filters, no leverage brackets
+ * and no liquidation estimate, so its numbers could not safely drive a trade.
+ * A test pins that these constants never reach the execution path.
+ *
+ * Reconciling the two bands is a separate future branch — deliberately not
+ * folded into the margin-policy work, because wiring a presentation constant
+ * into execution is exactly the change that needs its own review.
+ */
 export const EXTREME_RR_PREFERRED_MARGIN_MIN = "6";
 export const EXTREME_RR_PREFERRED_MARGIN_MAX = "10";
 

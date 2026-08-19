@@ -69,14 +69,28 @@ export const BLOCKER_SCOPE: Record<Exclude<CanaryReadinessCode, "CANARY_READY">,
   CANARY_BLOCKED_GATE_STATE: "LIVE_ACTIVATION",
 };
 
-/** The exact policy the initial $1.50 canary requires. */
+/**
+ * The exact policy the initial $1.50 canary requires.
+ *
+ * Capacity stays at one trade in every dimension. Only the aggregate margin
+ * ceiling moved, and only because admission reserves `maximumIsolatedMargin`
+ * (risk × BINANCE_MAX_MARGIN_MULTIPLIER), never the smaller selected margin:
+ * at the recommended 5.333333 multiplier a single $1.50 plan reserves
+ * $7.9999995, so a $5.00 aggregate ceiling could not admit even ONE trade.
+ * $8.00 is therefore the one-trade ceiling, NOT room for a second trade —
+ * maxTotalActiveTrades = 1 is what bounds the count.
+ *
+ * These are compared against the ENV globals (see canary-preflight.service),
+ * so raising the ceiling here fails the preflight closed until an operator
+ * sets EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD deliberately.
+ */
 export const CANARY_POLICY = {
   maxOpenPositions: 1,
   maxPendingEntries: 1,
   maxTotalActiveTrades: 1,
   maxActivePerSymbolSide: 1,
   maxTotalPlannedRiskUsd: "1.50",
-  maxTotalIsolatedMarginUsd: "5.00",
+  maxTotalIsolatedMarginUsd: "8.00",
 } as const;
 
 export interface InfrastructureState {

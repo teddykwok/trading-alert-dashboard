@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { Prisma, PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { CanaryPreflightService } from "./canary-preflight.service";
 import { CANARY_POLICY } from "./canary-readiness";
@@ -76,6 +76,14 @@ async function main(): Promise<void> {
         : `${env.BINANCE_MIN_MARGIN_USD} (smallest margin at or above the floor)`
     );
 
+    // The multipliers are the configuration; DOLLARS are what the policy is
+    // actually reasoned about in. Derived at the planned-risk cap, which is
+    // the whole budget while maxTotalActiveTrades is 1. Display only — the
+    // engine derives its own envelope from each plan's own risk budget.
+    const referenceRisk = new Prisma.Decimal(policy.maxTotalPlannedRiskUsd);
+    line("  → target margin at that risk", referenceRisk.times(env.BINANCE_TARGET_MARGIN_MULTIPLIER).toFixed());
+    line("  → maximum per-plan margin", referenceRisk.times(env.BINANCE_MAX_MARGIN_MULTIPLIER).toFixed());
+
     section("Safety posture");
     line("globalKillSwitch", gates.globalKillSwitch);
     line("profileKillSwitchEngaged", gates.profileKillSwitchEngaged);
@@ -104,6 +112,21 @@ async function main(): Promise<void> {
       line("profile", `resolved (${profile.environment})`);
       line("profile isEnabled", profile.isEnabled);
       line("profile killSwitchActive", profile.safetyPolicy?.killSwitchActive ?? null);
+      // The limits above are the ENV globals; the profile row is a SECOND
+      // clamp and the effective policy is min(global, row). The preflight
+      // blockers only judge the globals, so the row is printed here — a row
+      // still at 5.00 silently caps an 8.00 global, and that would otherwise
+      // be invisible until an admission failed with TOTAL_MARGIN_LIMIT_REACHED.
+      const row = profile.safetyPolicy;
+      line("row maxTotalActiveTrades", row ? row.maxTotalActiveTrades : null);
+      line("row maxTotalPlannedRiskUsd", row ? row.maxTotalPlannedRiskUsd.toFixed() : null);
+      line("row maxTotalIsolatedMarginUsd", row ? row.maxTotalIsolatedMarginUsd.toFixed() : null);
+      if (row) {
+        // Effective = min(global, row), the same rule resolveEffectivePolicy uses.
+        const globalCap = new Prisma.Decimal(policy.maxTotalIsolatedMarginUsd);
+        const rowCap = new Prisma.Decimal(row.maxTotalIsolatedMarginUsd.toFixed());
+        line("  → effective aggregate margin", (rowCap.lessThan(globalCap) ? rowCap : globalCap).toFixed());
+      }
       // [] means ALLOW ALL — always worth seeing explicitly.
       const allowed = profile.safetyPolicy?.allowedSymbols ?? [];
       line("allowedSymbols", allowed.length === 0 ? "[] (ALLOW ALL)" : `[${allowed.join(", ")}]`);

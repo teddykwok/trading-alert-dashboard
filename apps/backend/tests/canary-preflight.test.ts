@@ -61,7 +61,7 @@ function baseline(overrides: Partial<CanaryPreflightInput> = {}): CanaryPrefligh
       maxTotalActiveTrades: 1,
       maxActivePerSymbolSide: 1,
       maxTotalPlannedRiskUsd: "1.50",
-      maxTotalIsolatedMarginUsd: "5.00",
+      maxTotalIsolatedMarginUsd: "8.00",
       ...overrides.policy,
     },
     gates: {
@@ -219,8 +219,23 @@ describe("canary policy", () => {
       maxTotalActiveTrades: 1,
       maxActivePerSymbolSide: 1,
       maxTotalPlannedRiskUsd: "1.50",
-      maxTotalIsolatedMarginUsd: "5.00",
+      // 8.00 is the ONE-trade aggregate ceiling, sized so a single plan
+      // reserving risk × 5.333333 = 7.9999995 fits. Capacity above is still 1
+      // in every dimension — this is not room for a second trade.
+      maxTotalIsolatedMarginUsd: "8.00",
     });
+  });
+
+  it("keeps the aggregate margin ceiling at or above the recommended per-plan ceiling", () => {
+    // Admission reserves maximumIsolatedMargin, so a canary policy below the
+    // per-plan ceiling could never admit even one trade. Both numbers are read
+    // from their real homes rather than restated here.
+    const example = readFileSync(path.join(process.cwd(), ".env.example"), "utf8");
+    const value = (key: string) => example.match(new RegExp(`^${key}=(.*)$`, "m"))![1].trim();
+    const perPlanCeiling =
+      Number(value("EXECUTION_MAX_TOTAL_PLANNED_RISK_USD")) * Number(value("BINANCE_MAX_MARGIN_MULTIPLIER"));
+    expect(perPlanCeiling).toBeLessThanOrEqual(Number(CANARY_POLICY.maxTotalIsolatedMarginUsd));
+    expect(value("EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD")).toBe(CANARY_POLICY.maxTotalIsolatedMarginUsd);
   });
 
   it("blocks a widened open, pending or active limit", () => {
@@ -236,10 +251,14 @@ describe("canary policy", () => {
     );
   });
 
-  it("blocks isolated margin above 5.00", () => {
-    expect(codesOf(baseline({ policy: { maxTotalIsolatedMarginUsd: "10.00" } as never }))).toContain(
-      "CANARY_BLOCKED_POLICY"
-    );
+  it("blocks any isolated-margin ceiling that is not exactly the canary value", () => {
+    // Exact equality in BOTH directions: too high is unreviewed headroom, and
+    // too low (e.g. an environment still on the old 5.00) cannot fund one plan.
+    for (const value of ["10.00", "5.00"]) {
+      expect(codesOf(baseline({ policy: { maxTotalIsolatedMarginUsd: value } as never })), value).toContain(
+        "CANARY_BLOCKED_POLICY"
+      );
+    }
   });
 
   it("compares risk as an exact decimal, not a string", () => {

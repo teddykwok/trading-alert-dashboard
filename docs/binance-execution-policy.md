@@ -113,6 +113,34 @@ maximum** — `min(bracket initialLeverage, BINANCE_MAX_AUTOMATION_LEVERAGE)`
 part) — computes `estimatedInitialMargin = notional / leverage`, discards
 anything above the maximum margin or failing liquidation safety, then picks
 the smallest `|margin − targetMargin|`; ties keep the **lower** leverage.
+
+`BINANCE_MIN_MARGIN_USD` adds an optional **absolute** floor in USD (not a
+multiplier — a few dollars of margin sits close to liquidation whatever the
+risk budget is). `0`, the code default, disables it and leaves the rule above
+untouched. Any positive value:
+
+* makes `estimatedInitialMargin < floor` ineligible, exactly as the maximum
+  makes anything above it ineligible; and
+* switches selection to the **smallest** margin at or above the floor, instead
+  of the nearest to the target.
+
+Liquidation safety is unchanged and still authoritative: a candidate that
+clears the floor but sits inside the safety buffer stays ineligible, and the
+next-smallest safe candidate is chosen instead. Three failures stay distinct —
+`REQUIRED_MARGIN_EXCEEDS_MAXIMUM` (band closed from above),
+`NO_LEVERAGE_MEETS_MARGIN_FLOOR` (band closed from below, before liquidation
+was consulted) and `NO_LIQUIDATION_SAFE_LEVERAGE` (candidates reached the
+liquidation test and failed it). A floor above the maximum is a configuration
+error and fails closed with `MARGIN_FLOOR_EXCEEDS_MAXIMUM`.
+
+**Quantity and notional are never touched by any of this.** Both are fixed from
+the risk budget and the entry-to-stop distance before the first leverage is
+considered; only the leverage changes.
+
+Recommended policy for this project (in both `.env.example` files; the code
+defaults stay conservative): floor `5.50`, target multiplier `4` (= `6.00` at a
+`1.50` budget), max multiplier `5.333333` (= `7.9999995`), aggregate ceiling
+`8.00`, one active trade.
 When Binance would allow a safe plan at a leverage above the user cap but
 nothing at or below the cap qualifies, the plan is skipped with
 `USER_LEVERAGE_CAP_PREVENTS_SAFE_PLAN`.
@@ -220,7 +248,7 @@ applies. Defaults are the locked canary values and fail closed:
 | `EXECUTION_MAX_PENDING_ENTRIES` | 1 | Concurrent pending entries |
 | `EXECUTION_MAX_TOTAL_ACTIVE_TRADES` | 1 | Union of the two above |
 | `EXECUTION_MAX_TOTAL_PLANNED_RISK_USD` | 1.50 | Sum of reserved risk budgets |
-| `EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD` | 5.00 | Sum of reserved maximum margins |
+| `EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD` | 5.00 | Sum of reserved maximum margins (recommended: `8.00`) |
 | `EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE` | 1 | Active trades per symbol AND side |
 | `EXECUTION_MAX_ALERT_AGE_SECONDS` | 300 | Signal freshness ceiling |
 

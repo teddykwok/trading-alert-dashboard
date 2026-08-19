@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  EXTREME_RR_PREFERRED_MARGIN_MAX,
+  EXTREME_RR_PREFERRED_MARGIN_MIN,
   MARGIN_ENGINE_DEFAULTS,
   calculateDynamicLeveragePlan,
   estimateIsolatedLiquidationPrice,
@@ -574,25 +576,232 @@ describe("minimum-margin floor configuration", () => {
   const BACKEND = process.cwd();
   const read = (relative: string) => readFileSync(path.join(BACKEND, relative), "utf8");
 
-  it("defaults the env variable to the shared disabled value", () => {
+  it("keeps the CODE default disabled, so adding the mechanism changed nothing", () => {
     // config/env deliberately does not import the shared package, so the "0"
-    // literal there is pinned to the engine default here instead.
+    // literal there is pinned to the engine default here instead. This is the
+    // fallback for an installation that never sets the variable, and it must
+    // stay 0 even though .env.example now recommends a live floor.
     expect(MARGIN_ENGINE_DEFAULTS.minimumMarginUsd).toBe("0");
     expect(read("src/config/env.ts")).toContain('BINANCE_MIN_MARGIN_USD: nonNegativeDecimalString.default("0")');
-  });
-
-  it("documents the floor as disabled in both .env.example files", () => {
-    for (const file of [path.join(BACKEND, ".env.example"), path.join(BACKEND, "..", "..", ".env.example")]) {
-      const source = readFileSync(file, "utf8");
-      expect(source).toContain("BINANCE_MIN_MARGIN_USD=0");
-      // A shipped example must never arm the floor for someone who copies it.
-      expect(source).not.toMatch(/^BINANCE_MIN_MARGIN_USD=(?!0\s*$).+$/m);
-    }
+    expect(read("src/config/env.ts")).toContain('BINANCE_TARGET_MARGIN_MULTIPLIER: positiveDecimalString.default("2.5")');
+    expect(read("src/config/env.ts")).toContain('BINANCE_MAX_MARGIN_MULTIPLIER: positiveDecimalString.default("3.333333")');
   });
 
   it("passes the configured floor through the plan service to the engine", () => {
     const service = read("src/modules/binance/binance-margin-plan.service.ts");
     expect(service).toContain("minimumMarginUsd: request.minimumMarginUsd ?? env.BINANCE_MIN_MARGIN_USD");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The intended single-trade margin policy, read from the shipped example
+// ---------------------------------------------------------------------------
+
+/**
+ * The recommended policy lives in `.env.example`, not in a constant, because a
+ * third declaration of the same numbers is exactly how the STOP/TP working
+ * types drifted apart. These tests therefore READ the shipped example and feed
+ * its literal values to the engine: if someone edits the file, the engine
+ * behaviour asserted here is what they get, or the suite fails.
+ *
+ * The code defaults stay conservative (previous describe). This is the
+ * `EXECUTION_ENTRY_TTL_SECONDS` split: fallback in the schema, recommendation
+ * in the example.
+ */
+describe("intended single-trade margin policy", () => {
+  const BACKEND = process.cwd();
+  const EXAMPLES = [path.join(BACKEND, ".env.example"), path.join(BACKEND, "..", "..", ".env.example")];
+
+  /** Reads one KEY=VALUE out of an example file, ignoring comments. */
+  const setting = (source: string, key: string): string => {
+    const match = source.match(new RegExp(`^${key}=(.*)$`, "m"));
+    if (!match) throw new Error(`${key} is missing from .env.example`);
+    return match[1].trim();
+  };
+
+  const backendExample = readFileSync(EXAMPLES[0], "utf8");
+  const POLICY = {
+    riskBudgetUsd: setting(backendExample, "EXECUTION_MAX_TOTAL_PLANNED_RISK_USD"),
+    minimumMarginUsd: setting(backendExample, "BINANCE_MIN_MARGIN_USD"),
+    targetMarginMultiplier: setting(backendExample, "BINANCE_TARGET_MARGIN_MULTIPLIER"),
+    maximumMarginMultiplier: setting(backendExample, "BINANCE_MAX_MARGIN_MULTIPLIER"),
+  };
+
+  const WHOLE_LOTS: MarginPlanSymbolFilters = { ...FILTERS, stepSize: "1", minQty: "1", minNotional: "5" };
+
+  /** One plan under the shipped policy; only entry/stop vary. */
+  const planFor = (entryPrice: string, stopLoss: string, overrides: Partial<DynamicLeveragePlanInput> = {}) =>
+    calculateDynamicLeveragePlan(
+      input({ ...POLICY, entryPrice, stopLoss, filters: WHOLE_LOTS, liquidationBufferRatio: "0", ...overrides })
+    );
+
+  const marginAt = (plan: ReturnType<typeof calculateDynamicLeveragePlan>, leverage: number) =>
+    plan.candidates.find((candidate) => candidate.leverage === leverage)!;
+
+  // --- The numbers themselves ---------------------------------------------
+
+  it("ships the same recommended policy in BOTH example files", () => {
+    const [backend, root] = EXAMPLES.map((file) => readFileSync(file, "utf8"));
+    for (const key of [
+      "BINANCE_MIN_MARGIN_USD",
+      "BINANCE_TARGET_MARGIN_MULTIPLIER",
+      "BINANCE_MAX_MARGIN_MULTIPLIER",
+      "EXECUTION_MAX_TOTAL_PLANNED_RISK_USD",
+      "EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD",
+      "EXECUTION_MAX_TOTAL_ACTIVE_TRADES",
+    ]) {
+      expect(setting(root, key), key).toBe(setting(backend, key));
+    }
+  });
+
+  it("recommends risk 1.50, floor 5.50, target ×4 and maximum ×5.333333", () => {
+    expect(POLICY.riskBudgetUsd).toBe("1.50");
+    expect(POLICY.minimumMarginUsd).toBe("5.50");
+    expect(POLICY.targetMarginMultiplier).toBe("4");
+    expect(POLICY.maximumMarginMultiplier).toBe("5.333333");
+  });
+
+  it("derives the intended envelope: floor 5.50 <= target 6.00 <= maximum ~8.00", () => {
+    const plan = planFor("11.4", "9.9");
+    expect(plan.minimumIsolatedMargin).toBe("5.5");
+    expect(plan.targetIsolatedMargin).toBe("6"); // 1.50 × 4
+    // 1.50 × 5.333333 — TRUNCATED, so the per-plan ceiling lands just UNDER
+    // the 8.00 aggregate cap rather than just over it.
+    expect(plan.maximumIsolatedMargin).toBe("7.9999995");
+    expect(plan.marginSelectionMode).toBe("SMALLEST_ABOVE_FLOOR");
+
+    expect(compareDecimalStrings(plan.minimumIsolatedMargin as string, plan.targetIsolatedMargin as string)).toBe(-1);
+    expect(compareDecimalStrings(plan.targetIsolatedMargin as string, plan.maximumIsolatedMargin as string)).toBe(-1);
+  });
+
+  it("keeps the per-plan ceiling at or below the aggregate admission cap", () => {
+    // Admission reserves maximumIsolatedMargin, so a per-plan ceiling above the
+    // aggregate cap would make every plan un-admittable. This is the invariant
+    // that binds the two files together.
+    const perPlanCeiling = planFor("11.4", "9.9").maximumIsolatedMargin as string;
+    const aggregateCap = setting(backendExample, "EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD");
+    expect(aggregateCap).toBe("8.00");
+    expect(compareDecimalStrings(perPlanCeiling, aggregateCap)).toBeLessThanOrEqual(0);
+  });
+
+  it("leaves the planned-risk cap and the one-trade capacity untouched", () => {
+    for (const source of EXAMPLES.map((file) => readFileSync(file, "utf8"))) {
+      expect(setting(source, "EXECUTION_MAX_TOTAL_PLANNED_RISK_USD")).toBe("1.50");
+      expect(setting(source, "EXECUTION_MAX_TOTAL_ACTIVE_TRADES")).toBe("1");
+      expect(setting(source, "EXECUTION_MAX_OPEN_POSITIONS")).toBe("1");
+      expect(setting(source, "EXECUTION_MAX_PENDING_ENTRIES")).toBe("1");
+      expect(setting(source, "EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE")).toBe("1");
+    }
+  });
+
+  // --- The three operator scenarios, under the REAL recommended values ------
+
+  it("A: notional 11.4 — candidates 11.40 / 5.70 / 3.80 → 5.70", () => {
+    const plan = planFor("11.4", "9.9");
+    expect(plan.positionNotional).toBe("11.4");
+    expect(marginAt(plan, 1).rejectionReason).toBe("estimated margin exceeds the maximum isolated margin");
+    expect(marginAt(plan, 3).rejectionReason).toBe("estimated margin is below the minimum isolated margin");
+    expect(plan.status).toBe("READY");
+    expect(plan.selectedLeverage).toBe(2);
+    expect(plan.estimatedInitialMargin).toBe("5.7");
+  });
+
+  it("B: notional 24 — candidates 8 / 6 / 4.80 → 6", () => {
+    const plan = planFor("24", "22.5");
+    expect(plan.positionNotional).toBe("24");
+    expect(marginAt(plan, 4).estimatedInitialMargin).toBe("6");
+    expect(marginAt(plan, 5).estimatedInitialMargin).toBe("4.8");
+    // Worth pinning: a candidate at EXACTLY 8 sits above the truncated ceiling
+    // 7.9999995 and is excluded. The answer is 6 either way, but the boundary
+    // is deliberate and should fail loudly if the multiplier is ever rounded up.
+    expect(marginAt(plan, 3).estimatedInitialMargin).toBe("8");
+    expect(marginAt(plan, 3).rejectionReason).toBe("estimated margin exceeds the maximum isolated margin");
+    expect(plan.status).toBe("READY");
+    expect(plan.selectedLeverage).toBe(4);
+    expect(plan.estimatedInitialMargin).toBe("6");
+  });
+
+  it("C: notional 14.8 — only 7.40 clears the floor → 7.40", () => {
+    const plan = planFor("14.8", "13.3");
+    expect(plan.positionNotional).toBe("14.8");
+    expect(marginAt(plan, 3).rejectionReason).toBe("estimated margin is below the minimum isolated margin");
+    expect(plan.status).toBe("READY");
+    expect(plan.selectedLeverage).toBe(2);
+    expect(plan.estimatedInitialMargin).toBe("7.4");
+  });
+
+  // --- Liquidation safety is still the authority ---------------------------
+
+  it("takes the next-smallest candidate when the smallest above the floor is unsafe", () => {
+    // Notional 45 puts THREE candidates in the band: 7.50 (6x), 6.43 (7x) and
+    // 5.625 (8x). With no buffer the smallest wins; with a buffer that makes
+    // only 5.625 unsafe, the next-smallest wins instead.
+    const relaxed = planFor("45", "43.5");
+    expect(relaxed.selectedLeverage).toBe(8);
+    expect(relaxed.estimatedInitialMargin).toBe("5.625");
+
+    const buffered = planFor("45", "43.5", { liquidationBufferRatio: "2.5" });
+    expect(marginAt(buffered, 8).rejectionReason).toBe(
+      "estimated liquidation price is inside the required safety buffer"
+    );
+    expect(buffered.status).toBe("READY");
+    expect(buffered.selectedLeverage).toBe(7);
+  });
+
+  it("fails closed with the LIQUIDATION reason when nothing clears both", () => {
+    const plan = planFor("24", "22.5", { liquidationBufferRatio: "4" });
+    expect(plan.status).toBe("SKIPPED");
+    expect(plan.reason).toBe("NO_LIQUIDATION_SAFE_LEVERAGE");
+    expect(plan.selectedLeverage).toBeNull();
+  });
+
+  // --- The dashboard band is a DIFFERENT model -----------------------------
+
+  it("never lets the Extreme RR dashboard band reach execution", () => {
+    // The dashboard prefers 6–10 USD; execution now recommends 5.50–8.00. They
+    // disagree, and that is fine ONLY because the dashboard constants are
+    // presentational — no exchange filters, no brackets, no liquidation. What
+    // must never happen is one silently becoming the other, so assert the
+    // execution path does not reference them at all.
+    expect(EXTREME_RR_PREFERRED_MARGIN_MIN).toBe("6");
+    expect(EXTREME_RR_PREFERRED_MARGIN_MAX).toBe("10");
+    for (const file of [
+      path.join(BACKEND, "..", "..", "packages", "shared", "src", "binance-margin-engine.ts"),
+      path.join(BACKEND, "src", "modules", "binance", "binance-margin-plan.service.ts"),
+      path.join(BACKEND, "src", "modules", "execution", "selected-plan-executor.ts"),
+      path.join(BACKEND, "src", "modules", "execution", "safety-engine.ts"),
+    ]) {
+      expect(readFileSync(file, "utf8"), file).not.toContain("EXTREME_RR_PREFERRED_MARGIN");
+    }
+  });
+
+  // --- Sizing is untouched by the whole policy ------------------------------
+
+  it("produces IDENTICAL quantity, notional and risk sizing to the old policy", () => {
+    const sizing = (plan: ReturnType<typeof calculateDynamicLeveragePlan>) => ({
+      quantityRaw: plan.quantityRaw,
+      roundedQuantity: plan.roundedQuantity,
+      positionNotional: plan.positionNotional,
+      actualPlannedLoss: plan.actualPlannedLoss,
+      unusedRiskBudget: plan.unusedRiskBudget,
+      riskBudgetUsd: plan.riskBudgetUsd,
+      stopDistance: plan.stopDistance,
+    });
+
+    for (const [entry, stop] of [["11.4", "9.9"], ["24", "22.5"], ["14.8", "13.3"], ["45", "43.5"]]) {
+      const intended = planFor(entry, stop);
+      // The previous policy: no floor, old multipliers, same risk budget.
+      const legacy = calculateDynamicLeveragePlan(
+        input({
+          entryPrice: entry,
+          stopLoss: stop,
+          riskBudgetUsd: POLICY.riskBudgetUsd,
+          filters: WHOLE_LOTS,
+          liquidationBufferRatio: "0",
+        })
+      );
+      expect(sizing(intended), `${entry}/${stop}`).toEqual(sizing(legacy));
+    }
   });
 });
 

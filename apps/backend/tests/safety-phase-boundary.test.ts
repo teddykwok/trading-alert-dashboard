@@ -169,7 +169,11 @@ describe("locked canary configuration", () => {
       const source = readFileSync(file, "utf8");
       expect(source).toContain("EXECUTION_GLOBAL_KILL_SWITCH=true");
       expect(source).toContain("EXECUTION_MAX_TOTAL_PLANNED_RISK_USD=1.50");
-      expect(source).toContain("EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD=5.00");
+      // The example carries the RECOMMENDED aggregate ceiling; the schema
+      // default asserted above stays 5.00. Admission reserves the per-plan
+      // MAXIMUM (risk × 5.333333 = 7.9999995), so 5.00 could not admit even
+      // one trade under the recommended multipliers.
+      expect(source).toContain("EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD=8.00");
       expect(source).toMatch(/blocks NEW admissions ONLY/i);
     }
   });
