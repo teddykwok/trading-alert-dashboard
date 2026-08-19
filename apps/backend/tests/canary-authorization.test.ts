@@ -924,19 +924,112 @@ describe("natural window is inert", () => {
     code: readFileSync(file, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, ""),
   }));
 
-  it("names NATURAL_WINDOW nowhere in production code", () => {
-    // The strongest inertness statement available: no runtime branch can
-    // depend on a value no runtime file mentions. Comments describing the
-    // future shape are stripped above and are deliberately allowed.
-    const offenders = productionCode.filter((entry) => entry.code.includes("NATURAL_WINDOW"));
-    expect(offenders.map((entry) => entry.file)).toEqual([]);
+  /**
+   * Phase 12.2 replaced a repo-wide "the string NATURAL_WINDOW appears nowhere"
+   * assertion with the two below.
+   *
+   * That assertion was the right pin for Phase 12.1, when natural mode was
+   * schema only. It stopped being a statement about INERTNESS the moment the
+   * domain and service primitives existed — it would only have been satisfiable
+   * by not writing Phase 2 at all. What actually has to stay true is narrower
+   * and stronger: the primitives exist, and NO execution entrypoint reaches
+   * them. So these assert on the entrypoints and their imports, which is what
+   * "cannot change live execution behaviour" really means.
+   */
+
+  /** The files that would have to change for natural mode to become live. */
+  const ENTRYPOINTS = [
+    "src/modules/execution/selected-plan-executor.ts",
+    "src/modules/execution/safety-admission.service.ts",
+    "src/modules/execution/safety-engine.ts",
+    "src/modules/execution/execution-orchestrator.ts",
+    "src/modules/execution/capacity-status.ts",
+    "src/modules/webhook/webhook.service.ts",
+    "src/modules/webhook/webhook.schema.ts",
+    "src/modules/jobs/vision-analysis.worker.ts",
+  ];
+
+  it("keeps every execution entrypoint free of the natural-window module", () => {
+    for (const file of ENTRYPOINTS) {
+      const entry = productionCode.find((source) => source.file === file);
+      expect(`${file} exists`, `${file} exists`).toBe(`${file} exists`);
+      // No import of the domain module, by any spelling.
+      expect(`${file}:${/from\s+["'][^"']*natural-authorization["']/.test(entry!.code)}`).toBe(`${file}:false`);
+      expect(`${file}:${entry!.code.includes("natural-authorization")}`).toBe(`${file}:false`);
+    }
   });
 
-  it("reads none of the natural-window columns in production code", () => {
-    for (const field of ["allowedDirections", "maxClaims", "claimedCount"]) {
-      const offenders = productionCode.filter((entry) => entry.code.includes(field));
-      expect(`${field}: ${offenders.map((entry) => entry.file).join(", ")}`).toBe(`${field}: `);
+  it("calls no natural primitive from any execution entrypoint", () => {
+    // Named individually rather than by substring: these are the four calls
+    // that would actually make a natural window do something.
+    const PRIMITIVES = [
+      "prepareNaturalWindow",
+      "claimNaturalWindow",
+      "revokeNaturalWindow",
+      "findNaturalWindow",
+      "naturalWindowAdmitsDirection",
+      "isNaturalWindowAvailable",
+    ];
+    for (const file of ENTRYPOINTS) {
+      const entry = productionCode.find((source) => source.file === file)!;
+      for (const primitive of PRIMITIVES) {
+        expect(`${file}:${primitive}:${entry.code.includes(primitive)}`).toBe(`${file}:${primitive}:false`);
+      }
+      // And no NATURAL_WINDOW branch of any kind.
+      expect(`${file}:NATURAL_WINDOW:${entry.code.includes("NATURAL_WINDOW")}`).toBe(`${file}:NATURAL_WINDOW:false`);
     }
+  });
+
+  it("confines the natural primitives to the two Phase-12 modules", () => {
+    // Nothing outside the domain module and the authorization service may
+    // mention a natural-window column, so a third caller cannot appear quietly.
+    const allowed = new Set([
+      "src/modules/execution/natural-authorization.ts",
+      "src/modules/execution/canary-authorization.service.ts",
+    ]);
+    for (const field of ["allowedDirections", "maxClaims", "claimedCount", "NATURAL_WINDOW"]) {
+      const offenders = productionCode
+        .filter((entry) => entry.code.includes(field) && !allowed.has(entry.file))
+        .map((entry) => entry.file);
+      expect(`${field}: ${offenders.join(", ")}`).toBe(`${field}: `);
+    }
+  });
+
+  it("keeps the natural domain free of symbol, watchlist and exchange authority", () => {
+    // The locked Option-B boundary, asserted on the module itself: a natural
+    // window authorizes PROFILE + DIRECTION + TIME + BUDGET, never a ticker.
+    const domain = productionCode.find((entry) => entry.file.endsWith("natural-authorization.ts"))!;
+    for (const forbidden of [
+      "allowedSymbols",
+      "Asset",
+      "watchlist",
+      "exchangeInfo",
+      "BinanceReadOnly",
+      "symbol",
+      "fetch(",
+    ]) {
+      expect(`${forbidden}:${domain.code.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+
+    // Purity, stated precisely: the module may import TYPES from @prisma/client
+    // (CanaryDirection, ExecutionCanaryAuthorization) but must issue no query
+    // and hold no client. The import it does have is `import type`.
+    expect(domain.code).toContain('import type { CanaryDirection, ExecutionCanaryAuthorization } from "@prisma/client"');
+    for (const forbidden of [
+      "PrismaClient",
+      "TransactionClient",
+      "prisma.",
+      "$transaction",
+      "findFirst",
+      "findMany",
+      "findUnique",
+      "updateMany",
+      "create(",
+    ]) {
+      expect(`${forbidden}:${domain.code.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+    // And no clock read — every function takes `now` from its caller.
+    expect(domain.code).not.toMatch(/new Date\(\s*\)/);
   });
 
   it("leaves the canary-mode predicate exactly as it was", () => {

@@ -1,6 +1,14 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import type { CanaryDirection, ExecutionCanaryAuthorization, PrismaClient } from "@prisma/client";
+import {
+  MAXIMUM_AUTHORIZATION_TTL_MINUTES,
+  isNaturalWindow,
+  isNaturalWindowOpen,
+  naturalWindowAdmitsDirection,
+  naturalWindowState,
+  normalizeNaturalDirections,
+} from "./natural-authorization";
 import { profileLockKey } from "./safety-admission.service";
 
 /**
@@ -163,6 +171,90 @@ export interface PrepareResult {
   token: string;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 12.2 — NATURAL_WINDOW contracts
+// ---------------------------------------------------------------------------
+
+export interface PrepareNaturalWindowInput {
+  executionProfileId: string;
+  /** Non-empty. Normalized and de-duplicated; empty is a rejection. */
+  allowedDirections: readonly string[];
+  /** CUMULATIVE budget for the window's whole life. >= 1, never unlimited. */
+  maxClaims: number;
+  ttlMinutes?: number;
+  now?: Date;
+}
+
+/** Raised when a proposed natural window could never be a valid one. */
+export class NaturalWindowValidationError extends Error {
+  readonly reasonCode = "NATURAL_WINDOW_INVALID";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "NaturalWindowValidationError";
+  }
+}
+
+/**
+ * Why a claim was refused. Every one is FAIL CLOSED and leaves `claimedCount`
+ * untouched.
+ *
+ * Deliberately NOT mapped onto `SafetyReasonCode` here. Translating these into
+ * admission decisions is the integration phase's job, and doing it early would
+ * put natural vocabulary inside the safety engine before anything calls it.
+ */
+export const NATURAL_CLAIM_FAILURES = [
+  "NATURAL_WINDOW_NOT_FOUND",
+  "NOT_NATURAL",
+  "MALFORMED_NATURAL_WINDOW",
+  "REVOKED",
+  "EXPIRED",
+  "EXHAUSTED",
+  "DIRECTION_NOT_ALLOWED",
+  "VERSION_CONFLICT",
+] as const;
+
+export type NaturalClaimFailure = (typeof NATURAL_CLAIM_FAILURES)[number];
+
+export type NaturalClaimResult =
+  | { ok: true; authorization: ExecutionCanaryAuthorization }
+  | { ok: false; reasonCode: NaturalClaimFailure; message: string };
+
+export interface ClaimNaturalWindowInput {
+  authorizationId: string;
+  /** The version the caller evaluated. A stale one refuses rather than racing. */
+  expectedVersion: number;
+  direction: string;
+  /** Explicit instant — this primitive never reads a clock. */
+  evaluatedAt: Date;
+}
+
+/**
+ * The ONE definition of "this profile already has a window open", shared by
+ * every preparation path.
+ *
+ * Deliberately type-agnostic. An EXACT_SIGNAL row is open while unconsumed,
+ * unrevoked and in date; a NATURAL_WINDOW never sets `consumedAt` at all, so
+ * the same predicate covers it without a clause about modes. That is what
+ * makes exact and natural preparation mutually exclusive through ONE mechanism
+ * rather than two that could disagree: whichever window is open blocks the
+ * other kind from being prepared beside it.
+ *
+ * Must be called inside the transaction that holds the per-profile advisory
+ * lock; on its own it is a read that a concurrent writer could invalidate.
+ */
+async function assertNoActiveWindow(
+  tx: Prisma.TransactionClient,
+  executionProfileId: string,
+  now: Date
+): Promise<void> {
+  const active = await tx.executionCanaryAuthorization.findFirst({
+    where: { executionProfileId, consumedAt: null, revokedAt: null, expiresAt: { gt: now } },
+    orderBy: { createdAt: "desc" },
+  });
+  if (active) throw new CanaryAuthorizationAlreadyActiveError(active);
+}
+
 export class CanaryAuthorizationService {
   constructor(private readonly prisma: PrismaClient) {}
 
@@ -205,16 +297,7 @@ export class CanaryAuthorizationService {
         input.executionProfileId
       )}::int)`;
 
-      const active = await tx.executionCanaryAuthorization.findFirst({
-        where: {
-          executionProfileId: input.executionProfileId,
-          consumedAt: null,
-          revokedAt: null,
-          expiresAt: { gt: now },
-        },
-        orderBy: { createdAt: "desc" },
-      });
-      if (active) throw new CanaryAuthorizationAlreadyActiveError(active);
+      await assertNoActiveWindow(tx, input.executionProfileId, now);
 
       const created = await tx.executionCanaryAuthorization.create({
         data: {
@@ -414,6 +497,240 @@ export class CanaryAuthorizationService {
     });
     return revoked.count;
   }
+
+  // -------------------------------------------------------------------------
+  // Phase 12.2 — NATURAL_WINDOW primitives. NOT WIRED TO PRODUCTION.
+  //
+  // No CLI, route, worker or execution path calls anything below. They exist so
+  // the later admission integration has a reviewed, tested foundation to call
+  // from inside the transaction it already holds.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Opens ONE natural window: a profile-scoped, expiring, revocable
+   * authorization for a set of directions with a cumulative claim budget.
+   *
+   * It creates no token, names no symbol, and touches nothing outside this
+   * table — not `ExecutionSafetyPolicy.allowedSymbols`, not the profile gates,
+   * not capacity. A natural window authorizes PROFILE + DIRECTION + TIME +
+   * BUDGET; which symbols are tradable stays the execution stack's business.
+   *
+   * Exclusivity is the SAME advisory lock and the SAME predicate exact
+   * preparation uses, so an open window of either kind blocks the other.
+   */
+  async prepareNaturalWindow(input: PrepareNaturalWindowInput): Promise<ExecutionCanaryAuthorization> {
+    const now = input.now ?? new Date();
+
+    const directions = normalizeNaturalDirections(input.allowedDirections);
+    if (directions === null) {
+      throw new NaturalWindowValidationError(
+        "A natural window requires at least one direction, and every entry must be LONG or SHORT. " +
+          "An empty set is a rejection, never 'all directions'."
+      );
+    }
+    if (!Number.isSafeInteger(input.maxClaims) || input.maxClaims < 1) {
+      throw new NaturalWindowValidationError(
+        "maxClaims must be a whole number of at least 1. There is deliberately no unlimited mode."
+      );
+    }
+    const ttlMinutes = input.ttlMinutes ?? DEFAULT_AUTHORIZATION_TTL_MINUTES;
+    if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0 || ttlMinutes > MAXIMUM_AUTHORIZATION_TTL_MINUTES) {
+      throw new NaturalWindowValidationError(
+        `ttlMinutes must be between 1 and ${MAXIMUM_AUTHORIZATION_TTL_MINUTES}. A window nobody is watching must shut on its own.`
+      );
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CANARY_PREPARE_LOCK_NAMESPACE}::int, ${profileLockKey(
+        input.executionProfileId
+      )}::int)`;
+
+      await assertNoActiveWindow(tx, input.executionProfileId, now);
+
+      return tx.executionCanaryAuthorization.create({
+        data: {
+          executionProfileId: input.executionProfileId,
+          authorizationType: "NATURAL_WINDOW",
+          // Explicitly absent, not merely unset: a natural window names no
+          // symbol, no single direction and holds no secret.
+          allowedSymbol: null,
+          allowedDirection: null,
+          tokenHash: null,
+          allowedDirections: directions,
+          maxClaims: input.maxClaims,
+          claimedCount: 0,
+          version: 1,
+          expiresAt: new Date(now.getTime() + ttlMinutes * 60_000),
+        },
+      });
+    });
+  }
+
+  /** The open natural window for a profile, if one exists. */
+  async findNaturalWindow(
+    executionProfileId: string,
+    now = new Date()
+  ): Promise<ExecutionCanaryAuthorization | null> {
+    const row = await this.prisma.executionCanaryAuthorization.findFirst({
+      where: {
+        executionProfileId,
+        authorizationType: "NATURAL_WINDOW",
+        revokedAt: null,
+        expiresAt: { gt: now },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+    // Open means well-formed too: a row that contradicts its own mode is not a
+    // window an operator can act on.
+    return row !== null && isNaturalWindowOpen(row, now) ? row : null;
+  }
+
+  /**
+   * Shuts one natural window. Idempotent: revoking an already-revoked window
+   * reports false rather than raising, matching how `revokeUnused` treats rows
+   * it does not move.
+   *
+   * Scoped to the profile AND to NATURAL_WINDOW, so it can never touch an exact
+   * row. The row is never deleted, `claimedCount` is never reset and the
+   * directions and budget stay readable — revocation shuts the door on FUTURE
+   * claims and rewrites no history.
+   */
+  async revokeNaturalWindow(
+    executionProfileId: string,
+    authorizationId: string,
+    now = new Date()
+  ): Promise<boolean> {
+    const revoked = await this.prisma.executionCanaryAuthorization.updateMany({
+      where: {
+        id: authorizationId,
+        executionProfileId,
+        authorizationType: "NATURAL_WINDOW",
+        revokedAt: null,
+      },
+      data: { revokedAt: now },
+    });
+    return revoked.count === 1;
+  }
+}
+
+/**
+ * Phase 12.2 — the guarded natural claim. NOT CALLED BY PRODUCTION.
+ *
+ * ## Why it takes a client instead of opening a transaction
+ *
+ * The claim must eventually commit or roll back TOGETHER with the capacity
+ * reservation in `SafetyAdmissionService.attempt()`, which already runs inside
+ * one transaction holding a per-profile advisory lock. So this takes that
+ * caller's `tx` rather than starting its own: a claim spent on a trade that
+ * capacity then refuses is exactly the waste the design exists to prevent.
+ *
+ * ## What it guarantees ON ITS OWN
+ *
+ * The conditional `updateMany` is the whole mechanism — a losing writer updates
+ * zero rows and is refused. That alone bounds `claimedCount` at `maxClaims` and
+ * makes the version CAS authoritative, WITHOUT any lock.
+ *
+ * ## What it does NOT guarantee on its own
+ *
+ * Serializing many contenders so that exactly N of N+k succeed in one pass is a
+ * property of the CALLER's advisory lock and retry loop, not of this function.
+ * Phase 2 deliberately adds no second lock to fake it; see the concurrency
+ * tests, which pin the honest contract.
+ *
+ * On success `claimedCount` and `version` each increment by one. `consumedAt`,
+ * `consumedAlertId` and `consumedExecutionId` are NEVER touched — those belong
+ * to one-shot exact consumption, and a natural claim is a cumulative counter.
+ * There is no path here or anywhere that decrements `claimedCount`.
+ */
+export async function claimNaturalWindow(
+  client: Prisma.TransactionClient,
+  input: ClaimNaturalWindowInput
+): Promise<NaturalClaimResult> {
+  const refuse = (reasonCode: NaturalClaimFailure, message: string): NaturalClaimResult => ({
+    ok: false,
+    reasonCode,
+    message,
+  });
+
+  const window = await client.executionCanaryAuthorization.findUnique({
+    where: { id: input.authorizationId },
+  });
+  if (!window) return refuse("NATURAL_WINDOW_NOT_FOUND", "No authorization exists with that id.");
+
+  // Structure before state before identity before version, so the reported
+  // reason names the most decisive problem rather than the first one checked.
+  if (window.authorizationType !== "NATURAL_WINDOW") {
+    return refuse("NOT_NATURAL", "The authorization is not a natural window.");
+  }
+  if (!isNaturalWindow(window)) {
+    return refuse("MALFORMED_NATURAL_WINDOW", "The natural window contradicts its own declared mode.");
+  }
+
+  const state = naturalWindowState(window, input.evaluatedAt);
+  if (state === "REVOKED") return refuse("REVOKED", "The natural window was revoked.");
+  if (state === "EXPIRED") return refuse("EXPIRED", "The natural window has expired.");
+  if (state === "EXHAUSTED") {
+    return refuse(
+      "EXHAUSTED",
+      `The natural window has spent its whole budget (${window.claimedCount}/${window.maxClaims}).`
+    );
+  }
+
+  if (!naturalWindowAdmitsDirection(window, input.direction, input.evaluatedAt)) {
+    return refuse(
+      "DIRECTION_NOT_ALLOWED",
+      `The window admits ${window.allowedDirections.join("/")}, not ${String(input.direction).toUpperCase()}.`
+    );
+  }
+
+  if (window.version !== input.expectedVersion) {
+    return refuse("VERSION_CONFLICT", "The window changed after it was evaluated.");
+  }
+
+  // --- The atomic claim ----------------------------------------------------
+  //
+  // Prisma cannot compare two columns, so `claimedCount < maxClaims` is
+  // expressed against the budget READ above, as a literal. That substitution is
+  // only honest if the row still holds the budget it was read with — so the
+  // predicate ALSO asserts `maxClaims` equals that value.
+  //
+  // Leaning on the version guard alone would be wrong. It proves `version` did
+  // not move; it does not prove `maxClaims` did not. A write that shrank the
+  // budget without bumping the version — a manual correction, a repair script,
+  // a future code path that forgets the convention — would leave the stale
+  // literal authorizing a spend the current row can no longer afford:
+  //
+  //     read    maxClaims 5, claimedCount 0, version 3   -> AVAILABLE
+  //     meanwhile              maxClaims 2, claimedCount 2, version 3
+  //     update  claimedCount(2) < 5 and version = 3      -> would GRANT
+  //             leaving claimedCount 3 against a budget of 2
+  //
+  // The equality costs one clause and removes the dependency on every future
+  // writer remembering to bump a counter. On a real-money primitive that trade
+  // is not close.
+  const claimed = await client.executionCanaryAuthorization.updateMany({
+    where: {
+      id: window.id,
+      authorizationType: "NATURAL_WINDOW",
+      revokedAt: null,
+      expiresAt: { gt: input.evaluatedAt },
+      // The budget must still be the one the ceiling below was derived from.
+      maxClaims: window.maxClaims,
+      claimedCount: { lt: window.maxClaims },
+      version: input.expectedVersion,
+    },
+    data: { claimedCount: { increment: 1 }, version: { increment: 1 } },
+  });
+
+  if (claimed.count !== 1) {
+    // Another writer won between the read and the update. Nothing was spent.
+    return refuse("VERSION_CONFLICT", "The window was claimed concurrently by another evaluation.");
+  }
+
+  return {
+    ok: true,
+    authorization: await client.executionCanaryAuthorization.findUniqueOrThrow({ where: { id: window.id } }),
+  };
 }
 
 /**
