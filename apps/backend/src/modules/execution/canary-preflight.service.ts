@@ -5,9 +5,11 @@ import { env } from "../../config/env";
 import { BinanceAccountConnectionService } from "../binance/binance-account-connection.service";
 import {
   evaluateCanaryPreflight,
+  type CanaryPolicyLimits,
   type CanaryPreflightInput,
   type CanaryPreflightResult,
 } from "./canary-readiness";
+import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
 /**
  * Phase 11A — READ-ONLY live-canary preflight.
@@ -106,7 +108,10 @@ export class CanaryPreflightService {
       recoveryRequiredCount: null,
     };
 
-    const profileKillSwitchEngaged = databaseReady ? await this.readProfileKillSwitch() : null;
+    // ONE read of the configured profile's row supplies both the kill switch
+    // and the limits, so the two can never describe different rows.
+    const profileRow = databaseReady ? await this.readProfilePolicyRow() : null;
+    const profileKillSwitchEngaged = profileRow ? profileRow.killSwitchActive : null;
 
     const gathered: CanaryPreflightInput = {
       infrastructure: {
@@ -130,12 +135,17 @@ export class CanaryPreflightService {
       },
       local,
       policy: {
-        maxOpenPositions: env.EXECUTION_MAX_OPEN_POSITIONS,
-        maxPendingEntries: env.EXECUTION_MAX_PENDING_ENTRIES,
-        maxTotalActiveTrades: env.EXECUTION_MAX_TOTAL_ACTIVE_TRADES,
-        maxActivePerSymbolSide: env.EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE,
-        maxTotalPlannedRiskUsd: env.EXECUTION_MAX_TOTAL_PLANNED_RISK_USD,
-        maxTotalIsolatedMarginUsd: env.EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD,
+        global: {
+          maxOpenPositions: env.EXECUTION_MAX_OPEN_POSITIONS,
+          maxPendingEntries: env.EXECUTION_MAX_PENDING_ENTRIES,
+          maxTotalActiveTrades: env.EXECUTION_MAX_TOTAL_ACTIVE_TRADES,
+          maxActivePerSymbolSide: env.EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE,
+          maxTotalPlannedRiskUsd: env.EXECUTION_MAX_TOTAL_PLANNED_RISK_USD,
+          maxTotalIsolatedMarginUsd: env.EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD,
+        },
+        // null when unreadable — the evaluator fails closed rather than
+        // assuming the row agrees with the env.
+        profile: profileRow ? profileRow.limits : null,
       },
       gates: {
         globalKillSwitch: env.EXECUTION_GLOBAL_KILL_SWITCH,
@@ -175,10 +185,39 @@ export class CanaryPreflightService {
   }
 
   /** True when the applicable profile's kill switch is engaged. */
-  private async readProfileKillSwitch(): Promise<boolean | null> {
+  /**
+   * The CONFIGURED profile's safety-policy row — kill switch and limits from
+   * one read.
+   *
+   * Scoped to `EXECUTION_PROFILE_ACCOUNT_IDENTIFIER` + `EXECUTION_PROFILE_ENVIRONMENT`,
+   * the same identity admission resolves, rather than "whichever policy row is
+   * oldest". A preflight that judged one profile's limits while execution used
+   * another's would be worse than no check at all.
+   *
+   * Returns null for every "we could not prove it" case — no profile
+   * configured, no match, an ambiguous match, no policy row, or an unreachable
+   * database. The evaluator turns that into a blocker.
+   */
+  private async readProfilePolicyRow(): Promise<{
+    killSwitchActive: boolean;
+    limits: CanaryPolicyLimits;
+  } | null> {
     try {
-      const policy = await this.prisma.executionSafetyPolicy.findFirst({ orderBy: { createdAt: "asc" } });
-      return policy ? policy.killSwitchActive : null;
+      const resolution = await resolveExecutionProfile(this.prisma, configuredProfileIdentity());
+      if (!resolution.ok) return null;
+      const policy = resolution.profile.safetyPolicy;
+      if (!policy) return null;
+      return {
+        killSwitchActive: policy.killSwitchActive,
+        limits: {
+          maxOpenPositions: policy.maxOpenPositions,
+          maxPendingEntries: policy.maxPendingEntries,
+          maxTotalActiveTrades: policy.maxTotalActiveTrades,
+          maxActivePerSymbolSide: policy.maxActivePerSymbolSide,
+          maxTotalPlannedRiskUsd: policy.maxTotalPlannedRiskUsd.toFixed(),
+          maxTotalIsolatedMarginUsd: policy.maxTotalIsolatedMarginUsd.toFixed(),
+        },
+      };
     } catch {
       return null;
     }

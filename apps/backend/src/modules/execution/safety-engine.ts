@@ -216,6 +216,47 @@ export interface SafetyDecisionResult {
  * monetary caps take the minimum; the kill switch is a logical OR, so either
  * side can stop admissions and neither can re-enable them alone.
  */
+/**
+ * The limits that exist on BOTH sides of the merge — env-wide and per-profile.
+ *
+ * Named as one shape so the canary preflight can reason about "global vs row vs
+ * effective" using the same arithmetic admission uses, instead of a second
+ * implementation that could drift.
+ */
+export interface SafetyCapacityLimits {
+  maxOpenPositions: number;
+  maxPendingEntries: number;
+  maxTotalActiveTrades: number;
+  maxActivePerSymbolSide: number;
+  maxAlertAgeSeconds: number;
+  maxTotalPlannedRiskUsd: string;
+  maxTotalIsolatedMarginUsd: string;
+}
+
+/**
+ * The ONE min-merge. Counts and monetary caps take the stricter (smaller) of
+ * the two sides; nothing here can widen a limit.
+ *
+ * `resolveEffectivePolicy` below and the canary preflight both call this, so
+ * "what will actually be enforced" has a single definition. Decimals are
+ * compared as decimals and returned as the ORIGINAL string, never reformatted.
+ */
+export function mergeCapacityLimits(
+  global: SafetyCapacityLimits,
+  profile: SafetyCapacityLimits
+): SafetyCapacityLimits {
+  const minDecimal = (a: string, b: string) => (new D(a).lessThan(new D(b)) ? a : b);
+  return {
+    maxOpenPositions: Math.min(global.maxOpenPositions, profile.maxOpenPositions),
+    maxPendingEntries: Math.min(global.maxPendingEntries, profile.maxPendingEntries),
+    maxTotalActiveTrades: Math.min(global.maxTotalActiveTrades, profile.maxTotalActiveTrades),
+    maxActivePerSymbolSide: Math.min(global.maxActivePerSymbolSide, profile.maxActivePerSymbolSide),
+    maxAlertAgeSeconds: Math.min(global.maxAlertAgeSeconds, profile.maxAlertAgeSeconds),
+    maxTotalPlannedRiskUsd: minDecimal(global.maxTotalPlannedRiskUsd, profile.maxTotalPlannedRiskUsd),
+    maxTotalIsolatedMarginUsd: minDecimal(global.maxTotalIsolatedMarginUsd, profile.maxTotalIsolatedMarginUsd),
+  };
+}
+
 export function resolveEffectivePolicy(
   global: {
     killSwitchActive: boolean;
@@ -245,8 +286,6 @@ export function resolveEffectivePolicy(
     allowedSymbols: string[];
   }
 ): EffectiveSafetyPolicy {
-  const minDecimal = (a: string, b: string) => (new D(a).lessThan(new D(b)) ? a : b);
-
   return {
     globalKillSwitchActive: global.killSwitchActive,
     profileKillSwitchActive: profile.killSwitchActive,
@@ -256,13 +295,8 @@ export function resolveEffectivePolicy(
     environmentMatchesConnector: profile.environmentMatchesConnector,
     expectedPositionMode: profile.expectedPositionMode,
     expectedMarginType: profile.expectedMarginType,
-    maxOpenPositions: Math.min(global.maxOpenPositions, profile.maxOpenPositions),
-    maxPendingEntries: Math.min(global.maxPendingEntries, profile.maxPendingEntries),
-    maxTotalActiveTrades: Math.min(global.maxTotalActiveTrades, profile.maxTotalActiveTrades),
-    maxTotalPlannedRiskUsd: minDecimal(global.maxTotalPlannedRiskUsd, profile.maxTotalPlannedRiskUsd),
-    maxTotalIsolatedMarginUsd: minDecimal(global.maxTotalIsolatedMarginUsd, profile.maxTotalIsolatedMarginUsd),
-    maxActivePerSymbolSide: Math.min(global.maxActivePerSymbolSide, profile.maxActivePerSymbolSide),
-    maxAlertAgeSeconds: Math.min(global.maxAlertAgeSeconds, profile.maxAlertAgeSeconds),
+    // The limits come from the shared merge so preflight cannot disagree.
+    ...mergeCapacityLimits(global, profile),
     signalFutureToleranceSeconds: global.signalFutureToleranceSeconds,
     allowedSymbols: profile.allowedSymbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean),
   };

@@ -138,6 +138,20 @@ export class SafetyPolicyService {
     return this.updateForProfile(executionProfileId, expectedVersion, { killSwitchActive: true });
   }
 
+  /**
+   * Runs the SAME validation a write runs, and writes nothing.
+   *
+   * Exists so a dry-run operator command can reject a malformed value without
+   * reimplementing the rules — a second validator that drifted from this one
+   * would be worse than no dry run at all. Throws `ValidationError`; the
+   * cross-field capacity invariant that needs the existing row is still only
+   * checkable at write time, and `updateForProfile` re-checks everything.
+   */
+  assertValidValues(values: SafetyPolicyValues): void {
+    const data = this.validate(values);
+    if (Object.keys(data).length === 0) throw new ValidationError("No safety policy values were supplied.");
+  }
+
   private validate(values: SafetyPolicyValues): Record<string, unknown> {
     const data: Record<string, unknown> = {};
 

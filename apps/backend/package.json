@@ -23,6 +23,7 @@
     "binance:testnet-protection-verify": "tsx src/modules/binance/run-testnet-protection-verify.ts",
     "execution:canary-preflight": "tsx src/modules/execution/run-canary-preflight.ts",
     "execution:ensure-profile": "tsx src/modules/execution/run-ensure-profile.ts",
+    "execution:set-policy": "tsx src/modules/execution/run-set-policy-cli.ts",
     "execution:prepare-canary": "tsx src/modules/execution/run-prepare-canary.ts",
     "execution:arm-canary": "tsx src/modules/execution/run-arm-canary.ts",
     "execution:close-canary-window": "tsx src/modules/execution/run-close-canary-window.ts",

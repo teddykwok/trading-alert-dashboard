@@ -1,4 +1,7 @@
 import { Prisma } from "@prisma/client";
+// The SAME min-merge admission applies, so preflight and execution can never
+// disagree about what the effective policy is.
+import { mergeCapacityLimits, type SafetyCapacityLimits } from "./safety-engine";
 
 /**
  * Phase 11A — pure live-canary readiness evaluation.
@@ -123,7 +126,8 @@ export interface LocalExecutionState {
   recoveryRequiredCount: number | null;
 }
 
-export interface PolicyState {
+/** Exactly the limits CANARY_POLICY pins, on one side of the merge. */
+export interface CanaryPolicyLimits {
   maxOpenPositions: number;
   maxPendingEntries: number;
   maxTotalActiveTrades: number;
@@ -131,6 +135,35 @@ export interface PolicyState {
   maxTotalPlannedRiskUsd: string;
   maxTotalIsolatedMarginUsd: string;
 }
+
+/**
+ * Both sides of the policy, never just one.
+ *
+ * Admission enforces `min(global, profile row)`. Judging the env alone let a
+ * correct global hide a stale row: with global 8.00 and a row still at 5.00 the
+ * effective ceiling is 5.00, and a canary pinned to 8.00 would have reported
+ * READY while being unable to admit its own plan.
+ */
+export interface PolicyState {
+  /** Env-wide limits from config/env. */
+  global: CanaryPolicyLimits;
+  /**
+   * The configured profile's ExecutionSafetyPolicy row. `null` means it could
+   * not be read (no profile, no policy row, or the database was unreachable) —
+   * never "assume it agrees".
+   */
+  profile: CanaryPolicyLimits | null;
+}
+
+/** Which side of the merge a mismatch came from. Carried in the finding detail. */
+export const POLICY_MISMATCH_SOURCES = [
+  "GLOBAL_POLICY_MISMATCH",
+  "PROFILE_POLICY_MISMATCH",
+  "PROFILE_POLICY_CLAMPS_REQUIRED_CANARY_LIMIT",
+  "EFFECTIVE_POLICY_MISMATCH",
+  "PROFILE_POLICY_UNAVAILABLE",
+] as const;
+export type PolicyMismatchSource = (typeof POLICY_MISMATCH_SOURCES)[number];
 
 export interface SafetyGateState {
   globalKillSwitch: boolean;
@@ -175,6 +208,47 @@ function equalDecimal(left: string, right: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** The limits the canary pins, in a fixed order for stable reporting. */
+export const CANARY_PINNED_LIMITS = [
+  "maxOpenPositions",
+  "maxPendingEntries",
+  "maxTotalActiveTrades",
+  "maxActivePerSymbolSide",
+  "maxTotalPlannedRiskUsd",
+  "maxTotalIsolatedMarginUsd",
+] as const satisfies ReadonlyArray<keyof CanaryPolicyLimits & keyof typeof CANARY_POLICY>;
+
+/**
+ * Pads the pinned limits into the shape the shared merge consumes.
+ *
+ * `maxAlertAgeSeconds` is min-merged by admission but is NOT pinned by the
+ * canary, so it is filled with a neutral value here and never read back. The
+ * point is to reuse the real arithmetic for the six that ARE pinned rather
+ * than restate `Math.min` in a second place.
+ */
+function withMergeDefaults(limits: CanaryPolicyLimits): SafetyCapacityLimits {
+  return { ...limits, maxAlertAgeSeconds: Number.MAX_SAFE_INTEGER };
+}
+
+/**
+ * The effective pinned limits, for callers that want to DISPLAY the merge
+ * (the preflight CLI) without restating the arithmetic.
+ */
+export function effectiveCanaryLimits(
+  global: CanaryPolicyLimits,
+  profile: CanaryPolicyLimits
+): CanaryPolicyLimits {
+  const merged = mergeCapacityLimits(withMergeDefaults(global), withMergeDefaults(profile));
+  return {
+    maxOpenPositions: merged.maxOpenPositions,
+    maxPendingEntries: merged.maxPendingEntries,
+    maxTotalActiveTrades: merged.maxTotalActiveTrades,
+    maxActivePerSymbolSide: merged.maxActivePerSymbolSide,
+    maxTotalPlannedRiskUsd: merged.maxTotalPlannedRiskUsd,
+    maxTotalIsolatedMarginUsd: merged.maxTotalIsolatedMarginUsd,
+  };
 }
 
 /**
@@ -273,19 +347,48 @@ export function evaluateCanaryPreflight(input: CanaryPreflightInput): CanaryPref
   }
 
   // --- Policy --------------------------------------------------------------
-  const policyChecks: Array<[string, boolean, string]> = [
-    ["maxOpenPositions", input.policy.maxOpenPositions === CANARY_POLICY.maxOpenPositions, String(input.policy.maxOpenPositions)],
-    ["maxPendingEntries", input.policy.maxPendingEntries === CANARY_POLICY.maxPendingEntries, String(input.policy.maxPendingEntries)],
-    ["maxTotalActiveTrades", input.policy.maxTotalActiveTrades === CANARY_POLICY.maxTotalActiveTrades, String(input.policy.maxTotalActiveTrades)],
-    ["maxActivePerSymbolSide", input.policy.maxActivePerSymbolSide === CANARY_POLICY.maxActivePerSymbolSide, String(input.policy.maxActivePerSymbolSide)],
-    ["maxTotalPlannedRiskUsd", equalDecimal(input.policy.maxTotalPlannedRiskUsd, CANARY_POLICY.maxTotalPlannedRiskUsd), input.policy.maxTotalPlannedRiskUsd],
-    ["maxTotalIsolatedMarginUsd", equalDecimal(input.policy.maxTotalIsolatedMarginUsd, CANARY_POLICY.maxTotalIsolatedMarginUsd), input.policy.maxTotalIsolatedMarginUsd],
-  ];
-  for (const [name, ok, actual] of policyChecks) {
-    if (!ok) {
+  // Every pinned limit is judged on THREE values, not one: the env global, the
+  // profile row, and the effective min-merge admission will actually apply.
+  // All three must equal the pinned canary value.
+  //
+  // Requiring the ROW to match, not merely the effective result, is deliberate:
+  // a row wider than the canary (row 10 while global is 8) produces a correct
+  // effective 8 today, but the moment the global is relaxed the row stops
+  // clamping and the canary silently runs under a limit nobody reviewed. A
+  // pinned canary has to be reproducible from its own configuration.
+  if (input.policy.profile === null) {
+    add(
+      "CANARY_BLOCKED_POLICY",
+      "PROFILE_POLICY_UNAVAILABLE: the profile's safety-policy row could not be read, " +
+        "so the effective policy cannot be proven. Run execution:ensure-profile."
+    );
+  } else {
+    const global = input.policy.global;
+    const row = input.policy.profile;
+    const effective = effectiveCanaryLimits(global, row);
+
+    for (const name of CANARY_PINNED_LIMITS) {
+      const required = CANARY_POLICY[name];
+      const same = (value: number | string) =>
+        typeof required === "number" ? value === required : equalDecimal(String(value), required);
+
+      const globalOk = same(global[name]);
+      const rowOk = same(row[name]);
+      const effectiveOk = same(effective[name]);
+      if (globalOk && rowOk && effectiveOk) continue;
+
+      // Name the side that is actually wrong. The clamp case is called out
+      // separately because it is the one an env-only check used to miss.
+      let source: PolicyMismatchSource;
+      if (!globalOk && !rowOk) source = "EFFECTIVE_POLICY_MISMATCH";
+      else if (!globalOk) source = "GLOBAL_POLICY_MISMATCH";
+      else if (!effectiveOk) source = "PROFILE_POLICY_CLAMPS_REQUIRED_CANARY_LIMIT";
+      else source = "PROFILE_POLICY_MISMATCH";
+
       add(
         "CANARY_BLOCKED_POLICY",
-        `${name} is ${actual}; the canary requires ${String(CANARY_POLICY[name as keyof typeof CANARY_POLICY])}.`
+        `${source}: ${name} global ${String(global[name])}, row ${String(row[name])}, ` +
+          `effective ${String(effective[name])}; the canary requires ${String(required)}.`
       );
     }
   }

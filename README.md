@@ -360,7 +360,37 @@ second; `EXECUTION_MAX_TOTAL_ACTIVE_TRADES = 1` is what bounds the count.
 
 The effective limit is `min(env global, ExecutionSafetyPolicy row)`, so raising
 the env alone changes nothing until the profile row is raised too — the canary
-preflight prints both and the resulting effective value.
+preflight prints both and the resulting effective value, and **blocks** unless
+the global, the row and the effective value all equal the pinned canary value.
+
+#### Activating the policy (run only after review)
+
+Steps 1–2 and 5 change live behaviour. Nothing here is run by the repository.
+
+1. **Edit `apps/backend/.env`** — add `BINANCE_MIN_MARGIN_USD=5.50`,
+   `BINANCE_TARGET_MARGIN_MULTIPLIER=4`, `BINANCE_MAX_MARGIN_MULTIPLIER=5.333333`,
+   `EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD=8.00`. Leave the planned-risk cap and
+   every capacity limit alone.
+2. **Restart the backend and the worker.** `config/env` is parsed once at import.
+3. **Dry run** — reports current / proposed / global / effective and writes nothing:
+   ```
+   pnpm --filter @trading-alert-dashboard/backend execution:set-policy -- \
+     --max-total-isolated-margin-usd=8.00
+   ```
+4. **Review** the printed `current row`, `proposed row`, `effective now` and
+   `effective after`, and confirm the target says `MAINNET — REAL FUNDS`.
+5. **Apply** — the only step that writes, and the only step with `--confirm`:
+   ```
+   pnpm --filter @trading-alert-dashboard/backend execution:set-policy -- \
+     --max-total-isolated-margin-usd=8.00 --confirm
+   ```
+   The row version read in step 3 is supplied with the write; a concurrent
+   change fails the command instead of overwriting it.
+6. **Verify** — `pnpm --filter @trading-alert-dashboard/backend execution:canary-preflight`.
+   Every pinned limit must show `global`, `profile` and `effective` all equal to
+   `required`, with no `CANARY_BLOCKED_POLICY`.
+7. **Confirm the posture is still FULL SAFE** — kill switch engaged, live entry
+   off, protection-ready off. Policy limits are capacity, never permission.
 | `EXECUTION_SIGNAL_FUTURE_TOLERANCE_SECONDS` | Tolerance for a signal timestamp slightly ahead of local time (clock skew). | `5` |
 
 Reaching a limit skips **only the requesting execution** — existing

@@ -5,7 +5,9 @@ import {
   BLOCKER_SCOPE,
   CANARY_POLICY,
   CANARY_READINESS_CODES,
+  effectiveCanaryLimits,
   evaluateCanaryPreflight,
+  type CanaryPolicyLimits,
   type CanaryPreflightInput,
 } from "../src/modules/execution/canary-readiness";
 import {
@@ -20,6 +22,22 @@ import {
  */
 
 const BACKEND = process.cwd();
+
+/** Exactly the pinned canary values, used for BOTH sides of the merge. */
+const CANARY_LIMITS: CanaryPolicyLimits = {
+  maxOpenPositions: 1,
+  maxPendingEntries: 1,
+  maxTotalActiveTrades: 1,
+  maxActivePerSymbolSide: 1,
+  maxTotalPlannedRiskUsd: "1.50",
+  maxTotalIsolatedMarginUsd: "8.00",
+};
+
+/** One helper for the "global X / row Y" cases that dominate the policy tests. */
+const withLimits = (
+  global: Partial<CanaryPolicyLimits>,
+  profile: Partial<CanaryPolicyLimits> | null
+): Partial<CanaryPreflightInput> => ({ policy: { global, profile } as CanaryPreflightInput["policy"] });
 
 // ---------------------------------------------------------------------------
 // Baseline: a fully prepared runtime with the gates correctly still closed
@@ -56,13 +74,13 @@ function baseline(overrides: Partial<CanaryPreflightInput> = {}): CanaryPrefligh
       ...overrides.local,
     },
     policy: {
-      maxOpenPositions: 1,
-      maxPendingEntries: 1,
-      maxTotalActiveTrades: 1,
-      maxActivePerSymbolSide: 1,
-      maxTotalPlannedRiskUsd: "1.50",
-      maxTotalIsolatedMarginUsd: "8.00",
-      ...overrides.policy,
+      global: { ...CANARY_LIMITS, ...overrides.policy?.global },
+      profile:
+        overrides.policy && "profile" in overrides.policy
+          ? overrides.policy.profile === null
+            ? null
+            : { ...CANARY_LIMITS, ...overrides.policy.profile }
+          : { ...CANARY_LIMITS },
     },
     gates: {
       globalKillSwitch: true,
@@ -238,34 +256,132 @@ describe("canary policy", () => {
     expect(value("EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD")).toBe(CANARY_POLICY.maxTotalIsolatedMarginUsd);
   });
 
-  it("blocks a widened open, pending or active limit", () => {
+  it("blocks a widened open, pending or active limit on the GLOBAL side", () => {
     for (const key of ["maxOpenPositions", "maxPendingEntries", "maxTotalActiveTrades"] as const) {
-      const codes = codesOf(baseline({ policy: { [key]: 2 } as never }));
-      expect(codes, key).toContain("CANARY_BLOCKED_POLICY");
+      expect(codesOf(baseline(withLimits({ [key]: 2 }, {}))), key).toContain("CANARY_BLOCKED_POLICY");
     }
   });
 
   it("blocks planned risk above 1.50", () => {
-    expect(codesOf(baseline({ policy: { maxTotalPlannedRiskUsd: "3.00" } as never }))).toContain(
-      "CANARY_BLOCKED_POLICY"
-    );
-  });
-
-  it("blocks any isolated-margin ceiling that is not exactly the canary value", () => {
-    // Exact equality in BOTH directions: too high is unreviewed headroom, and
-    // too low (e.g. an environment still on the old 5.00) cannot fund one plan.
-    for (const value of ["10.00", "5.00"]) {
-      expect(codesOf(baseline({ policy: { maxTotalIsolatedMarginUsd: value } as never })), value).toContain(
-        "CANARY_BLOCKED_POLICY"
-      );
-    }
+    expect(codesOf(baseline(withLimits({ maxTotalPlannedRiskUsd: "3.00" }, {})))).toContain("CANARY_BLOCKED_POLICY");
   });
 
   it("compares risk as an exact decimal, not a string", () => {
-    // "1.5" and "1.50" are the same budget.
-    expect(codesOf(baseline({ policy: { maxTotalPlannedRiskUsd: "1.5" } as never }))).not.toContain(
-      "CANARY_BLOCKED_POLICY"
+    // "1.5" and "1.50" are the same budget, on BOTH sides of the merge.
+    expect(
+      codesOf(baseline(withLimits({ maxTotalPlannedRiskUsd: "1.5" }, { maxTotalPlannedRiskUsd: "1.5" })))
+    ).not.toContain("CANARY_BLOCKED_POLICY");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Policy: global vs profile row vs effective
+// ---------------------------------------------------------------------------
+
+/**
+ * The gap this closes: readiness used to judge the ENV alone. With the env at
+ * 8.00 and a profile row still at 5.00, admission enforces min(8, 5) = 5.00 —
+ * so a canary pinned to 8.00 would have reported READY while being unable to
+ * admit its own plan. All three values are now judged.
+ */
+describe("canary policy — merge sources", () => {
+  const marginFinding = (input: Parameters<typeof evaluateCanaryPreflight>[0]) =>
+    evaluateCanaryPreflight(input).findings.find(
+      (finding) => finding.code === "CANARY_BLOCKED_POLICY" && finding.detail.includes("maxTotalIsolatedMarginUsd")
     );
+
+  it("1. global 8 / row 8 / effective 8 → no policy blocker", () => {
+    expect(codesOf(baseline())).not.toContain("CANARY_BLOCKED_POLICY");
+  });
+
+  it("2. global 8 / row 5 / effective 5 → BLOCKED, naming the row as the clamp", () => {
+    const finding = marginFinding(baseline(withLimits({}, { maxTotalIsolatedMarginUsd: "5.00" })));
+    expect(finding).toBeDefined();
+    expect(finding!.detail).toContain("PROFILE_POLICY_CLAMPS_REQUIRED_CANARY_LIMIT");
+    expect(finding!.detail).toContain("global 8.00");
+    expect(finding!.detail).toContain("row 5.00");
+    expect(finding!.detail).toContain("effective 5.00");
+    expect(finding!.detail).toContain("requires 8.00");
+  });
+
+  it("3. global 5 / row 8 / effective 5 → BLOCKED, naming the global", () => {
+    const finding = marginFinding(baseline(withLimits({ maxTotalIsolatedMarginUsd: "5.00" }, {})));
+    expect(finding).toBeDefined();
+    expect(finding!.detail).toContain("GLOBAL_POLICY_MISMATCH");
+    expect(finding!.detail).toContain("global 5.00");
+    expect(finding!.detail).toContain("row 8.00");
+    expect(finding!.detail).toContain("effective 5.00");
+  });
+
+  it("4. global 8 / row 10 / effective 8 → BLOCKED even though effective is correct", () => {
+    // Decision, made explicitly rather than by omission: the ROW must also be
+    // exact. A row wider than the canary yields a correct effective value only
+    // for as long as the global keeps clamping it; relax the global later and
+    // the canary silently runs under a limit nobody reviewed. A pinned canary
+    // has to be reproducible from its own configuration.
+    const finding = marginFinding(baseline(withLimits({}, { maxTotalIsolatedMarginUsd: "10.00" })));
+    expect(finding).toBeDefined();
+    expect(finding!.detail).toContain("PROFILE_POLICY_MISMATCH");
+    expect(finding!.detail).toContain("row 10.00");
+    expect(finding!.detail).toContain("effective 8.00");
+  });
+
+  it("4b. both sides wrong in the same direction is reported as an EFFECTIVE mismatch", () => {
+    const finding = marginFinding(
+      baseline(withLimits({ maxTotalIsolatedMarginUsd: "5.00" }, { maxTotalIsolatedMarginUsd: "5.00" }))
+    );
+    expect(finding!.detail).toContain("EFFECTIVE_POLICY_MISMATCH");
+  });
+
+  it("5. a count mismatch in the profile row blocks", () => {
+    for (const key of ["maxOpenPositions", "maxPendingEntries", "maxTotalActiveTrades", "maxActivePerSymbolSide"] as const) {
+      const codes = codesOf(baseline(withLimits({}, { [key]: 2 })));
+      expect(codes, key).toContain("CANARY_BLOCKED_POLICY");
+    }
+  });
+
+  it("6. a planned-risk mismatch in the profile row blocks", () => {
+    const codes = codesOf(baseline(withLimits({}, { maxTotalPlannedRiskUsd: "0.50" })));
+    expect(codes).toContain("CANARY_BLOCKED_POLICY");
+  });
+
+  it("7. every value exact on both sides → no policy blocker", () => {
+    const result = evaluateCanaryPreflight(baseline());
+    expect(result.findings.filter((finding) => finding.code === "CANARY_BLOCKED_POLICY")).toHaveLength(0);
+    expect(result.preparationReady).toBe(true);
+  });
+
+  it("fails closed when the profile policy row cannot be read", () => {
+    const finding = evaluateCanaryPreflight(baseline(withLimits({}, null))).findings.find(
+      (entry) => entry.code === "CANARY_BLOCKED_POLICY"
+    );
+    expect(finding).toBeDefined();
+    expect(finding!.detail).toContain("PROFILE_POLICY_UNAVAILABLE");
+  });
+
+  it("8. leaves kill switches and gates as separate blockers", () => {
+    // A policy mismatch must not absorb, mask or rename the gate blockers.
+    const result = evaluateCanaryPreflight(baseline(withLimits({}, { maxTotalIsolatedMarginUsd: "5.00" })));
+    expect(result.findings.map((finding) => finding.code)).toContain("CANARY_BLOCKED_KILL_SWITCH_STATE");
+    expect(result.liveActivationBlockers.map((finding) => finding.code)).toContain("CANARY_BLOCKED_GATE_STATE");
+    // The policy problem is a PREPARATION blocker, the gates are not.
+    expect(result.preparationBlockers.map((finding) => finding.code)).toContain("CANARY_BLOCKED_POLICY");
+    expect(result.preparationBlockers.map((finding) => finding.code)).not.toContain("CANARY_BLOCKED_GATE_STATE");
+  });
+
+  it("reuses the admission min-merge rather than its own arithmetic", () => {
+    // Preflight and admission must never disagree about the effective policy.
+    const global = { ...CANARY_LIMITS, maxTotalIsolatedMarginUsd: "8.00", maxOpenPositions: 3 };
+    const profile = { ...CANARY_LIMITS, maxTotalIsolatedMarginUsd: "5.00", maxOpenPositions: 2 };
+    expect(effectiveCanaryLimits(global, profile)).toEqual({
+      ...CANARY_LIMITS,
+      maxTotalIsolatedMarginUsd: "5.00",
+      maxOpenPositions: 2,
+    });
+    const source = readFileSync(path.join(BACKEND, "src/modules/execution/canary-readiness.ts"), "utf8");
+    expect(source).toContain("mergeCapacityLimits");
+    // No second implementation of the merge.
+    expect(source).not.toMatch(/Math\.min\(/);
   });
 });
 

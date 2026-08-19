@@ -1,7 +1,7 @@
 import { Prisma, PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { CanaryPreflightService } from "./canary-preflight.service";
-import { CANARY_POLICY } from "./canary-readiness";
+import { CANARY_PINNED_LIMITS, CANARY_POLICY, effectiveCanaryLimits } from "./canary-readiness";
 import { CanaryAuthorizationService, describeAuthorizationWindow } from "./canary-authorization.service";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
@@ -59,13 +59,23 @@ async function main(): Promise<void> {
     line("openPositionCount", local.openPositionCount);
     line("recoveryRequiredCount", local.recoveryRequiredCount);
 
-    section("Policy");
-    line("maxOpenPositions", `${policy.maxOpenPositions} (required ${CANARY_POLICY.maxOpenPositions})`);
-    line("maxPendingEntries", `${policy.maxPendingEntries} (required ${CANARY_POLICY.maxPendingEntries})`);
-    line("maxTotalActiveTrades", `${policy.maxTotalActiveTrades} (required ${CANARY_POLICY.maxTotalActiveTrades})`);
-    line("maxActivePerSymbolSide", `${policy.maxActivePerSymbolSide} (required ${CANARY_POLICY.maxActivePerSymbolSide})`);
-    line("maxTotalPlannedRiskUsd", `${policy.maxTotalPlannedRiskUsd} (required ${CANARY_POLICY.maxTotalPlannedRiskUsd})`);
-    line("maxTotalIsolatedMarginUsd", `${policy.maxTotalIsolatedMarginUsd} (required ${CANARY_POLICY.maxTotalIsolatedMarginUsd})`);
+    // Every pinned limit on all three values. A correct global hiding a stale
+    // profile row is exactly the failure this layout exists to make visible.
+    section("Policy (global / profile row / effective / required)");
+    if (policy.profile === null) {
+      line("profile policy row", "UNREADABLE — effective policy cannot be proven");
+    }
+    // Effective comes from the SHARED merge, never recomputed here.
+    const effective = policy.profile === null ? null : effectiveCanaryLimits(policy.global, policy.profile);
+    for (const name of CANARY_PINNED_LIMITS) {
+      console.log(`  ${name}`);
+      line("    global", policy.global[name]);
+      line("    profile", policy.profile ? policy.profile[name] : null);
+      line("    effective", effective ? effective[name] : null);
+      line("    required", CANARY_POLICY[name]);
+    }
+
+    section("Per-plan margin envelope (env only — not min-merged)");
     line("targetMarginMultiplier", env.BINANCE_TARGET_MARGIN_MULTIPLIER);
     line("maxMarginMultiplier", env.BINANCE_MAX_MARGIN_MULTIPLIER);
     // Which leverage-selection rule is live, not just the number behind it.
@@ -77,10 +87,12 @@ async function main(): Promise<void> {
     );
 
     // The multipliers are the configuration; DOLLARS are what the policy is
-    // actually reasoned about in. Derived at the planned-risk cap, which is
-    // the whole budget while maxTotalActiveTrades is 1. Display only — the
-    // engine derives its own envelope from each plan's own risk budget.
-    const referenceRisk = new Prisma.Decimal(policy.maxTotalPlannedRiskUsd);
+    // actually reasoned about in. Derived at the EFFECTIVE planned-risk cap,
+    // which is the whole budget while maxTotalActiveTrades is 1. Display only —
+    // the engine derives its own envelope from each plan's own risk budget.
+    const referenceRisk = new Prisma.Decimal(
+      (effective ?? policy.global).maxTotalPlannedRiskUsd
+    );
     line("  → target margin at that risk", referenceRisk.times(env.BINANCE_TARGET_MARGIN_MULTIPLIER).toFixed());
     line("  → maximum per-plan margin", referenceRisk.times(env.BINANCE_MAX_MARGIN_MULTIPLIER).toFixed());
 
@@ -112,21 +124,10 @@ async function main(): Promise<void> {
       line("profile", `resolved (${profile.environment})`);
       line("profile isEnabled", profile.isEnabled);
       line("profile killSwitchActive", profile.safetyPolicy?.killSwitchActive ?? null);
-      // The limits above are the ENV globals; the profile row is a SECOND
-      // clamp and the effective policy is min(global, row). The preflight
-      // blockers only judge the globals, so the row is printed here — a row
-      // still at 5.00 silently caps an 8.00 global, and that would otherwise
-      // be invisible until an admission failed with TOTAL_MARGIN_LIMIT_REACHED.
-      const row = profile.safetyPolicy;
-      line("row maxTotalActiveTrades", row ? row.maxTotalActiveTrades : null);
-      line("row maxTotalPlannedRiskUsd", row ? row.maxTotalPlannedRiskUsd.toFixed() : null);
-      line("row maxTotalIsolatedMarginUsd", row ? row.maxTotalIsolatedMarginUsd.toFixed() : null);
-      if (row) {
-        // Effective = min(global, row), the same rule resolveEffectivePolicy uses.
-        const globalCap = new Prisma.Decimal(policy.maxTotalIsolatedMarginUsd);
-        const rowCap = new Prisma.Decimal(row.maxTotalIsolatedMarginUsd.toFixed());
-        line("  → effective aggregate margin", (rowCap.lessThan(globalCap) ? rowCap : globalCap).toFixed());
-      }
+      // The row's limits are reported in the Policy section above, against the
+      // global and the effective merge; only its version is useful here, since
+      // that is what execution:set-policy must supply to write safely.
+      line("policy row version", profile.safetyPolicy?.version ?? null);
       // [] means ALLOW ALL — always worth seeing explicitly.
       const allowed = profile.safetyPolicy?.allowedSymbols ?? [];
       line("allowedSymbols", allowed.length === 0 ? "[] (ALLOW ALL)" : `[${allowed.join(", ")}]`);
