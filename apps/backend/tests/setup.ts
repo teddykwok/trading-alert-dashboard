@@ -30,6 +30,22 @@ process.env.WEBHOOK_SECRET ??= "test-secret";
 process.env.SCREENSHOT_STORAGE_DIR ??= "src/storage/screenshots";
 process.env.AI_VISION_PROVIDER ??= "mock";
 
+/**
+ * The test suite owns its own execution CAPACITY policy, always.
+ *
+ * Overwriting (not `??=`) for the same reason DATABASE_URL is overwritten: a
+ * value inherited from the operator's real `.env` is not a default, it is a
+ * leak. When MAINNET was activated to a soft target of 3, suites that pinned
+ * `EXECUTION_MAX_OPEN_POSITIONS=1` but not this one inherited 3, and the env
+ * schema correctly rejected `soft 3 > maxOpen 1` — taking whole suites down at
+ * import for a reason that had nothing to do with the code under test.
+ *
+ * 1 is the shipped default and the value the fixtures are written against.
+ * Suites that want a different capacity still pin their own values in their
+ * own module body, which runs after this file.
+ */
+process.env.EXECUTION_SOFT_OPEN_POSITION_TARGET = "1";
+
 vi.mock("ioredis", () => {
   class FakeRedis {
     duplicate(): FakeRedis {

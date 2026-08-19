@@ -841,10 +841,14 @@ describe("soft open-position target", () => {
   });
 
   it("uses the STRICTER of the env global and the profile row", () => {
-    // The row says 3, the shipped env global says 1, so the effective target is
-    // 1 and ONE open position already closes admission. This is the same
-    // min-merge admission applies; the orchestrator must not read the row
-    // alone, or it would keep placing entries the safety engine would refuse.
+    // The row says 3 and the global says 1, so the effective target is 1 and
+    // ONE open position already closes admission. This is the same min-merge
+    // admission applies; the orchestrator must not read the row alone, or it
+    // would keep placing entries the safety engine would refuse.
+    //
+    // The global comes from tests/setup.ts, which pins it for the whole suite.
+    // This asserts the FIXTURE, not the operator's .env — reading their real
+    // value here is what made this test fail once MAINNET moved to 3.
     expect(env.EXECUTION_SOFT_OPEN_POSITION_TARGET).toBe(1);
 
     const { orchestrator: below, calls: belowCalls } = harness({

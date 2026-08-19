@@ -39,6 +39,9 @@ if (databaseNameOf(process.env.DATABASE_URL ?? "") !== testDatabaseName) {
 /** Env globals the CLI merges the row against. Deliberately the canary values. */
 const GLOBALS = {
   EXECUTION_MAX_OPEN_POSITIONS: "1",
+  // Pinned WITH the hard cap: the env schema enforces soft <= hard, so an
+  // inherited operator value above 1 would fail env parsing for every case.
+  EXECUTION_SOFT_OPEN_POSITION_TARGET: "1",
   EXECUTION_MAX_PENDING_ENTRIES: "1",
   EXECUTION_MAX_TOTAL_ACTIVE_TRADES: "1",
   EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE: "1",

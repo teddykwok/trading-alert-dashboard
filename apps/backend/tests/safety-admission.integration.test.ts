@@ -25,6 +25,10 @@ const SYNTHETIC_TAG = "phase5-synthetic";
  */
 process.env.EXECUTION_GLOBAL_KILL_SWITCH = "false";
 process.env.EXECUTION_MAX_OPEN_POSITIONS = "1";
+// Pinned WITH the hard cap, never separately: the env schema enforces
+// soft <= hard, so leaving this to the operator's .env fails the whole suite
+// at import the moment their soft target exceeds this fixture's 1.
+process.env.EXECUTION_SOFT_OPEN_POSITION_TARGET = "1";
 process.env.EXECUTION_MAX_PENDING_ENTRIES = "1";
 process.env.EXECUTION_MAX_TOTAL_ACTIVE_TRADES = "1";
 process.env.EXECUTION_MAX_TOTAL_PLANNED_RISK_USD = "1.50";
