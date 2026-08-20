@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client";
 import type { ExecutionCanaryAuthorization, PrismaClient, SafetyAdmission, TradeExecution } from "@prisma/client";
 import { claimNaturalWindow, type NaturalClaimFailure } from "./canary-authorization.service";
 import { naturalWindowAdmitsDirection, naturalWindowState } from "./natural-authorization";
+import { connectorEnvironmentMatches } from "../binance/binance-environment";
 import { profileLockKey } from "./profile-lock";
 import { env } from "../../config/env";
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
@@ -645,9 +646,9 @@ export class SafetyAdmissionService {
   }
 
   private environmentMatches(profileEnvironment: string): boolean {
-    const host = env.BINANCE_FUTURES_REST_BASE_URL.toLowerCase();
-    const connectorEnvironment = host.includes("testnet") ? "TESTNET" : "MAINNET";
-    return profileEnvironment === connectorEnvironment;
+    // Shared with the entry lifecycle so the two can never disagree about the
+    // same base URL. Exact-origin, and an unrecognised origin matches nothing.
+    return connectorEnvironmentMatches(profileEnvironment, env.BINANCE_FUTURES_REST_BASE_URL);
   }
 }
 

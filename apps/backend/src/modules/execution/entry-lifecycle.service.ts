@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import type { BinanceOrder, PrismaClient, TradeExecution } from "@prisma/client";
+import { connectorEnvironmentMatches } from "../binance/binance-environment";
 import { env } from "../../config/env";
 import { NotFoundError } from "../../utils/errors";
 import { BinanceError } from "../binance/binance.errors";
@@ -1577,8 +1578,8 @@ export class EntryLifecycleService {
   }
 
   private environmentMatches(profileEnvironment: string): boolean {
-    const host = env.BINANCE_FUTURES_REST_BASE_URL.toLowerCase();
-    return profileEnvironment === (host.includes("testnet") ? "TESTNET" : "MAINNET");
+    // The SAME predicate SafetyAdmission uses; see binance-environment.ts.
+    return connectorEnvironmentMatches(profileEnvironment, env.BINANCE_FUTURES_REST_BASE_URL);
   }
 
   private asFailureShape(error: unknown) {

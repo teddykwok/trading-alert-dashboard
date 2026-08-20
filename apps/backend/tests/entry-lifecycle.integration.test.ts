@@ -27,7 +27,12 @@ process.env.EXECUTION_ENTRY_TTL_SECONDS = String(TTL_SECONDS);
 process.env.EXECUTION_ENTRY_RECONCILE_MAX_ATTEMPTS = "3";
 process.env.EXECUTION_ENTRY_RECONCILE_DELAY_MS = "1";
 process.env.EXECUTION_MAX_ALERT_AGE_SECONDS = "300";
-process.env.BINANCE_FUTURES_REST_BASE_URL = "https://testnet.binancefuture.example";
+// A REAL sanctioned Binance futures testnet origin, because connector
+// environment is now classified by exact origin (binance-environment.ts) and a
+// reserved `.example` host is deliberately not one. Nothing here reaches the
+// network: every real client in this suite is built with a transport that
+// throws if it is ever called.
+process.env.BINANCE_FUTURES_REST_BASE_URL = "https://demo-fapi.binance.com";
 
 // Integration state lives in the DEDICATED test database. The helper refuses
 // to fall back to the runtime/canary database, so a misconfiguration fails the
