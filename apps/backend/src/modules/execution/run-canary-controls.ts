@@ -2,6 +2,11 @@ import { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { CanaryPreflightService } from "./canary-preflight.service";
 import type { ExecutionCanaryAuthorization } from "@prisma/client";
+import {
+  currentProcessGateSnapshot,
+  readRuntimeAttestationStatusOnce,
+  type RuntimeAttestationStatus,
+} from "../runtime/runtime-attestation";
 import { CANARY_PREPARE_LOCK_NAMESPACE } from "./canary-authorization.service";
 import { profileLockKey } from "./profile-lock";
 import {
@@ -233,6 +238,58 @@ export async function prepareCanary(): Promise<void> {
  * values, and only once the operator has already changed `.env` and restarted —
  * so a process start can never trade on its own.
  */
+/**
+ * Phase 12.4D-A.1 — the shared activation interlock.
+ *
+ * Both arm paths create the identical ARMED pair, so both consult this. It is
+ * read BEFORE any Prisma transaction opens: Phase 12.4C forbids network I/O
+ * inside the shared advisory-lock critical section, and Redis is network I/O.
+ *
+ * The residual that ordering leaves is honest and accepted — a runtime can die
+ * in the gap between this read and the DB commit. This interlock's job is
+ * narrower: make it impossible to KNOWINGLY arm against a runtime that is
+ * already missing, stale, duplicated or running a different .env snapshot.
+ * Operator CLOSE/DISARM and the runtime's own safety remain the response to a
+ * runtime that dies afterwards.
+ *
+ * Deliberately NOT applied to close-canary-window or disarm-canary: a safety-off
+ * action must never depend on the runtime being healthy, or on Redis being
+ * reachable at all.
+ */
+async function evaluateRuntimeAttestation(): Promise<RuntimeAttestationStatus> {
+  const identity = configuredProfileIdentity();
+  // One-shot client: this is a short-lived CLI, so it must not hold the shared
+  // BullMQ connection open or the command would never exit.
+  return readRuntimeAttestationStatusOnce({
+    identity: { accountIdentifier: identity.accountIdentifier, environment: identity.environment },
+    // This command's OWN parsed snapshot. Both runtimes must match it.
+    expected: currentProcessGateSnapshot(),
+  });
+}
+
+/** Prints the attestation block shown by both arm commands. */
+function reportRuntimeAttestation(status: RuntimeAttestationStatus): void {
+  console.log("Runtime attestation");
+  for (const role of [status.backend, status.worker]) {
+    line(`  ${role.role.toLowerCase()} instances`, `${role.freshCount} fresh / ${role.staleCount} stale`);
+    if (role.gates) {
+      line("    globalKillSwitch", role.gates.globalKillSwitch);
+      line("    liveEntryEnabled", role.gates.liveEntryEnabled);
+      line("    protectionReady", role.gates.protectionReady);
+      line("    accountSetupMutations", role.gates.accountSetupMutationsEnabled);
+      line("    testOrderEnabled", role.gates.testOrderEnabled);
+      line("    autoAddMarginEnabled", role.gates.autoAddMarginEnabled);
+      line("    emergencyCloseMode", role.gates.emergencyCloseMode);
+    } else {
+      line("    gates", "— (no fresh attestation)");
+    }
+  }
+  line("  result", status.ok ? "PASS" : "BLOCKED");
+  if (!status.ok) line("  reason", `${status.reasonCode}: ${status.message}`);
+  console.log("");
+}
+
+
 export async function armCanary(): Promise<void> {
   const confirmed = process.argv.includes(CONFIRM_ARM);
 
@@ -276,6 +333,12 @@ export async function armCanary(): Promise<void> {
     const preflight = await new CanaryPreflightService(prisma).run();
     for (const finding of preflight.preparationBlockers) blockers.push(`${finding.code}: ${finding.detail}`);
 
+    // Phase 12.4D-A.1: exact arm opens the SAME armed pair as natural arm, so it
+    // carries the SAME interlock. Read before the transaction — never inside the
+    // advisory lock. Nothing about token or one-shot semantics changes.
+    const attestation = await evaluateRuntimeAttestation();
+    if (!attestation.ok) blockers.push(`${attestation.reasonCode}: ${attestation.message}`);
+
     console.log("Preconditions");
     line("profile", `${profile.accountIdentifier} (${profile.environment})`);
     line("authorization", active ? describeAuthorizationSubject(active) : "none");
@@ -288,6 +351,7 @@ export async function armCanary(): Promise<void> {
     line("local recovery", preflight.gathered.local.recoveryRequiredCount);
     line("confirmation flag", confirmed);
     console.log("");
+    reportRuntimeAttestation(attestation);
 
     if (blockers.length > 0) {
       console.log("BLOCKED — nothing was changed:");
@@ -900,6 +964,11 @@ export async function armNaturalCanary(): Promise<void> {
       blockers.push("environment activation gates are not in the required state (edit .env and restart FIRST)");
     }
 
+    // The Phase 4D-A finding: this CLI's own .env snapshot proves nothing about
+    // what the RUNNING backend and worker loaded. Read before any transaction.
+    const attestation = await evaluateRuntimeAttestation();
+    if (!attestation.ok) blockers.push(`${attestation.reasonCode}: ${attestation.message}`);
+
     const remainingMs = window.expiresAt.getTime() - now.getTime();
 
     console.log("Proposed natural activation");
@@ -928,6 +997,7 @@ export async function armNaturalCanary(): Promise<void> {
     line("  policy.killSwitchActive", `${policy.killSwitchActive} -> false`);
     line("  authorization row", "UNCHANGED — arming spends no claim");
     console.log("");
+    reportRuntimeAttestation(attestation);
 
     if (blockers.length > 0) {
       console.log("BLOCKED — nothing was changed:");

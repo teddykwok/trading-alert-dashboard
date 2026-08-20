@@ -5,6 +5,11 @@ import { CANARY_PINNED_LIMITS, CANARY_POLICY, effectiveCanaryLimits } from "./ca
 import { CanaryAuthorizationService, describeAuthorizationWindow } from "./canary-authorization.service";
 import { describeNaturalWindow } from "./natural-authorization";
 import type { CanaryAuthorizationMode } from "./canary-readiness";
+import {
+  currentProcessGateSnapshot,
+  configuredRuntimeIdentity,
+  readRuntimeAttestationStatusOnce,
+} from "../runtime/runtime-attestation";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
 /**
@@ -94,7 +99,26 @@ async function main(): Promise<void> {
     }
     const mode = requested.mode;
 
-    const service = new CanaryPreflightService(prisma);
+    // Phase 12.4D-A.1: the preflight CLI opts INTO runtime attestation, so an
+    // operator can see whether the running processes match this command's own
+    // configuration. It is a LIVE_ACTIVATION concern only — preparation
+    // readiness is unaffected when the runtime is intentionally down.
+    const service = new CanaryPreflightService(prisma, {
+      probes: {
+        runtimeAttestation: async () => {
+          const status = await readRuntimeAttestationStatusOnce({
+            identity: configuredRuntimeIdentity(),
+            expected: currentProcessGateSnapshot(),
+          });
+          return {
+            evaluated: true,
+            ok: status.ok,
+            reasonCode: status.reasonCode,
+            message: status.message,
+          };
+        },
+      },
+    });
     const result = await service.run(mode);
     const { infrastructure, binance, local, policy, gates } = result.gathered;
 

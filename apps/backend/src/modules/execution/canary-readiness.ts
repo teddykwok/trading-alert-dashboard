@@ -54,6 +54,13 @@ export const CANARY_READINESS_CODES = [
    * `execution:prepare-canary` refuse to run.
    */
   "CANARY_BLOCKED_AUTHORIZATION",
+  /**
+   * Phase 12.4D-A.1. ONE code for every runtime-attestation failure — missing,
+   * stale, duplicate, mismatched or unreadable — with the specific cause in the
+   * detail, deliberately avoiding a five-code explosion for one concern.
+   * Scoped LIVE_ACTIVATION: preparation must stay possible with runtime DOWN.
+   */
+  "CANARY_BLOCKED_RUNTIME_ATTESTATION",
 ] as const;
 
 export type CanaryReadinessCode = (typeof CANARY_READINESS_CODES)[number];
@@ -83,6 +90,7 @@ export const BLOCKER_SCOPE: Record<Exclude<CanaryReadinessCode, "CANARY_READY">,
   // All three of these are SUPPOSED to block right now.
   CANARY_BLOCKED_KILL_SWITCH_STATE: "LIVE_ACTIVATION",
   CANARY_BLOCKED_GATE_STATE: "LIVE_ACTIVATION",
+  CANARY_BLOCKED_RUNTIME_ATTESTATION: "LIVE_ACTIVATION",
   // An unprepared window is the expected state while preparing, exactly like a
   // closed gate. Making it a PREPARATION blocker would deadlock the operator:
   // `execution:prepare-canary` refuses to run while any preparation blocker
@@ -268,6 +276,20 @@ export interface CanaryPreflightInput {
   policy: PolicyState;
   gates: SafetyGateState;
   authorization: AuthorizationReadinessState;
+  /**
+   * Absent when the caller did not evaluate runtime attestation at all (for
+   * example a pure preparation check). Absent is NOT a blocker — only an
+   * evaluated failure is.
+   */
+  runtimeAttestation?: RuntimeAttestationReadiness;
+}
+
+/** Sanitized view of the attestation verdict; carries no gate secrets. */
+export interface RuntimeAttestationReadiness {
+  evaluated: boolean;
+  ok: boolean;
+  reasonCode: string | null;
+  message: string | null;
 }
 
 export interface CanaryFinding {
@@ -545,6 +567,17 @@ export function evaluateCanaryPreflight(input: CanaryPreflightInput): CanaryPref
         }
         break;
     }
+  }
+
+  // --- Runtime attestation (LIVE_ACTIVATION scope) ------------------------
+  // Only an EVALUATED failure blocks. When the caller did not evaluate it at
+  // all — the normal case while the runtime is intentionally down — nothing is
+  // added, so preparationReady is unaffected.
+  if (input.runtimeAttestation?.evaluated && !input.runtimeAttestation.ok) {
+    add(
+      "CANARY_BLOCKED_RUNTIME_ATTESTATION",
+      `${input.runtimeAttestation.reasonCode}: ${input.runtimeAttestation.message}`
+    );
   }
 
   // --- Gates (LIVE_ACTIVATION scope) --------------------------------------

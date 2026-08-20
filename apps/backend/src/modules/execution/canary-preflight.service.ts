@@ -10,6 +10,7 @@ import {
   type CanaryPolicyLimits,
   type CanaryPreflightInput,
   type CanaryPreflightResult,
+  type RuntimeAttestationReadiness,
 } from "./canary-readiness";
 import { naturalWindowState } from "./natural-authorization";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
@@ -57,6 +58,13 @@ export interface PreflightProbes {
   executionWorkerReady: () => Promise<boolean>;
   notificationSchedulerReady: () => Promise<boolean>;
   executionOrchestrationWired: () => Promise<boolean>;
+  /**
+   * Phase 12.4D-A.1, OPTIONAL on purpose. When absent the readiness evaluation
+   * records "not evaluated", which is never a blocker — so every existing
+   * caller, and preparation while the runtime is intentionally down, behave
+   * exactly as before. Only the preflight CLI opts in.
+   */
+  runtimeAttestation?: () => Promise<RuntimeAttestationReadiness>;
 }
 
 export class CanaryPreflightService {
@@ -98,6 +106,10 @@ export class CanaryPreflightService {
         this.probes.notificationSchedulerReady(),
         this.probes.executionOrchestrationWired(),
       ]);
+
+    const runtimeAttestation: RuntimeAttestationReadiness = this.probes.runtimeAttestation
+      ? await this.probes.runtimeAttestation()
+      : { evaluated: false, ok: true, reasonCode: null, message: null };
 
     // Repeated signed health checks against the real account (GET only).
     let consecutiveSignedSuccesses = 0;
@@ -174,6 +186,7 @@ export class CanaryPreflightService {
         profile: profileRow ? profileRow.limits : null,
       },
       authorization,
+      runtimeAttestation,
       gates: {
         globalKillSwitch: env.EXECUTION_GLOBAL_KILL_SWITCH,
         profileKillSwitchEngaged,

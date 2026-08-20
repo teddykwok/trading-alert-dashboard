@@ -61,11 +61,55 @@ let preflightFindings: { preparation: Array<{ code: string; detail: string }>; l
   live: [],
 };
 
+/**
+ * Phase 12.4D-A.1. Arm now consults runtime attestation, which is a Redis read
+ * against processes that are deliberately NOT running in tests. Default PASS so
+ * every pre-existing assertion still exercises what it was written for; the
+ * interlock's own BLOCKED behaviour is driven explicitly below.
+ */
+const LIVE_GATES = {
+  globalKillSwitch: false,
+  liveEntryEnabled: true,
+  protectionReady: true,
+  accountSetupMutationsEnabled: false,
+  testOrderEnabled: false,
+  autoAddMarginEnabled: false,
+  emergencyCloseMode: "DISABLED",
+};
+let attestationResult: {
+  ok: boolean;
+  reasonCode: string | null;
+  message: string | null;
+  backend: { role: string; freshCount: number; staleCount: number; gates: typeof LIVE_GATES | null; instanceId: string | null };
+  worker: { role: string; freshCount: number; staleCount: number; gates: typeof LIVE_GATES | null; instanceId: string | null };
+};
+const passingAttestation = () => ({
+  ok: true,
+  reasonCode: null,
+  message: null,
+  backend: { role: "BACKEND", freshCount: 1, staleCount: 0, gates: LIVE_GATES, instanceId: "b1" },
+  worker: { role: "WORKER", freshCount: 1, staleCount: 0, gates: LIVE_GATES, instanceId: "w1" },
+});
+attestationResult = passingAttestation();
+
 async function loadControls(gates: Record<string, string> = ARMED_GATES) {
   vi.resetModules();
   process.env.EXECUTION_PROFILE_ACCOUNT_IDENTIFIER = TEST_IDENTIFIER;
   process.env.EXECUTION_PROFILE_ENVIRONMENT = "MAINNET";
   Object.assign(process.env, gates);
+
+  vi.doMock("../src/modules/runtime/runtime-attestation", async () => {
+    const actual = await vi.importActual<typeof import("../src/modules/runtime/runtime-attestation")>(
+      "../src/modules/runtime/runtime-attestation"
+    );
+    return {
+      ...actual,
+      // Only the one-shot CLI reader is replaced; nothing else is stubbed, so
+      // the module's real key/schema/gate logic is still the thing under test
+      // in runtime-attestation.test.ts.
+      readRuntimeAttestationStatusOnce: async () => attestationResult,
+    };
+  });
 
   vi.doMock("../src/modules/execution/canary-preflight.service", () => ({
     REQUIRED_CONSECUTIVE_SIGNED_SUCCESSES: 3,
@@ -188,6 +232,7 @@ beforeEach(async () => {
     });
   }
   if (available) await resetProfile();
+  attestationResult = passingAttestation();
 });
 
 afterEach(() => {
@@ -925,6 +970,194 @@ describeDb("disarm: natural window behaviour", () => {
 
     await prisma!.tradeExecution.delete({ where: { id: outstanding.id } });
     await prisma!.alert.delete({ where: { id: alert.id } });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 15. Runtime attestation interlock (Phase 12.4D-A.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * The Phase 4D-A finding, at the arm boundary.
+ *
+ * The `.env` on disk, and therefore this CLI's own snapshot, can say the
+ * activation gates are open while the backend or worker that actually executes
+ * trades is still running the snapshot IT parsed at startup. `environmentIsArmed()`
+ * cannot see that — it only reads this process's configuration. These tests
+ * prove arm refuses whenever the running processes cannot be shown to agree.
+ */
+describeDb("arm-natural-window: runtime attestation interlock", () => {
+  const SAFE_STATE = { isEnabled: false, killSwitchActive: true };
+
+  const blockedAttestation = (reasonCode: string, message: string, overrides: Record<string, unknown> = {}) => ({
+    ...passingAttestation(),
+    ok: false,
+    reasonCode,
+    message,
+    ...overrides,
+  });
+
+  it("BLOCKS a confirmed arm when the backend is running a stale .env snapshot", async () => {
+    // THE core Phase-4D-A regression: worker restarted, backend not.
+    const window = await makeWindow();
+    const before = await untouchable();
+    attestationResult = blockedAttestation(
+      "RUNTIME_ATTESTATION_MISMATCH",
+      "the running processes loaded different execution gates than this command did; restart them after editing .env.",
+      {
+        backend: {
+          role: "BACKEND",
+          freshCount: 1,
+          staleCount: 0,
+          gates: { ...LIVE_GATES, globalKillSwitch: true, liveEntryEnabled: false, protectionReady: false },
+          instanceId: "b1",
+        },
+      }
+    );
+
+    argv(`--id=${window.id}`, "--confirm-arm");
+    const { armNaturalCanary } = await loadControls();
+    await armNaturalCanary();
+
+    expect(output()).toContain("RUNTIME_ATTESTATION_MISMATCH");
+    // Fails closed BEFORE any DB mutation.
+    expect(await profileState()).toEqual(SAFE_STATE);
+    const after = await untouchable();
+    expect(after.windows).toEqual(before.windows);
+    expect(after.policy.killSwitchActive).toBe(true);
+    expect(after.policy.version).toBe(before.policy.version);
+  });
+
+  it.each([
+    ["RUNTIME_ATTESTATION_MISSING", "no BACKEND runtime is attesting for this execution identity."],
+    ["RUNTIME_ATTESTATION_STALE", "the WORKER runtime last reported more than 15s ago."],
+    ["RUNTIME_ATTESTATION_DUPLICATE", "2 fresh BACKEND runtimes are attesting; exactly one is required."],
+    ["RUNTIME_ATTESTATION_UNAVAILABLE", "runtime attestation could not be read (connection refused)."],
+  ])("BLOCKS a confirmed arm on %s", async (reasonCode, message) => {
+    const window = await makeWindow();
+    attestationResult = blockedAttestation(reasonCode, message);
+
+    argv(`--id=${window.id}`, "--confirm-arm");
+    const { armNaturalCanary } = await loadControls();
+    await armNaturalCanary();
+
+    expect(output()).toContain(reasonCode);
+    expect(await profileState()).toEqual(SAFE_STATE);
+    // No claim, no authorization rewrite.
+    const after = await prisma!.executionCanaryAuthorization.findUniqueOrThrow({ where: { id: window.id } });
+    expect(after.claimedCount).toBe(0);
+    expect(after.version).toBe(window.version);
+  });
+
+  it("displays the attestation block in a DRY RUN, including each role's gates", async () => {
+    const window = await makeWindow();
+    argv(`--id=${window.id}`);
+    const { armNaturalCanary } = await loadControls();
+    await armNaturalCanary();
+
+    const text = output();
+    expect(text).toContain("Runtime attestation");
+    expect(text).toMatch(/backend instances\s+1 fresh \/ 0 stale/);
+    expect(text).toMatch(/worker instances\s+1 fresh \/ 0 stale/);
+    expect(text).toMatch(/result\s+PASS/);
+    expect(text).toContain("DRY RUN");
+  });
+
+  it("shows BLOCKED and the reason in a dry run without hiding the mismatch", async () => {
+    const window = await makeWindow();
+    attestationResult = blockedAttestation("RUNTIME_ATTESTATION_DUPLICATE", "2 fresh WORKER runtimes are attesting; exactly one is required.");
+
+    argv(`--id=${window.id}`);
+    const { armNaturalCanary } = await loadControls();
+    await armNaturalCanary();
+
+    expect(output()).toMatch(/result\s+BLOCKED/);
+    expect(output()).toContain("2 fresh WORKER runtimes");
+  });
+
+  it("still arms when attestation PASSES and every existing gate also passes", async () => {
+    // Attestation must be an ADDITIONAL gate, never a replacement for one.
+    const window = await makeWindow();
+    argv(`--id=${window.id}`, "--confirm-arm");
+    const { armNaturalCanary } = await loadControls();
+    await armNaturalCanary();
+
+    expect(output()).toContain("ARMED.");
+    expect(await profileState()).toEqual({ isEnabled: true, killSwitchActive: false });
+  });
+
+  it("does not let a PASSING attestation bypass any existing check", async () => {
+    // Attestation PASS + expired window must still refuse on the window.
+    const window = await makeWindow({ ttlMinutes: -5 });
+    argv(`--id=${window.id}`, "--confirm-arm");
+    const { armNaturalCanary } = await loadControls();
+    await armNaturalCanary();
+
+    expect(output()).toContain("WINDOW_EXPIRED");
+    expect(await profileState()).toEqual(SAFE_STATE);
+  });
+
+  it("never writes runtime presence — arm only reads it", () => {
+    const controls = readFileSync(path.join(process.cwd(), "src/modules/execution/run-canary-controls.ts"), "utf8");
+    // The publisher API must not be reachable from operator control code.
+    for (const forbidden of ["createRuntimeAttestationPublisher", "publishOnce", ".start()", "runtimeAttestationKey"]) {
+      expect(`${forbidden}:${controls.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+  });
+
+  it("leaves CLOSE and DISARM independent of attestation", async () => {
+    // A safety-off action must work when the runtime is missing or Redis is
+    // down. If either ever consulted attestation, this fails.
+    const controls = readFileSync(path.join(process.cwd(), "src/modules/execution/run-canary-controls.ts"), "utf8");
+    const slice = (start: string, end?: string) => {
+      const from = controls.indexOf(start);
+      const to = end ? controls.indexOf(end, from) : controls.length;
+      return controls.slice(from, to === -1 ? controls.length : to);
+    };
+    for (const [name, code] of [
+      ["close", slice("export async function closeCanaryWindow", "export async function disarmCanary")],
+      ["disarm", slice("export async function disarmCanary", "export async function armNaturalCanary")],
+    ] as Array<[string, string]>) {
+      expect(`${name}:${code.includes("evaluateRuntimeAttestation")}`).toBe(`${name}:false`);
+    }
+
+    // And behaviourally: with attestation hard-blocked, disarm still works.
+    const window = await makeWindow();
+    argv(`--id=${window.id}`, "--confirm-arm");
+    const { armNaturalCanary, disarmCanary } = await loadControls();
+    await armNaturalCanary();
+    expect(await profileState()).toEqual({ isEnabled: true, killSwitchActive: false });
+
+    attestationResult = blockedAttestation("RUNTIME_ATTESTATION_UNAVAILABLE", "redis down");
+    await disarmCanary();
+
+    expect(await profileState()).toEqual(SAFE_STATE);
+  });
+
+  it("applies the SAME interlock to historical exact arm", async () => {
+    // Exact arm opens the identical armed pair, so leaving it uninterlocked
+    // would be a bypass of this entire feature.
+    await makeExactWindow();
+    attestationResult = blockedAttestation("RUNTIME_ATTESTATION_MISSING", "no WORKER runtime is attesting for this execution identity.");
+
+    argv(CONFIRM_ARM_FLAG);
+    const { armCanary } = await loadControls();
+    await armCanary();
+
+    expect(output()).toContain("RUNTIME_ATTESTATION_MISSING");
+    expect(await profileState()).toEqual(SAFE_STATE);
+  });
+
+  it("exact arm still reaches its historical checks when attestation passes", async () => {
+    // Proves the interlock did not replace exact arm's own contract: with no
+    // authorization prepared it must still refuse for the historical reason.
+    attestationResult = passingAttestation();
+    argv(CONFIRM_ARM_FLAG);
+    const { armCanary } = await loadControls();
+    await armCanary();
+
+    expect(output()).toMatch(/no active unexpired authorization/i);
+    expect(await profileState()).toEqual(SAFE_STATE);
   });
 });
 

@@ -19,6 +19,10 @@ import { ExtremeRRService } from "../extreme-rr/extreme-rr.service";
 import { bullConnection, type ExtremeRRJobData, type VisionAnalysisJobData } from "./queue";
 import { startCleanupScheduler } from "./cleanup.worker";
 import { setupRetentionSchedule } from "./retention.worker";
+import {
+  asAttestationRedis,
+  createRuntimeAttestationPublisher,
+} from "../runtime/runtime-attestation";
 import { startExecutionNotificationScheduler } from "./execution-notification.scheduler";
 import {
   createExecutionOrchestrator,
@@ -222,7 +226,20 @@ setupRetentionSchedule()
 
 logger.info("vision-analysis worker started, waiting for jobs...");
 
+// Phase 12.4D-A.1: published only after the worker has reached its ready point,
+// carrying the execution gates THIS process loaded. An activation command
+// refuses unless this agrees with the backend and with the command's own
+// snapshot, which is what makes a stale-.env worker impossible to arm over.
+const runtimeAttestation = createRuntimeAttestationPublisher({
+  role: "WORKER",
+  redis: asAttestationRedis(bullConnection),
+  onError: (error) => logger.error({ error }, "Runtime attestation heartbeat failed"),
+});
+runtimeAttestation.start();
+
 process.on("SIGTERM", async () => {
+  // Best effort; a crash relies on TTL expiry instead.
+  await runtimeAttestation.stop();
   clearInterval(cleanupTimer);
   clearInterval(notificationTimer);
   clearInterval(orchestrationTimer);

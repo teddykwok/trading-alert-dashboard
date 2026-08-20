@@ -93,6 +93,36 @@ async function loadControls(gates: Record<string, string>) {
   process.env.EXECUTION_PROFILE_ENVIRONMENT = "MAINNET";
   Object.assign(process.env, gates);
 
+  // Phase 12.4D-A.1: exact arm now consults runtime attestation, which is a
+  // Redis read against processes deliberately not running in tests. PASS by
+  // default so these historical exact-arm assertions keep testing what they
+  // were written for; the interlock's own BLOCKED behaviour is covered in
+  // natural-arm.integration.test.ts.
+  vi.doMock("../src/modules/runtime/runtime-attestation", async () => {
+    const actual = await vi.importActual<typeof import("../src/modules/runtime/runtime-attestation")>(
+      "../src/modules/runtime/runtime-attestation"
+    );
+    const gates = {
+      globalKillSwitch: false,
+      liveEntryEnabled: true,
+      protectionReady: true,
+      accountSetupMutationsEnabled: false,
+      testOrderEnabled: false,
+      autoAddMarginEnabled: false,
+      emergencyCloseMode: "DISABLED",
+    };
+    return {
+      ...actual,
+      readRuntimeAttestationStatusOnce: async () => ({
+        ok: true,
+        reasonCode: null,
+        message: null,
+        backend: { role: "BACKEND", freshCount: 1, staleCount: 0, gates, instanceId: "b1" },
+        worker: { role: "WORKER", freshCount: 1, staleCount: 0, gates, instanceId: "w1" },
+      }),
+    };
+  });
+
   vi.doMock("../src/modules/execution/canary-preflight.service", () => ({
     REQUIRED_CONSECUTIVE_SIGNED_SUCCESSES: 3,
     CanaryPreflightService: class {
