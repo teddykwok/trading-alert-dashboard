@@ -1,6 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { CanaryPreflightService } from "./canary-preflight.service";
+import type { ExecutionCanaryAuthorization } from "@prisma/client";
 import {
   CanaryAuthorizationAlreadyActiveError,
   CanaryAuthorizationService,
@@ -8,8 +9,14 @@ import {
   MINIMUM_REMAINING_LIFETIME_MS,
   describeAuthorizationSubject,
   describeAuthorizationWindow,
+  NaturalWindowValidationError,
   type PrepareResult,
 } from "./canary-authorization.service";
+import {
+  MAXIMUM_AUTHORIZATION_TTL_MINUTES,
+  describeNaturalWindow,
+  normalizeNaturalDirections,
+} from "./natural-authorization";
 import { validateCanarySymbol } from "./canary-symbol-validation";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
@@ -29,6 +36,22 @@ import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-
  */
 
 const CONFIRM_ARM = "--confirm-arm";
+
+/**
+ * Phase 12.4A natural-window writes follow the `execution:set-policy`
+ * convention rather than arm's: DRY RUN by default, `--confirm` to apply.
+ * Arming keeps its own `--confirm-arm` because it is the one command that
+ * starts real trading; preparing a window is a policy-shaped write, so it reads
+ * like one.
+ *
+ * The emergency paths — `close-canary-window` and `disarm-canary` — deliberately
+ * take NO flag at all, so reaching safety stays instant.
+ *
+ * None of the natural commands touches `allowedSymbols`, the Asset table,
+ * TradingView or Binance. A natural window authorizes PROFILE + DIRECTION +
+ * TIME + CUMULATIVE CLAIM BUDGET, and nothing about a ticker.
+ */
+const CONFIRM = "--confirm";
 
 function line(label: string, value: string | number | boolean | null | undefined): void {
   console.log(`  ${label.padEnd(30)} ${value === null || value === undefined ? "—" : String(value)}`);
@@ -445,5 +468,261 @@ export async function disarmCanary(): Promise<void> {
     }
     console.log("The symbol allowlist is left narrow on purpose: [] would mean allow ALL.");
     console.log("Nothing was sent to Binance. No environment variable was changed.");
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 12.4A — natural-window operator controls
+// ---------------------------------------------------------------------------
+
+/** Parses `--directions=LONG,SHORT`. Returns null for anything unusable. */
+function parseDirections(raw: string | null): string[] | null {
+  if (raw === null || raw.trim() === "") return null;
+  return raw.split(",").map((entry) => entry.trim()).filter((entry) => entry !== "");
+}
+
+/**
+ * Opens ONE natural window: directions, a cumulative claim budget and a bounded
+ * expiry. No token is generated, because natural mode has no secret.
+ */
+export async function prepareNaturalWindow(): Promise<void> {
+  const confirmed = process.argv.includes(CONFIRM);
+  const rawDirections = parseDirections(arg("directions"));
+  const rawMaxClaims = arg("max-claims");
+  const rawTtl = arg("ttl-minutes");
+
+  console.log("PREPARE NATURAL WINDOW (Phase 12.4A) — authorizes a direction and a budget, never a symbol.");
+  console.log("");
+
+  if (rawDirections === null || rawMaxClaims === null) {
+    console.log(
+      "Usage: execution:prepare-natural-window -- --directions=LONG[,SHORT] --max-claims=5 " +
+        `[--ttl-minutes=${DEFAULT_AUTHORIZATION_TTL_MINUTES}] [${CONFIRM}]`
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  // Validated through the SAME domain helpers the service uses, so the dry run
+  // can never report a proposal the write would reject.
+  const directions = normalizeNaturalDirections(rawDirections);
+  if (directions === null) {
+    console.log("BLOCKED — --directions must be a non-empty list of LONG and/or SHORT. Empty admits nothing.");
+    process.exitCode = 1;
+    return;
+  }
+  const maxClaims = Number(rawMaxClaims);
+  if (!Number.isSafeInteger(maxClaims) || maxClaims < 1) {
+    console.log("BLOCKED — --max-claims must be a whole number of at least 1. There is no unlimited mode.");
+    process.exitCode = 1;
+    return;
+  }
+  const ttlMinutes = rawTtl === null ? DEFAULT_AUTHORIZATION_TTL_MINUTES : Number(rawTtl);
+  if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0 || ttlMinutes > MAXIMUM_AUTHORIZATION_TTL_MINUTES) {
+    console.log(`BLOCKED — --ttl-minutes must be between 1 and ${MAXIMUM_AUTHORIZATION_TTL_MINUTES}.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  await withPrisma(async (prisma) => {
+    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
+    if (!resolution.ok) {
+      console.log(`BLOCKED — ${resolution.reasonCode}: ${resolution.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    const profile = resolution.profile;
+
+    console.log("Proposed natural window");
+    line("environment", profile.environment === "MAINNET" ? "MAINNET — REAL FUNDS" : profile.environment);
+    line("authorizationType", "NATURAL_WINDOW");
+    line("allowedDirections", `[${directions.join(", ")}]`);
+    line("maxClaims", `${maxClaims} (cumulative; never refunded)`);
+    line("claimedCount", 0);
+    line("version", 1);
+    line("ttlMinutes", ttlMinutes);
+    // Projected, NOT reserved. The authoritative expiry is computed by the
+    // service at apply time from ttlMinutes, so this line must not read as a
+    // timestamp the operator already holds.
+    line(
+      "expiresAt (projected)",
+      `${new Date(Date.now() + ttlMinutes * 60_000).toISOString()} — nothing is reserved until ${CONFIRM}`
+    );
+    line("allowedSymbol", "null — a window names no symbol");
+    line("token", "none — natural authorization is server-side");
+    line("profile isEnabled", profile.isEnabled);
+    line("profile killSwitch", profile.safetyPolicy?.killSwitchActive ?? null);
+    console.log("");
+
+    if (!confirmed) {
+      console.log("DRY RUN");
+      console.log(`  NO DATABASE WRITE WAS PERFORMED. Re-run with ${CONFIRM} to apply.`);
+      return;
+    }
+
+    let window: ExecutionCanaryAuthorization;
+    try {
+      // Exclusivity, validation and the write all belong to the Phase-2
+      // service. Reproducing any of it here would create a second set of rules.
+      window = await new CanaryAuthorizationService(prisma).prepareNaturalWindow({
+        executionProfileId: profile.id,
+        allowedDirections: directions,
+        maxClaims,
+        ttlMinutes,
+      });
+    } catch (error) {
+      if (error instanceof CanaryAuthorizationAlreadyActiveError) {
+        console.log(`NOT APPLIED — ${error.reasonCode}: ${error.message}`);
+        console.log("  Nothing was changed. An open window must expire or be revoked first.");
+        process.exitCode = 1;
+        return;
+      }
+      if (error instanceof NaturalWindowValidationError) {
+        console.log(`NOT APPLIED — ${error.reasonCode}: ${error.message}`);
+        process.exitCode = 1;
+        return;
+      }
+      throw error;
+    }
+
+    console.log("APPLIED.");
+    line("authorization id", window.id);
+    line("allowedDirections", `[${window.allowedDirections.join(", ")}]`);
+    line("maxClaims", window.maxClaims);
+    line("claimedCount", window.claimedCount);
+    line("version", window.version);
+    line("expiresAt", window.expiresAt.toISOString());
+    console.log("");
+    console.log("No token exists for a natural window; nothing goes into TradingView.");
+    console.log("allowedSymbols, the profile gates and the safety policy were NOT touched.");
+  });
+}
+
+/**
+ * Read-only authorization status for the configured profile.
+ *
+ * Prints state, never secrets: a natural window has none, and an exact one has
+ * only a hash that must not leave the service.
+ */
+export async function showAuthorization(): Promise<void> {
+  console.log("AUTHORIZATION STATUS — read only. Nothing is prepared, revoked, consumed or claimed.");
+  console.log("");
+
+  await withPrisma(async (prisma) => {
+    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
+    if (!resolution.ok) {
+      console.log(`BLOCKED — ${resolution.reasonCode}: ${resolution.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    const profile = resolution.profile;
+    const now = new Date();
+    const rows = await new CanaryAuthorizationService(prisma).listForProfile(profile.id);
+
+    line("profile", `${profile.accountIdentifier} (${profile.environment})`);
+    line("profile isEnabled", profile.isEnabled);
+    line("profile killSwitch", profile.safetyPolicy?.killSwitchActive ?? null);
+    line("authorizations on record", rows.length);
+    console.log("");
+
+    // EXACT rows keep their historical window summary, unchanged.
+    const exact = rows.filter((row) => row.authorizationType === "EXACT_SIGNAL");
+    const exactStatus = describeAuthorizationWindow(exact, now);
+    console.log("EXACT_SIGNAL");
+    line("  on record", exact.length);
+    line("  prepared (active)", exactStatus.prepared);
+    line("  symbol", exactStatus.symbol);
+    line("  direction", exactStatus.direction);
+    line("  expiresAt", exactStatus.expiresAt);
+    line("  consumed", exactStatus.consumed);
+    line("  revoked", exactStatus.revoked);
+    line("  activeCount", exactStatus.activeCount);
+    console.log("");
+
+    const natural = rows.filter((row) => row.authorizationType === "NATURAL_WINDOW");
+    console.log("NATURAL_WINDOW");
+    line("  on record", natural.length);
+    if (natural.length === 0) {
+      line("  state", "none prepared");
+    }
+    for (const row of natural) {
+      const status = describeNaturalWindow(row, now);
+      console.log("");
+      line("  authorization id", row.id);
+      line("  state", status.state);
+      line("  allowedDirections", `[${status.allowedDirections.join(", ")}]`);
+      line("  maxClaims", status.maxClaims);
+      line("  claimedCount", status.claimedCount);
+      line("  remainingClaims", status.remainingClaims);
+      line("  version", status.version);
+      line("  createdAt", row.createdAt.toISOString());
+      line("  expiresAt", status.expiresAt);
+      line("  revokedAt", row.revokedAt ? row.revokedAt.toISOString() : null);
+    }
+    console.log("");
+    console.log("No token or token hash is ever printed.");
+  });
+}
+
+/**
+ * Shuts one natural window. Future admissions only — an already-admitted
+ * execution keeps its reservation, its protection and its spent claim.
+ */
+export async function revokeNaturalWindow(): Promise<void> {
+  const confirmed = process.argv.includes(CONFIRM);
+  const id = arg("id");
+
+  console.log("REVOKE NATURAL WINDOW — blocks FUTURE admissions. Nothing already admitted is affected.");
+  console.log("");
+
+  await withPrisma(async (prisma) => {
+    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
+    if (!resolution.ok) {
+      console.log(`BLOCKED — ${resolution.reasonCode}: ${resolution.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    const profile = resolution.profile;
+    const authorizations = new CanaryAuthorizationService(prisma);
+
+    // Default to the open window so the operator does not have to paste an id
+    // in the ordinary case; an explicit --id always wins.
+    const target = id ?? (await authorizations.findNaturalWindow(profile.id))?.id ?? null;
+    if (target === null) {
+      console.log("BLOCKED — no open natural window for this profile. Pass --id=<authorization id> to target one.");
+      process.exitCode = 1;
+      return;
+    }
+
+    const before = await prisma.executionCanaryAuthorization.findUnique({ where: { id: target } });
+    if (!before || before.executionProfileId !== profile.id || before.authorizationType !== "NATURAL_WINDOW") {
+      console.log("BLOCKED — that id is not a natural window belonging to this profile.");
+      process.exitCode = 1;
+      return;
+    }
+
+    line("environment", profile.environment === "MAINNET" ? "MAINNET — REAL FUNDS" : profile.environment);
+    line("authorization id", before.id);
+    line("state", describeNaturalWindow(before, new Date()).state);
+    line("allowedDirections", `[${before.allowedDirections.join(", ")}]`);
+    line("claimedCount", `${before.claimedCount}/${before.maxClaims} (preserved; never refunded)`);
+    console.log("");
+
+    if (!confirmed) {
+      console.log("DRY RUN");
+      console.log(`  NO DATABASE WRITE WAS PERFORMED. Re-run with ${CONFIRM} to apply.`);
+      return;
+    }
+
+    const revoked = await authorizations.revokeNaturalWindow(profile.id, target);
+    const after = await prisma.executionCanaryAuthorization.findUniqueOrThrow({ where: { id: target } });
+
+    console.log(revoked ? "APPLIED." : "ALREADY REVOKED — nothing changed.");
+    line("revokedAt", after.revokedAt ? after.revokedAt.toISOString() : null);
+    line("claimedCount", after.claimedCount);
+    line("maxClaims", after.maxClaims);
+    line("allowedDirections", `[${after.allowedDirections.join(", ")}]`);
+    console.log("");
+    console.log("The row was kept. Revocation stops NEW admissions and refunds no claim.");
   });
 }

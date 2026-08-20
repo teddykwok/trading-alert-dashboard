@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client";
 // The SAME min-merge admission applies, so preflight and execution can never
 // disagree about what the effective policy is.
+import type { NaturalWindowState } from "./natural-authorization";
 import { mergeCapacityLimits, type SafetyCapacityLimits } from "./safety-engine";
 
 /**
@@ -41,6 +42,18 @@ export const CANARY_READINESS_CODES = [
    * whatever the gates say.
    */
   "CANARY_BLOCKED_ORCHESTRATION_NOT_WIRED",
+
+  /**
+   * Phase 12.4A. The profile has no usable authorization for the canary it is
+   * being prepared for.
+   *
+   * ONE code with the specific cause in `detail`, mirroring how
+   * CANARY_BLOCKED_POLICY reports POLICY_MISMATCH_SOURCES — rather than seven
+   * near-identical codes. Scoped LIVE_ACTIVATION, because a window that has not
+   * been prepared yet is the NORMAL state while preparing: it must never make
+   * `execution:prepare-canary` refuse to run.
+   */
+  "CANARY_BLOCKED_AUTHORIZATION",
 ] as const;
 
 export type CanaryReadinessCode = (typeof CANARY_READINESS_CODES)[number];
@@ -67,38 +80,65 @@ export const BLOCKER_SCOPE: Record<Exclude<CanaryReadinessCode, "CANARY_READY">,
   CANARY_BLOCKED_DATABASE: "PREPARATION",
   CANARY_BLOCKED_REDIS: "PREPARATION",
   CANARY_BLOCKED_ORCHESTRATION_NOT_WIRED: "PREPARATION",
-  // Both of these are SUPPOSED to block right now.
+  // All three of these are SUPPOSED to block right now.
   CANARY_BLOCKED_KILL_SWITCH_STATE: "LIVE_ACTIVATION",
   CANARY_BLOCKED_GATE_STATE: "LIVE_ACTIVATION",
+  // An unprepared window is the expected state while preparing, exactly like a
+  // closed gate. Making it a PREPARATION blocker would deadlock the operator:
+  // `execution:prepare-canary` refuses to run while any preparation blocker
+  // exists, so "no window yet" would prevent creating one.
+  CANARY_BLOCKED_AUTHORIZATION: "LIVE_ACTIVATION",
 };
 
 /**
- * The exact policy the initial $1.50 canary requires.
+ * The exact policy the natural canary requires.
  *
- * Capacity stays at one trade in every dimension. Only the aggregate margin
- * ceiling moved, and only because admission reserves `maximumIsolatedMargin`
- * (risk × BINANCE_MAX_MARGIN_MULTIPLIER), never the smaller selected margin:
- * at the recommended 5.333333 multiplier a single $1.50 plan reserves
- * $7.9999995, so a $5.00 aggregate ceiling could not admit even ONE trade.
- * $8.00 is therefore the one-trade ceiling, NOT room for a second trade —
- * maxTotalActiveTrades = 1 is what bounds the count.
+ * This is a READINESS CONTRACT, not the runtime capacity engine. Nothing here
+ * limits a live trade: admission enforces `min(env global, profile row)` through
+ * `mergeCapacityLimits`, and this constant is only compared against those two
+ * so an operator cannot activate under limits nobody reviewed. Changing it
+ * changes what preflight DEMANDS, never what execution ALLOWS.
  *
- * These are compared against the ENV globals (see canary-preflight.service),
- * so raising the ceiling here fails the preflight closed until an operator
- * sets EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD deliberately.
+ * Every pinned value is judged on THREE sides — env global, profile row and the
+ * effective merge — and all three must equal it, so a stale row cannot hide
+ * behind a correct global.
+ *
+ * Phase 12.4A moved this from the historical one-slot $1.50 contract to the
+ * reviewed 3-soft/5-hard envelope the live profile has held since policy
+ * version 3. The MAINNET row was NOT touched; only this code expectation moved
+ * to match it, which is what unblocks CANARY_BLOCKED_POLICY.
  */
 export const CANARY_POLICY = {
-  maxOpenPositions: 1,
-  maxPendingEntries: 1,
-  maxTotalActiveTrades: 1,
+  maxOpenPositions: 5,
+  maxPendingEntries: 5,
+  maxTotalActiveTrades: 5,
   maxActivePerSymbolSide: 1,
-  // Soft == hard == 1 for the canary: exactly one position, and the soft
-  // gate closes admission at the same point the hard cap does. Raising this
-  // to the future 3/5 topology is a separate reviewed step.
-  softOpenPositionTarget: 1,
-  maxTotalPlannedRiskUsd: "1.50",
-  maxTotalIsolatedMarginUsd: "8.00",
+  // SOFT 3 under a HARD 5. New admission stops at three open positions while
+  // the account can still safely hold five, so a fill that beats a cancellation
+  // is never invalidated. See softOpenPositionTarget on ExecutionSafetyPolicy.
+  softOpenPositionTarget: 3,
+  // Five $1.50 plans reserve 5 x 1.50 = 7.50 of planned risk, and five MAXIMUM
+  // isolated margins at the 5.333333 multiplier reserve 5 x 7.9999995 =
+  // 39.9999975, which 40.00 covers. Both are AGGREGATE admission ceilings and
+  // are never an input to per-plan sizing.
+  maxTotalPlannedRiskUsd: "7.50",
+  maxTotalIsolatedMarginUsd: "40.00",
 } as const;
+
+/**
+ * The cumulative claim budget the FIRST supervised natural canary is pinned to.
+ *
+ * Deliberately a SEPARATE constant rather than derived from
+ * `CANARY_POLICY.maxTotalActiveTrades`, even though both are 5 today. They mean
+ * different things: `maxTotalActiveTrades` bounds how many trades may be open
+ * AT ONCE, while `maxClaims` bounds how many may ever be admitted from one
+ * window. A future canary could legitimately pair five concurrent slots with a
+ * larger cumulative budget, and deriving one from the other would silently
+ * couple them.
+ *
+ * Defined once, here, so no second module hard-codes the number.
+ */
+export const CANARY_NATURAL_MAX_CLAIMS = 5;
 
 export interface InfrastructureState {
   databaseReady: boolean;
@@ -181,12 +221,53 @@ export interface SafetyGateState {
   emergencyCloseMode: string;
 }
 
+/** Which mode the canary being prepared is expected to run in. */
+export const CANARY_AUTHORIZATION_MODES = ["EXACT_SIGNAL", "NATURAL_WINDOW"] as const;
+export type CanaryAuthorizationMode = (typeof CANARY_AUTHORIZATION_MODES)[number];
+
+/** Why the authorization is not ready. Carried in the finding detail. */
+export const AUTHORIZATION_MISMATCH_SOURCES = [
+  "AUTHORIZATION_STATE_UNAVAILABLE",
+  "NO_EXACT_AUTHORIZATION",
+  "NO_NATURAL_WINDOW",
+  "NATURAL_WINDOW_INVALID",
+  "NATURAL_WINDOW_EXPIRED",
+  "NATURAL_WINDOW_REVOKED",
+  "NATURAL_WINDOW_EXHAUSTED",
+  "NATURAL_WINDOW_DIRECTION_CONFIGURATION_INVALID",
+  "NATURAL_WINDOW_MAX_CLAIMS_MISMATCH",
+] as const;
+export type AuthorizationMismatchSource = (typeof AUTHORIZATION_MISMATCH_SOURCES)[number];
+
+/**
+ * The authorization side of readiness — SANITIZED, never a row.
+ *
+ * A natural window carries no secret, and an exact one carries only a hash that
+ * must never leave the service, so this describes state rather than passing the
+ * record through. `null` fields mean "could not be read", which is always a
+ * blocker: not knowing is never the same as being ready.
+ */
+export interface AuthorizationReadinessState {
+  /** Which mode this preflight is judging. */
+  mode: CanaryAuthorizationMode;
+  /** False when the authorization table could not be read at all. */
+  available: boolean;
+  /** EXACT_SIGNAL: an unconsumed, unrevoked, unexpired authorization exists. */
+  exactPrepared: boolean;
+  /** NATURAL_WINDOW: the newest window's state, or null when none exists. */
+  naturalState: NaturalWindowState | null;
+  naturalAllowedDirections: string[];
+  naturalMaxClaims: number | null;
+  naturalClaimedCount: number | null;
+}
+
 export interface CanaryPreflightInput {
   infrastructure: InfrastructureState;
   binance: BinanceState;
   local: LocalExecutionState;
   policy: PolicyState;
   gates: SafetyGateState;
+  authorization: AuthorizationReadinessState;
 }
 
 export interface CanaryFinding {
@@ -397,6 +478,72 @@ export function evaluateCanaryPreflight(input: CanaryPreflightInput): CanaryPref
         `${source}: ${name} global ${String(global[name])}, row ${String(row[name])}, ` +
           `effective ${String(effective[name])}; the canary requires ${String(required)}.`
       );
+    }
+  }
+
+  // --- Authorization (LIVE_ACTIVATION scope) -------------------------------
+  // Judged for the mode the operator says they are preparing. Nothing here is
+  // a PREPARATION blocker: an unprepared window is the normal starting state.
+  const authorization = input.authorization;
+  const refuseAuthorization = (source: AuthorizationMismatchSource, detail: string): void => {
+    add("CANARY_BLOCKED_AUTHORIZATION", `${source}: ${detail}`);
+  };
+
+  if (!authorization.available) {
+    refuseAuthorization(
+      "AUTHORIZATION_STATE_UNAVAILABLE",
+      "the authorization table could not be read, so readiness cannot be proven."
+    );
+  } else if (authorization.mode === "EXACT_SIGNAL") {
+    // Unchanged historical expectation: one prepared, unconsumed exact
+    // authorization. Natural fields are NOT required and are not consulted.
+    if (!authorization.exactPrepared) {
+      refuseAuthorization(
+        "NO_EXACT_AUTHORIZATION",
+        "no active exact authorization is prepared. Run execution:prepare-canary."
+      );
+    }
+  } else {
+    // NATURAL_WINDOW. No token, no symbol, no singular direction is required.
+    switch (authorization.naturalState) {
+      case null:
+        refuseAuthorization(
+          "NO_NATURAL_WINDOW",
+          "no natural window has been prepared. Run execution:prepare-natural-window."
+        );
+        break;
+      case "INVALID":
+        refuseAuthorization("NATURAL_WINDOW_INVALID", "the natural window contradicts its own declared mode.");
+        break;
+      case "EXPIRED":
+        refuseAuthorization("NATURAL_WINDOW_EXPIRED", "the natural window has expired. Prepare a fresh one.");
+        break;
+      case "REVOKED":
+        refuseAuthorization("NATURAL_WINDOW_REVOKED", "the natural window was revoked. Prepare a fresh one.");
+        break;
+      case "EXHAUSTED":
+        refuseAuthorization(
+          "NATURAL_WINDOW_EXHAUSTED",
+          `the natural window has spent its whole budget ` +
+            `(${authorization.naturalClaimedCount ?? "?"}/${authorization.naturalMaxClaims ?? "?"}).`
+        );
+        break;
+      case "AVAILABLE":
+        // The window is usable; now judge how it was CONFIGURED.
+        if (authorization.naturalAllowedDirections.length === 0) {
+          refuseAuthorization(
+            "NATURAL_WINDOW_DIRECTION_CONFIGURATION_INVALID",
+            "the window names no direction, which admits nothing."
+          );
+        }
+        if (authorization.naturalMaxClaims !== CANARY_NATURAL_MAX_CLAIMS) {
+          refuseAuthorization(
+            "NATURAL_WINDOW_MAX_CLAIMS_MISMATCH",
+            `maxClaims is ${authorization.naturalMaxClaims ?? "unset"}; the canary is pinned to ` +
+              `${CANARY_NATURAL_MAX_CLAIMS} cumulative admitted executions.`
+          );
+        }
+        break;
     }
   }
 

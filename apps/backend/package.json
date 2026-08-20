@@ -28,6 +28,9 @@
     "execution:arm-canary": "tsx src/modules/execution/run-arm-canary.ts",
     "execution:close-canary-window": "tsx src/modules/execution/run-close-canary-window.ts",
     "execution:disarm-canary": "tsx src/modules/execution/run-disarm-canary.ts",
+    "execution:prepare-natural-window": "tsx src/modules/execution/run-prepare-natural-window.ts",
+    "execution:show-authorization": "tsx src/modules/execution/run-show-authorization.ts",
+    "execution:revoke-natural-window": "tsx src/modules/execution/run-revoke-natural-window.ts",
     "test": "vitest run",
     "test:db:setup": "tsx scripts/setup-test-db.ts",
     "playwright:install": "playwright install chromium"

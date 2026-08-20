@@ -603,10 +603,29 @@ describe("canary control boundary", () => {
   it("requires an explicit confirmation flag to arm, and none to reach safety", () => {
     const source = readFileSync(CONTROLS, "utf8");
     expect(source).toContain("--confirm-arm");
-    const disarm = source.slice(source.indexOf("export async function disarmCanary"));
-    const close = source.slice(source.indexOf("export async function closeCanaryWindow"), source.indexOf("export async function disarmCanary"));
+    // Bounded to the FUNCTION, not to end-of-file. Phase 12.4A appended the
+    // natural-window commands after disarmCanary, and those legitimately take
+    // --confirm: preparing a window is a write. What must stay true is that the
+    // two EMERGENCY paths — close-window and disarm — need no flag at all, so an
+    // operator can reach safety in a hurry.
+    const disarmStart = source.indexOf("export async function disarmCanary");
+    const afterDisarm = source.indexOf("export async function", disarmStart + 1);
+    const disarm = source.slice(disarmStart, afterDisarm === -1 ? undefined : afterDisarm);
+    const close = source.slice(source.indexOf("export async function closeCanaryWindow"), disarmStart);
     expect(disarm).not.toContain("--confirm");
     expect(close).not.toContain("--confirm");
+    // ...and the natural WRITE commands DO require confirmation, through the
+    // shared CONFIRM constant rather than a scattered literal.
+    expect(source).toContain('const CONFIRM = "--confirm";');
+    for (const fn of ["prepareNaturalWindow", "revokeNaturalWindow"]) {
+      const start = source.indexOf(`export async function ${fn}`);
+      const end = source.indexOf("export async function", start + 1);
+      const body = source.slice(start, end === -1 ? undefined : end);
+      expect(`${fn}:${body.includes("process.argv.includes(CONFIRM)")}`).toBe(`${fn}:true`);
+    }
+    // The read-only inspector must NOT ask for confirmation — it writes nothing.
+    const show = source.slice(source.indexOf("export async function showAuthorization"));
+    expect(show.slice(0, show.indexOf("export async function", 1))).not.toContain("CONFIRM");
   });
 
   it("never widens the symbol allowlist back to allow-all", () => {
@@ -620,6 +639,9 @@ describe("canary control boundary", () => {
       ["run-arm-canary.ts", "armCanary"],
       ["run-close-canary-window.ts", "closeCanaryWindow"],
       ["run-disarm-canary.ts", "disarmCanary"],
+      ["run-prepare-natural-window.ts", "prepareNaturalWindow"],
+      ["run-show-authorization.ts", "showAuthorization"],
+      ["run-revoke-natural-window.ts", "revokeNaturalWindow"],
     ]) {
       const source = readFileSync(path.join(BACKEND, "src", "modules", "execution", file), "utf8");
       // No injected profile, no injected preflight — the command always
@@ -975,10 +997,21 @@ describe("natural authorization: runtime boundary", () => {
 
   /** The only production files permitted to know natural authorization exists. */
   const ALLOWED = [
+    // The RUNTIME half (Phase 12.2/12.3): these can admit and claim.
     "src/modules/execution/natural-authorization.ts",
     "src/modules/execution/canary-authorization.service.ts",
     "src/modules/execution/selected-plan-executor.ts",
     "src/modules/execution/safety-admission.service.ts",
+    // The OPERATOR half (Phase 12.4A): these prepare, inspect, revoke and
+    // report. None of them admits, claims or executes anything, so they widen
+    // what an operator can SEE without widening what the runtime DOES.
+    "src/modules/execution/run-canary-controls.ts",
+    "src/modules/execution/run-prepare-natural-window.ts",
+    "src/modules/execution/run-show-authorization.ts",
+    "src/modules/execution/run-revoke-natural-window.ts",
+    "src/modules/execution/run-canary-preflight.ts",
+    "src/modules/execution/canary-readiness.ts",
+    "src/modules/execution/canary-preflight.service.ts",
   ];
 
   /**

@@ -179,7 +179,10 @@ describeDb("execution:set-policy — dry run", () => {
     // row today, and 8.00 after the change.
     expect(text).toMatch(/effective now\s+5/);
     expect(text).toMatch(/effective after\s+8/);
-    expect(text).toMatch(/canary requires\s+8\.00/);
+    // Phase 12.4A raised CANARY_POLICY to the 3/5 envelope, so the canary now
+      // requires 40.00 here. The env global (8.00) and the row (5.00) above are
+      // unrelated to that pin and are unchanged.
+      expect(text).toMatch(/canary requires\s+40\.00/);
   });
 
   it("names MAINNET before any confirmation", async () => {

@@ -4,6 +4,7 @@ import { Prisma } from "@prisma/client";
 import { describe, expect, it } from "vitest";
 import {
   BLOCKER_SCOPE,
+  CANARY_NATURAL_MAX_CLAIMS,
   CANARY_POLICY,
   CANARY_READINESS_CODES,
   effectiveCanaryLimits,
@@ -11,6 +12,7 @@ import {
   type CanaryPolicyLimits,
   type CanaryPreflightInput,
 } from "../src/modules/execution/canary-readiness";
+import { resolveMode } from "../src/modules/execution/run-canary-preflight";
 import {
   CanaryPreflightService,
   detectExecutionOrchestration,
@@ -26,13 +28,13 @@ const BACKEND = process.cwd();
 
 /** Exactly the pinned canary values, used for BOTH sides of the merge. */
 const CANARY_LIMITS: CanaryPolicyLimits = {
-  maxOpenPositions: 1,
-  maxPendingEntries: 1,
-  maxTotalActiveTrades: 1,
+  maxOpenPositions: 5,
+  maxPendingEntries: 5,
+  maxTotalActiveTrades: 5,
   maxActivePerSymbolSide: 1,
-  softOpenPositionTarget: 1,
-  maxTotalPlannedRiskUsd: "1.50",
-  maxTotalIsolatedMarginUsd: "8.00",
+  softOpenPositionTarget: 3,
+  maxTotalPlannedRiskUsd: "7.50",
+  maxTotalIsolatedMarginUsd: "40.00",
 };
 
 /** One helper for the "global X / row Y" cases that dominate the policy tests. */
@@ -83,6 +85,19 @@ function baseline(overrides: Partial<CanaryPreflightInput> = {}): CanaryPrefligh
             ? null
             : { ...CANARY_LIMITS, ...overrides.policy.profile }
           : { ...CANARY_LIMITS },
+    },
+    // Phase 12.4A. The baseline is a READY exact authorization, which is what
+    // every pre-existing case in this file implicitly assumed before
+    // authorization became a readiness dimension.
+    authorization: {
+      mode: "EXACT_SIGNAL",
+      available: true,
+      exactPrepared: true,
+      naturalState: null,
+      naturalAllowedDirections: [],
+      naturalMaxClaims: null,
+      naturalClaimedCount: null,
+      ...overrides.authorization,
     },
     gates: {
       globalKillSwitch: true,
@@ -232,20 +247,28 @@ describe("Binance readiness", () => {
 // ---------------------------------------------------------------------------
 
 describe("canary policy", () => {
-  it("requires exactly the documented one-trade policy", () => {
+  it("requires exactly the reviewed 3-soft / 5-hard natural canary policy", () => {
     expect(CANARY_POLICY).toEqual({
-      maxOpenPositions: 1,
-      maxPendingEntries: 1,
-      maxTotalActiveTrades: 1,
+      maxOpenPositions: 5,
+      maxPendingEntries: 5,
+      maxTotalActiveTrades: 5,
       maxActivePerSymbolSide: 1,
-      // Soft == hard == 1: unchanged canary behaviour in this branch.
-      softOpenPositionTarget: 1,
-      maxTotalPlannedRiskUsd: "1.50",
-      // 8.00 is the ONE-trade aggregate ceiling, sized so a single plan
-      // reserving risk × 5.333333 = 7.9999995 fits. Capacity above is still 1
-      // in every dimension — this is not room for a second trade.
-      maxTotalIsolatedMarginUsd: "8.00",
+      // SOFT 3 under HARD 5: new admission stops at three open positions while
+      // the account can still hold five, so a fill that beats a cancellation is
+      // never invalidated.
+      softOpenPositionTarget: 3,
+      // Five $1.50 plans reserve 7.50 of planned risk...
+      maxTotalPlannedRiskUsd: "7.50",
+      // ...and five MAXIMUM isolated margins at 5.333333 reserve 39.9999975,
+      // which 40.00 covers. Both are AGGREGATE admission ceilings.
+      maxTotalIsolatedMarginUsd: "40.00",
     });
+  });
+
+  it("pins the natural claim budget separately from concurrent capacity", () => {
+    // Equal today, but deliberately not derived from one another: maxClaims is
+    // CUMULATIVE, maxTotalActiveTrades is CONCURRENT.
+    expect(CANARY_NATURAL_MAX_CLAIMS).toBe(5);
   });
 
   it("keeps the aggregate margin ceiling at or above the recommended per-plan ceiling", () => {
@@ -257,7 +280,22 @@ describe("canary policy", () => {
     const perPlanCeiling =
       Number(value("EXECUTION_MAX_TOTAL_PLANNED_RISK_USD")) * Number(value("BINANCE_MAX_MARGIN_MULTIPLIER"));
     expect(perPlanCeiling).toBeLessThanOrEqual(Number(CANARY_POLICY.maxTotalIsolatedMarginUsd));
-    expect(value("EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD")).toBe(CANARY_POLICY.maxTotalIsolatedMarginUsd);
+
+    // Phase 12.4A deliberately BROKE the old equality with .env.example.
+    //
+    // The shipped example stays at the conservative one-trade defaults, because
+    // that is what a fresh clone should inherit: capacity 1 and a 8.00 ceiling
+    // admit a single trade and nothing more. CANARY_POLICY is now the 3/5
+    // envelope the canary DEMANDS an operator raise those globals to, on
+    // purpose. Asserting they are equal would force every new clone to ship the
+    // wider limits, which is exactly the fail-open the defaults exist to
+    // prevent — so the assertion below pins the RELATIONSHIP instead.
+    expect(Number(value("EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD"))).toBeLessThanOrEqual(
+      Number(CANARY_POLICY.maxTotalIsolatedMarginUsd)
+    );
+    expect(Number(value("EXECUTION_MAX_TOTAL_PLANNED_RISK_USD"))).toBeLessThanOrEqual(
+      Number(CANARY_POLICY.maxTotalPlannedRiskUsd)
+    );
   });
 
   it("blocks a widened open, pending or active limit on the GLOBAL side", () => {
@@ -271,9 +309,9 @@ describe("canary policy", () => {
   });
 
   it("compares risk as an exact decimal, not a string", () => {
-    // "1.5" and "1.50" are the same budget, on BOTH sides of the merge.
+    // "7.5" and "7.50" are the same budget, on BOTH sides of the merge.
     expect(
-      codesOf(baseline(withLimits({ maxTotalPlannedRiskUsd: "1.5" }, { maxTotalPlannedRiskUsd: "1.5" })))
+      codesOf(baseline(withLimits({ maxTotalPlannedRiskUsd: "7.5" }, { maxTotalPlannedRiskUsd: "7.5" })))
     ).not.toContain("CANARY_BLOCKED_POLICY");
   });
 });
@@ -298,36 +336,36 @@ describe("canary policy — merge sources", () => {
     expect(codesOf(baseline())).not.toContain("CANARY_BLOCKED_POLICY");
   });
 
-  it("2. global 8 / row 5 / effective 5 → BLOCKED, naming the row as the clamp", () => {
+  it("2. global 40 / row 5 / effective 5 → BLOCKED, naming the row as the clamp", () => {
     const finding = marginFinding(baseline(withLimits({}, { maxTotalIsolatedMarginUsd: "5.00" })));
     expect(finding).toBeDefined();
     expect(finding!.detail).toContain("PROFILE_POLICY_CLAMPS_REQUIRED_CANARY_LIMIT");
-    expect(finding!.detail).toContain("global 8.00");
+    expect(finding!.detail).toContain("global 40.00");
     expect(finding!.detail).toContain("row 5.00");
     expect(finding!.detail).toContain("effective 5.00");
-    expect(finding!.detail).toContain("requires 8.00");
+    expect(finding!.detail).toContain("requires 40.00");
   });
 
-  it("3. global 5 / row 8 / effective 5 → BLOCKED, naming the global", () => {
+  it("3. global 5 / row 40 / effective 5 → BLOCKED, naming the global", () => {
     const finding = marginFinding(baseline(withLimits({ maxTotalIsolatedMarginUsd: "5.00" }, {})));
     expect(finding).toBeDefined();
     expect(finding!.detail).toContain("GLOBAL_POLICY_MISMATCH");
     expect(finding!.detail).toContain("global 5.00");
-    expect(finding!.detail).toContain("row 8.00");
+    expect(finding!.detail).toContain("row 40.00");
     expect(finding!.detail).toContain("effective 5.00");
   });
 
-  it("4. global 8 / row 10 / effective 8 → BLOCKED even though effective is correct", () => {
+  it("4. global 40 / row 50 / effective 40 → BLOCKED even though effective is correct", () => {
     // Decision, made explicitly rather than by omission: the ROW must also be
     // exact. A row wider than the canary yields a correct effective value only
     // for as long as the global keeps clamping it; relax the global later and
     // the canary silently runs under a limit nobody reviewed. A pinned canary
     // has to be reproducible from its own configuration.
-    const finding = marginFinding(baseline(withLimits({}, { maxTotalIsolatedMarginUsd: "10.00" })));
+    const finding = marginFinding(baseline(withLimits({}, { maxTotalIsolatedMarginUsd: "50.00" })));
     expect(finding).toBeDefined();
     expect(finding!.detail).toContain("PROFILE_POLICY_MISMATCH");
-    expect(finding!.detail).toContain("row 10.00");
-    expect(finding!.detail).toContain("effective 8.00");
+    expect(finding!.detail).toContain("row 50.00");
+    expect(finding!.detail).toContain("effective 40.00");
   });
 
   it("4b. both sides wrong in the same direction is reported as an EFFECTIVE mismatch", () => {
@@ -652,8 +690,32 @@ describe("Phase 11A boundary", () => {
     for (const forbidden of ["--force", "--skip-safety", "--ignore-preflight", "--force-live", "--yes"]) {
       expect(`${forbidden}:${cli.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
-    // And no argv inspection at all — the command takes no arguments.
-    expect(cli).not.toContain("process.argv");
+    // Phase 12.4A NARROWED this from "no argv inspection at all".
+    //
+    // The command previously took no arguments, so "contains no process.argv"
+    // was the simplest way to say "has no bypass". It now accepts exactly one
+    // read-only selector, --mode=natural, which chooses WHICH authorization is
+    // judged and can only ever make the preflight stricter or differently
+    // scoped — never permissive. So the assertion enumerates the single
+    // permitted use instead of forbidding argv outright.
+    //
+    // This is a deliberate, narrow relaxation: the bypass-flag list above is
+    // unchanged and still exhaustive.
+    //
+    // The adversarial review then tightened it further. argv is read in exactly
+    // ONE place and handed straight to `resolveMode`, which is pure, exported
+    // and exhaustively tested (see "preflight --mode parsing"). So the command
+    // has no ad-hoc flag handling left to audit at all.
+    const argvUses = cli.split("\n").filter((sourceLine) => sourceLine.includes("process.argv"));
+    expect(argvUses).toHaveLength(1);
+    expect(argvUses[0]).toContain("resolveMode(process.argv)");
+    expect(argvUses[0]).not.toMatch(/force|skip|ignore|yes|bypass/i);
+
+    // And a refused mode must stop the command BEFORE it reads anything.
+    const refusalAt = cli.indexOf("if (!requested.ok)");
+    const preflightRunAt = cli.indexOf("service.run(mode)");
+    expect(refusalAt).toBeGreaterThan(0);
+    expect(refusalAt).toBeLessThan(preflightRunAt);
   });
 
   it("prints no credential, balance, symbol detail or order id", () => {
@@ -842,5 +904,231 @@ describe("per-trade risk authority", () => {
     // Compared against the PROJECTED total, never handed to a sizing call.
     expect(engine).toContain("projectedRisk.greaterThan(new D(policy.maxTotalPlannedRiskUsd))");
     expect(engine).toContain("projectedMargin.greaterThan(new D(policy.maxTotalIsolatedMarginUsd))");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 12.4A — natural-window authorization readiness
+// ---------------------------------------------------------------------------
+
+describe("natural authorization readiness", () => {
+  /** A baseline judging NATURAL mode with a fully usable window. */
+  const natural = (overrides: Partial<CanaryPreflightInput["authorization"]> = {}) =>
+    baseline({
+      authorization: {
+        mode: "NATURAL_WINDOW",
+        available: true,
+        exactPrepared: false,
+        naturalState: "AVAILABLE",
+        naturalAllowedDirections: ["LONG", "SHORT"],
+        naturalMaxClaims: CANARY_NATURAL_MAX_CLAIMS,
+        naturalClaimedCount: 0,
+        ...overrides,
+      },
+    });
+
+  const authorizationFinding = (input: CanaryPreflightInput) =>
+    evaluateCanaryPreflight(input).findings.find((finding) => finding.code === "CANARY_BLOCKED_AUTHORIZATION");
+
+  it("a valid natural window raises no authorization blocker", () => {
+    expect(authorizationFinding(natural())).toBeUndefined();
+    // ...and it reaches READY once the gates are open, with no exact token,
+    // no allowedSymbol and no singular direction anywhere in sight.
+    const result = evaluateCanaryPreflight(natural({}) as never);
+    expect(result.preparationReady).toBe(true);
+  });
+
+  it("reaches CANARY_READY for a natural canary inside an authorized window", () => {
+    const input = natural();
+    const result = evaluateCanaryPreflight({ ...input, gates: OPEN_WINDOW as never });
+    expect(result.ready).toBe(true);
+    expect(result.summary).toBe("CANARY_READY");
+  });
+
+  it.each([
+    ["no window prepared", { naturalState: null }, "NO_NATURAL_WINDOW"],
+    ["malformed", { naturalState: "INVALID" as const }, "NATURAL_WINDOW_INVALID"],
+    ["expired", { naturalState: "EXPIRED" as const }, "NATURAL_WINDOW_EXPIRED"],
+    ["revoked", { naturalState: "REVOKED" as const }, "NATURAL_WINDOW_REVOKED"],
+    ["exhausted", { naturalState: "EXHAUSTED" as const, naturalClaimedCount: 5 }, "NATURAL_WINDOW_EXHAUSTED"],
+    ["no direction configured", { naturalAllowedDirections: [] }, "NATURAL_WINDOW_DIRECTION_CONFIGURATION_INVALID"],
+    ["budget below the pin", { naturalMaxClaims: 2 }, "NATURAL_WINDOW_MAX_CLAIMS_MISMATCH"],
+    ["budget above the pin", { naturalMaxClaims: 50 }, "NATURAL_WINDOW_MAX_CLAIMS_MISMATCH"],
+    ["unreadable", { available: false }, "AUTHORIZATION_STATE_UNAVAILABLE"],
+  ])("blocks on %s", (_label, overrides, source) => {
+    const finding = authorizationFinding(natural(overrides as never));
+    expect(finding).toBeDefined();
+    expect(finding!.detail).toContain(source);
+  });
+
+  it("keeps every authorization blocker in LIVE_ACTIVATION scope", () => {
+    // An unprepared window must never stop `execution:prepare-canary` running —
+    // that would deadlock the operator out of creating one.
+    const result = evaluateCanaryPreflight(natural({ naturalState: null }));
+    expect(result.preparationBlockers.map((finding) => finding.code)).not.toContain("CANARY_BLOCKED_AUTHORIZATION");
+    expect(result.liveActivationBlockers.map((finding) => finding.code)).toContain("CANARY_BLOCKED_AUTHORIZATION");
+    expect(BLOCKER_SCOPE.CANARY_BLOCKED_AUTHORIZATION).toBe("LIVE_ACTIVATION");
+  });
+
+  it("judges EXACT mode by the exact authorization alone", () => {
+    // The historical expectation, unchanged: a prepared exact authorization is
+    // enough, and NO natural field is consulted.
+    const exact = baseline({
+      authorization: {
+        mode: "EXACT_SIGNAL",
+        available: true,
+        exactPrepared: true,
+        // Deliberately hostile natural fields — none may be read in exact mode.
+        naturalState: "REVOKED",
+        naturalAllowedDirections: [],
+        naturalMaxClaims: 999,
+        naturalClaimedCount: 999,
+      },
+    });
+    expect(authorizationFinding(exact)).toBeUndefined();
+
+    const missing = baseline({
+      authorization: { ...exact.authorization, exactPrepared: false },
+    });
+    expect(authorizationFinding(missing)!.detail).toContain("NO_EXACT_AUTHORIZATION");
+  });
+
+  it("does not require a token, symbol or singular direction in natural mode", () => {
+    // The whole point of Option B: a window authorizes a direction and a budget.
+    const finding = authorizationFinding(
+      natural({ naturalAllowedDirections: ["LONG"], naturalMaxClaims: CANARY_NATURAL_MAX_CLAIMS })
+    );
+    expect(finding).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 12.4A review — --mode parsing must fail closed
+// ---------------------------------------------------------------------------
+
+describe("preflight --mode parsing", () => {
+  const parse = (...args: string[]) => resolveMode(["node", "cli", ...args]);
+
+  it("defaults to EXACT_SIGNAL when --mode is absent", () => {
+    // The compatibility contract every existing caller depends on.
+    const result = parse();
+    expect(result).toEqual({ ok: true, mode: "EXACT_SIGNAL" });
+  });
+
+  it.each([
+    ["exact", "EXACT_SIGNAL"],
+    ["EXACT_SIGNAL", "EXACT_SIGNAL"],
+    ["natural", "NATURAL_WINDOW"],
+    ["NATURAL_WINDOW", "NATURAL_WINDOW"],
+  ])("accepts --mode=%s", (value, expected) => {
+    expect(parse(`--mode=${value}`)).toEqual({ ok: true, mode: expected });
+  });
+
+  it.each([
+    ["--mode=natrual", "a typo"],
+    ["--mode=foo", "an unknown mode"],
+    ["--mode=", "an empty value"],
+    ["--mode", "a bare flag"],
+    ["--mode=NATURAL", "the wrong case"],
+    ["--mode=Natural", "mixed case"],
+    ["--mode=exact_signal", "the wrong case on exact"],
+    ["--mode=both", "a mode that does not exist"],
+  ])("REFUSES %s rather than falling back to exact (%s)", (arg) => {
+    // The defect this test exists for: the first parser matched only
+    // `natural` and fell through to EXACT_SIGNAL for everything else, so a
+    // typo printed a confident EXACT readiness report while the operator
+    // believed they were reading NATURAL readiness.
+    const result = parse(arg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toContain("--mode");
+      // The error names the valid values, so the fix is obvious.
+      expect(result.message).toContain("natural");
+      expect(result.message).toContain("exact");
+    }
+  });
+
+  it("REFUSES a repeated --mode rather than picking a winner", () => {
+    // There is no defensible precedence between these two, and guessing one
+    // produces exactly the misreading above.
+    for (const args of [
+      ["--mode=natural", "--mode=exact"],
+      ["--mode=exact", "--mode=natural"],
+      ["--mode=natural", "--mode=natural"],
+      ["--mode=natural", "--mode"],
+    ]) {
+      const result = parse(...args);
+      expect(`${args.join(" ")}:${result.ok}`).toBe(`${args.join(" ")}:false`);
+    }
+  });
+
+  it("ignores unrelated arguments entirely", () => {
+    expect(parse("--verbose", "--mode=natural", "somefile")).toEqual({ ok: true, mode: "NATURAL_WINDOW" });
+    expect(parse("--modest=natural")).toEqual({ ok: true, mode: "EXACT_SIGNAL" });
+  });
+
+  it("never accepts a bypass-shaped value", () => {
+    for (const value of ["force", "skip", "ignore", "yes", "bypass", "all"]) {
+      expect(parse(`--mode=${value}`).ok).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 12.4A review — the operator must never be deadlocked
+// ---------------------------------------------------------------------------
+
+describe("natural readiness progression", () => {
+  const withAuthorization = (overrides: Partial<CanaryPreflightInput["authorization"]>) =>
+    baseline({
+      authorization: {
+        mode: "NATURAL_WINDOW",
+        available: true,
+        exactPrepared: false,
+        naturalState: null,
+        naturalAllowedDirections: [],
+        naturalMaxClaims: null,
+        naturalClaimedCount: null,
+        ...overrides,
+      },
+    });
+
+  it("walks from no window, to prepared, to fully ready without ever deadlocking", () => {
+    // 1. Nothing prepared. preparationReady MUST still be true, or the
+    //    operator could never run prepare-natural-window to fix it.
+    const none = evaluateCanaryPreflight(withAuthorization({}));
+    expect(none.preparationReady).toBe(true);
+    expect(none.ready).toBe(false);
+    expect(none.findings.map((f) => f.code)).toContain("CANARY_BLOCKED_AUTHORIZATION");
+
+    // 2. A window is prepared. The authorization blocker clears; only the
+    //    gates still hold it back, which is correct before an arm step.
+    const prepared = evaluateCanaryPreflight(
+      withAuthorization({
+        naturalState: "AVAILABLE",
+        naturalAllowedDirections: ["LONG"],
+        naturalMaxClaims: CANARY_NATURAL_MAX_CLAIMS,
+        naturalClaimedCount: 0,
+      })
+    );
+    expect(prepared.preparationReady).toBe(true);
+    expect(prepared.findings.map((f) => f.code)).not.toContain("CANARY_BLOCKED_AUTHORIZATION");
+    expect(prepared.ready).toBe(false);
+    for (const finding of prepared.liveActivationBlockers) {
+      expect(["CANARY_BLOCKED_KILL_SWITCH_STATE", "CANARY_BLOCKED_GATE_STATE"]).toContain(finding.code);
+    }
+
+    // 3. Gates opened inside a supervised window: fully ready.
+    const armed = evaluateCanaryPreflight({
+      ...withAuthorization({
+        naturalState: "AVAILABLE",
+        naturalAllowedDirections: ["LONG"],
+        naturalMaxClaims: CANARY_NATURAL_MAX_CLAIMS,
+        naturalClaimedCount: 0,
+      }),
+      gates: OPEN_WINDOW as never,
+    });
+    expect(armed.ready).toBe(true);
+    expect(armed.summary).toBe("CANARY_READY");
   });
 });

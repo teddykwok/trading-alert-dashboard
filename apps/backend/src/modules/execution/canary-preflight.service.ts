@@ -5,10 +5,13 @@ import { env } from "../../config/env";
 import { BinanceAccountConnectionService } from "../binance/binance-account-connection.service";
 import {
   evaluateCanaryPreflight,
+  type AuthorizationReadinessState,
+  type CanaryAuthorizationMode,
   type CanaryPolicyLimits,
   type CanaryPreflightInput,
   type CanaryPreflightResult,
 } from "./canary-readiness";
+import { naturalWindowState } from "./natural-authorization";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
 /**
@@ -77,8 +80,16 @@ export class CanaryPreflightService {
     };
   }
 
-  /** Gathers every input, then evaluates. Read-only from end to end. */
-  async run(): Promise<CanaryPreflightResult & { gathered: CanaryPreflightInput }> {
+  /**
+   * Gathers every input, then evaluates. Read-only from end to end.
+   *
+   * `mode` says which authorization the canary is being judged for. It defaults
+   * to EXACT_SIGNAL so every existing caller — `prepare-canary`, `arm-canary`,
+   * the preflight CLI — keeps its historical behaviour unchanged.
+   */
+  async run(
+    mode: CanaryAuthorizationMode = "EXACT_SIGNAL"
+  ): Promise<CanaryPreflightResult & { gathered: CanaryPreflightInput }> {
     const [databaseReady, redisReady, executionWorkerReady, notificationSchedulerReady, executionOrchestrationWired] =
       await Promise.all([
         this.probes.databaseReady(),
@@ -112,6 +123,20 @@ export class CanaryPreflightService {
     // and the limits, so the two can never describe different rows.
     const profileRow = databaseReady ? await this.readProfilePolicyRow() : null;
     const profileKillSwitchEngaged = profileRow ? profileRow.killSwitchActive : null;
+
+    // Authorization readiness. READ ONLY — this never prepares, revokes,
+    // consumes or claims anything.
+    const authorization = databaseReady
+      ? await this.readAuthorizationState(mode)
+      : {
+          mode,
+          available: false,
+          exactPrepared: false,
+          naturalState: null,
+          naturalAllowedDirections: [],
+          naturalMaxClaims: null,
+          naturalClaimedCount: null,
+        };
 
     const gathered: CanaryPreflightInput = {
       infrastructure: {
@@ -148,6 +173,7 @@ export class CanaryPreflightService {
         // assuming the row agrees with the env.
         profile: profileRow ? profileRow.limits : null,
       },
+      authorization,
       gates: {
         globalKillSwitch: env.EXECUTION_GLOBAL_KILL_SWITCH,
         profileKillSwitchEngaged,
@@ -161,6 +187,66 @@ export class CanaryPreflightService {
     };
 
     return { ...evaluateCanaryPreflight(gathered), gathered };
+  }
+
+  /**
+   * The authorization side of readiness, SANITIZED. Reads only — no token, no
+   * hash and no row leaves this method.
+   *
+   * For NATURAL_WINDOW it describes the NEWEST window regardless of state, so
+   * the finding can say REVOKED or EXPIRED rather than a uselessly generic
+   * "none prepared". Preparation exclusivity guarantees a newer window implies
+   * every older one was already shut.
+   */
+  private async readAuthorizationState(mode: CanaryAuthorizationMode): Promise<AuthorizationReadinessState> {
+    const unavailable: AuthorizationReadinessState = {
+      mode,
+      available: false,
+      exactPrepared: false,
+      naturalState: null,
+      naturalAllowedDirections: [],
+      naturalMaxClaims: null,
+      naturalClaimedCount: null,
+    };
+
+    try {
+      const resolution = await resolveExecutionProfile(this.prisma, configuredProfileIdentity());
+      if (!resolution.ok) return unavailable;
+      const profileId = resolution.profile.id;
+      const now = new Date();
+
+      if (mode === "EXACT_SIGNAL") {
+        const active = await this.prisma.executionCanaryAuthorization.count({
+          where: {
+            executionProfileId: profileId,
+            authorizationType: "EXACT_SIGNAL",
+            consumedAt: null,
+            revokedAt: null,
+            expiresAt: { gt: now },
+          },
+        });
+        return { ...unavailable, available: true, exactPrepared: active > 0 };
+      }
+
+      const window = await this.prisma.executionCanaryAuthorization.findFirst({
+        where: { executionProfileId: profileId, authorizationType: "NATURAL_WINDOW" },
+        orderBy: { createdAt: "desc" },
+      });
+      if (!window) return { ...unavailable, available: true };
+
+      return {
+        mode,
+        available: true,
+        exactPrepared: false,
+        naturalState: naturalWindowState(window, now),
+        naturalAllowedDirections: [...window.allowedDirections],
+        naturalMaxClaims: window.maxClaims,
+        naturalClaimedCount: window.claimedCount,
+      };
+    } catch {
+      // Unreadable is never "ready": the evaluator turns this into a blocker.
+      return unavailable;
+    }
   }
 
   /** Counts only — never a symbol, quantity or id. */
