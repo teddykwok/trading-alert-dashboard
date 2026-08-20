@@ -1003,11 +1003,20 @@ describe("arm-natural-window: structural boundaries", () => {
  * operator command is genuinely blocked while it is held, and only then lets
  * the first commit.
  *
- * The legitimate final states are exactly three:
+ * The legitimate final pairs are:
  *
  *   SAFE OFF       isEnabled=false killSwitchActive=true
- *   SAFE RECOVERY  isEnabled=true  killSwitchActive=true   (outstanding work)
- *   ARMED          isEnabled=true  killSwitchActive=false  (serialized arm)
+ *   SAFE BLOCKED   isEnabled=true  killSwitchActive=true
+ *   ARMED          isEnabled=true  killSwitchActive=false
+ *
+ * SAFE BLOCKED is the normal result of an explicit `close-canary-window`, which
+ * engages the kill switch and deliberately leaves the profile ENABLED — it
+ * blocks new admission without disabling anything, and needs no outstanding
+ * work to be legitimate. SAFE RECOVERY is the SAME persisted pair reached for a
+ * different operational reason: disarm found outstanding work and kept the
+ * profile enabled so reconciliation and protection could continue. The pair
+ * alone therefore never proves which of the two happened, and no test here
+ * treats true/true as evidence of outstanding work.
  *
  * `isEnabled=false, killSwitchActive=false` is not reachable and every test
  * below asserts the PAIR, never one field.
