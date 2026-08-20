@@ -631,19 +631,33 @@ describe("canary control boundary", () => {
   it("keeps the authorization as an ADDITIONAL guard, never a bypass", () => {
     const source = readCode(path.join(BACKEND, "src", "modules", "execution", "selected-plan-executor.ts"));
 
-    // The canary check only ever refuses; it grants nothing. The block ends
-    // where Phase 3 planning begins — anchored on the planner call, which is
-    // stable, rather than on a local variable name.
+    // The authorization check only ever refuses; it grants nothing. The block
+    // ends where Phase 3 planning begins — anchored on the planner call, which
+    // is stable, rather than on a local variable name.
+    //
+    // Phase 12.3 renamed the opening variable `canaryMode` ->
+    // `authorizationsOnRecord`, because it no longer means "exact-only mode":
+    // it means "this profile is authorization-controlled", which may now be
+    // satisfied by an exact binding OR a natural window. The assertions below
+    // are unchanged — only the anchor moved.
+    const blockStart = source.indexOf("const authorizationsOnRecord");
+    expect(blockStart).toBeGreaterThan(0);
     const blockEnd = source.indexOf("this.deps.marginPlanner");
     expect(blockEnd).toBeGreaterThan(0);
-    const block = source.slice(source.indexOf("const canaryMode"), blockEnd);
+    const block = source.slice(blockStart, blockEnd);
     expect(block).toContain("handled: false");
     expect(block).not.toContain("handled: true");
     expect(block).not.toMatch(/allowDisabledProfile|killSwitch|bypass|skip/i);
 
+    // The precheck reads the window; it must never spend a claim. The claim
+    // belongs to SafetyAdmission, inside its transaction, and nowhere else.
+    expect(block).not.toContain("claimNaturalWindow");
+    expect(block).not.toContain("claimedCount");
+    expect(block).not.toMatch(/\.update|\.updateMany|\.create\(/);
+
     // Admission still runs afterwards, unconditionally.
     expect(source).toContain("this.deps.orchestrator.admitAndSubmit({ executionId })");
-    expect(source.indexOf("admitAndSubmit")).toBeGreaterThan(source.indexOf("const canaryMode"));
+    expect(source.indexOf("admitAndSubmit")).toBeGreaterThan(blockStart);
   });
 
   it("runs where the real canary profile does not exist", async () => {
@@ -905,7 +919,7 @@ describe("exact-row assertion", () => {
   });
 });
 
-describe("natural window is inert", () => {
+describe("natural authorization: runtime boundary", () => {
   const BACKEND = process.cwd();
   const SRC = path.join(BACKEND, "src");
 
@@ -924,81 +938,158 @@ describe("natural window is inert", () => {
     code: readFileSync(file, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, ""),
   }));
 
+  const codeOf = (file: string) => productionCode.find((entry) => entry.file === file)!.code;
+
   /**
-   * Phase 12.2 replaced a repo-wide "the string NATURAL_WINDOW appears nowhere"
-   * assertion with the two below.
+   * ## Why the Phase-12.2 assertions here were REPLACED, not extended
    *
-   * That assertion was the right pin for Phase 12.1, when natural mode was
-   * schema only. It stopped being a statement about INERTNESS the moment the
-   * domain and service primitives existed — it would only have been satisfiable
-   * by not writing Phase 2 at all. What actually has to stay true is narrower
-   * and stronger: the primitives exist, and NO execution entrypoint reaches
-   * them. So these assert on the entrypoints and their imports, which is what
-   * "cannot change live execution behaviour" really means.
+   * Phase 12.2 asserted that NO execution entrypoint imported the natural
+   * module, called any natural primitive, or named NATURAL_WINDOW. That was the
+   * correct pin while natural mode was inert: it stated "this cannot change
+   * live execution behaviour", and it was true.
+   *
+   * Phase 12.3 is precisely the change those assertions forbade. Keeping them
+   * would have been keeping a test that says the feature must not exist, which
+   * no amount of correct implementation can satisfy — so they are replaced
+   * rather than loosened.
+   *
+   * What replaces them is narrower and, for a real-money system, stronger: the
+   * dependency is now permitted in exactly TWO production files and forbidden
+   * everywhere else. Specifically:
+   *
+   *   REPLACED  "keeps every execution entrypoint free of the natural-window
+   *             module"            -> ALLOWED/FORBIDDEN split below
+   *   REPLACED  "calls no natural primitive from any execution entrypoint"
+   *                                -> "the claim exists in exactly one place"
+   *   REPLACED  "confines the natural primitives to the two Phase-12 modules"
+   *                                -> confined to the FOUR modules, named
+   *   REPLACED  "leaves the canary-mode predicate exactly as it was"
+   *                                -> the predicate is now type-aware by
+   *                                   design; what is pinned instead is that
+   *                                   historical rows still gate the profile
+   *   REPLACED  "keeps safety admission free of authorization entirely"
+   *                                -> admission OWNS authorization; the engine
+   *                                   stays pure instead
+   *   KEPT      the domain module's purity and Option-B boundary, unchanged
    */
 
-  /** The files that would have to change for natural mode to become live. */
-  const ENTRYPOINTS = [
+  /** The only production files permitted to know natural authorization exists. */
+  const ALLOWED = [
+    "src/modules/execution/natural-authorization.ts",
+    "src/modules/execution/canary-authorization.service.ts",
     "src/modules/execution/selected-plan-executor.ts",
     "src/modules/execution/safety-admission.service.ts",
+  ];
+
+  /**
+   * Files that must stay ignorant of it. Protection and reconciliation are the
+   * load-bearing entries: authorization gates NEW admission only, so a window
+   * expiring must never be able to stop a live position being protected.
+   */
+  const FORBIDDEN = [
     "src/modules/execution/safety-engine.ts",
     "src/modules/execution/execution-orchestrator.ts",
     "src/modules/execution/capacity-status.ts",
+    "src/modules/execution/entry-lifecycle.ts",
+    "src/modules/execution/entry-lifecycle.service.ts",
+    "src/modules/execution/protection-lifecycle.ts",
+    "src/modules/execution/protection-lifecycle.service.ts",
+    "src/modules/execution/execution.service.ts",
     "src/modules/webhook/webhook.service.ts",
     "src/modules/webhook/webhook.schema.ts",
     "src/modules/jobs/vision-analysis.worker.ts",
   ];
 
-  it("keeps every execution entrypoint free of the natural-window module", () => {
-    for (const file of ENTRYPOINTS) {
-      const entry = productionCode.find((source) => source.file === file);
-      expect(`${file} exists`, `${file} exists`).toBe(`${file} exists`);
-      // No import of the domain module, by any spelling.
-      expect(`${file}:${/from\s+["'][^"']*natural-authorization["']/.test(entry!.code)}`).toBe(`${file}:false`);
-      expect(`${file}:${entry!.code.includes("natural-authorization")}`).toBe(`${file}:false`);
-    }
-  });
+  const NATURAL_SYMBOLS = [
+    "natural-authorization",
+    "claimNaturalWindow",
+    "prepareNaturalWindow",
+    "revokeNaturalWindow",
+    "findNaturalWindow",
+    "naturalWindowAdmitsDirection",
+    "naturalWindowState",
+    "isNaturalWindowAvailable",
+    "NATURAL_WINDOW",
+  ];
 
-  it("calls no natural primitive from any execution entrypoint", () => {
-    // Named individually rather than by substring: these are the four calls
-    // that would actually make a natural window do something.
-    const PRIMITIVES = [
-      "prepareNaturalWindow",
-      "claimNaturalWindow",
-      "revokeNaturalWindow",
-      "findNaturalWindow",
-      "naturalWindowAdmitsDirection",
-      "isNaturalWindowAvailable",
-    ];
-    for (const file of ENTRYPOINTS) {
-      const entry = productionCode.find((source) => source.file === file)!;
-      for (const primitive of PRIMITIVES) {
-        expect(`${file}:${primitive}:${entry.code.includes(primitive)}`).toBe(`${file}:${primitive}:false`);
+  it("keeps protection, reconciliation and the webhook ignorant of authorization", () => {
+    for (const file of FORBIDDEN) {
+      for (const symbol of NATURAL_SYMBOLS) {
+        expect(`${file}:${symbol}:${codeOf(file).includes(symbol)}`).toBe(`${file}:${symbol}:false`);
       }
-      // And no NATURAL_WINDOW branch of any kind.
-      expect(`${file}:NATURAL_WINDOW:${entry.code.includes("NATURAL_WINDOW")}`).toBe(`${file}:NATURAL_WINDOW:false`);
     }
   });
 
-  it("confines the natural primitives to the two Phase-12 modules", () => {
-    // Nothing outside the domain module and the authorization service may
-    // mention a natural-window column, so a third caller cannot appear quietly.
-    const allowed = new Set([
-      "src/modules/execution/natural-authorization.ts",
-      "src/modules/execution/canary-authorization.service.ts",
-    ]);
-    for (const field of ["allowedDirections", "maxClaims", "claimedCount", "NATURAL_WINDOW"]) {
+  it("keeps the pure safety engine free of any authorization concept", () => {
+    // The engine gains the reason CODES (it owns the catalogue) but must never
+    // read a window: it has no Prisma client and no lock, so an authorization
+    // decision taken there could not be atomic with the claim.
+    const engine = codeOf("src/modules/execution/safety-engine.ts");
+    for (const forbidden of ["executionCanaryAuthorization", "claimNaturalWindow", "natural-authorization"]) {
+      expect(`${forbidden}:${engine.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+  });
+
+  it("confines every natural symbol to the four permitted modules", () => {
+    for (const symbol of NATURAL_SYMBOLS) {
       const offenders = productionCode
-        .filter((entry) => entry.code.includes(field) && !allowed.has(entry.file))
+        .filter((entry) => entry.code.includes(symbol) && !ALLOWED.includes(entry.file))
         .map((entry) => entry.file);
-      expect(`${field}: ${offenders.join(", ")}`).toBe(`${field}: `);
+      expect(`${symbol}: ${offenders.join(", ")}`).toBe(`${symbol}: `);
+    }
+  });
+
+  it("spends the claim in EXACTLY one production place", () => {
+    // The single most important structural fact in Phase 3: one call site, and
+    // it is inside the transaction that also reserves capacity.
+    // Call sites only — the `export async function claimNaturalWindow(` in the
+    // Phase-2 service is the definition, not a caller.
+    const callers = productionCode.filter((entry) =>
+      /(?<!function\s)claimNaturalWindow\s*\(/.test(entry.code.replace(/export async function claimNaturalWindow/g, ""))
+    );
+    expect(callers.map((entry) => entry.file)).toEqual(["src/modules/execution/safety-admission.service.ts"]);
+
+    const admission = codeOf("src/modules/execution/safety-admission.service.ts");
+    // It is passed the TRANSACTION client, not the service-level client, so it
+    // commits or rolls back with the reservation.
+    expect(admission).toMatch(/claimNaturalWindow\(tx,/);
+    // And it opens no transaction of its own beside the admission one.
+    expect((admission.match(/\$transaction/g) ?? []).length).toBe(1);
+  });
+
+  it("never claims from the selected-plan precheck", () => {
+    // The precheck runs before margin planning, so a claim there could be spent
+    // on a plan that is about to be rejected — and claims are never refunded.
+    const executor = codeOf("src/modules/execution/selected-plan-executor.ts");
+    expect(executor).not.toContain("claimNaturalWindow");
+    expect(executor).not.toContain("claimedCount");
+    // It reads the window and nothing else: no write to the authorization table
+    // beyond the pre-existing exact `consumedExecutionId` binding.
+    const authorizationWrites = [...executor.matchAll(/executionCanaryAuthorization\.(\w+)/g)].map((m) => m[1]);
+    expect(authorizationWrites.sort()).toEqual(["count", "findFirst", "findFirst", "updateMany"]);
+  });
+
+  it("still requires authorization for a profile with only historical rows", () => {
+    // The predicate became type-aware, but its GATE did not move: any row on
+    // record still means the profile is authorization-controlled. A profile
+    // whose windows have all been consumed or revoked does not become open.
+    const executor = codeOf("src/modules/execution/selected-plan-executor.ts");
+    expect(executor).toContain("const authorizationsOnRecord = await");
+    expect(executor).toContain("if (authorizationsOnRecord > 0) {");
+    // Counting is still unfiltered — history counts, exactly as before.
+    const predicate = executor.slice(
+      executor.indexOf("const authorizationsOnRecord"),
+      executor.indexOf("if (authorizationsOnRecord > 0)")
+    );
+    for (const forbidden of ["authorizationType", "revokedAt", "expiresAt", "consumedAt"]) {
+      expect(`${forbidden}:${predicate.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
   });
 
   it("keeps the natural domain free of symbol, watchlist and exchange authority", () => {
     // The locked Option-B boundary, asserted on the module itself: a natural
     // window authorizes PROFILE + DIRECTION + TIME + BUDGET, never a ticker.
-    const domain = productionCode.find((entry) => entry.file.endsWith("natural-authorization.ts"))!;
+    const domain = codeOf("src/modules/execution/natural-authorization.ts");
     for (const forbidden of [
       "allowedSymbols",
       "Asset",
@@ -1008,13 +1099,13 @@ describe("natural window is inert", () => {
       "symbol",
       "fetch(",
     ]) {
-      expect(`${forbidden}:${domain.code.includes(forbidden)}`).toBe(`${forbidden}:false`);
+      expect(`${forbidden}:${domain.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
 
     // Purity, stated precisely: the module may import TYPES from @prisma/client
     // (CanaryDirection, ExecutionCanaryAuthorization) but must issue no query
     // and hold no client. The import it does have is `import type`.
-    expect(domain.code).toContain('import type { CanaryDirection, ExecutionCanaryAuthorization } from "@prisma/client"');
+    expect(domain).toContain('import type { CanaryDirection, ExecutionCanaryAuthorization } from "@prisma/client"');
     for (const forbidden of [
       "PrismaClient",
       "TransactionClient",
@@ -1026,32 +1117,21 @@ describe("natural window is inert", () => {
       "updateMany",
       "create(",
     ]) {
-      expect(`${forbidden}:${domain.code.includes(forbidden)}`).toBe(`${forbidden}:false`);
+      expect(`${forbidden}:${domain.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
     // And no clock read — every function takes `now` from its caller.
-    expect(domain.code).not.toMatch(/new Date\(\s*\)/);
+    expect(domain).not.toMatch(/new Date\(\s*\)/);
   });
 
-  it("leaves the canary-mode predicate exactly as it was", () => {
-    // The line that keeps natural tokenless alerts blocked on MAINNET today.
-    // Changing it belongs to the admission-integration phase, not this one.
-    const executor = productionCode.find((entry) => entry.file.endsWith("selected-plan-executor.ts"))!.code;
-    expect(executor).toContain("executionCanaryAuthorization.count({");
-    expect(executor).toContain("where: { executionProfileId: profile.profile.id },");
-    expect(executor).toContain("if (canaryMode > 0) {");
-    // Still unfiltered by type, state or expiry — ANY row means canary mode.
-    const predicate = executor.slice(executor.indexOf("const canaryMode"), executor.indexOf("if (canaryMode > 0)"));
-    for (const forbidden of ["authorizationType", "revokedAt", "expiresAt", "consumedAt"]) {
-      expect(`${forbidden}:${predicate.includes(forbidden)}`).toBe(`${forbidden}:false`);
-    }
-  });
-
-  it("keeps safety admission free of authorization entirely", () => {
-    for (const name of ["safety-engine.ts", "safety-admission.service.ts", "execution-orchestrator.ts"]) {
-      const entry = productionCode.find((source) => source.file.endsWith(name))!;
-      for (const forbidden of ["CanaryAuthorization", "canaryAuthorization", "authorizationType", "isExactAuthorization"]) {
-        expect(`${name}:${forbidden}:${entry.code.includes(forbidden)}`).toBe(`${name}:${forbidden}:false`);
-      }
-    }
+  it("reads the window under the advisory lock, never before it", () => {
+    // Ordering is the correctness argument: a window read before the lock could
+    // be claimed by a concurrent admission between the read and the update.
+    const admission = codeOf("src/modules/execution/safety-admission.service.ts");
+    const lock = admission.indexOf("pg_advisory_xact_lock");
+    const resolve = admission.indexOf("resolveAdmissionAuthorization(tx");
+    const claim = admission.indexOf("claimNaturalWindow(tx");
+    expect(lock).toBeGreaterThan(0);
+    expect(resolve).toBeGreaterThan(lock);
+    expect(claim).toBeGreaterThan(resolve);
   });
 });

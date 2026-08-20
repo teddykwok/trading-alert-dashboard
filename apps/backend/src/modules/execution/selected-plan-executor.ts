@@ -4,6 +4,7 @@ import type { ExtremeRRPlanDto } from "@trading-alert-dashboard/shared";
 import { logger } from "../../config/logger";
 import type { BinanceMarginPlanService } from "../binance/binance-margin-plan.service";
 import { isExactAuthorization } from "./canary-authorization.service";
+import { naturalWindowAdmitsDirection } from "./natural-authorization";
 import type { ExecutionService } from "./execution.service";
 import type { ExecutionOrchestrator } from "./execution-orchestrator";
 import { resolveExecutionProfile, type ProfileIdentity } from "./execution-profile.service";
@@ -113,18 +114,28 @@ export class SelectedPlanExecutor {
     }
 
     // --- Canary authorization (fail closed) --------------------------------
-    // While ANY authorization has been prepared for this profile, the profile
-    // is in canary mode and only the one specifically authorized signal may
-    // proceed. That closes the activation-window race: an unrelated alert, or
-    // the right symbol in the wrong direction, cannot consume the slot simply
-    // because the gates happen to be open.
+    // ANY authorization on record means this profile is authorization-
+    // controlled. Historical rows never decay into "anything goes": a profile
+    // that was once put under authorization stays under it, and a profile that
+    // never was keeps its existing behaviour untouched.
     //
-    // The check is on the durable binding written at ingestion, never on a
-    // token — nothing reusable is persisted or passed around.
-    const canaryMode = await this.deps.prisma.executionCanaryAuthorization.count({
+    // Two ways a signal can be authorized, in strict order of precedence:
+    //
+    //   EXACT   a durable binding written at ingestion names THIS alert. The
+    //           historical one-shot flow, unchanged, and it wins outright.
+    //   NATURAL no binding names this alert, but an open natural window
+    //           currently authorizes signals in this direction.
+    //
+    // The natural half of this check is NON-AUTHORITATIVE. It exists to fail
+    // closed early and to avoid spending margin-planning and Binance reads on
+    // a signal nothing authorizes — SafetyAdmission re-reads the window under
+    // the profile lock and decides for real. Deliberately no claim is spent
+    // here: this path can run for a plan that later fails margin planning, and
+    // a claim is cumulative and never refunded.
+    const authorizationsOnRecord = await this.deps.prisma.executionCanaryAuthorization.count({
       where: { executionProfileId: profile.profile.id },
     });
-    if (canaryMode > 0) {
+    if (authorizationsOnRecord > 0) {
       const bound = await this.deps.prisma.executionCanaryAuthorization.findFirst({
         where: {
           executionProfileId: profile.profile.id,
@@ -133,23 +144,40 @@ export class SelectedPlanExecutor {
         },
       });
       if (!bound) {
-        return {
-          handled: false,
-          reasonCode: "CANARY_AUTHORIZATION_REQUIRED",
-          message: "This profile is in canary mode and this signal carries no valid authorization.",
-        };
-      }
-      // The binding must be a usable EXACT_SIGNAL row before its identity can
-      // mean anything. Since Phase 12.1 the symbol and direction columns are
-      // nullable — so `bound.allowedSymbol !== symbol` would compare against a
-      // null and report a symbol mismatch, describing a corrupt row as a
-      // merely-wrong one. A row that cannot prove what it authorizes is
-      // treated as no authorization at all, which is the existing reason code.
-      //
-      // Nothing creates a NATURAL_WINDOW yet, and this check is NOT the
-      // natural-window path: it is the exact path refusing everything that is
-      // not exact.
-      if (!isExactAuthorization(bound)) {
+        // No exact binding. A natural window may still authorize this signal.
+        const now = new Date();
+        const window = await this.deps.prisma.executionCanaryAuthorization.findFirst({
+          where: {
+            executionProfileId: profile.profile.id,
+            authorizationType: "NATURAL_WINDOW",
+            revokedAt: null,
+            expiresAt: { gt: now },
+          },
+          orderBy: { createdAt: "desc" },
+        });
+        if (!window || !naturalWindowAdmitsDirection(window, plan.direction, now)) {
+          return {
+            handled: false,
+            reasonCode: "CANARY_AUTHORIZATION_REQUIRED",
+            message: "This profile requires authorization and nothing currently authorizes this signal.",
+          };
+        }
+        // Provisionally natural. Fall through to planning and creation; the
+        // authoritative decision — and the only claim — happens in admission.
+      } else {
+        // --- EXACT mode. Unchanged, and it takes precedence -----------------
+        // A binding names THIS alert, so the historical one-shot flow governs
+        // it outright — even if a natural window is open beside it. The alert
+        // was authorized specifically, which outranks being authorized
+        // generically, and no natural claim is spent for it.
+        //
+        // The binding must be a usable EXACT_SIGNAL row before its identity can
+        // mean anything. Since Phase 12.1 the symbol and direction columns are
+        // nullable — so `bound.allowedSymbol !== symbol` would compare against a
+        // null and report a symbol mismatch, describing a corrupt row as a
+        // merely-wrong one. A row that cannot prove what it authorizes is
+        // treated as no authorization at all, which is the existing reason code.
+        if (!isExactAuthorization(bound)) {
         return {
           handled: false,
           reasonCode: "CANARY_AUTHORIZATION_REQUIRED",
@@ -186,8 +214,9 @@ export class SelectedPlanExecutor {
             message: "The authorization is already bound to a different execution.",
           };
         }
+        }
+        this.boundAuthorizationId = bound.id;
       }
-      this.boundAuthorizationId = bound.id;
     }
 
     // --- Phase 3 does the mathematics -------------------------------------

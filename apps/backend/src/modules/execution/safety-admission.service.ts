@@ -1,6 +1,8 @@
-import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
-import type { PrismaClient, SafetyAdmission, TradeExecution } from "@prisma/client";
+import type { ExecutionCanaryAuthorization, PrismaClient, SafetyAdmission, TradeExecution } from "@prisma/client";
+import { claimNaturalWindow, type NaturalClaimFailure } from "./canary-authorization.service";
+import { naturalWindowAdmitsDirection, naturalWindowState } from "./natural-authorization";
+import { profileLockKey } from "./profile-lock";
 import { env } from "../../config/env";
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { NotFoundError } from "../../utils/errors";
@@ -18,6 +20,7 @@ import {
   type EffectiveSafetyPolicy,
   type LocalCapacitySnapshot,
   type SafetyDecisionResult,
+  type SafetyReasonCode,
   type SymbolStateSnapshot,
 } from "./safety-engine";
 
@@ -69,11 +72,169 @@ export interface SafetyAdmissionOutcome {
   idempotentReplay: boolean;
 }
 
-/** Stable 32-bit key derived from the profile id for pg_advisory_xact_lock. */
-export function profileLockKey(executionProfileId: string): number {
-  const digest = createHash("sha256").update(executionProfileId).digest();
-  // Signed 32-bit: Postgres advisory lock keys are int4.
-  return digest.readInt32BE(0);
+/**
+ * Re-exported from its own module so this file can import the natural claim
+ * without an import cycle. The implementation and the keys it produces are
+ * unchanged; see `profile-lock.ts`.
+ */
+export { profileLockKey } from "./profile-lock";
+
+// ---------------------------------------------------------------------------
+// Phase 12.3 — admission-time authorization
+// ---------------------------------------------------------------------------
+
+/**
+ * Which authorization actually governs THIS execution, decided from persisted
+ * state alone.
+ *
+ * Nothing is carried in from `SelectedPlanExecutor`. The reconciliation tick
+ * calls `admitAndSubmit` on recovered PLAN_READY rows with no signal context at
+ * all, so anything held in process memory would be absent exactly when a
+ * restart made it matter. Every input here is a row: the execution's `alertId`,
+ * its profile, and the authorization table.
+ */
+export type AdmissionAuthorization =
+  /** The profile has no authorization history: pre-existing behaviour, untouched. */
+  | { ok: true; mode: "LEGACY" }
+  /** A durable EXACT_SIGNAL binding already names this alert. */
+  | { ok: true; mode: "EXACT"; authorizationId: string }
+  /** A usable natural window authorizes it; the claim is still to be spent. */
+  | { ok: true; mode: "NATURAL"; window: ExecutionCanaryAuthorization }
+  | { ok: false; reasonCode: SafetyReasonCode; message: string };
+
+/**
+ * Turns a PASSing decision into a terminal authorization refusal.
+ *
+ * Downgrade only. It never manufactures a PASS, and it leaves every measured
+ * value — capacity counts, projections, reservations — exactly as the engine
+ * reported them, so the stored admission still shows what capacity looked like
+ * at the moment authorization refused.
+ */
+function refuseForAuthorization(
+  result: SafetyDecisionResult,
+  reasonCode: SafetyReasonCode,
+  message: string
+): SafetyDecisionResult {
+  return {
+    ...result,
+    decision: "SKIP",
+    reasonCode,
+    failedChecks: [...result.failedChecks, { reasonCode, message }],
+    message,
+  };
+}
+
+/** Phase-2 claim outcomes → admission reason codes. One-to-one, no disguising. */
+const NATURAL_CLAIM_REASON: Record<NaturalClaimFailure, SafetyReasonCode> = {
+  NATURAL_WINDOW_NOT_FOUND: "NATURAL_AUTHORIZATION_REQUIRED",
+  NOT_NATURAL: "NATURAL_AUTHORIZATION_REQUIRED",
+  MALFORMED_NATURAL_WINDOW: "NATURAL_AUTHORIZATION_INVALID",
+  REVOKED: "NATURAL_AUTHORIZATION_REVOKED",
+  EXPIRED: "NATURAL_AUTHORIZATION_EXPIRED",
+  EXHAUSTED: "NATURAL_AUTHORIZATION_EXHAUSTED",
+  DIRECTION_NOT_ALLOWED: "NATURAL_AUTHORIZATION_DIRECTION_NOT_ALLOWED",
+  VERSION_CONFLICT: "NATURAL_AUTHORIZATION_CONFLICT",
+};
+
+/**
+ * Resolves the authorization mode from the database, inside the caller's
+ * transaction.
+ *
+ * MUST be called after the per-profile advisory lock is held: it reads the
+ * window that a concurrent admission may be claiming, and the lock is what
+ * makes that read stable through to the claim.
+ *
+ * Precedence, and why:
+ *
+ *  1. NO authorization rows at all -> LEGACY. A profile that has never been
+ *     put under authorization control keeps behaving exactly as it did. This
+ *     feature is additive; it does not conscript every profile.
+ *
+ *  2. A durable EXACT_SIGNAL binding for this alert -> EXACT. The historical
+ *     one-shot flow wins outright and spends no natural claim, even when a
+ *     natural window happens to be open beside it. The alert was authorized
+ *     specifically; that is stronger than being authorized generically.
+ *
+ *  3. Otherwise the profile IS authorization-controlled and this alert is not
+ *     individually authorized, so a natural window must authorize it — or it
+ *     is refused. Historical rows still mean "this profile requires
+ *     authorization"; they never decay into "anything goes".
+ */
+export async function resolveAdmissionAuthorization(
+  tx: Prisma.TransactionClient,
+  execution: Pick<TradeExecution, "alertId" | "executionProfileId" | "positionSide">,
+  evaluatedAt: Date
+): Promise<AdmissionAuthorization> {
+  const onRecord = await tx.executionCanaryAuthorization.count({
+    where: { executionProfileId: execution.executionProfileId },
+  });
+  if (onRecord === 0) return { ok: true, mode: "LEGACY" };
+
+  // --- 2. Exact binding wins ------------------------------------------------
+  // `alertId` is nullable on TradeExecution (pre-Phase-5 rows). A row without
+  // one simply cannot hold an exact binding, so it falls through to natural —
+  // which is the fail-closed direction.
+  if (execution.alertId !== null) {
+    const bound = await tx.executionCanaryAuthorization.findFirst({
+      where: {
+        executionProfileId: execution.executionProfileId,
+        authorizationType: "EXACT_SIGNAL",
+        consumedAlertId: execution.alertId,
+        revokedAt: null,
+      },
+      select: { id: true },
+    });
+    if (bound) return { ok: true, mode: "EXACT", authorizationId: bound.id };
+  }
+
+  // --- 3. A natural window must authorize it --------------------------------
+  // The NEWEST natural row is the only relevant one: preparation exclusivity
+  // means a second window cannot be opened while one is still open, so a newer
+  // row implies every older one was already shut. Reading it regardless of
+  // state (rather than filtering to the usable ones) is what lets the refusal
+  // say REVOKED or EXPIRED instead of a uselessly generic REQUIRED.
+  const window = await tx.executionCanaryAuthorization.findFirst({
+    where: { executionProfileId: execution.executionProfileId, authorizationType: "NATURAL_WINDOW" },
+    orderBy: { createdAt: "desc" },
+  });
+
+  const refuse = (reasonCode: SafetyReasonCode, message: string): AdmissionAuthorization => ({
+    ok: false,
+    reasonCode,
+    message,
+  });
+
+  if (!window) {
+    return refuse(
+      "NATURAL_AUTHORIZATION_REQUIRED",
+      "This profile requires authorization and no natural window has been prepared."
+    );
+  }
+
+  switch (naturalWindowState(window, evaluatedAt)) {
+    case "INVALID":
+      return refuse("NATURAL_AUTHORIZATION_INVALID", "The natural window contradicts its own declared mode.");
+    case "REVOKED":
+      return refuse("NATURAL_AUTHORIZATION_REVOKED", "The natural window was revoked.");
+    case "EXPIRED":
+      return refuse("NATURAL_AUTHORIZATION_EXPIRED", "The natural window has expired.");
+    case "EXHAUSTED":
+      return refuse(
+        "NATURAL_AUTHORIZATION_EXHAUSTED",
+        `The natural window has spent its whole budget (${window.claimedCount}/${window.maxClaims}).`
+      );
+  }
+
+  // Direction is the only signal property a window judges. It never looks at
+  // the symbol — that is the execution stack's concern, not authorization's.
+  if (!naturalWindowAdmitsDirection(window, execution.positionSide, evaluatedAt)) {
+    return refuse(
+      "NATURAL_AUTHORIZATION_DIRECTION_NOT_ALLOWED",
+      `The window admits ${window.allowedDirections.join("/")}, not ${execution.positionSide}.`
+    );
+  }
+
+  return { ok: true, mode: "NATURAL", window };
 }
 
 export class SafetyAdmissionService {
@@ -202,7 +363,7 @@ export class SafetyAdmissionService {
 
       const local = await this.buildLocalSnapshot(tx, execution);
 
-      const result = evaluateSafetyAdmission({
+      let result = evaluateSafetyAdmission({
         evaluatedAt: input.evaluatedAt,
         proposed: {
           executionId: execution.id,
@@ -228,6 +389,53 @@ export class SafetyAdmissionService {
       });
 
       /**
+       * --- Phase 12.3: authorization, and the claim -----------------------
+       *
+       * Reached ONLY when every safety and capacity check already passed.
+       * That ordering is the whole point: a claim is a cumulative, never
+       * refunded budget, so it must not be spent on a trade that capacity was
+       * always going to refuse.
+       *
+       * Consequently every non-PASS decision — terminal capacity refusals and
+       * retryable UNAVAILABLE alike — skips this block entirely and spends
+       * nothing. An infrastructure blip must never cost an authorization.
+       *
+       * The reverse direction is a downgrade only: authorization can turn a
+       * PASS into a SKIP, and can never turn any other decision into a PASS.
+       *
+       * It also fixes CLASSIFICATION: when capacity and authorization would
+       * both refuse, the capacity reason is the one reported. An opportunity
+       * the account was never going to take is not an authorization problem.
+       */
+      let claimedWindowId: string | null = null;
+      if (result.decision === "PASS") {
+        const authorization = await resolveAdmissionAuthorization(tx, execution, input.evaluatedAt);
+
+        if (!authorization.ok) {
+          result = refuseForAuthorization(result, authorization.reasonCode, authorization.message);
+        } else if (authorization.mode === "NATURAL") {
+          // The claim rides in THIS transaction, under THIS profile lock, so
+          // it commits or rolls back with the capacity reservation below.
+          const claim = await claimNaturalWindow(tx, {
+            authorizationId: authorization.window.id,
+            expectedVersion: authorization.window.version,
+            direction: execution.positionSide,
+            evaluatedAt: input.evaluatedAt,
+          });
+          if (claim.ok) {
+            claimedWindowId = authorization.window.id;
+          } else {
+            // Fail closed. Under the lock a conflict means something changed
+            // the window from outside the admission path, which is exactly the
+            // case not to retry blindly — a later fresh alert may try again.
+            result = refuseForAuthorization(result, NATURAL_CLAIM_REASON[claim.reasonCode], claim.message);
+          }
+        }
+        // mode EXACT and mode LEGACY fall through untouched: the historical
+        // paths spend no natural claim.
+      }
+
+      /**
        * UNAVAILABLE is NOT terminal. Missing Binance state, a connector
        * failure, a rate limit or a network blip say nothing about whether the
        * trade is allowed — only that we could not tell yet. Burning the
@@ -235,6 +443,9 @@ export class SafetyAdmissionService {
        * refusal, so the status stays PLAN_READY and only the version moves.
        * The caller retries with the new expectedVersion and may then get PASS,
        * SKIP or another UNAVAILABLE.
+       *
+       * An authorization refusal is the opposite: it is TERMINAL, so it lands
+       * in SKIPPED and is never revived. No queue, exactly as capacity.
        */
       const targetStatus: TradeExecutionStatusName =
         result.decision === "PASS" ? "PREFLIGHT" : result.decision === "SKIP" ? "SKIPPED" : "PLAN_READY";
@@ -277,6 +488,10 @@ export class SafetyAdmissionService {
             failedChecks: result.failedChecks.map((check) => check.reasonCode),
             signalAgeSeconds: result.signalAgeSeconds,
             killSwitchShortCircuit: killSwitched,
+            // Which natural window paid for this admission, when one did. The
+            // id only — a window carries no secret, and this is what makes a
+            // spent claim traceable back to the execution it bought.
+            naturalWindowId: claimedWindowId,
           } as Prisma.InputJsonValue,
         },
       });

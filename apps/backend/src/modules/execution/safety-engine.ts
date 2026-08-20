@@ -56,6 +56,31 @@ export const SAFETY_REASON_CODES = [
   "BINANCE_ACCOUNT_STATE_UNAVAILABLE",
   "BINANCE_SYMBOL_STATE_UNAVAILABLE",
   "CAPACITY_CONFLICT_RETRY",
+
+  // --- Phase 12.3 — natural-window authorization -------------------------
+  //
+  // These describe the AUTHORIZATION to admit a new execution, never its
+  // capacity. They are deliberately distinct codes rather than reuses: an
+  // operator seeing TOTAL_ACTIVE_LIMIT_REACHED would reasonably conclude the
+  // account was full, which is a completely different situation from "nothing
+  // currently authorizes this signal".
+  //
+  // Every one is TERMINAL (none appears in RETRYABLE_REASONS below), so an
+  // unauthorized alert is SKIPPED once and never revived. A later trade
+  // closing, or a fresh window being opened, does not resurrect it — a NEW
+  // alert must arrive. That is the same no-queue rule capacity already has.
+  //
+  // The engine itself never raises these: it stays pure and knows nothing
+  // about authorization. SafetyAdmissionService folds them in from inside its
+  // transaction, which is the only place the window can be read under the
+  // profile lock. See `resolveAdmissionAuthorization` there.
+  "NATURAL_AUTHORIZATION_REQUIRED",
+  "NATURAL_AUTHORIZATION_INVALID",
+  "NATURAL_AUTHORIZATION_REVOKED",
+  "NATURAL_AUTHORIZATION_EXPIRED",
+  "NATURAL_AUTHORIZATION_EXHAUSTED",
+  "NATURAL_AUTHORIZATION_DIRECTION_NOT_ALLOWED",
+  "NATURAL_AUTHORIZATION_CONFLICT",
 ] as const;
 export type SafetyReasonCode = (typeof SAFETY_REASON_CODES)[number];
 

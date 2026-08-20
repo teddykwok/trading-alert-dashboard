@@ -9,7 +9,7 @@ import {
   naturalWindowState,
   normalizeNaturalDirections,
 } from "./natural-authorization";
-import { profileLockKey } from "./safety-admission.service";
+import { profileLockKey } from "./profile-lock";
 
 /**
  * Phase 11B.0 — one-shot live-canary authorization.

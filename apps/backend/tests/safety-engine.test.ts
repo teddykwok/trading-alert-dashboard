@@ -846,13 +846,54 @@ describe("reason retryability classification", () => {
   });
 });
 
+/**
+ * The Phase-12.3 authorization codes, named once so both catalogue tests agree.
+ * These are produced by SafetyAdmissionService, never by the pure engine.
+ */
+const NATURAL_AUTHORIZATION_CODES = [
+  "NATURAL_AUTHORIZATION_REQUIRED",
+  "NATURAL_AUTHORIZATION_INVALID",
+  "NATURAL_AUTHORIZATION_REVOKED",
+  "NATURAL_AUTHORIZATION_EXPIRED",
+  "NATURAL_AUTHORIZATION_EXHAUSTED",
+  "NATURAL_AUTHORIZATION_DIRECTION_NOT_ALLOWED",
+  "NATURAL_AUTHORIZATION_CONFLICT",
+] as const satisfies readonly SafetyReasonCode[];
+
 describe("reason code catalogue", () => {
-  it("exposes exactly the 30 stable reason codes", () => {
-    expect(SAFETY_REASON_CODES).toHaveLength(30);
-    expect(new Set(SAFETY_REASON_CODES).size).toBe(30);
+  it("exposes exactly the 37 stable reason codes", () => {
+    // 30 through Phase 11, plus the 7 natural-authorization codes added in
+    // Phase 12.3. The count is pinned so a code cannot be added without a
+    // deliberate edit here.
+    expect(SAFETY_REASON_CODES).toHaveLength(37);
+    expect(new Set(SAFETY_REASON_CODES).size).toBe(37);
     // The soft target is its OWN code, never folded into the hard one.
     expect(SAFETY_REASON_CODES).toContain("SOFT_OPEN_TARGET_REACHED");
     expect(SAFETY_REASON_CODES).toContain("OPEN_POSITION_LIMIT_REACHED");
+  });
+
+  it("keeps authorization codes distinct from capacity codes", () => {
+    // The property that matters more than the count: an operator must never
+    // read "the account is full" when the truth is "nothing authorized this".
+    for (const code of NATURAL_AUTHORIZATION_CODES) {
+      expect(SAFETY_REASON_CODES).toContain(code);
+      expect(code.startsWith("NATURAL_AUTHORIZATION_")).toBe(true);
+    }
+    for (const capacity of [
+      "OPEN_POSITION_LIMIT_REACHED",
+      "SOFT_OPEN_TARGET_REACHED",
+      "PENDING_ENTRY_LIMIT_REACHED",
+      "TOTAL_ACTIVE_LIMIT_REACHED",
+      "TOTAL_RISK_LIMIT_REACHED",
+      "TOTAL_MARGIN_LIMIT_REACHED",
+      "SYMBOL_SIDE_ALREADY_ACTIVE",
+    ] as const) {
+      expect(NATURAL_AUTHORIZATION_CODES).not.toContain(capacity);
+    }
+    // All terminal: an unauthorized alert is SKIPPED once, never revived.
+    for (const code of NATURAL_AUTHORIZATION_CODES) {
+      expect(classifySafetyReasonRetryability(code)).toBe("TERMINAL");
+    }
   });
 
   it("keeps a distinct code for each configuration mismatch", () => {
@@ -906,9 +947,18 @@ describe("reason code catalogue", () => {
     collect(evaluate({ binance: binance({ available: false }) }));
     collect(evaluate({ symbolState: symbolState({ available: false }) }));
 
-    // CAPACITY_CONFLICT_RETRY is produced by the transactional service, not by
-    // the pure engine, so it is exercised in the integration suite instead.
-    const pureCodes = SAFETY_REASON_CODES.filter((code) => code !== "CAPACITY_CONFLICT_RETRY");
+    // Some codes are produced by the TRANSACTIONAL SERVICE, not by the pure
+    // engine, and are exercised in the integration suite instead:
+    //
+    //   CAPACITY_CONFLICT_RETRY   the optimistic-lock loser
+    //   NATURAL_AUTHORIZATION_*   read and claimed under the profile advisory
+    //                             lock, which the pure engine has no access to
+    //                             — it stays free of any authorization concept
+    //
+    // Everything else must be reachable from the engine, so a code cannot be
+    // added to the catalogue and then never emitted by anything.
+    const serviceOnly = new Set<SafetyReasonCode>(["CAPACITY_CONFLICT_RETRY", ...NATURAL_AUTHORIZATION_CODES]);
+    const pureCodes = SAFETY_REASON_CODES.filter((code) => !serviceOnly.has(code));
     expect([...emitted].sort()).toEqual([...pureCodes].sort());
   });
 });
