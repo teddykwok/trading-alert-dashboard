@@ -1002,14 +1002,24 @@ describe("natural authorization: runtime boundary", () => {
     "src/modules/execution/canary-authorization.service.ts",
     "src/modules/execution/selected-plan-executor.ts",
     "src/modules/execution/safety-admission.service.ts",
-    // The OPERATOR half (Phase 12.4A): these prepare, inspect, revoke and
-    // report. None of them admits, claims or executes anything, so they widen
-    // what an operator can SEE without widening what the runtime DOES.
+    // The OPERATOR READ/PREPARE half (Phase 12.4A): these prepare, inspect,
+    // revoke and report. None of them admits, claims or executes anything, so
+    // they widen what an operator can SEE without widening what the runtime DOES.
     "src/modules/execution/run-canary-controls.ts",
     "src/modules/execution/run-prepare-natural-window.ts",
     "src/modules/execution/run-show-authorization.ts",
     "src/modules/execution/run-revoke-natural-window.ts",
     "src/modules/execution/run-canary-preflight.ts",
+    // PRIVILEGED OPERATOR ACTIVATION (Phase 12.4C). These are a DIFFERENT
+    // category from everything above: arming opens a real-money profile for
+    // admission, so it is a state-changing control, NOT an inspection one. It
+    // earns its place on this list not by being harmless but by being bounded —
+    // it never claims, never writes the authorization row, never reaches the
+    // exchange, and writes exactly two profile/policy fields, all pinned
+    // structurally in natural-arm.integration.test.ts. It reads the natural
+    // domain classifier for the same reason the inspector does.
+    "src/modules/execution/natural-arm.ts",
+    "src/modules/execution/run-arm-natural-window.ts",
     "src/modules/execution/canary-readiness.ts",
     "src/modules/execution/canary-preflight.service.ts",
   ];

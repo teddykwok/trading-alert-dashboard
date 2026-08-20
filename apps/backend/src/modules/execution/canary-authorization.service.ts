@@ -42,7 +42,13 @@ export const MINIMUM_REMAINING_LIFETIME_MS = 2 * 60 * 1000;
  * Advisory-lock namespace for canary preparation, distinct from the entry,
  * protection and admission namespaces already in use.
  */
-const CANARY_PREPARE_LOCK_NAMESPACE = 0x11b0;
+export const CANARY_PREPARE_LOCK_NAMESPACE = 0x11b0;
+
+/**
+ * Either the root client or a transaction client. Used by the readers that an
+ * operator command may need to run inside its advisory-locked transaction.
+ */
+type AuthorizationReader = Pick<PrismaClient, "executionCanaryAuthorization"> | Prisma.TransactionClient;
 
 /** Raised when a profile already holds an authorization that is still usable. */
 export class CanaryAuthorizationAlreadyActiveError extends Error {
@@ -322,15 +328,26 @@ export class CanaryAuthorizationService {
   }
 
   /** How many authorizations are active right now. Should never exceed one. */
-  async countActive(executionProfileId: string, now = new Date()): Promise<number> {
-    return this.prisma.executionCanaryAuthorization.count({
+  /**
+   * The four readers below accept an optional client so an operator command
+   * holding the profile advisory lock can read INSIDE its own transaction.
+   * Omitting it keeps the historical root-client behaviour for every existing
+   * caller. A read that escaped the lock would be exactly the stale snapshot
+   * the operator serialization contract exists to prevent.
+   */
+  async countActive(executionProfileId: string, now = new Date(), client: AuthorizationReader = this.prisma): Promise<number> {
+    return client.executionCanaryAuthorization.count({
       where: { executionProfileId, consumedAt: null, revokedAt: null, expiresAt: { gt: now } },
     });
   }
 
   /** The single active (unconsumed, unrevoked, unexpired) authorization, if any. */
-  async findActive(executionProfileId: string, now = new Date()): Promise<ExecutionCanaryAuthorization | null> {
-    return this.prisma.executionCanaryAuthorization.findFirst({
+  async findActive(
+    executionProfileId: string,
+    now = new Date(),
+    client: AuthorizationReader = this.prisma
+  ): Promise<ExecutionCanaryAuthorization | null> {
+    return client.executionCanaryAuthorization.findFirst({
       where: {
         executionProfileId,
         consumedAt: null,
@@ -342,8 +359,11 @@ export class CanaryAuthorizationService {
   }
 
   /** Everything prepared for this profile, newest first. Read-only. */
-  async listForProfile(executionProfileId: string): Promise<ExecutionCanaryAuthorization[]> {
-    return this.prisma.executionCanaryAuthorization.findMany({
+  async listForProfile(
+    executionProfileId: string,
+    client: AuthorizationReader = this.prisma
+  ): Promise<ExecutionCanaryAuthorization[]> {
+    return client.executionCanaryAuthorization.findMany({
       where: { executionProfileId },
       orderBy: { createdAt: "desc" },
     });
@@ -490,8 +510,8 @@ export class CanaryAuthorizationService {
   }
 
   /** Revokes every unused authorization for a profile. Returns how many. */
-  async revokeUnused(executionProfileId: string, now = new Date()): Promise<number> {
-    const revoked = await this.prisma.executionCanaryAuthorization.updateMany({
+  async revokeUnused(executionProfileId: string, now = new Date(), client: AuthorizationReader = this.prisma): Promise<number> {
+    const revoked = await client.executionCanaryAuthorization.updateMany({
       where: { executionProfileId, consumedAt: null, revokedAt: null },
       data: { revokedAt: now },
     });

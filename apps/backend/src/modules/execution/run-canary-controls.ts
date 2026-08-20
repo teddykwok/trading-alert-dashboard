@@ -2,6 +2,8 @@ import { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { CanaryPreflightService } from "./canary-preflight.service";
 import type { ExecutionCanaryAuthorization } from "@prisma/client";
+import { CANARY_PREPARE_LOCK_NAMESPACE } from "./canary-authorization.service";
+import { profileLockKey } from "./profile-lock";
 import {
   CanaryAuthorizationAlreadyActiveError,
   CanaryAuthorizationService,
@@ -17,6 +19,11 @@ import {
   describeNaturalWindow,
   normalizeNaturalDirections,
 } from "./natural-authorization";
+import {
+  NATURAL_ARM_MINIMUM_REMAINING_MS,
+  armNaturalWindow as armNaturalWindowTransactional,
+  evaluateNaturalWindowForArm,
+} from "./natural-arm";
 import { validateCanarySymbol } from "./canary-symbol-validation";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
@@ -293,14 +300,70 @@ export async function armCanary(): Promise<void> {
       return;
     }
 
-    // --- The two dynamic values, in one transaction ----------------------
-    await prisma.$transaction(async (tx) => {
+    // --- Serialized, authoritative activation ----------------------------
+    // The advisory lock is taken FIRST and every value that justifies arming
+    // is re-read under it. Adding the lock around the pre-lock snapshot would
+    // be decorative: a concurrent disarm revokes the authorization and leaves
+    // the policy row byte-identical, so nothing about the stale snapshot could
+    // reveal it. Only a post-lock re-read can.
+    //
+    // The Binance preflight above deliberately stays OUTSIDE this block: no
+    // network call may run while the operator lock is held.
+    const armOutcome = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CANARY_PREPARE_LOCK_NAMESPACE}::int, ${profileLockKey(
+        profile.id
+      )}::int)`;
+
+      const fresh = await tx.executionProfile.findUnique({
+        where: { id: profile.id },
+        include: { safetyPolicy: true },
+      });
+      if (!fresh) return { ok: false as const, reason: "the execution profile no longer exists." };
+      const freshPolicy = fresh.safetyPolicy;
+      if (!freshPolicy) return { ok: false as const, reason: "the profile has no safety policy row." };
+
+      const now = new Date();
+      const freshActive = await authorizations.findActive(profile.id, now, tx);
+      const freshCount = await authorizations.countActive(profile.id, now, tx);
+
+      if (!freshActive) {
+        return {
+          ok: false as const,
+          reason: "no active unexpired authorization remains — it was revoked, consumed or expired while arming.",
+        };
+      }
+      if (freshActive.id !== active!.id) {
+        return { ok: false as const, reason: "the active authorization changed while arming." };
+      }
+      if (freshCount > 1) {
+        return { ok: false as const, reason: `${freshCount} authorizations are active; exactly one is required.` };
+      }
+      if (freshActive.expiresAt.getTime() - now.getTime() < MINIMUM_REMAINING_LIFETIME_MS) {
+        return { ok: false as const, reason: "the authorization is too close to expiry; prepare a fresh one." };
+      }
+      // The historical exact contract, unchanged: the allowlist must name
+      // exactly the authorized symbol. A natural window's allowedSymbol is
+      // null, so this still refuses one without exact arm knowing what a
+      // natural window is.
+      const allow = freshPolicy.allowedSymbols;
+      if (allow.length !== 1 || allow[0] !== freshActive.allowedSymbol) {
+        return { ok: false as const, reason: "the symbol allowlist no longer matches the authorization exactly." };
+      }
+
       await tx.executionProfile.update({ where: { id: profile.id }, data: { isEnabled: true } });
       await tx.executionSafetyPolicy.update({
         where: { executionProfileId: profile.id },
         data: { killSwitchActive: false },
       });
+      return { ok: true as const };
     });
+
+    if (!armOutcome.ok) {
+      console.log(`BLOCKED — ${armOutcome.reason}`);
+      console.log("The profile was NOT armed.");
+      process.exitCode = 1;
+      return;
+    }
 
     // Never trust the write — read it back.
     const verified = await prisma.executionProfile.findUniqueOrThrow({
@@ -344,14 +407,26 @@ export async function closeCanaryWindow(): Promise<void> {
     }
     const profile = resolution.profile;
 
-    // FIRST action, before anything is reported.
-    await prisma.executionSafetyPolicy.update({
-      where: { executionProfileId: profile.id },
-      data: { killSwitchActive: true },
-    });
+    // FIRST action, before anything is reported — and serialized against every
+    // other operator mutation on this profile. Without the lock an in-flight
+    // arm could release the kill switch AFTER this engaged it, silently undoing
+    // the fastest safety action the operator has.
+    //
+    // The bounded wait is deliberate: waiting briefly for an in-flight arm and
+    // then authoritatively engaging safety beats returning fast with a write
+    // that can be overwritten. Only DB work happens under the lock.
+    const [active, recovery, authorization] = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CANARY_PREPARE_LOCK_NAMESPACE}::int, ${profileLockKey(
+        profile.id
+      )}::int)`;
 
-    const [active, recovery, authorization] = await Promise.all([
-      prisma.tradeExecution.count({
+      await tx.executionSafetyPolicy.update({
+        where: { executionProfileId: profile.id },
+        data: { killSwitchActive: true },
+      });
+
+      return Promise.all([
+      tx.tradeExecution.count({
         where: {
           executionProfileId: profile.id,
           status: {
@@ -359,7 +434,7 @@ export async function closeCanaryWindow(): Promise<void> {
           },
         },
       }),
-      prisma.tradeExecution.count({
+      tx.tradeExecution.count({
         where: {
           executionProfileId: profile.id,
           OR: [
@@ -368,8 +443,11 @@ export async function closeCanaryWindow(): Promise<void> {
           ],
         },
       }),
-      new CanaryAuthorizationService(prisma).listForProfile(profile.id),
-    ]);
+      // Read inside the lock, so the report describes the state the close
+      // actually committed rather than one a concurrent operator moved.
+      new CanaryAuthorizationService(prisma).listForProfile(profile.id, tx),
+      ]);
+    });
 
     console.log("CLOSED — profile kill switch is engaged. No new admission is possible.");
     line("active executions", active);
@@ -417,38 +495,49 @@ export async function disarmCanary(): Promise<void> {
     }
     const profile = resolution.profile;
 
-    // 1. Kill switch FIRST.
-    await prisma.executionSafetyPolicy.update({
-      where: { executionProfileId: profile.id },
-      data: { killSwitchActive: true },
-    });
+    // The WHOLE shutdown is one serialized operation. It used to be three
+    // unsynchronized statements, which let an in-flight arm interleave and
+    // re-enable the profile after the operator had disarmed it. The ordering
+    // inside is unchanged — kill switch first, then revoke, then the
+    // conditional disable — it is simply atomic now.
+    const { revoked, outstanding, outcome } = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CANARY_PREPARE_LOCK_NAMESPACE}::int, ${profileLockKey(
+        profile.id
+      )}::int)`;
 
-    // 2. Revoke anything unused.
-    const revoked = await new CanaryAuthorizationService(prisma).revokeUnused(profile.id);
+      // 1. Kill switch FIRST.
+      await tx.executionSafetyPolicy.update({
+        where: { executionProfileId: profile.id },
+        data: { killSwitchActive: true },
+      });
 
-    // 3. Only then consider disabling the profile.
-    const outstanding = await prisma.tradeExecution.count({
-      where: {
-        executionProfileId: profile.id,
-        OR: [
-          {
-            status: {
-              in: ["PLAN_READY", "PREFLIGHT", "ENTRY_SUBMITTING", "ENTRY_PENDING", "PARTIALLY_FILLED", "ENTRY_FILLED", "PLACING_PROTECTION", "PROTECTED", "MANUAL_INTERVENTION"],
+      // 2. Revoke anything unused. Deliberately authorization-type agnostic:
+      // an open NATURAL_WINDOW is revoked exactly like an unused exact one.
+      // Claims already spent are never refunded and the row is never deleted.
+      const revokedCount = await new CanaryAuthorizationService(prisma).revokeUnused(profile.id, new Date(), tx);
+
+      // 3. Only then consider disabling the profile.
+      const outstandingCount = await tx.tradeExecution.count({
+        where: {
+          executionProfileId: profile.id,
+          OR: [
+            {
+              status: {
+                in: ["PLAN_READY", "PREFLIGHT", "ENTRY_SUBMITTING", "ENTRY_PENDING", "PARTIALLY_FILLED", "ENTRY_FILLED", "PLACING_PROTECTION", "PROTECTED", "MANUAL_INTERVENTION"],
+              },
             },
-          },
-          { requiresManualIntervention: true },
-        ],
-      },
-    });
+            { requiresManualIntervention: true },
+          ],
+        },
+      });
 
-    let outcome: string;
-    if (outstanding > 0) {
-      // The profile stays intact: reconciliation and protection need it.
-      outcome = "CANARY_DISARMED_NEW_WORK_BLOCKED_RECOVERY_CONTINUES";
-    } else {
-      await prisma.executionProfile.update({ where: { id: profile.id }, data: { isEnabled: false } });
-      outcome = "CANARY_DISARMED_CLEAN";
-    }
+      if (outstandingCount > 0) {
+        // The profile stays intact: reconciliation and protection need it.
+        return { revoked: revokedCount, outstanding: outstandingCount, outcome: "CANARY_DISARMED_NEW_WORK_BLOCKED_RECOVERY_CONTINUES" };
+      }
+      await tx.executionProfile.update({ where: { id: profile.id }, data: { isEnabled: false } });
+      return { revoked: revokedCount, outstanding: outstandingCount, outcome: "CANARY_DISARMED_CLEAN" };
+    });
 
     const verified = await prisma.executionProfile.findUniqueOrThrow({
       where: { id: profile.id },
@@ -724,5 +813,163 @@ export async function revokeNaturalWindow(): Promise<void> {
     line("allowedDirections", `[${after.allowedDirections.join(", ")}]`);
     console.log("");
     console.log("The row was kept. Revocation stops NEW admissions and refunds no claim.");
+  });
+}
+
+// ---------------------------------------------------------------------------
+// arm natural window (Phase 12.4C)
+// ---------------------------------------------------------------------------
+
+/**
+ * Opens the profile for NATURAL admission.
+ *
+ * Deliberately a separate command from `arm-canary` rather than a mode flag on
+ * it. Phase 12.4A pinned a regression proving a NATURAL_WINDOW cannot be armed
+ * by the historical exact command, and routing both through one entry point
+ * would make "which authorization am I arming?" a question of argument parsing
+ * on the single command that starts real trading. Explicit intent is cheaper
+ * than a careful reader.
+ *
+ * The operator must name the window by id. Arming "whatever is current" would
+ * mean the row that gets armed is chosen by a query the operator never saw.
+ */
+export async function armNaturalCanary(): Promise<void> {
+  const confirmed = process.argv.includes(CONFIRM_ARM);
+  const authorizationId = (arg("id") ?? "").trim();
+
+  console.log("ARM NATURAL WINDOW (Phase 12.4C) — opens the profile for natural admission.");
+  console.log("");
+
+  if (!authorizationId) {
+    console.log(`Usage: execution:arm-natural-window -- --id=<authorization-id> [${CONFIRM_ARM}]`);
+    console.log("The window must be named explicitly; there is no fuzzy selection.");
+    process.exitCode = 1;
+    return;
+  }
+
+  await withPrisma(async (prisma) => {
+    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
+    if (!resolution.ok) {
+      console.log(`BLOCKED — ${resolution.reasonCode}: ${resolution.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    const profile = resolution.profile;
+    const policy = profile.safetyPolicy;
+    if (!policy) {
+      console.log("BLOCKED — the profile has no safety policy row; effective limits cannot be proven.");
+      process.exitCode = 1;
+      return;
+    }
+
+    const window = await prisma.executionCanaryAuthorization.findUnique({ where: { id: authorizationId } });
+    if (!window) {
+      console.log(`BLOCKED — WINDOW_NOT_FOUND: no authorization exists with id ${authorizationId}.`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const now = new Date();
+    const blockers: string[] = [];
+
+    // --- The window itself, judged by the shared arm rules ------------------
+    const windowRejection = evaluateNaturalWindowForArm(window, profile.id, window.version, now);
+    if (windowRejection && !windowRejection.ok) {
+      blockers.push(`${windowRejection.reasonCode}: ${windowRejection.message}`);
+    }
+
+    // --- Natural preflight, explicitly. Never the default exact mode. -------
+    // Which blockers must be clear is NOT "all of them": the profile kill
+    // switch is itself a live-activation blocker and is precisely what arming
+    // releases, so demanding a READY verdict here would be unsatisfiable. The
+    // staged model that `arm-canary` established is preserved — preparation
+    // must be complete, and the dimensions arming does NOT resolve
+    // (authorization, policy) must already pass.
+    const preflight = await new CanaryPreflightService(prisma).run("NATURAL_WINDOW");
+    for (const finding of preflight.preparationBlockers) blockers.push(`${finding.code}: ${finding.detail}`);
+    for (const finding of preflight.liveActivationBlockers) {
+      if (finding.code === "CANARY_BLOCKED_AUTHORIZATION" || finding.code === "CANARY_BLOCKED_POLICY") {
+        blockers.push(`${finding.code}: ${finding.detail}`);
+      }
+    }
+
+    // Environment gates are NOT database state and this command never writes
+    // them. `.env` plus a restart is the only way they move, exactly as for
+    // exact arm.
+    if (!environmentIsArmed()) {
+      blockers.push("environment activation gates are not in the required state (edit .env and restart FIRST)");
+    }
+
+    const remainingMs = window.expiresAt.getTime() - now.getTime();
+
+    console.log("Proposed natural activation");
+    line("environment", `${profile.environment} — REAL FUNDS`);
+    line("window id", window.id);
+    line("authorizationType", window.authorizationType);
+    line("state", describeNaturalWindow(window, now).state);
+    line("allowedDirections", `[${window.allowedDirections.join(", ")}]`);
+    line("maxClaims", window.maxClaims);
+    line("claimedCount", window.claimedCount);
+    line("remainingClaims", describeNaturalWindow(window, now).remainingClaims);
+    line("window version", window.version);
+    line("expiresAt", window.expiresAt.toISOString());
+    line("remaining lifetime", `${Math.floor(remainingMs / 1000)}s (minimum ${NATURAL_ARM_MINIMUM_REMAINING_MS / 1000}s)`);
+    console.log("");
+    line("profile isEnabled", profile.isEnabled);
+    line("profile killSwitch", policy.killSwitchActive);
+    line("policy row version", policy.version);
+    line("allowedSymbols", policy.allowedSymbols.length === 0 ? "[] (ALLOW ALL)" : `[${policy.allowedSymbols.join(", ")}]`);
+    line("  (observed only)", "this command never writes allowedSymbols");
+    line("env gates armed", environmentIsArmed());
+    line("confirmation flag", confirmed);
+    console.log("");
+    console.log("WOULD MUTATE (nothing else):");
+    line("  ExecutionProfile.isEnabled", `${profile.isEnabled} -> true`);
+    line("  policy.killSwitchActive", `${policy.killSwitchActive} -> false`);
+    line("  authorization row", "UNCHANGED — arming spends no claim");
+    console.log("");
+
+    if (blockers.length > 0) {
+      console.log("BLOCKED — nothing was changed:");
+      for (const blocker of blockers) console.log(`  - ${blocker}`);
+      process.exitCode = 1;
+      return;
+    }
+    if (!confirmed) {
+      console.log("DRY RUN");
+      console.log(`  NO DATABASE WRITE WAS PERFORMED. Re-run with ${CONFIRM_ARM} to arm.`);
+      return;
+    }
+
+    // --- Authoritative recheck + mutation, in ONE transaction --------------
+    // The values printed above are NOT what gets armed on: everything is
+    // re-read under the advisory lock, so a window that closed or a policy that
+    // moved between the dry run and this call refuses instead of arming.
+    const result = await prisma.$transaction((tx) =>
+      armNaturalWindowTransactional(tx, {
+        executionProfileId: profile.id,
+        authorizationId: window.id,
+        expectedWindowVersion: window.version,
+        expectedPolicyVersion: policy.version,
+        expectedAllowedSymbols: policy.allowedSymbols,
+      })
+    );
+
+    if (!result.ok) {
+      console.log(`BLOCKED — ${result.reasonCode}: ${result.message}`);
+      console.log("The profile was NOT armed and no authorization was changed.");
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(result.alreadyArmed ? "ALREADY ARMED — no change was made." : "ARMED.");
+    line("profile isEnabled", result.snapshot.profileIsEnabled);
+    line("profile killSwitch", result.snapshot.killSwitchActive);
+    line("window claimedCount", result.snapshot.claimedCount);
+    line("window version", result.snapshot.windowVersion);
+    line("allowedSymbols", `[${result.snapshot.allowedSymbols.join(", ")}]`);
+    console.log("");
+    console.log("No signal was sent, no execution was created and no claim was spent.");
+    console.log("Run execution:disarm-canary to return to the safe posture.");
   });
 }

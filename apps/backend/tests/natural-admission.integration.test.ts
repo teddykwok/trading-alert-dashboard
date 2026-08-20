@@ -855,3 +855,98 @@ describeDb("natural admission: authorization does not follow the trade", () => {
     expect((await windowOf(window.id)).claimedCount).toBe(5);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Symbol allowlist under live traffic (Phase 12.4B condition, 12.4C regression)
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 12.4B brought the runtime up for twelve minutes and nine real
+ * TradingView alerts arrived — STARUSDT, AIAUSDT, EVAAUSDT, XMRUSDT,
+ * PROMPTUSDT, PORTALUSDT, 1000RATSUSDT, XPINUSDT, JELLYJELLYUSDT. None of them
+ * was COWUSDT, and none of them may ever reach the exchange during a COWUSDT-only
+ * supervised rollout.
+ *
+ * That posture currently holds because the global kill switch refuses everything
+ * first. These tests remove that crutch: the profile is fully open and a valid
+ * natural window is present, so the ONLY thing standing between a foreign symbol
+ * and an order is the allowlist. If a future change made the window sufficient
+ * on its own, exactly these tests fail.
+ *
+ * No new symbol logic is introduced — the refusal is the existing engine's.
+ */
+describeDb("natural admission: COWUSDT-only rollout under live traffic", () => {
+  /** An open profile whose ONLY remaining restriction is the allowlist. */
+  async function cowOnlyProfile(): Promise<string> {
+    const profileId = await newProfile();
+    await prisma!.executionSafetyPolicy.update({
+      where: { executionProfileId: profileId },
+      data: { allowedSymbols: ["COWUSDT"] },
+    });
+    return profileId;
+  }
+
+  const PHASE_4B_TRAFFIC = [
+    "STARUSDT",
+    "AIAUSDT",
+    "EVAAUSDT",
+    "XMRUSDT",
+    "PROMPTUSDT",
+    "PORTALUSDT",
+    "1000RATSUSDT",
+    "XPINUSDT",
+    "JELLYJELLYUSDT",
+  ];
+
+  it.each(PHASE_4B_TRAFFIC)("refuses %s even with an AVAILABLE natural window", async (symbol) => {
+    const profileId = await cowOnlyProfile();
+    const window = await newWindow(profileId, { directions: ["LONG", "SHORT"] });
+    const execution = await newExecution(profileId, { symbol, direction: "LONG" });
+
+    const outcome = await admit(execution);
+
+    // The existing engine's own reason — nothing new was added for this.
+    expect(outcome.decision).not.toBe("PASS");
+    expect(outcome.reasonCode).toBe("SYMBOL_NOT_ALLOWED");
+    expect((await executionOf(execution.id)).status).not.toBe("PREFLIGHT");
+
+    // The whole point: a refused foreign symbol costs the canary nothing.
+    const after = await windowOf(window.id);
+    expect(after.claimedCount).toBe(0);
+    expect(after.version).toBe(window.version);
+  });
+
+  it("spends zero claims across the entire Phase-4B alert burst", async () => {
+    const profileId = await cowOnlyProfile();
+    const window = await newWindow(profileId, { directions: ["LONG", "SHORT"], maxClaims: 5 });
+
+    for (const symbol of PHASE_4B_TRAFFIC) {
+      const execution = await newExecution(profileId, { symbol, direction: "LONG" });
+      await admit(execution);
+    }
+
+    // Nine eligible-looking alerts, a five-claim budget, and not one spent.
+    const after = await windowOf(window.id);
+    expect(after.claimedCount).toBe(0);
+    expect(after.version).toBe(window.version);
+    expect(
+      await prisma!.tradeExecution.count({ where: { executionProfileId: profileId, status: "PREFLIGHT" } })
+    ).toBe(0);
+  });
+
+  it("CONTROL — COWUSDT is admitted under the identical setup", async () => {
+    // Without this the test above would pass even if the allowlist refused
+    // everything, which would prove nothing about COWUSDT being usable.
+    const profileId = await cowOnlyProfile();
+    const window = await newWindow(profileId, { directions: ["LONG", "SHORT"] });
+    const execution = await newExecution(profileId, { symbol: "COWUSDT", direction: "LONG" });
+
+    const outcome = await admit(execution);
+
+    expect(outcome.decision).toBe("PASS");
+    expect(outcome.reasonCode).not.toBe("SYMBOL_NOT_ALLOWED");
+    expect((await executionOf(execution.id)).status).toBe("PREFLIGHT");
+    // The control DOES spend exactly one claim — that is what admission is.
+    expect((await windowOf(window.id)).claimedCount).toBe(1);
+  });
+});
