@@ -1022,6 +1022,14 @@ describe("natural authorization: runtime boundary", () => {
     "src/modules/execution/run-arm-natural-window.ts",
     "src/modules/execution/canary-readiness.ts",
     "src/modules/execution/canary-preflight.service.ts",
+    // READ-ONLY OPERATOR REPORTING over HTTP (Phase 12.5). Same category as the
+    // inspection CLIs above and admitted on the same terms: it describes the
+    // newest window for the dashboard and does nothing else. It never claims,
+    // never prepares, never revokes, never arms and never writes a row --
+    // asserted structurally in trading-control.test.ts, which forbids every
+    // Prisma write verb in the file. It widens what an operator can SEE without
+    // widening what the runtime DOES.
+    "src/modules/operator/trading-control.service.ts",
   ];
 
   /**
