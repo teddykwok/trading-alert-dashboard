@@ -21,11 +21,15 @@ import {
   presentStatus,
   readGates,
   renderStatus,
+  cleanupAfterModeMismatch,
+  expectedGateSnapshotFor,
   verifyOwnership,
+  verifyRuntimeMode,
   windowsSpawnPlan,
   type DiskMode,
   type LauncherRole,
   type OwnedProcess,
+  type AttestationStatusView,
   type DurableTradingState,
   type ProcessProbe,
   type RuntimeState,
@@ -109,9 +113,43 @@ function portOpen(port: number): Promise<boolean> {
  * Starts one role. The command shape lives in `windowsSpawnPlan`, which is pure
  * and tested; this only performs the spawn.
  */
-function spawnRole(role: LauncherRole): ChildProcess {
-  const plan = windowsSpawnPlan(role, REPO_ROOT);
+function spawnRole(role: LauncherRole, mode: "SAFE" | "LIVE_READY"): ChildProcess {
+  const plan = windowsSpawnPlan(role, REPO_ROOT, mode);
   return spawn(plan.command, plan.args, plan.options);
+}
+
+/**
+ * Reads the runtime attestation both roles publish, with a bounded wait.
+ *
+ * Heartbeats are periodic, so the first read after startup can legitimately
+ * find nothing. This waits a bounded number of cycles and then gives up: it
+ * never retries forever, and a timeout is a refusal, not a shrug.
+ */
+async function readRuntimeModeAttestation(
+  mode: "SAFE" | "LIVE_READY"
+): Promise<AttestationStatusView | null> {
+  const { configuredRuntimeIdentity, readRuntimeAttestationStatusOnce } = await import(
+    "../runtime/runtime-attestation"
+  );
+  const expected = expectedGateSnapshotFor(mode);
+  // Heartbeat is 5s and the TTL is 15s, so ~30s covers a slow cold start
+  // without turning a failure into an indefinite wait.
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    try {
+      const status = await readRuntimeAttestationStatusOnce({
+        identity: configuredRuntimeIdentity(),
+        expected,
+      });
+      if (verifyRuntimeMode(status, mode).ok) return status;
+      // Keep the LAST reading so the refusal can name what was actually seen.
+      if (attempt === 14) return status;
+    } catch {
+      // Message deliberately dropped: it can carry a Redis endpoint.
+      if (attempt === 14) return null;
+    }
+    await sleep(2000);
+  }
+  return null;
 }
 
 /** taskkill /T on ONE verified repo-owned root. Never a name-based sweep. */
@@ -260,7 +298,7 @@ async function startRuntime(mode: "SAFE" | "LIVE_READY"): Promise<void> {
 
   const started: OwnedProcess[] = [];
   for (const role of LAUNCHER_ROLES) {
-    const child = spawnRole(role);
+    const child = spawnRole(role, mode);
     if (typeof child.pid !== "number") {
       console.log(`FAILED — ${role} could not be started.`);
       break;
@@ -297,6 +335,47 @@ async function startRuntime(mode: "SAFE" | "LIVE_READY"): Promise<void> {
     console.log("Check the spawned windows, then use 'Stop Runtime & Return SAFE' if needed.");
     return;
   }
+
+  // --- The running processes must ATTEST the requested mode ---------------
+  // Open ports and a rewritten file prove only that this tool did its part.
+  // Nothing may be reported as active before the runtime itself agrees.
+  console.log("");
+  console.log("Verifying the running runtime attested the requested mode…");
+  const verification = verifyRuntimeMode(await readRuntimeModeAttestation(mode), mode);
+  if (!verification.ok) {
+    console.log("");
+    console.log(`BLOCKED — runtime did not attest the requested deployment mode: ${verification.reason}`);
+    // A mismatch means the running configuration is not the one that was asked
+    // for, and it may be the MORE permissive one. Refusing to print success is
+    // not enough: the untrusted runtime is taken back down here.
+    console.log("Shutting the unverified runtime back down…");
+    const cleanup = cleanupAfterModeMismatch(store.read() ?? { repoRoot: REPO_ROOT, mode, startedAtMs: Date.now(), processes: started }, {
+      probe: (pid) => probeProcesses([pid]).get(pid) ?? null,
+      terminate: (pid) => terminateTree(pid),
+      restoreSafeGates: () => {
+        const restored = applyGates(readEnvText(), gatesFor("SAFE"));
+        if (!restored.ok) return false;
+        writeEnvText(restored.text);
+        return true;
+      },
+      clearState: () => store.clear(),
+      log: (line) => console.log(line),
+    });
+
+    console.log("");
+    console.log(cleanup.safeGatesRestored ? "Deployment gates restored: SAFE" : "WARNING — the deployment gates could NOT be restored to SAFE.");
+    if (cleanup.unresolved.length > 0) {
+      console.log("");
+      console.log("OPERATOR RECOVERY REQUIRED — these roots are not provably stopped:");
+      for (const entry of cleanup.unresolved) console.log(`  ${entry.role} pid ${entry.pid}: ${entry.outcome}`);
+      console.log("Launcher ownership state was KEPT so 'Stop Runtime & Return SAFE' can still find them.");
+    } else {
+      console.log("The unverified runtime was stopped and launcher state was cleared.");
+    }
+    console.log("Nothing was armed and no durable trading state was changed.");
+    return;
+  }
+  console.log(`Runtime attested ${mode}.`);
 
   if (mode === "LIVE_READY") {
     console.log("");

@@ -22,7 +22,10 @@ import {
   presentStatus,
   readGates,
   renderStatus,
+  cleanupAfterModeMismatch,
+  expectedGateSnapshotFor,
   verifyOwnership,
+  verifyRuntimeMode,
   windowsSpawnPlan,
   ROLE_COMMANDS,
   type OwnedProcess,
@@ -357,14 +360,15 @@ describe("runtime launcher: process ownership", () => {
 describe("runtime launcher: the Windows spawn shape", () => {
   const REPO = "C:\\Projects\\trading-alert-dashboard";
   const env = { ComSpec: "C:\\WINDOWS\\system32\\cmd.exe" } as NodeJS.ProcessEnv;
-  const plan = (role: "backend" | "worker" | "frontend" = "backend") => windowsSpawnPlan(role, REPO, env);
+  const plan = (role: "backend" | "worker" | "frontend" = "backend") =>
+    windowsSpawnPlan(role, REPO, "SAFE", env);
 
   it("never executes pnpm.cmd directly", () => {
     // The defect the first real SAFE rehearsal hit: since the CVE-2024-27980
     // fix, spawn refuses .cmd/.bat without a shell and returns EINVAL, so no
     // role could start at all.
     for (const role of LAUNCHER_ROLES) {
-      const built = windowsSpawnPlan(role, REPO, env);
+      const built = windowsSpawnPlan(role, REPO, "SAFE", env);
       expect(`${role}:${built.command.toLowerCase().endsWith(".cmd")}`).toBe(`${role}:false`);
       expect(built.args.some((arg) => arg.toLowerCase().endsWith(".cmd"))).toBe(false);
     }
@@ -375,7 +379,7 @@ describe("runtime launcher: the Windows spawn shape", () => {
   });
 
   it("falls back to cmd.exe when ComSpec is absent", () => {
-    expect(windowsSpawnPlan("backend", REPO, {} as NodeJS.ProcessEnv).command).toBe("cmd.exe");
+    expect(windowsSpawnPlan("backend", REPO, "SAFE", {} as NodeJS.ProcessEnv).command).toBe("cmd.exe");
   });
 
   it("passes /d /s /c, so AutoRun cannot run first and quoting is deterministic", () => {
@@ -396,7 +400,7 @@ describe("runtime launcher: the Windows spawn shape", () => {
     ["worker", "@trading-alert-dashboard/backend", "worker"],
     ["frontend", "@trading-alert-dashboard/frontend", "dev"],
   ] as const)("maps %s to the repo's own pnpm script", (role, filter, script) => {
-    expect(windowsSpawnPlan(role, REPO, env).args).toEqual([
+    expect(windowsSpawnPlan(role, REPO, "SAFE", env).args).toEqual([
       "/d",
       "/s",
       "/c",
@@ -439,7 +443,7 @@ describe("runtime launcher: the Windows spawn shape", () => {
     expect(Object.isFrozen(ROLE_COMMANDS)).toBe(true);
     expect(Object.keys(ROLE_COMMANDS).sort()).toEqual(["backend", "frontend", "worker"]);
     for (const role of LAUNCHER_ROLES) {
-      const args = windowsSpawnPlan(role, REPO, env).args;
+      const args = windowsSpawnPlan(role, REPO, "SAFE", env).args;
       // No shell metacharacter can appear, because nothing is concatenated.
       for (const arg of args) {
         expect(`${arg}:${/[&|<>^]/.test(arg)}`).toBe(`${arg}:false`);
@@ -452,11 +456,523 @@ describe("runtime launcher: the Windows spawn shape", () => {
       path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"),
       "utf8"
     );
-    expect(source).toContain("windowsSpawnPlan(role, REPO_ROOT)");
+    expect(source).toContain("windowsSpawnPlan(role, REPO_ROOT, mode)");
     expect(source).not.toContain("pnpm.cmd");
     expect(source).not.toContain("shell: true");
     // One spawn call site for roles; the probe/kill adapters use spawnSync.
     expect((source.match(/(?<!\w)spawn\(/g) ?? []).length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The child environment (the stale-inheritance defect)
+// ---------------------------------------------------------------------------
+
+describe("runtime launcher: the child environment carries the REQUESTED gates", () => {
+  const REPO = "C:\\Projects\\trading-alert-dashboard";
+
+  /** A launcher environment already polluted with the OPPOSITE mode's gates. */
+  const staleEnv = (stale: "SAFE" | "LIVE_READY") =>
+    ({
+      ComSpec: "C:\\WINDOWS\\system32\\cmd.exe",
+      PATH: "C:\\Windows;C:\\Windows\\system32",
+      DATABASE_URL: "postgresql://user:password@localhost:15432/db",
+      OPERATOR_API_TOKEN: "synthetic-token-0123456789abcdefgh",
+      ...(stale === "SAFE"
+        ? { EXECUTION_GLOBAL_KILL_SWITCH: "true", EXECUTION_LIVE_ENTRY_ENABLED: "false", EXECUTION_PROTECTION_READY: "false" }
+        : { EXECUTION_GLOBAL_KILL_SWITCH: "false", EXECUTION_LIVE_ENTRY_ENABLED: "true", EXECUTION_PROTECTION_READY: "true" }),
+    }) as NodeJS.ProcessEnv;
+
+  it("pins SAFE gates for a SAFE start", () => {
+    const built = windowsSpawnPlan("backend", REPO, "SAFE", staleEnv("LIVE_READY"));
+    expect(built.options.env.EXECUTION_GLOBAL_KILL_SWITCH).toBe("true");
+    expect(built.options.env.EXECUTION_LIVE_ENTRY_ENABLED).toBe("false");
+    expect(built.options.env.EXECUTION_PROTECTION_READY).toBe("false");
+  });
+
+  it("pins LIVE-READY gates for a LIVE-READY start", () => {
+    const built = windowsSpawnPlan("backend", REPO, "LIVE_READY", staleEnv("SAFE"));
+    expect(built.options.env.EXECUTION_GLOBAL_KILL_SWITCH).toBe("false");
+    expect(built.options.env.EXECUTION_LIVE_ENTRY_ENABLED).toBe("true");
+    expect(built.options.env.EXECUTION_PROTECTION_READY).toBe("true");
+  });
+
+  it("OVERRIDES a stale inherited gate rather than deferring to it", () => {
+    // The exact defect: the launcher loads dotenv-backed configuration before
+    // rewriting the gates, so its own environment holds the previous mode. A
+    // child inheriting that would ignore the freshly written file, because
+    // dotenv never overwrites a variable that is already present.
+    for (const [requested, stale] of [
+      ["LIVE_READY", "SAFE"],
+      ["SAFE", "LIVE_READY"],
+    ] as const) {
+      const built = windowsSpawnPlan("worker", REPO, requested, staleEnv(stale));
+      const expected = gatesFor(requested);
+      for (const key of RUNTIME_GATE_KEYS) {
+        expect(`${requested}:${key}:${built.options.env[key]}`).toBe(`${requested}:${key}:${expected[key]}`);
+      }
+    }
+  });
+
+  it("passes every gate as a string, as child_process requires", () => {
+    const built = windowsSpawnPlan("backend", REPO, "LIVE_READY", staleEnv("SAFE"));
+    for (const key of RUNTIME_GATE_KEYS) {
+      expect(typeof built.options.env[key]).toBe("string");
+    }
+  });
+
+  it("leaves unrelated inherited variables untouched", () => {
+    // Credentials and connection strings must reach the child unchanged; this
+    // fix narrows nothing except the three gates.
+    const inherited = staleEnv("SAFE");
+    const built = windowsSpawnPlan("frontend", REPO, "LIVE_READY", inherited);
+    expect(built.options.env.PATH).toBe(inherited.PATH);
+    expect(built.options.env.DATABASE_URL).toBe(inherited.DATABASE_URL);
+    expect(built.options.env.OPERATOR_API_TOKEN).toBe(inherited.OPERATOR_API_TOKEN);
+    expect(built.options.env.ComSpec).toBe(inherited.ComSpec);
+  });
+
+  it("does NOT mutate the environment it was given", () => {
+    const inherited = staleEnv("SAFE");
+    const before = JSON.stringify(inherited);
+    windowsSpawnPlan("backend", REPO, "LIVE_READY", inherited);
+    expect(JSON.stringify(inherited)).toBe(before);
+  });
+
+  it("does not mutate the real process.env", () => {
+    const before = {
+      kill: process.env.EXECUTION_GLOBAL_KILL_SWITCH,
+      live: process.env.EXECUTION_LIVE_ENTRY_ENABLED,
+      prot: process.env.EXECUTION_PROTECTION_READY,
+    };
+    windowsSpawnPlan("backend", REPO, "LIVE_READY", staleEnv("SAFE"));
+    expect({
+      kill: process.env.EXECUTION_GLOBAL_KILL_SWITCH,
+      live: process.env.EXECUTION_LIVE_ENTRY_ENABLED,
+      prot: process.env.EXECUTION_PROTECTION_READY,
+    }).toEqual(before);
+  });
+
+  it("never logs the environment it builds", () => {
+    const source = readFileSync(
+      path.join(process.cwd(), "src/modules/operator/runtime-launcher.ts"),
+      "utf8"
+    );
+    for (const forbidden of ["console.log(env", "console.log(plan", "JSON.stringify(env"]) {
+      expect(`${forbidden}:${source.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Post-start runtime mode verification
+// ---------------------------------------------------------------------------
+
+describe("runtime launcher: the runtime must ATTEST the requested mode", () => {
+  const snapshot = (mode: "SAFE" | "LIVE_READY") => expectedGateSnapshotFor(mode);
+  const role = (gates: ReturnType<typeof snapshot> | null, freshCount = 1) => ({ freshCount, gates });
+  const status = (
+    backendGates: ReturnType<typeof snapshot> | null,
+    workerGates: ReturnType<typeof snapshot> | null,
+    overrides: { ok?: boolean; reasonCode?: string | null; backendFresh?: number; workerFresh?: number } = {}
+  ) => ({
+    ok: overrides.ok ?? true,
+    reasonCode: overrides.reasonCode ?? null,
+    message: null,
+    backend: role(backendGates, overrides.backendFresh ?? 1),
+    worker: role(workerGates, overrides.workerFresh ?? 1),
+  });
+
+  it("expects the reviewed conservative flags alongside the three gates", () => {
+    expect(snapshot("SAFE")).toEqual({
+      globalKillSwitch: true,
+      liveEntryEnabled: false,
+      protectionReady: false,
+      accountSetupMutationsEnabled: false,
+      testOrderEnabled: false,
+      autoAddMarginEnabled: false,
+      emergencyCloseMode: "DISABLED",
+    });
+    expect(snapshot("LIVE_READY")).toEqual({
+      globalKillSwitch: false,
+      liveEntryEnabled: true,
+      protectionReady: true,
+      accountSetupMutationsEnabled: false,
+      testOrderEnabled: false,
+      autoAddMarginEnabled: false,
+      emergencyCloseMode: "DISABLED",
+    });
+  });
+
+  it("A. accepts SAFE requested with SAFE attestations", () => {
+    expect(verifyRuntimeMode(status(snapshot("SAFE"), snapshot("SAFE")), "SAFE")).toEqual({ ok: true });
+  });
+
+  it("B. accepts LIVE_READY requested with LIVE_READY attestations", () => {
+    expect(verifyRuntimeMode(status(snapshot("LIVE_READY"), snapshot("LIVE_READY")), "LIVE_READY")).toEqual({ ok: true });
+  });
+
+  it("C. REFUSES LIVE_READY requested with stale SAFE attestations", () => {
+    // The exact real-world failure: disk said LIVE-READY, both processes said
+    // SAFE, and the tool reported success anyway.
+    const verdict = verifyRuntimeMode(status(snapshot("SAFE"), snapshot("SAFE")), "LIVE_READY");
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toContain("BACKEND attested");
+    expect(verdict.ok === false && verdict.reason).toContain("liveEntry=false");
+  });
+
+  it("D. REFUSES SAFE requested with LIVE_READY attestations", () => {
+    const verdict = verifyRuntimeMode(status(snapshot("LIVE_READY"), snapshot("LIVE_READY")), "SAFE");
+    expect(verdict.ok).toBe(false);
+  });
+
+  it("E. REFUSES when the backend is right but the worker is wrong", () => {
+    // A half-converted runtime is the most dangerous shape of all.
+    const verdict = verifyRuntimeMode(status(snapshot("LIVE_READY"), snapshot("SAFE")), "LIVE_READY");
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toContain("WORKER attested");
+  });
+
+  it("F. REFUSES a missing BACKEND", () => {
+    const verdict = verifyRuntimeMode(
+      status(null, snapshot("SAFE"), { backendFresh: 0 }),
+      "SAFE"
+    );
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toContain("BACKEND");
+  });
+
+  it("G. REFUSES a missing WORKER", () => {
+    const verdict = verifyRuntimeMode(
+      status(snapshot("SAFE"), null, { workerFresh: 0 }),
+      "SAFE"
+    );
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toContain("WORKER");
+  });
+
+  it("H. REFUSES a duplicated role", () => {
+    // Two stacks competing is never a valid runtime.
+    const verdict = verifyRuntimeMode(
+      status(snapshot("SAFE"), snapshot("SAFE"), { backendFresh: 2 }),
+      "SAFE"
+    );
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toContain("found 2");
+  });
+
+  it("I. REFUSES a malformed attestation with no gate snapshot", () => {
+    const verdict = verifyRuntimeMode(status(null, snapshot("SAFE")), "SAFE");
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toContain("no gate snapshot");
+  });
+
+  it("I2. REFUSES when the attestation reader itself reports not-ok", () => {
+    const verdict = verifyRuntimeMode(
+      status(snapshot("SAFE"), snapshot("SAFE"), { ok: false, reasonCode: "RUNTIME_ATTESTATION_STALE" }),
+      "SAFE"
+    );
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toContain("RUNTIME_ATTESTATION_STALE");
+  });
+
+  it("J. REFUSES an unreadable state / timeout", () => {
+    // "We could not tell" is not "it is correct".
+    const verdict = verifyRuntimeMode(null, "LIVE_READY");
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toContain("could not be read");
+  });
+
+  it("refuses a runtime whose conservative mutation flags drifted", () => {
+    const drifted = { ...snapshot("LIVE_READY"), testOrderEnabled: true };
+    expect(verifyRuntimeMode(status(drifted, snapshot("LIVE_READY")), "LIVE_READY").ok).toBe(false);
+  });
+
+  it("names only the three non-secret gates in its refusal", () => {
+    const verdict = verifyRuntimeMode(status(snapshot("SAFE"), snapshot("SAFE")), "LIVE_READY");
+    const reason = verdict.ok === false ? verdict.reason : "";
+    for (const forbidden of ["DATABASE_URL", "postgresql://", "redis://", "TOKEN", "accountSetup"]) {
+      expect(`${forbidden}:${reason.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+    expect(reason).toContain("killSwitch=");
+  });
+});
+
+describe("runtime launcher: success is never announced before verification", () => {
+  const cli = () =>
+    readFileSync(path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"), "utf8");
+
+  it("verifies the attested mode BEFORE printing any success", () => {
+    // Ports and a rewritten file are not proof. If this ordering is ever
+    // inverted, the tool can report LIVE-READY for a SAFE runtime again.
+    const start = cli();
+    const body = start.slice(start.indexOf("async function startRuntime"), start.indexOf("async function startLiveReady"));
+    const verify = body.indexOf("verifyRuntimeMode(");
+    const attested = body.indexOf("Runtime attested");
+    const liveBanner = body.indexOf("The runtime is LIVE-READY");
+    expect(verify).toBeGreaterThan(-1);
+    expect(attested).toBeGreaterThan(verify);
+    expect(liveBanner).toBeGreaterThan(verify);
+    // And the ports check still precedes the verification.
+    expect(body.indexOf("waitForPorts()")).toBeLessThan(verify);
+  });
+
+  it("records ownership BEFORE verification, so a refusal can still clean up", () => {
+    // The recovery contract: a failed verification must never strand processes
+    // the launcher can no longer identify or stop.
+    const start = cli();
+    const body = start.slice(start.indexOf("async function startRuntime"), start.indexOf("async function startLiveReady"));
+    expect(body.indexOf("store.write(")).toBeLessThan(body.indexOf("verifyRuntimeMode("));
+  });
+
+  it("reaches store.clear() and termination ONLY through the cleanup routine", () => {
+    // Cleanup decides whether clearing is safe; the startup path must never
+    // clear ownership or kill a process on its own.
+    const start = cli();
+    const body = start.slice(start.indexOf("async function startRuntime"), start.indexOf("async function startLiveReady"));
+    const clears = (body.match(/store\.clear\(\)/g) ?? []).length;
+    const kills = (body.match(/terminateTree\(/g) ?? []).length;
+    expect(clears).toBe(1);
+    expect(kills).toBe(1);
+    // Both appear as injected adapters handed to the cleanup routine, after it.
+    const cleanup = body.indexOf("cleanupAfterModeMismatch(");
+    expect(body.indexOf("store.clear()")).toBeGreaterThan(cleanup);
+    expect(body.indexOf("terminateTree(")).toBeGreaterThan(cleanup);
+  });
+
+  it("uses no preflight, exchange or trading path to verify", () => {
+    const source = cli();
+    for (const forbidden of ["CanaryPreflightService", "readReadiness", "binance", "armNaturalWindow", "safeOff("]) {
+      expect(`${forbidden}:${source.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+    // It reuses the existing attestation reader rather than a new state model.
+    expect(source).toContain("readRuntimeAttestationStatusOnce");
+  });
+
+  it("bounds the wait instead of retrying forever", () => {
+    const source = cli();
+    const fn = source.slice(source.indexOf("async function readRuntimeModeAttestation"), source.indexOf("const sleep ="));
+    const bounded = source.slice(source.indexOf("async function readRuntimeModeAttestation"));
+    expect(bounded).toContain("attempt < 15");
+    expect(bounded).not.toContain("while (true)");
+    expect(fn.length + bounded.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fail-closed cleanup after a mode mismatch
+// ---------------------------------------------------------------------------
+
+describe("runtime launcher: a runtime that did not attest the requested mode is taken down", () => {
+  const REPO = "C:\\Projects\\trading-alert-dashboard";
+  const CMD = (role: string) =>
+    "C:\\WINDOWS\\system32\\cmd.exe /d /s /c pnpm -C C:\\Projects\\trading-alert-dashboard --filter x " + role;
+
+  const state = (): RuntimeState => ({
+    repoRoot: REPO,
+    mode: "SAFE",
+    startedAtMs: 1_700_000_000_000,
+    processes: [
+      { role: "backend", pid: 101, startedAtMs: 1_700_000_000_000 },
+      { role: "worker", pid: 102, startedAtMs: 1_700_000_000_100 },
+      { role: "frontend", pid: 103, startedAtMs: 1_700_000_000_200 },
+    ],
+  });
+
+  /**
+   * A fake machine. `alive` is the set of live PIDs; terminating removes them
+   * unless the pid is listed in `unkillable`.
+   */
+  function machine(options: { alive?: number[]; unkillable?: number[]; reusedPid?: number; safeRestoreOk?: boolean } = {}) {
+    const alive = new Set(options.alive ?? [101, 102, 103]);
+    const unkillable = new Set(options.unkillable ?? []);
+    const calls = { terminated: [] as number[], cleared: 0, restored: 0 };
+    const lines: string[] = [];
+    const adapters = {
+      probe: (pid: number) => {
+        if (!alive.has(pid)) return null;
+        const record = state().processes.find((p) => p.pid === pid)!;
+        return {
+          pid,
+          // A reused PID reports a creation time that does not match.
+          startedAtMs: options.reusedPid === pid ? record.startedAtMs + 60_000 : record.startedAtMs,
+          commandLine: CMD(record.role),
+        };
+      },
+      terminate: (pid: number) => {
+        calls.terminated.push(pid);
+        if (!unkillable.has(pid)) alive.delete(pid);
+        return !unkillable.has(pid);
+      },
+      restoreSafeGates: () => {
+        calls.restored += 1;
+        return options.safeRestoreOk ?? true;
+      },
+      clearState: () => {
+        calls.cleared += 1;
+      },
+      log: (line: string) => lines.push(line),
+    };
+    return { adapters, calls, alive, lines };
+  }
+
+  it("A/B. terminates every owned root, restores SAFE and clears state", () => {
+    // The critical case is a requested SAFE start whose processes came up
+    // LIVE-READY: refusing to print success would leave an armable runtime
+    // alive while the operator has been told the start failed.
+    const m = machine();
+    const result = cleanupAfterModeMismatch(state(), m.adapters);
+
+    expect(m.calls.terminated.sort()).toEqual([101, 102, 103]);
+    expect(result.results.map((r) => r.outcome)).toEqual(["TERMINATED", "TERMINATED", "TERMINATED"]);
+    expect(result.unresolved).toEqual([]);
+    expect(result.safeGatesRestored).toBe(true);
+    expect(result.stateCleared).toBe(true);
+    expect(m.calls.cleared).toBe(1);
+    // Nothing is left running.
+    expect([...m.alive]).toEqual([]);
+  });
+
+  it("C/D. cleans up regardless of WHICH role or reading caused the mismatch", () => {
+    // The routine does not care why verification failed; an untrusted runtime
+    // is an untrusted runtime.
+    const m = machine();
+    const result = cleanupAfterModeMismatch(state(), m.adapters);
+    expect(result.stateCleared).toBe(true);
+    expect([...m.alive]).toEqual([]);
+  });
+
+  it("counts a root that already exited as resolved", () => {
+    const m = machine({ alive: [101, 103] });
+    const result = cleanupAfterModeMismatch(state(), m.adapters);
+    expect(result.results.find((r) => r.pid === 102)?.outcome).toBe("ALREADY_GONE");
+    expect(m.calls.terminated).not.toContain(102);
+    expect(result.stateCleared).toBe(true);
+  });
+
+  it("E. never terminates a root it cannot prove it owns, and KEEPS the state", () => {
+    // A recycled PID now belongs to something else on the operator's machine.
+    const m = machine({ reusedPid: 102 });
+    const result = cleanupAfterModeMismatch(state(), m.adapters);
+
+    expect(m.calls.terminated).not.toContain(102);
+    expect(result.results.find((r) => r.pid === 102)?.outcome).toBe("NOT_OWNED");
+    expect(result.unresolved.map((r) => r.pid)).toEqual([102]);
+    // Ownership state is retained: discarding it would remove the only path
+    // that can still find and stop the remaining processes.
+    expect(result.stateCleared).toBe(false);
+    expect(m.calls.cleared).toBe(0);
+    // SAFE restoration is still attempted.
+    expect(result.safeGatesRestored).toBe(true);
+    expect(m.calls.restored).toBe(1);
+  });
+
+  it("F. retains state when a root cannot be terminated", () => {
+    const m = machine({ unkillable: [103] });
+    const result = cleanupAfterModeMismatch(state(), m.adapters);
+
+    expect(m.calls.terminated).toContain(103);
+    expect(result.results.find((r) => r.pid === 103)?.outcome).toBe("TERMINATION_FAILED");
+    expect(result.unresolved.map((r) => r.pid)).toEqual([103]);
+    expect(result.stateCleared).toBe(false);
+    expect(m.calls.cleared).toBe(0);
+    expect(m.lines.join("\n")).toContain("could NOT be stopped");
+  });
+
+  it("attempts SAFE restoration even when cleanup could not finish", () => {
+    // A file still claiming LIVE-READY would hand the next start a posture
+    // nobody asked for.
+    const m = machine({ unkillable: [101, 102, 103] });
+    const result = cleanupAfterModeMismatch(state(), m.adapters);
+    expect(m.calls.restored).toBe(1);
+    expect(result.unresolved).toHaveLength(3);
+    expect(result.stateCleared).toBe(false);
+  });
+
+  it("reports a failed SAFE restoration without clearing state", () => {
+    const m = machine({ unkillable: [101], safeRestoreOk: false });
+    const result = cleanupAfterModeMismatch(state(), m.adapters);
+    expect(result.safeGatesRestored).toBe(false);
+    expect(result.stateCleared).toBe(false);
+  });
+
+  it("trusts a re-probe rather than the termination return value", () => {
+    // A tool that believed its own exit code would report a stopped process
+    // that is still running.
+    const m = machine({ unkillable: [102] });
+    const result = cleanupAfterModeMismatch(state(), m.adapters);
+    expect(result.results.find((r) => r.pid === 102)?.outcome).toBe("TERMINATION_FAILED");
+  });
+
+  it("never sweeps by image name", () => {
+    const source = readFileSync(
+      path.join(process.cwd(), "src/modules/operator/runtime-launcher.ts"),
+      "utf8"
+    );
+    const from = source.indexOf("export function cleanupAfterModeMismatch");
+    const fn = source.slice(from, source.indexOf("\n// ---", from));
+    expect(fn.length).toBeGreaterThan(200);
+    for (const forbidden of ["node.exe", "/IM", "Stop-Process", "taskkill"]) {
+      expect(`${forbidden}:${fn.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+    // It goes through the same ownership rules used everywhere else.
+    expect(fn).toContain("verifyOwnership(");
+  });
+
+  it("mutates no durable trading state", () => {
+    const source = readFileSync(
+      path.join(process.cwd(), "src/modules/operator/runtime-launcher.ts"),
+      "utf8"
+    );
+    // Bounded to the function itself: an unbounded slice would sweep in every
+    // later declaration and assert nothing about this one.
+    const from = source.indexOf("export function cleanupAfterModeMismatch");
+    const fn = source.slice(from, source.indexOf("\n// ---", from));
+    expect(fn.length).toBeGreaterThan(200);
+    for (const forbidden of ["safeOff", "stopNewTrades", "startTrading", "disarm", "revoke", "prisma", "binance"]) {
+      expect(`${forbidden}:${fn.toLowerCase().includes(forbidden.toLowerCase())}`).toBe(`${forbidden}:false`);
+    }
+  });
+});
+
+describe("runtime launcher: G. a verified runtime is left alone", () => {
+  it("performs no cleanup on the success path", () => {
+    // Cleanup must be reachable ONLY from the mismatch branch.
+    const cli = readFileSync(
+      path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"),
+      "utf8"
+    );
+    const body = cli.slice(cli.indexOf("async function startRuntime"), cli.indexOf("async function startLiveReady"));
+    const verify = body.indexOf("verifyRuntimeMode(");
+    const cleanup = body.indexOf("cleanupAfterModeMismatch(");
+    const attested = body.indexOf("Runtime attested");
+    expect(cleanup).toBeGreaterThan(verify);
+    // Cleanup sits inside the failure branch, before the success line.
+    expect(cleanup).toBeLessThan(attested);
+    // Exactly one call site.
+    expect((body.match(/cleanupAfterModeMismatch\(/g) ?? []).length).toBe(1);
+  });
+
+  it("still reports success only after verification", () => {
+    const cli = readFileSync(
+      path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"),
+      "utf8"
+    );
+    const body = cli.slice(cli.indexOf("async function startRuntime"), cli.indexOf("async function startLiveReady"));
+    expect(body.indexOf("verifyRuntimeMode(")).toBeLessThan(body.indexOf("Runtime attested"));
+    expect(body.indexOf("verifyRuntimeMode(")).toBeLessThan(body.indexOf("The runtime is LIVE-READY"));
+  });
+
+  it("leaves the unrelated partial-start and port-failure paths unchanged", () => {
+    // This change is specifically about an untrusted runtime configuration.
+    const cli = readFileSync(
+      path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"),
+      "utf8"
+    );
+    expect(cli).toContain("PARTIAL START");
+    expect(cli).toContain("an expected port did not open");
+    const partial = cli.slice(cli.indexOf("PARTIAL START"), cli.indexOf("Waiting for the expected ports"));
+    expect(partial).not.toContain("cleanupAfterModeMismatch");
   });
 });
 

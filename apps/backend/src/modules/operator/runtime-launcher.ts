@@ -1,6 +1,10 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
+// Type-only: erased at compile time, so this module pulls in no dotenv-backed
+// configuration and stays testable without touching a real environment.
+import type { RuntimeGateSnapshot } from "../runtime/runtime-attestation";
+
 /**
  * The local Windows runtime launcher — pure core.
  *
@@ -264,7 +268,14 @@ export const ROLE_COMMANDS: Readonly<Record<LauncherRole, { filter: string; scri
 export interface SpawnPlan {
   command: string;
   args: string[];
-  options: { cwd: string; detached: true; stdio: "ignore"; windowsHide: boolean };
+  options: {
+    cwd: string;
+    detached: true;
+    stdio: "ignore";
+    windowsHide: boolean;
+    /** The child's environment, with the REQUESTED gates pinned explicitly. */
+    env: NodeJS.ProcessEnv;
+  };
 }
 
 /**
@@ -305,6 +316,7 @@ export interface SpawnPlan {
 export function windowsSpawnPlan(
   role: LauncherRole,
   repoRoot: string,
+  mode: Exclude<DiskMode, "INVALID">,
   env: NodeJS.ProcessEnv = process.env
 ): SpawnPlan {
   const { filter, script } = ROLE_COMMANDS[role];
@@ -318,8 +330,235 @@ export function windowsSpawnPlan(
       detached: true,
       stdio: "ignore",
       windowsHide: false,
+      // The REQUESTED gates, pinned on top of the inherited environment.
+      // Spread, never mutated: `process.env` itself is left alone.
+      //
+      // This is the fix for the defect the first LIVE-READY rehearsal exposed.
+      // The launcher loads dotenv-backed configuration while checking the
+      // durable state, which happens BEFORE the gates are rewritten. Its own
+      // environment therefore holds the OLD values, children inherit them, and
+      // dotenv in the child will not overwrite a variable that is already
+      // present -- so the runtime came up in the previous mode while both the
+      // file and the launcher reported the new one.
+      //
+      // Inheriting everything else is deliberate: credentials, DATABASE_URL and
+      // the rest must reach the child untouched.
+      env: { ...env, ...gatesFor(mode) },
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Post-start runtime mode verification
+// ---------------------------------------------------------------------------
+
+/**
+ * The gate snapshot the running processes must attest for a requested mode.
+ *
+ * The three activation gates come from the canonical tables; the four mutation
+ * flags are pinned to their conservative values because this tool only ever
+ * supports the reviewed posture. A runtime attesting anything else is refused
+ * rather than accommodated.
+ */
+export function expectedGateSnapshotFor(mode: Exclude<DiskMode, "INVALID">): RuntimeGateSnapshot {
+  const gates = gatesFor(mode);
+  return {
+    globalKillSwitch: gates.EXECUTION_GLOBAL_KILL_SWITCH === "true",
+    liveEntryEnabled: gates.EXECUTION_LIVE_ENTRY_ENABLED === "true",
+    protectionReady: gates.EXECUTION_PROTECTION_READY === "true",
+    accountSetupMutationsEnabled: false,
+    testOrderEnabled: false,
+    autoAddMarginEnabled: false,
+    emergencyCloseMode: "DISABLED",
+  };
+}
+
+/** Just enough of the attestation status to judge it, with no runtime import. */
+export interface AttestationRoleView {
+  freshCount: number;
+  gates: RuntimeGateSnapshot | null;
+}
+
+export interface AttestationStatusView {
+  ok: boolean;
+  reasonCode: string | null;
+  message: string | null;
+  backend: AttestationRoleView;
+  worker: AttestationRoleView;
+}
+
+export type RuntimeModeVerdict = { ok: true } | { ok: false; reason: string };
+
+function gatesEqual(a: RuntimeGateSnapshot, b: RuntimeGateSnapshot): boolean {
+  return (
+    a.globalKillSwitch === b.globalKillSwitch &&
+    a.liveEntryEnabled === b.liveEntryEnabled &&
+    a.protectionReady === b.protectionReady &&
+    a.accountSetupMutationsEnabled === b.accountSetupMutationsEnabled &&
+    a.testOrderEnabled === b.testOrderEnabled &&
+    a.autoAddMarginEnabled === b.autoAddMarginEnabled &&
+    a.emergencyCloseMode === b.emergencyCloseMode
+  );
+}
+
+/** The three non-secret activation gates only. Nothing else is ever printed. */
+function describeGates(g: RuntimeGateSnapshot): string {
+  return "killSwitch=" + g.globalKillSwitch + " liveEntry=" + g.liveEntryEnabled + " protectionReady=" + g.protectionReady;
+}
+
+/**
+ * Whether the RUNNING processes actually loaded the requested mode.
+ *
+ * Open ports and a rewritten file prove only that the launcher did its own
+ * part. The first LIVE-READY rehearsal came up with LIVE-READY on disk and SAFE
+ * in both processes, and nothing in the tool noticed -- so this asks the
+ * runtime itself, through the attestation both roles already publish.
+ *
+ * Everything is refused except the exact expected shape: one fresh BACKEND, one
+ * fresh WORKER, both attesting the requested gates. Missing, duplicated, stale,
+ * malformed and unreadable all fail closed, because "we could not tell" is not
+ * the same as "it is correct".
+ */
+export function verifyRuntimeMode(
+  status: AttestationStatusView | null,
+  mode: Exclude<DiskMode, "INVALID">
+): RuntimeModeVerdict {
+  if (!status) return { ok: false, reason: "runtime attestation could not be read" };
+  if (!status.ok) return { ok: false, reason: status.reasonCode ?? "runtime attestation is not valid" };
+
+  const expected = expectedGateSnapshotFor(mode);
+  const roles: Array<[string, AttestationRoleView]> = [
+    ["BACKEND", status.backend],
+    ["WORKER", status.worker],
+  ];
+  for (const [role, view] of roles) {
+    // Exactly one fresh instance per role: zero means it never started or has
+    // gone stale, more than one means two stacks are competing.
+    if (view.freshCount !== 1) {
+      return { ok: false, reason: "expected exactly 1 fresh " + role + " attestation, found " + view.freshCount };
+    }
+    if (!view.gates) {
+      return { ok: false, reason: role + " attestation carried no gate snapshot" };
+    }
+    if (!gatesEqual(view.gates, expected)) {
+      return {
+        ok: false,
+        reason: role + " attested " + describeGates(view.gates) + ", expected " + describeGates(expected),
+      };
+    }
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed cleanup after a runtime mode mismatch
+// ---------------------------------------------------------------------------
+
+export type CleanupRootOutcome = "TERMINATED" | "ALREADY_GONE" | "NOT_OWNED" | "TERMINATION_FAILED";
+
+export interface CleanupRootResult {
+  role: LauncherRole;
+  pid: number;
+  outcome: CleanupRootOutcome;
+}
+
+export interface CleanupResult {
+  results: CleanupRootResult[];
+  /** Roots that are NOT provably gone. Any entry means operator recovery. */
+  unresolved: CleanupRootResult[];
+  safeGatesRestored: boolean;
+  stateCleared: boolean;
+}
+
+/** The side effects cleanup needs. Injected so this stays testable with fakes. */
+export interface CleanupAdapters {
+  probe(pid: number): ProcessProbe | null;
+  terminate(pid: number): boolean;
+  /** Rewrites the three gates to canonical SAFE. Returns false on any failure. */
+  restoreSafeGates(): boolean;
+  clearState(): void;
+  log(line: string): void;
+}
+
+/**
+ * Shuts down a runtime that did NOT attest the requested mode.
+ *
+ * ## Why refusing to print success is not enough
+ *
+ * A mismatch means the running configuration is not the one that was asked
+ * for, and it may be the MORE permissive one: a requested SAFE start whose
+ * processes came up LIVE-READY leaves an armable runtime alive while the
+ * operator has been told the start failed. Start SAFE deliberately does not
+ * require a durably SAFE_OFF profile, so nothing downstream can be assumed to
+ * make that harmless. The only safe response is to take the untrusted runtime
+ * back down and put the deployment gates back to SAFE.
+ *
+ * ## What it will not do
+ *
+ * Every root is re-verified through the same ownership rules used everywhere
+ * else — exists, creation time matches, command line belongs to this
+ * repository. Anything that fails those checks is REPORTED and left alone;
+ * there is no name-based sweep and no force applied to a process this tool
+ * cannot prove it started.
+ *
+ * Ownership state is cleared only when every root is provably gone. If even
+ * one is unresolved the record is kept, because throwing it away would strip
+ * the operator of the one path that can still find and stop those processes —
+ * making the launcher look clean at the cost of making the machine unsafe.
+ *
+ * SAFE gate restoration is attempted either way: a file that still says
+ * LIVE-READY would hand the next start a posture nobody asked for.
+ *
+ * It mutates no durable trading state, calls no operator action and never
+ * reaches the exchange.
+ */
+export function cleanupAfterModeMismatch(state: RuntimeState, adapters: CleanupAdapters): CleanupResult {
+  const results: CleanupRootResult[] = [];
+
+  for (const record of state.processes) {
+    const verdict = verifyOwnership(record, adapters.probe(record.pid), state.repoRoot);
+
+    if (!verdict.owned) {
+      if (verdict.reason === "GONE") {
+        results.push({ role: record.role, pid: record.pid, outcome: "ALREADY_GONE" });
+        adapters.log(`  ${record.role} pid ${record.pid}: already gone`);
+      } else {
+        // PID reused, or the process no longer looks like ours. Reported, never
+        // terminated: killing an unrelated program is not recoverable.
+        results.push({ role: record.role, pid: record.pid, outcome: "NOT_OWNED" });
+        adapters.log(`  ${record.role} pid ${record.pid}: ${verdict.reason} — NOT terminated`);
+      }
+      continue;
+    }
+
+    adapters.terminate(record.pid);
+    // Trust the re-probe, not the exit code: what matters is whether the
+    // process is actually gone.
+    const stillThere = verifyOwnership(record, adapters.probe(record.pid), state.repoRoot).owned;
+    if (stillThere) {
+      results.push({ role: record.role, pid: record.pid, outcome: "TERMINATION_FAILED" });
+      adapters.log(`  ${record.role} pid ${record.pid}: could NOT be stopped`);
+    } else {
+      results.push({ role: record.role, pid: record.pid, outcome: "TERMINATED" });
+      adapters.log(`  ${record.role} pid ${record.pid}: stopped`);
+    }
+  }
+
+  const unresolved = results.filter(
+    (entry) => entry.outcome === "NOT_OWNED" || entry.outcome === "TERMINATION_FAILED"
+  );
+
+  // Attempted regardless: the disk must not be left claiming a mode nobody
+  // asked for, even when a process could not be stopped.
+  const safeGatesRestored = adapters.restoreSafeGates();
+
+  let stateCleared = false;
+  if (unresolved.length === 0) {
+    adapters.clearState();
+    stateCleared = true;
+  }
+
+  return { results, unresolved, safeGatesRestored, stateCleared };
 }
 
 // ---------------------------------------------------------------------------
