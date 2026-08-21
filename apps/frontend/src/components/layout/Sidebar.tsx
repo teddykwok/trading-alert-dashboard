@@ -3,10 +3,11 @@ import { classNames } from "../../utils/classNames";
 
 // Assets is intentionally not listed: the /assets route still exists for
 // manual/debugging access, but day-to-day workflow is signals-only.
-const NAV_ITEMS = [
+export const NAV_ITEMS = [
   { to: "/", label: "Dashboard", end: true },
   { to: "/risk-templates", label: "Risk Templates" },
   { to: "/executions", label: "Executions" },
+  { to: "/trading-control", label: "Trading Control" },
   { to: "/settings", label: "Settings" },
 ];
 

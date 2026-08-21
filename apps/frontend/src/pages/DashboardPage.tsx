@@ -6,7 +6,6 @@ import { AlertFeed } from "../components/alerts/AlertFeed";
 import { AlertFilters } from "../components/alerts/AlertFilters";
 import { OutcomeSummary } from "../components/alerts/OutcomeSummary";
 import { TradeDisciplineSummary } from "../components/alerts/TradeDisciplineSummary";
-import { TradingControlCard } from "../components/operator/TradingControlCard";
 import { useAlerts } from "../hooks/useAlerts";
 import { useAlertStats } from "../hooks/useAlertStats";
 import { useSocketAlerts } from "../hooks/useSocketAlerts";
@@ -174,8 +173,6 @@ export function DashboardPage() {
           </Card>
         ))}
       </div>
-
-      <TradingControlCard />
 
       <OutcomeSummary />
 

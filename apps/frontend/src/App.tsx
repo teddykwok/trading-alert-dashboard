@@ -7,6 +7,7 @@ import { RiskTemplatesPage } from "./pages/RiskTemplatesPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { ExecutionsPage } from "./pages/ExecutionsPage";
 import { ExecutionDetailPage } from "./pages/ExecutionDetailPage";
+import { TradingControlPage } from "./pages/TradingControlPage";
 
 export function App() {
   return (
@@ -19,6 +20,7 @@ export function App() {
         <Route path="/risk-templates" element={<RiskTemplatesPage />} />
         <Route path="/executions" element={<ExecutionsPage />} />
         <Route path="/executions/:executionId" element={<ExecutionDetailPage />} />
+        <Route path="/trading-control" element={<TradingControlPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Routes>
     </AppLayout>
