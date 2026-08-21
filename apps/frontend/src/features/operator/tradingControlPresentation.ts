@@ -141,30 +141,3 @@ export function presentReadinessSnapshot(
   const ready = scope === "PREPARATION" ? snapshot.preparationReady : snapshot.liveActivationReady;
   return presentReadiness(ready, scope);
 }
-
-// ---------------------------------------------------------------------------
-// The locked future actions
-// ---------------------------------------------------------------------------
-
-export const LOCKED_ACTION_HINT =
-  "Trading actions will be enabled after the operator-control mutation phase.";
-
-export interface LockedAction {
-  label: string;
-  disabled: true;
-  hint: string;
-}
-
-/**
- * Placeholders only.
- *
- * `disabled` is typed as the literal `true` so a future edit cannot make one of
- * these clickable without the type changing — no mutation endpoint exists, and
- * a button that looks live before its endpoint does is how someone comes to
- * believe they stopped trading when they did not.
- */
-export const LOCKED_ACTIONS: readonly LockedAction[] = [
-  { label: "Start Trading", disabled: true, hint: LOCKED_ACTION_HINT },
-  { label: "Stop New Trades", disabled: true, hint: LOCKED_ACTION_HINT },
-  { label: "Safe Off", disabled: true, hint: LOCKED_ACTION_HINT },
-];

@@ -1030,6 +1030,12 @@ describe("natural authorization: runtime boundary", () => {
     // Prisma write verb in the file. It widens what an operator can SEE without
     // widening what the runtime DOES.
     "src/modules/operator/trading-control.service.ts",
+    // The HTTP half of the SAME privileged activation as natural-arm.ts above,
+    // and admitted on the same terms: it prepares one window through the
+    // reviewed service and hands it to `armNaturalWindow`. It implements no
+    // admission, spends no claim, takes no lock of its own and reaches no
+    // exchange -- pinned structurally in trading-control-actions.test.ts.
+    "src/modules/operator/trading-control-actions.service.ts",
   ];
 
   /**

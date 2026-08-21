@@ -1,0 +1,211 @@
+import type { TradingControlStatusDto, TradingSystemState } from "../../api/operator";
+import { START_TRADING_CONFIRMATION } from "../../api/operator";
+
+/**
+ * The three operator actions, as pure descriptions.
+ *
+ * Everything the confirmation dialog says, and every rule about when a button
+ * is offered, lives here so it can be asserted directly. The component is a
+ * thin mapping, exactly as the status presentation is.
+ *
+ * The backend is always the final authority: these rules decide what to OFFER,
+ * never what is permitted. A button being enabled is not a claim that the
+ * action will succeed — the server re-checks attestation, readiness, the
+ * environment gates and the advisory lock regardless.
+ */
+
+export type TradingControlActionId = "START" | "STOP_NEW_TRADES" | "SAFE_OFF";
+
+export interface TradingControlAction {
+  id: TradingControlActionId;
+  label: string;
+  /** Shown in the confirmation dialog. Must not overstate what the action does. */
+  description: string;
+  /** Non-null when the operator must type a phrase exactly. */
+  requiredPhrase: string | null;
+  destructiveLooking: boolean;
+}
+
+export const TRADING_CONTROL_ACTIONS: readonly TradingControlAction[] = [
+  {
+    id: "START",
+    label: "Start Trading",
+    description:
+      "Opens one natural authorization window and arms the profile so new entries can be admitted. No order is placed by this action.",
+    // The one action that opens a real-money account to admission gets the
+    // highest-friction confirmation there is.
+    requiredPhrase: START_TRADING_CONFIRMATION,
+    destructiveLooking: true,
+  },
+  {
+    id: "STOP_NEW_TRADES",
+    label: "Stop New Trades",
+    description:
+      "Blocks new entries. Existing positions continue to be managed: nothing is cancelled and no position is closed.",
+    requiredPhrase: null,
+    destructiveLooking: false,
+  },
+  {
+    id: "SAFE_OFF",
+    label: "Safe Off",
+    description:
+      "Disarms trading and revokes unused authorization. Existing executions remain managed until it is safe to disable the profile.",
+    requiredPhrase: null,
+    destructiveLooking: false,
+  },
+];
+
+export function findAction(id: TradingControlActionId): TradingControlAction {
+  const action = TRADING_CONTROL_ACTIONS.find((entry) => entry.id === id);
+  if (!action) throw new Error(`unknown trading control action: ${id}`);
+  return action;
+}
+
+/**
+ * Whether an action is worth offering for the current system state.
+ *
+ * Deliberately permissive for START: the operator may legitimately try while
+ * the panel shows blockers, and the server's refusal carries far better
+ * information than a greyed-out button does. What must NOT happen is offering
+ * Start on a system that is already armed, or offering Stop on one where
+ * nothing can be admitted anyway.
+ */
+export function isActionRelevant(id: TradingControlActionId, state: TradingSystemState): boolean {
+  switch (id) {
+    case "START":
+      // Nothing to start when already armed.
+      return state !== "ARMED";
+    case "STOP_NEW_TRADES":
+      // Only meaningful while admission is possible.
+      return state === "ARMED";
+    case "SAFE_OFF":
+      // Meaningful whenever the profile is still enabled, which includes the
+      // recovery state where work is being wound down.
+      return state === "ARMED" || state === "SAFE_RECOVERY" || state === "INVALID";
+    default:
+      return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The deployment prerequisite
+// ---------------------------------------------------------------------------
+
+export const START_PREREQUISITE_REASON =
+  "Runtime activation gates are SAFE. Start the runtime in live-ready mode before arming.";
+
+export const START_ATTESTATION_WARNING =
+  "The running backend and worker are not attesting live-ready gates. Arming will be refused until they do.";
+
+export interface StartPrerequisite {
+  ready: boolean;
+  reason: string | null;
+  /** Advisory only: shown, but never used to disable the control. */
+  warning: string | null;
+}
+
+/**
+ * Whether the deployment prerequisite for arming is satisfied.
+ *
+ * This is NOT a second copy of the backend's readiness logic. It reads the
+ * three activation gates the status endpoint already publishes and answers one
+ * question: has the runtime been started in live-ready mode at all?
+ *
+ * The distinction matters because that prerequisite is categorically different
+ * from a readiness blocker. A readiness blocker is something the server
+ * evaluates and may clear on its own, so the panel deliberately still offers
+ * Start and lets the server explain its refusal. The activation gates are
+ * process environment variables: nothing in the application writes them, and
+ * Start can NEVER resolve them. Leaving the button live in that state invites
+ * exactly one wrong belief — that pressing it will bring the runtime up live.
+ *
+ * Attestation is surfaced as a WARNING rather than a disabler: it can be
+ * transiently unreadable, and the server is the authority on whether it blocks.
+ */
+export function describeStartPrerequisite(
+  status: Pick<TradingControlStatusDto, "environmentGates" | "runtimeAttestation"> | null
+): StartPrerequisite {
+  if (!status) {
+    // Unknown is not ready. The panel must not imply arming is possible before
+    // it has read anything.
+    return { ready: false, reason: START_PREREQUISITE_REASON, warning: null };
+  }
+  const gates = status.environmentGates;
+  const ready = !gates.globalKillSwitch && gates.liveEntryEnabled && gates.protectionReady;
+  return {
+    ready,
+    reason: ready ? null : START_PREREQUISITE_REASON,
+    warning: status.runtimeAttestation.status === "PASS" ? null : START_ATTESTATION_WARNING,
+  };
+}
+
+/** The server accepts the phrase only when it matches exactly. So does this. */
+export function isConfirmationSatisfied(action: TradingControlAction, typed: string): boolean {
+  if (action.requiredPhrase === null) return true;
+  return typed === action.requiredPhrase;
+}
+
+export interface StartContext {
+  environment: string;
+  allowedSymbols: string;
+  riskLimit: string;
+  marginLimit: string;
+  desiredOpen: number;
+  hardTotal: number;
+  maxClaims: number;
+  windowMinutes: number;
+}
+
+/** The reviewed first-live defaults, mirrored from the server for display. */
+export const START_WINDOW_MINUTES = 15;
+export const START_MAX_CLAIMS = 5;
+
+/**
+ * The authoritative context shown before arming.
+ *
+ * Every figure comes from the status the server already sent. None of it is
+ * editable: risk, margin, capacity, leverage, strategy and the symbol allowlist
+ * are server-side policy, and this dialog reports them rather than offering
+ * them.
+ */
+export function describeStartContext(status: TradingControlStatusDto): StartContext {
+  return {
+    environment: status.profile?.environment ?? "UNKNOWN",
+    allowedSymbols:
+      status.allowedSymbols.length === 0 ? "ALL (unrestricted)" : status.allowedSymbols.join(", "),
+    riskLimit: `${status.reservations.riskUsd} / ${status.reservations.riskLimitUsd} USD`,
+    marginLimit: `${status.reservations.marginUsd} / ${status.reservations.marginLimitUsd} USD`,
+    desiredOpen: status.capacity.desiredOpen,
+    hardTotal: status.capacity.hardTotal,
+    maxClaims: START_MAX_CLAIMS,
+    windowMinutes: START_WINDOW_MINUTES,
+  };
+}
+
+/**
+ * How an action's result should read on the panel.
+ *
+ * A refusal is reported with the server's own blocker text. Nothing here
+ * invents a verdict, and nothing here claims ARMED that the server did not.
+ */
+export function presentActionResult(result: {
+  ok: boolean;
+  outcome: string;
+  message: string;
+  blockers: string[];
+}): { tone: "green" | "yellow" | "red"; headline: string; detail: string[] } {
+  if (result.ok) {
+    return {
+      tone: result.outcome === "ARMED" || result.outcome === "ALREADY_ARMED" ? "yellow" : "green",
+      headline: result.outcome,
+      detail: [result.message],
+    };
+  }
+  return {
+    // A prepared-but-not-armed window is a state the operator must act on, and
+    // it is not the same as a clean refusal.
+    tone: result.outcome === "WINDOW_PREPARED_NOT_ARMED" ? "red" : "yellow",
+    headline: result.outcome,
+    detail: [result.message, ...result.blockers],
+  };
+}

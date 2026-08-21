@@ -10,6 +10,11 @@ import {
 import { CANARY_PREPARE_LOCK_NAMESPACE } from "./canary-authorization.service";
 import { profileLockKey } from "./profile-lock";
 import {
+  closeCanaryWindowOperation,
+  disarmCanaryOperation,
+  environmentIsArmed,
+} from "./operator-actions";
+import {
   CanaryAuthorizationAlreadyActiveError,
   CanaryAuthorizationService,
   DEFAULT_AUTHORIZATION_TTL_MINUTES,
@@ -87,18 +92,6 @@ function environmentIsStillSafe(): boolean {
 }
 
 /** Every gate that must already be OPEN before arming. */
-function environmentIsArmed(): boolean {
-  return (
-    !env.EXECUTION_GLOBAL_KILL_SWITCH &&
-    env.EXECUTION_LIVE_ENTRY_ENABLED &&
-    env.EXECUTION_PROTECTION_READY &&
-    !env.BINANCE_ACCOUNT_SETUP_MUTATIONS_ENABLED &&
-    !env.BINANCE_TEST_ORDER_ENABLED &&
-    !env.EXECUTION_AUTO_ADD_MARGIN_ENABLED &&
-    env.EXECUTION_EMERGENCY_CLOSE_MODE === "DISABLED"
-  );
-}
-
 async function withPrisma<T>(run: (prisma: PrismaClient) => Promise<T>): Promise<T> {
   const prisma = new PrismaClient();
   try {
@@ -479,39 +472,12 @@ export async function closeCanaryWindow(): Promise<void> {
     // The bounded wait is deliberate: waiting briefly for an in-flight arm and
     // then authoritatively engaging safety beats returning fast with a write
     // that can be overwritten. Only DB work happens under the lock.
-    const [active, recovery, authorization] = await prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CANARY_PREPARE_LOCK_NAMESPACE}::int, ${profileLockKey(
-        profile.id
-      )}::int)`;
-
-      await tx.executionSafetyPolicy.update({
-        where: { executionProfileId: profile.id },
-        data: { killSwitchActive: true },
-      });
-
-      return Promise.all([
-      tx.tradeExecution.count({
-        where: {
-          executionProfileId: profile.id,
-          status: {
-            in: ["PLAN_READY", "PREFLIGHT", "ENTRY_SUBMITTING", "ENTRY_PENDING", "PARTIALLY_FILLED", "ENTRY_FILLED", "PLACING_PROTECTION", "PROTECTED"],
-          },
-        },
-      }),
-      tx.tradeExecution.count({
-        where: {
-          executionProfileId: profile.id,
-          OR: [
-            { status: { in: ["ENTRY_SUBMITTING", "PARTIALLY_FILLED", "ENTRY_FILLED", "PLACING_PROTECTION", "MANUAL_INTERVENTION"] } },
-            { requiresManualIntervention: true },
-          ],
-        },
-      }),
-      // Read inside the lock, so the report describes the state the close
-      // actually committed rather than one a concurrent operator moved.
-      new CanaryAuthorizationService(prisma).listForProfile(profile.id, tx),
-      ]);
-    });
+    // The operation itself lives in `operator-actions.ts` so the HTTP route
+    // performs the identical transaction. This command only prints it.
+    const { active, recovery, authorizations: authorization } = await closeCanaryWindowOperation(
+      prisma,
+      profile.id
+    );
 
     console.log("CLOSED — profile kill switch is engaged. No new admission is possible.");
     line("active executions", active);
@@ -564,44 +530,8 @@ export async function disarmCanary(): Promise<void> {
     // re-enable the profile after the operator had disarmed it. The ordering
     // inside is unchanged — kill switch first, then revoke, then the
     // conditional disable — it is simply atomic now.
-    const { revoked, outstanding, outcome } = await prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CANARY_PREPARE_LOCK_NAMESPACE}::int, ${profileLockKey(
-        profile.id
-      )}::int)`;
-
-      // 1. Kill switch FIRST.
-      await tx.executionSafetyPolicy.update({
-        where: { executionProfileId: profile.id },
-        data: { killSwitchActive: true },
-      });
-
-      // 2. Revoke anything unused. Deliberately authorization-type agnostic:
-      // an open NATURAL_WINDOW is revoked exactly like an unused exact one.
-      // Claims already spent are never refunded and the row is never deleted.
-      const revokedCount = await new CanaryAuthorizationService(prisma).revokeUnused(profile.id, new Date(), tx);
-
-      // 3. Only then consider disabling the profile.
-      const outstandingCount = await tx.tradeExecution.count({
-        where: {
-          executionProfileId: profile.id,
-          OR: [
-            {
-              status: {
-                in: ["PLAN_READY", "PREFLIGHT", "ENTRY_SUBMITTING", "ENTRY_PENDING", "PARTIALLY_FILLED", "ENTRY_FILLED", "PLACING_PROTECTION", "PROTECTED", "MANUAL_INTERVENTION"],
-              },
-            },
-            { requiresManualIntervention: true },
-          ],
-        },
-      });
-
-      if (outstandingCount > 0) {
-        // The profile stays intact: reconciliation and protection need it.
-        return { revoked: revokedCount, outstanding: outstandingCount, outcome: "CANARY_DISARMED_NEW_WORK_BLOCKED_RECOVERY_CONTINUES" };
-      }
-      await tx.executionProfile.update({ where: { id: profile.id }, data: { isEnabled: false } });
-      return { revoked: revokedCount, outstanding: outstandingCount, outcome: "CANARY_DISARMED_CLEAN" };
-    });
+    // Same operation the HTTP Safe Off route runs, for the same reason.
+    const { revoked, outstanding, outcome } = await disarmCanaryOperation(prisma, profile.id);
 
     const verified = await prisma.executionProfile.findUniqueOrThrow({
       where: { id: profile.id },

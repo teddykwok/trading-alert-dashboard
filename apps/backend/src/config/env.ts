@@ -109,6 +109,12 @@ const envSchema = z.object({
   // can never be exhausted by (or exhaust) dashboard traffic.
   WEBHOOK_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(60),
   WEBHOOK_RATE_LIMIT_WINDOW: z.string().min(1).default("1 minute"),
+  // Operator MUTATION budget, deliberately tiny. These routes arm and disarm
+  // a real-money account; a human clicks them a handful of times an hour, so
+  // anything larger is capacity nobody needs and an attacker might. The
+  // read-only status poll keeps the generous dashboard budget.
+  OPERATOR_ACTION_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
+  OPERATOR_ACTION_RATE_LIMIT_WINDOW: z.string().min(1).default("1 minute"),
   BINANCE_REST_BASE_URL: z.string().min(1).default("https://api.binance.com"),
   // USD-M futures REST host, used for TradingView ".P" perpetual symbols
   // (GET /fapi/v1/klines). Spot keeps using BINANCE_REST_BASE_URL.

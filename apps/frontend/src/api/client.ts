@@ -87,12 +87,28 @@ function dedupedGet<T>(path: string): Promise<T> {
  */
 const OPERATOR_PATH_PREFIX = "/api/operator/";
 
+function assertOperatorPath(path: string): void {
+  if (!path.startsWith(OPERATOR_PATH_PREFIX)) {
+    throw new Error(`operatorApiClient refuses a non-operator path: ${path}`);
+  }
+}
+
 export const operatorApiClient = {
   get: <T>(path: string): Promise<T> => {
-    if (!path.startsWith(OPERATOR_PATH_PREFIX)) {
-      throw new Error(`operatorApiClient refuses a non-operator path: ${path}`);
-    }
+    assertOperatorPath(path);
     return request<T>(path, { method: "GET", headers: operatorAuthHeaders() });
+  },
+  /**
+   * Operator mutations. The credential travels in the Authorization header and
+   * never in the body, so a request log or a proxy trace cannot capture it.
+   */
+  post: <T>(path: string, data?: unknown): Promise<T> => {
+    assertOperatorPath(path);
+    return request<T>(path, {
+      method: "POST",
+      body: JSON.stringify(data ?? {}),
+      headers: operatorAuthHeaders(),
+    });
   },
 };
 

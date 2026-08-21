@@ -1,7 +1,13 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { PrismaClient } from "@prisma/client";
 
+import { env } from "../config/env";
 import { requireOperatorAuth } from "../modules/operator/operator-auth";
+import {
+  START_TRADING_CONFIRMATION,
+  TradingControlActionsService,
+  type TradingControlActionResult,
+} from "../modules/operator/trading-control-actions.service";
 import { TradingControlService } from "../modules/operator/trading-control.service";
 import { CANARY_AUTHORIZATION_MODES, type CanaryAuthorizationMode } from "../modules/execution/canary-readiness";
 import { ValidationError } from "../utils/errors";
@@ -21,6 +27,23 @@ import { ValidationError } from "../utils/errors";
  * Start / Stop New Trades / Safe Off do NOT exist here. Those are mutations and
  * they arrive only in a later, separately reviewed phase.
  */
+/**
+ * Operator MUTATION budget.
+ *
+ * Follows the webhook route's convention of overriding the global dashboard
+ * policy per route, but far stricter: these three actions arm and disarm a
+ * real-money account, and a human uses them a handful of times an hour. The
+ * read-only status poll deliberately keeps the generous dashboard budget.
+ */
+const OPERATOR_ACTION_RATE_LIMIT = {
+  config: {
+    rateLimit: {
+      max: env.OPERATOR_ACTION_RATE_LIMIT_MAX,
+      timeWindow: env.OPERATOR_ACTION_RATE_LIMIT_WINDOW,
+    },
+  },
+} as const;
+
 export interface OperatorRoutesOptions {
   /**
    * How the trading-control reader is built.
@@ -30,6 +53,15 @@ export interface OperatorRoutesOptions {
    * nothing and gets the real service.
    */
   tradingControlFactory?: (prisma: PrismaClient) => TradingControlReader;
+  /** Injected in tests so no real preflight, Redis read or profile write happens. */
+  tradingControlActionsFactory?: (prisma: PrismaClient) => TradingControlActor;
+}
+
+/** The mutation surface. Three actions, and deliberately nothing else. */
+export interface TradingControlActor {
+  startTrading(confirmation: unknown): Promise<TradingControlActionResult>;
+  stopNewTrades(): Promise<TradingControlActionResult>;
+  safeOff(): Promise<TradingControlActionResult>;
 }
 
 /** The read-only surface the routes need. Narrow on purpose: no mutation. */
@@ -44,6 +76,26 @@ export async function operatorRoutes(
 ): Promise<void> {
   const buildTradingControl =
     options.tradingControlFactory ?? ((prisma: PrismaClient) => new TradingControlService(prisma));
+  const buildTradingControlActions =
+    options.tradingControlActionsFactory ??
+    ((prisma: PrismaClient) => new TradingControlActionsService(prisma));
+
+  /**
+   * Every mutation answers the same way: the action's own sanitized result, and
+   * HTTP 409 when it refused. 409 rather than 400 because a refusal is almost
+   * always a CONFLICT with authoritative state — gates shut, attestation
+   * failing, a window already active — not a malformed request. The operator
+   * session must survive it, which is exactly what distinguishes it from 401.
+   */
+  const runAction = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    run: (actor: TradingControlActor) => Promise<TradingControlActionResult>
+  ): Promise<TradingControlActionResult> => {
+    const result = await run(buildTradingControlActions(request.server.prisma));
+    if (!result.ok) reply.code(409);
+    return result;
+  };
 
   app.get("/api/operator/auth-check", { preHandler: requireOperatorAuth }, async () => ({
     authenticated: true,
@@ -66,7 +118,38 @@ export async function operatorRoutes(
     const service = buildTradingControl(request.server.prisma);
     return service.readReadiness(resolveMode(request.query));
   });
+
+  // --- Operator ACTIONS ---------------------------------------------------
+  // Three POSTs, each behind the operator guard and the strict mutation budget.
+  // Each one delegates to the SAME function the operator CLI calls; none of
+  // them contains control logic of its own.
+
+  app.post(
+    "/api/operator/trading-control/start",
+    { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
+    async (request, reply) => {
+      // The confirmation phrase is validated by the service, on the server.
+      // The browser dialog is a courtesy, never the boundary.
+      const body = request.body as { confirmation?: unknown } | null | undefined;
+      return runAction(request, reply, (actor) => actor.startTrading(body?.confirmation));
+    }
+  );
+
+  app.post(
+    "/api/operator/trading-control/stop-new-trades",
+    { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
+    async (request, reply) => runAction(request, reply, (actor) => actor.stopNewTrades())
+  );
+
+  app.post(
+    "/api/operator/trading-control/safe-off",
+    { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
+    async (request, reply) => runAction(request, reply, (actor) => actor.safeOff())
+  );
 }
+
+/** Exposed so the panel can render the exact phrase it must send. */
+export { START_TRADING_CONFIRMATION };
 
 /**
  * Resolves `?mode=`, FAIL CLOSED.

@@ -3,11 +3,10 @@ import { useState, type FormEvent, type ReactNode } from "react";
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { Card } from "../ui/Card";
+import { classNames } from "../../utils/classNames";
 import { useTradingControl } from "../../hooks/useTradingControl";
 import type { TradingControlReadinessSnapshot, TradingControlStatusDto } from "../../api/operator";
 import {
-  LOCKED_ACTIONS,
-  LOCKED_ACTION_HINT,
   presentAllowedSymbols,
   presentAttestation,
   presentAuthorization,
@@ -19,6 +18,15 @@ import {
   presentRuntime,
   presentSystemState,
 } from "../../features/operator/tradingControlPresentation";
+import {
+  TRADING_CONTROL_ACTIONS,
+  describeStartContext,
+  describeStartPrerequisite,
+  isActionRelevant,
+  isConfirmationSatisfied,
+  presentActionResult,
+  type TradingControlAction,
+} from "../../features/operator/tradingControlActions";
 
 /**
  * The operator's Trading Control panel. READ ONLY.
@@ -161,6 +169,91 @@ function StatusBody({
   );
 }
 
+/**
+ * The confirmation step.
+ *
+ * Start Trading demands the phrase typed exactly, because it is the one action
+ * that opens a real-money account to admission. The server re-checks the same
+ * phrase, so this is friction for the operator's benefit, never the boundary.
+ *
+ * The context shown is entirely read from the authoritative status: none of it
+ * is editable, because risk, margin, capacity and the symbol allowlist are
+ * server-side policy.
+ */
+function ConfirmDialog({
+  action,
+  status,
+  pending,
+  onCancel,
+  onConfirm,
+}: {
+  action: TradingControlAction;
+  status: TradingControlStatusDto | null;
+  pending: boolean;
+  onCancel: () => void;
+  onConfirm: (phrase: string) => void;
+}) {
+  const [typed, setTyped] = useState("");
+  const context = status ? describeStartContext(status) : null;
+  const satisfied = isConfirmationSatisfied(action, typed);
+
+  return (
+    <div className="space-y-2 rounded-lg border border-yellow-500/40 bg-yellow-500/10 p-3">
+      <p className="text-sm font-semibold text-slate-100">{action.label}</p>
+      <p className="text-xs text-slate-300">{action.description}</p>
+
+      {action.id === "START" && context ? (
+        <dl className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs text-slate-400">
+          <dt>Environment</dt>
+          <dd className="text-slate-200">{context.environment}</dd>
+          <dt>Allowed symbols</dt>
+          <dd className="text-slate-200">{context.allowedSymbols}</dd>
+          <dt>Risk</dt>
+          <dd className="text-slate-200">{context.riskLimit}</dd>
+          <dt>Margin</dt>
+          <dd className="text-slate-200">{context.marginLimit}</dd>
+          <dt>Desired open</dt>
+          <dd className="text-slate-200">{context.desiredOpen}</dd>
+          <dt>Hard active limit</dt>
+          <dd className="text-slate-200">{context.hardTotal}</dd>
+          <dt>Max claims</dt>
+          <dd className="text-slate-200">{context.maxClaims}</dd>
+          <dt>Window</dt>
+          <dd className="text-slate-200">{context.windowMinutes} minutes</dd>
+        </dl>
+      ) : null}
+
+      {action.requiredPhrase ? (
+        <label className="block space-y-1">
+          <span className="text-xs text-slate-400">
+            Type <span className="font-mono text-slate-200">{action.requiredPhrase}</span> to continue
+          </span>
+          <input
+            value={typed}
+            onChange={(event) => setTyped(event.target.value)}
+            autoComplete="off"
+            spellCheck={false}
+            className="w-full rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-sm text-slate-200"
+          />
+        </label>
+      ) : null}
+
+      <div className="flex gap-2">
+        <Button
+          variant={action.destructiveLooking ? "danger" : "primary"}
+          disabled={!satisfied || pending}
+          onClick={() => onConfirm(typed)}
+        >
+          {pending ? "Working…" : `Confirm ${action.label}`}
+        </Button>
+        <Button variant="ghost" onClick={onCancel} disabled={pending}>
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function TradingControlCard() {
   const {
     authState,
@@ -175,7 +268,16 @@ export function TradingControlCard() {
     signOut,
     refresh,
     checkReadiness,
+    pendingAction,
+    actionResult,
+    actionError,
+    runAction,
+    dismissActionResult,
   } = useTradingControl();
+  const [confirming, setConfirming] = useState<TradingControlAction | null>(null);
+  // Read from the polled status the server already sends; nothing extra is
+  // fetched and no readiness check is triggered.
+  const startPrerequisite = describeStartPrerequisite(status);
 
   return (
     <Card className="space-y-3 p-4" data-testid="trading-control-card">
@@ -210,14 +312,90 @@ export function TradingControlCard() {
             </Button>
           </div>
 
-          <div className="flex flex-wrap gap-2 border-t border-surface-border pt-2">
-            {LOCKED_ACTIONS.map((action) => (
-              <Button key={action.label} variant="secondary" disabled={action.disabled} title={action.hint}>
-                {action.label} 🔒
-              </Button>
-            ))}
+          {confirming ? (
+            <ConfirmDialog
+              action={confirming}
+              status={status}
+              pending={pendingAction !== null}
+              onCancel={() => setConfirming(null)}
+              onConfirm={(phrase) => {
+                const action = confirming;
+                setConfirming(null);
+                void runAction(action.id, phrase);
+              }}
+            />
+          ) : null}
+
+          {actionResult ? (
+            (() => {
+              const presented = presentActionResult(actionResult);
+              return (
+                <div
+                  className={classNames(
+                    "space-y-1 rounded-lg border p-2",
+                    presented.tone === "green"
+                      ? "border-green-500/30 bg-green-500/10"
+                      : presented.tone === "yellow"
+                        ? "border-yellow-500/30 bg-yellow-500/10"
+                        : "border-red-500/30 bg-red-500/10"
+                  )}
+                >
+                  <p className="text-xs font-semibold text-slate-200">{presented.headline}</p>
+                  {presented.detail.map((line) => (
+                    <p key={line} className="text-xs text-slate-300">
+                      {line}
+                    </p>
+                  ))}
+                  <button type="button" onClick={dismissActionResult} className="text-xs text-slate-500 underline">
+                    Dismiss
+                  </button>
+                </div>
+              );
+            })()
+          ) : null}
+          {actionError ? <p className="text-xs text-red-400">{actionError}</p> : null}
+
+          <div className="space-y-2 border-t border-surface-border pt-2">
+            {/* The deployment prerequisite, stated BEFORE the operator can form
+                the belief that Start alone brings the runtime up live. */}
+            {startPrerequisite.reason ? (
+              <p className="rounded-lg border border-slate-500/30 bg-slate-500/10 p-2 text-xs text-slate-300">
+                {startPrerequisite.reason}
+              </p>
+            ) : null}
+            {startPrerequisite.warning ? (
+              <p className="text-xs text-yellow-400">{startPrerequisite.warning}</p>
+            ) : null}
+
+            <div className="flex flex-wrap gap-2">
+              {TRADING_CONTROL_ACTIONS.map((action) => {
+                const relevant = status ? isActionRelevant(action.id, status.systemState) : false;
+                // Start additionally needs the deployment prerequisite. Stop and
+                // Safe Off do NOT: they only ever reduce risk, and must stay
+                // reachable no matter what state the runtime is in.
+                const eligible = relevant && (action.id !== "START" || startPrerequisite.ready);
+                return (
+                  <Button
+                    key={action.id}
+                    variant={action.destructiveLooking ? "danger" : "secondary"}
+                    // Disabled while ANY action is in flight: a second submission
+                    // is pointless, and the server serializes them anyway.
+                    disabled={!eligible || pendingAction !== null}
+                    onClick={() => setConfirming(action)}
+                    title={
+                      !relevant
+                        ? "Not applicable in the current system state."
+                        : !eligible
+                          ? (startPrerequisite.reason ?? action.description)
+                          : action.description
+                    }
+                  >
+                    {pendingAction === action.id ? `${action.label}…` : action.label}
+                  </Button>
+                );
+              })}
+            </div>
           </div>
-          <p className="text-xs text-slate-500">{LOCKED_ACTION_HINT}</p>
         </>
       ) : (
         <OperatorTokenForm

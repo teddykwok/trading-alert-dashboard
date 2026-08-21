@@ -81,3 +81,54 @@ export function fetchTradingControlStatus(): Promise<TradingControlStatusDto> {
 export function fetchTradingControlReadiness(): Promise<TradingControlReadinessSnapshot> {
   return operatorApiClient.get("/api/operator/trading-control/readiness");
 }
+
+
+// ---------------------------------------------------------------------------
+// Operator actions
+// ---------------------------------------------------------------------------
+
+export type TradingControlActionOutcome =
+  | "ARMED"
+  | "ALREADY_ARMED"
+  | "NEW_TRADES_BLOCKED"
+  | "SAFE_OFF"
+  | "SAFE_RECOVERY"
+  | "BLOCKED"
+  | "WINDOW_PREPARED_NOT_ARMED";
+
+export interface TradingControlActionResult {
+  ok: boolean;
+  outcome: TradingControlActionOutcome;
+  systemState: TradingSystemState;
+  profile: { environment: string; isEnabled: boolean; killSwitchActive: boolean | null } | null;
+  authorization: {
+    id: string;
+    state: string;
+    expiresAt: string;
+    maxClaims: number | null;
+    claimedCount: number;
+    remainingClaims: number;
+  } | null;
+  outstandingExecutions: number | null;
+  authorizationsRevoked: number | null;
+  blockers: string[];
+  message: string;
+}
+
+/**
+ * The exact phrase the server demands. Sent verbatim; the server re-checks it,
+ * so this is a courtesy to the operator rather than the security boundary.
+ */
+export const START_TRADING_CONFIRMATION = "START TRADING";
+
+export function postStartTrading(confirmation: string): Promise<TradingControlActionResult> {
+  return operatorApiClient.post("/api/operator/trading-control/start", { confirmation });
+}
+
+export function postStopNewTrades(): Promise<TradingControlActionResult> {
+  return operatorApiClient.post("/api/operator/trading-control/stop-new-trades");
+}
+
+export function postSafeOff(): Promise<TradingControlActionResult> {
+  return operatorApiClient.post("/api/operator/trading-control/safe-off");
+}

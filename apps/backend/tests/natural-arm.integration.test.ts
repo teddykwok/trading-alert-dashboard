@@ -1566,9 +1566,17 @@ describeDb("operator concurrency: serialized whole operations", () => {
 describe("operator concurrency: shared lock namespace", () => {
   const controls = readFileSync(path.join(process.cwd(), "src/modules/execution/run-canary-controls.ts"), "utf8");
   const arm = readFileSync(path.join(process.cwd(), "src/modules/execution/natural-arm.ts"), "utf8");
+  // CLOSE and DISARM were lifted out of the CLI so the operator HTTP routes run
+  // the identical transaction. The lock assertions follow them to their new
+  // home rather than being dropped.
+  const actions = readFileSync(path.join(process.cwd(), "src/modules/execution/operator-actions.ts"), "utf8");
 
   const sliceOf = (source: string, start: string, end?: string) => {
     const from = source.indexOf(start);
+    // Loudly, not silently: a missing anchor used to yield an empty slice, and
+    // an empty slice satisfies every "does not contain" assertion below. That
+    // is how a structural guard quietly stops guarding anything.
+    if (from === -1) throw new Error(`slice anchor not found: ${start}`);
     const to = end ? source.indexOf(end, from) : source.length;
     return source.slice(from, to === -1 ? source.length : to);
   };
@@ -1577,8 +1585,8 @@ describe("operator concurrency: shared lock namespace", () => {
     const paths: Array<[string, string]> = [
       ["natural arm", arm],
       ["exact arm", sliceOf(controls, "export async function armCanary", "export async function closeCanaryWindow")],
-      ["close", sliceOf(controls, "export async function closeCanaryWindow", "export async function disarmCanary")],
-      ["disarm", sliceOf(controls, "export async function disarmCanary")],
+      ["close", sliceOf(actions, "export async function closeCanaryWindowOperation", "export type DisarmOutcomeCode")],
+      ["disarm", sliceOf(actions, "export async function disarmCanaryOperation")],
     ];
     for (const [name, code] of paths) {
       // By the shared exported constant and helper, never a bare 0x11b0, so a
@@ -1595,8 +1603,8 @@ describe("operator concurrency: shared lock namespace", () => {
     // The Binance preflight must stay OUTSIDE the locked transaction.
     for (const [name, code] of [
       ["exact arm", sliceOf(controls, "const armOutcome = await prisma.$transaction", "if (!armOutcome.ok)")],
-      ["close", sliceOf(controls, "const [active, recovery, authorization] = await prisma.$transaction", "console.log(\"CLOSED")],
-      ["disarm", sliceOf(controls, "const { revoked, outstanding, outcome } = await prisma.$transaction", "console.log(outcome)")],
+      ["close", sliceOf(actions, "export async function closeCanaryWindowOperation", "export type DisarmOutcomeCode")],
+      ["disarm", sliceOf(actions, "export async function disarmCanaryOperation")],
     ] as Array<[string, string]>) {
       for (const forbidden of ["CanaryPreflightService", "binance", "fetch(", "axios"]) {
         expect(`${name}:${forbidden}:${code.includes(forbidden)}`).toBe(`${name}:${forbidden}:false`);

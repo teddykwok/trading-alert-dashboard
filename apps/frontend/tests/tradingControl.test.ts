@@ -1,8 +1,8 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  LOCKED_ACTIONS,
-  LOCKED_ACTION_HINT,
   TRADING_SYSTEM_STATES,
   formatTtl,
   presentAllowedSymbols,
@@ -359,23 +359,18 @@ describe("trading control panel: polling calls status only", () => {
 // The locked future actions
 // ---------------------------------------------------------------------------
 
-describe("trading control panel: future actions are placeholders", () => {
-  it("offers exactly Start Trading, Stop New Trades and Safe Off", () => {
-    expect(LOCKED_ACTIONS.map((action) => action.label)).toEqual([
-      "Start Trading",
-      "Stop New Trades",
-      "Safe Off",
-    ]);
-  });
-
-  it("has every one of them disabled with the same explanation", () => {
-    // No mutation endpoint exists. A button that looks live before its endpoint
-    // does is exactly how someone comes to believe they stopped trading when
-    // they did not.
-    for (const action of LOCKED_ACTIONS) {
-      expect(`${action.label}:${action.disabled}`).toBe(`${action.label}:true`);
-      expect(action.hint).toBe(LOCKED_ACTION_HINT);
-    }
+describe("trading control panel: the actions are no longer placeholders", () => {
+  it("no longer exports a locked-placeholder table", () => {
+    // Superseded, not dropped: the three actions are real now and live in
+    // `tradingControlActions`, asserted in tradingControlActions.test.ts. A
+    // leftover placeholder list would be a second source of truth about what
+    // the panel offers.
+    const presentation = readFileSync(
+      path.join(process.cwd(), "src/features/operator/tradingControlPresentation.ts"),
+      "utf8"
+    );
+    expect(presentation).not.toContain("LOCKED_ACTIONS");
+    expect(presentation).not.toContain("LOCKED_ACTION_HINT");
   });
 });
 

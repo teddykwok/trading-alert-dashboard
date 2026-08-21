@@ -3,9 +3,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   fetchTradingControlReadiness,
   fetchTradingControlStatus,
+  postSafeOff,
+  postStartTrading,
+  postStopNewTrades,
+  type TradingControlActionResult,
   type TradingControlReadinessSnapshot,
   type TradingControlStatusDto,
 } from "../api/operator";
+import type { TradingControlActionId } from "../features/operator/tradingControlActions";
 import { clearOperatorToken, hasOperatorToken } from "../api/operator-token";
 import {
   authenticateOperator,
@@ -35,10 +40,16 @@ export interface TradingControlHandle {
   readiness: TradingControlReadinessSnapshot | null;
   readinessError: string | null;
   checkingReadiness: boolean;
+  /** The action currently in flight, or null. Blocks a second submission. */
+  pendingAction: TradingControlActionId | null;
+  actionResult: TradingControlActionResult | null;
+  actionError: string | null;
   authenticate: (token: string) => Promise<void>;
   signOut: () => void;
   refresh: () => Promise<void>;
   checkReadiness: () => Promise<void>;
+  runAction: (id: TradingControlActionId, confirmation?: string) => Promise<void>;
+  dismissActionResult: () => void;
 }
 
 /**
@@ -59,6 +70,9 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
   const [readiness, setReadiness] = useState<TradingControlReadinessSnapshot | null>(null);
   const [readinessError, setReadinessError] = useState<string | null>(null);
   const [checkingReadiness, setCheckingReadiness] = useState(false);
+  const [pendingAction, setPendingAction] = useState<TradingControlActionId | null>(null);
+  const [actionResult, setActionResult] = useState<TradingControlActionResult | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // Guards against a slow response from a previous token overwriting state
   // after the operator has already signed out.
@@ -78,6 +92,8 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
     setStatus(null);
     setReadiness(null);
     setReadinessError(null);
+    setActionResult(null);
+    setActionError(null);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -145,6 +161,59 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
     [refresh]
   );
 
+  /**
+   * Runs ONE operator action, then refreshes status.
+   *
+   * `pendingAction` is set before the request and cleared after, which is what
+   * makes a double click impossible from this side. The server's own advisory
+   * lock and preparation exclusivity are the real guarantee; this only avoids
+   * sending a pointless second request.
+   *
+   * The readiness snapshot is dropped afterwards rather than re-fetched: the
+   * verdict it holds was computed before the state changed, and a stale READY
+   * beside a freshly armed profile is worse than showing nothing. Readiness
+   * stays a question the operator asks.
+   */
+  const runAction = useCallback(
+    async (id: TradingControlActionId, confirmation?: string) => {
+      if (!hasOperatorToken()) return;
+      if (pendingAction !== null) return;
+      const mine = generation.current;
+      setPendingAction(id);
+      setActionError(null);
+      try {
+        const result =
+          id === "START"
+            ? await postStartTrading(confirmation ?? "")
+            : id === "STOP_NEW_TRADES"
+              ? await postStopNewTrades()
+              : await postSafeOff();
+        if (generation.current !== mine) return;
+        setActionResult(result);
+        setReadiness(null);
+      } catch (error) {
+        if (generation.current !== mine) return;
+        // Only a 401 ends the session. A refused control action is a conflict
+        // with authoritative state, and logging the operator out for it would
+        // be both wrong and infuriating.
+        if (isSessionEnded(error)) {
+          endSession();
+          return;
+        }
+        setActionError(error instanceof Error ? error.message : "The action could not be completed.");
+      } finally {
+        if (generation.current === mine) setPendingAction(null);
+      }
+      await refresh();
+    },
+    [endSession, pendingAction, refresh]
+  );
+
+  const dismissActionResult = useCallback(() => {
+    setActionResult(null);
+    setActionError(null);
+  }, []);
+
   const signOut = useCallback(() => {
     generation.current += 1;
     clearOperatorToken();
@@ -154,6 +223,9 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
     setStatusError(null);
     setReadiness(null);
     setReadinessError(null);
+    setActionResult(null);
+    setActionError(null);
+    setPendingAction(null);
   }, []);
 
   useEffect(() => {
@@ -181,5 +253,10 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
     signOut,
     refresh,
     checkReadiness,
+    pendingAction,
+    actionResult,
+    actionError,
+    runAction,
+    dismissActionResult,
   };
 }

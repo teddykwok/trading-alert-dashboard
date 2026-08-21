@@ -732,14 +732,16 @@ describe("trading control: structural guarantees", () => {
       })
       .join("\n");
 
-  it("adds no mutation route to the operator surface", () => {
-    // The whole point of this phase. Start / Stop New Trades / Safe Off are
-    // mutations and they do not exist yet.
+  it("keeps the READ surface read-only and fully guarded", () => {
     const code = codeOf("src/routes/operator.routes.ts");
-    expect(code.match(/app\.(post|put|patch|delete)\(/g)).toBeNull();
     const routes = code.match(/app\.(get|post|put|patch|delete)\(/g) ?? [];
     const guards = code.match(/preHandler: requireOperatorAuth/g) ?? [];
-    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:3 guards:3`);
+    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:6 guards:6`);
+    // Three GETs (probe, status, readiness) and three POSTs (the reviewed
+    // actions). Nothing else, and no PUT/PATCH/DELETE at all.
+    expect((code.match(/app\.get\(/g) ?? []).length).toBe(3);
+    expect((code.match(/app\.post\(/g) ?? []).length).toBe(3);
+    expect(code.match(/app\.(put|patch|delete)\(/g)).toBeNull();
   });
 
   it("writes nothing from the trading-control service", () => {

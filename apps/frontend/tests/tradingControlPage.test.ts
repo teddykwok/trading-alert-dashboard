@@ -125,7 +125,7 @@ describe("trading control page: the card moved, it was not rebuilt", () => {
       "fetchTradingControlReadiness",
       "setInterval",
       "SAFE_OFF",
-      "LOCKED_ACTIONS",
+      "TRADING_CONTROL_ACTIONS",
     ]) {
       expect(`${forbidden}:${page.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
@@ -137,7 +137,7 @@ describe("trading control page: the card moved, it was not rebuilt", () => {
     // readiness check and the disabled actions all still live where they did.
     const card = src("components/operator/TradingControlCard.tsx");
     const hook = src("hooks/useTradingControl.ts");
-    for (const expected of ["useTradingControl", "checkReadiness", "LOCKED_ACTIONS", "presentReadinessSnapshot"]) {
+    for (const expected of ["useTradingControl", "checkReadiness", "TRADING_CONTROL_ACTIONS", "presentReadinessSnapshot"]) {
       expect(`card:${expected}:${card.includes(expected)}`).toBe(`card:${expected}:true`);
     }
     for (const expected of ["setInterval", "fetchTradingControlStatus", "fetchTradingControlReadiness", "endSession"]) {
