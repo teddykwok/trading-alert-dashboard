@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   INVALID_MODE_WARNING,
+  LAUNCHER_ROLES,
   LIVE_READY_CONFIRMATION,
   LIVE_READY_GATES,
   MemoryStateStore,
@@ -22,6 +23,8 @@ import {
   readGates,
   renderStatus,
   verifyOwnership,
+  windowsSpawnPlan,
+  ROLE_COMMANDS,
   type OwnedProcess,
   type ProcessProbe,
 } from "../src/modules/operator/runtime-launcher";
@@ -344,6 +347,116 @@ describe("runtime launcher: process ownership", () => {
   it("matches the repo path regardless of slash direction or case", () => {
     const mixed = probe({ commandLine: "node c:/projects/TRADING-ALERT-DASHBOARD/apps/backend/x.ts" });
     expect(verifyOwnership(record, mixed, REPO).owned).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// How each role is launched (the machine adapter's shape)
+// ---------------------------------------------------------------------------
+
+describe("runtime launcher: the Windows spawn shape", () => {
+  const REPO = "C:\\Projects\\trading-alert-dashboard";
+  const env = { ComSpec: "C:\\WINDOWS\\system32\\cmd.exe" } as NodeJS.ProcessEnv;
+  const plan = (role: "backend" | "worker" | "frontend" = "backend") => windowsSpawnPlan(role, REPO, env);
+
+  it("never executes pnpm.cmd directly", () => {
+    // The defect the first real SAFE rehearsal hit: since the CVE-2024-27980
+    // fix, spawn refuses .cmd/.bat without a shell and returns EINVAL, so no
+    // role could start at all.
+    for (const role of LAUNCHER_ROLES) {
+      const built = windowsSpawnPlan(role, REPO, env);
+      expect(`${role}:${built.command.toLowerCase().endsWith(".cmd")}`).toBe(`${role}:false`);
+      expect(built.args.some((arg) => arg.toLowerCase().endsWith(".cmd"))).toBe(false);
+    }
+  });
+
+  it("runs through the explicit command processor from ComSpec", () => {
+    expect(plan().command).toBe("C:\\WINDOWS\\system32\\cmd.exe");
+  });
+
+  it("falls back to cmd.exe when ComSpec is absent", () => {
+    expect(windowsSpawnPlan("backend", REPO, {} as NodeJS.ProcessEnv).command).toBe("cmd.exe");
+  });
+
+  it("passes /d /s /c, so AutoRun cannot run first and quoting is deterministic", () => {
+    // /d skips a machine-local AutoRun registry command that would otherwise
+    // execute before ours.
+    expect(plan().args.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
+  });
+
+  it("uses an argument VECTOR rather than a shell string", () => {
+    // `shell: true` would flatten these into one string for cmd to re-parse.
+    const built = plan();
+    expect("shell" in built.options).toBe(false);
+    expect(Array.isArray(built.args)).toBe(true);
+  });
+
+  it.each([
+    ["backend", "@trading-alert-dashboard/backend", "dev"],
+    ["worker", "@trading-alert-dashboard/backend", "worker"],
+    ["frontend", "@trading-alert-dashboard/frontend", "dev"],
+  ] as const)("maps %s to the repo's own pnpm script", (role, filter, script) => {
+    expect(windowsSpawnPlan(role, REPO, env).args).toEqual([
+      "/d",
+      "/s",
+      "/c",
+      "pnpm",
+      "-C",
+      REPO,
+      "--filter",
+      filter,
+      script,
+    ]);
+  });
+
+  it("carries the repository path so the recorded root stays verifiable", () => {
+    // Load-bearing, not cosmetic: the recorded root PID is the cmd process, and
+    // verifyOwnership only terminates a PID whose command line contains this
+    // repository's absolute path. Without -C the launcher could start a process
+    // it would later refuse to recognise, and could never stop it.
+    const built = plan();
+    const commandLine = [built.command, ...built.args].join(" ");
+    const record: OwnedProcess = { role: "backend", pid: 5150, startedAtMs: 1_700_000_000_000 };
+    expect(
+      verifyOwnership(record, { pid: 5150, startedAtMs: record.startedAtMs, commandLine }, REPO)
+    ).toEqual({ owned: true });
+  });
+
+  it("runs from the repository root", () => {
+    expect(plan().options.cwd).toBe(REPO);
+  });
+
+  it("keeps the detached, tree-killable process semantics", () => {
+    const built = plan();
+    expect(built.options.detached).toBe(true);
+    expect(built.options.stdio).toBe("ignore");
+    expect(built.options.windowsHide).toBe(false);
+  });
+
+  it("exposes no path from operator input to an arbitrary command", () => {
+    // Every value is a fixed repo constant. A role is one of three literals,
+    // and the table is frozen.
+    expect(Object.isFrozen(ROLE_COMMANDS)).toBe(true);
+    expect(Object.keys(ROLE_COMMANDS).sort()).toEqual(["backend", "frontend", "worker"]);
+    for (const role of LAUNCHER_ROLES) {
+      const args = windowsSpawnPlan(role, REPO, env).args;
+      // No shell metacharacter can appear, because nothing is concatenated.
+      for (const arg of args) {
+        expect(`${arg}:${/[&|<>^]/.test(arg)}`).toBe(`${arg}:false`);
+      }
+    }
+  });
+
+  it("is the only way the CLI starts a process", () => {
+    const source = readFileSync(
+      path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"),
+      "utf8"
+    );
+    expect(source).toContain("windowsSpawnPlan(role, REPO_ROOT)");
+    expect(source).not.toContain("pnpm.cmd");
+    expect(source).not.toContain("shell: true");
+    // One spawn call site for roles; the probe/kill adapters use spawnSync.
+    expect((source.match(/(?<!\w)spawn\(/g) ?? []).length).toBe(1);
   });
 });
 

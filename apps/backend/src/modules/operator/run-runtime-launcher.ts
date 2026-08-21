@@ -22,6 +22,7 @@ import {
   readGates,
   renderStatus,
   verifyOwnership,
+  windowsSpawnPlan,
   type DiskMode,
   type LauncherRole,
   type OwnedProcess,
@@ -52,14 +53,6 @@ const REPO_ROOT = path.resolve(__dirname, "../../../../..");
 const BACKEND_DIR = path.join(REPO_ROOT, "apps", "backend");
 const ENV_PATH = path.join(BACKEND_DIR, ".env");
 const store = new FileStateStore(defaultStatePath());
-
-// The repo's OWN commands, unchanged. The launcher runs what an operator would
-// have typed; it does not define a second way to start anything.
-const ROLE_COMMANDS: Record<LauncherRole, { filter: string; script: string }> = {
-  backend: { filter: "@trading-alert-dashboard/backend", script: "dev" },
-  worker: { filter: "@trading-alert-dashboard/backend", script: "worker" },
-  frontend: { filter: "@trading-alert-dashboard/frontend", script: "dev" },
-};
 
 // ---------------------------------------------------------------------------
 // Machine adapters
@@ -112,16 +105,13 @@ function portOpen(port: number): Promise<boolean> {
   });
 }
 
+/**
+ * Starts one role. The command shape lives in `windowsSpawnPlan`, which is pure
+ * and tested; this only performs the spawn.
+ */
 function spawnRole(role: LauncherRole): ChildProcess {
-  const { filter, script } = ROLE_COMMANDS[role];
-  // detached so the whole tree can be terminated by root PID later, and so the
-  // launcher's own console is not the parent of a long-lived dev server.
-  return spawn("pnpm.cmd", ["--filter", filter, script], {
-    cwd: REPO_ROOT,
-    detached: true,
-    stdio: "ignore",
-    windowsHide: false,
-  });
+  const plan = windowsSpawnPlan(role, REPO_ROOT);
+  return spawn(plan.command, plan.args, plan.options);
 }
 
 /** taskkill /T on ONE verified repo-owned root. Never a name-based sweep. */

@@ -247,6 +247,82 @@ export function verifyOwnership(
 }
 
 // ---------------------------------------------------------------------------
+// How each role is launched
+// ---------------------------------------------------------------------------
+
+/**
+ * The repo's OWN commands. Fixed, repo-controlled values: nothing an operator
+ * types can reach this table, and there is no path by which a role name becomes
+ * an arbitrary command.
+ */
+export const ROLE_COMMANDS: Readonly<Record<LauncherRole, { filter: string; script: string }>> = Object.freeze({
+  backend: { filter: "@trading-alert-dashboard/backend", script: "dev" },
+  worker: { filter: "@trading-alert-dashboard/backend", script: "worker" },
+  frontend: { filter: "@trading-alert-dashboard/frontend", script: "dev" },
+});
+
+export interface SpawnPlan {
+  command: string;
+  args: string[];
+  options: { cwd: string; detached: true; stdio: "ignore"; windowsHide: boolean };
+}
+
+/**
+ * How a role is started on Windows.
+ *
+ * ## Why the command processor, and not `pnpm.cmd` directly
+ *
+ * Since the CVE-2024-27980 fix (Node 18.20.2 / 20.12.2 and later) `spawn`
+ * refuses to execute `.cmd` and `.bat` files unless a shell is involved, and
+ * returns EINVAL. The first real SAFE rehearsal hit exactly that: no role could
+ * start at all.
+ *
+ * ## Why not `shell: true`
+ *
+ * `shell: true` makes Node flatten the arguments into ONE command string and
+ * hand it to cmd with verbatim-argument semantics, so every value becomes
+ * subject to cmd's metacharacter parsing. Invoking the command processor
+ * explicitly keeps Node's own argument quoting and confines cmd to `/c` plus a
+ * fixed argument vector. For a tool whose job is starting a real-money runtime,
+ * "exactly these arguments" beats "a string cmd will re-parse".
+ *
+ *  - `/d` skips any machine-local AutoRun registry command, which would
+ *    otherwise execute before ours.
+ *  - `/s` gives deterministic quote handling.
+ *  - `/c` runs the command and exits with it, which is what keeps the cmd
+ *    process alive for the role's whole lifetime.
+ *
+ * ## Why `-C <repoRoot>` is present even though `cwd` is already set
+ *
+ * It is redundant to pnpm and load-bearing for SAFETY. The recorded root PID is
+ * the cmd process, and `verifyOwnership` will only terminate a PID whose
+ * command line contains this repository's absolute path. Without `-C` the cmd
+ * command line reads `pnpm --filter @trading-alert-dashboard/backend dev`,
+ * which names the package but not the path — so the launcher could start a
+ * process it would later refuse to recognise as its own, and could never stop
+ * it.
+ */
+export function windowsSpawnPlan(
+  role: LauncherRole,
+  repoRoot: string,
+  env: NodeJS.ProcessEnv = process.env
+): SpawnPlan {
+  const { filter, script } = ROLE_COMMANDS[role];
+  return {
+    command: env.ComSpec ?? "cmd.exe",
+    args: ["/d", "/s", "/c", "pnpm", "-C", repoRoot, "--filter", filter, script],
+    options: {
+      cwd: repoRoot,
+      // detached so the whole tree can be terminated by root PID later, and so
+      // the launcher's own console is not the parent of a long-lived dev server.
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Runtime state file — machine-local, never in source control
 // ---------------------------------------------------------------------------
 
