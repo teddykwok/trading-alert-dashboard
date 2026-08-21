@@ -1,4 +1,5 @@
 import type { ApiErrorBody } from "../types/api";
+import { operatorAuthHeaders } from "./operator-token";
 
 // An explicit VITE_API_URL overrides everything (e.g. pointing at a separate
 // API host). When empty/unset we use same-origin relative requests ("/api/…"),
@@ -73,6 +74,27 @@ function dedupedGet<T>(path: string): Promise<T> {
   inFlightGets.set(path, pending);
   return pending;
 }
+
+/**
+ * Operator-only requests: the ONLY place the operator token is attached.
+ *
+ * The path prefix is checked rather than assumed. Without it, one mistyped path
+ * at a future call site would send the credential that can arm a real-money
+ * account to an ordinary dashboard endpoint, a third-party origin, or an
+ * attacker-supplied URL. Refusing is cheap; the mistake is not.
+ *
+ * Deliberately not deduped like `apiClient.get`: an auth probe must always ask.
+ */
+const OPERATOR_PATH_PREFIX = "/api/operator/";
+
+export const operatorApiClient = {
+  get: <T>(path: string): Promise<T> => {
+    if (!path.startsWith(OPERATOR_PATH_PREFIX)) {
+      throw new Error(`operatorApiClient refuses a non-operator path: ${path}`);
+    }
+    return request<T>(path, { method: "GET", headers: operatorAuthHeaders() });
+  },
+};
 
 export const apiClient = {
   get: <T>(path: string) => dedupedGet<T>(path),

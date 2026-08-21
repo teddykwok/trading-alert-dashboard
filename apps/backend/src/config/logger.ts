@@ -8,6 +8,14 @@ import pino from "pino";
  */
 export const loggerOptions = {
   level: process.env.LOG_LEVEL ?? "info",
+  // Fastify's default request serializer does not include headers, so an
+  // operator bearer token never reaches a log line today. This makes that
+  // structural rather than incidental: if request logging is ever widened,
+  // the credential still cannot be printed.
+  redact: {
+    paths: ["req.headers.authorization", "request.headers.authorization", "headers.authorization"],
+    censor: "***REDACTED***",
+  },
   transport: {
     target: "pino-pretty",
     options: {

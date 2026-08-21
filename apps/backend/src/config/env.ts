@@ -56,6 +56,13 @@ const envSchema = z.object({
   // utils/dashboard-url.ts, which also treats loopback hosts as "not public").
   PUBLIC_DASHBOARD_URL: z.string().optional().default(""),
   WEBHOOK_SECRET: z.string().min(1, "WEBHOOK_SECRET is required"),
+  // --- Operator control credential ------------------------------------------
+  // Guards the operator-only control API. Optional so an ordinary dashboard
+  // install starts without one; the guard fails CLOSED when it is unset, so an
+  // unconfigured deployment simply has no operator API rather than an open one.
+  // Deliberately NOT the TradingView webhook secret: that value is shared with
+  // an external service and travels in alert bodies.
+  OPERATOR_API_TOKEN: z.string().optional().default(""),
   SCREENSHOT_STORAGE_DIR: z.string().min(1).default("src/storage/screenshots"),
   AI_VISION_PROVIDER: z.enum(["mock", "openai"]).default("mock"),
   OPENAI_API_KEY: z.string().optional().default(""),
@@ -335,6 +342,17 @@ const envSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ["EXECUTION_SOFT_OPEN_POSITION_TARGET"],
       message: "EXECUTION_SOFT_OPEN_POSITION_TARGET must be <= EXECUTION_MAX_OPEN_POSITIONS",
+    });
+  }
+
+  // A weak operator token is worse than none: it protects the one API that can
+  // arm a real-money account. Length is checked at startup rather than per
+  // request so a mistake fails loudly at boot, not silently under load.
+  if (value.OPERATOR_API_TOKEN && value.OPERATOR_API_TOKEN.length < 32) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["OPERATOR_API_TOKEN"],
+      message: "OPERATOR_API_TOKEN must be at least 32 characters when set",
     });
   }
 
