@@ -1,0 +1,538 @@
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+
+/**
+ * The local Windows runtime launcher — pure core.
+ *
+ * Everything in this file is a function of its inputs: no process is started,
+ * no process is killed and no real `.env` is touched. The CLI in
+ * `run-runtime-launcher.ts` supplies the adapters that do those things, which
+ * is what makes the safety-sensitive parts testable without a machine.
+ *
+ * ## What this tool is, and is not
+ *
+ * It owns exactly THREE non-secret deployment gates and the lifecycle of the
+ * repo's own dev processes. It is a deployment tool, not a trading control.
+ * It cannot arm, cannot create an authorization window, cannot reach Binance
+ * and cannot touch the execution profile. LIVE-READY only loads the process
+ * prerequisites that let the authenticated Trading Control page arm later —
+ * the durable ARM remains a separate, confirmed, audited action there.
+ */
+
+// ---------------------------------------------------------------------------
+// The three gates this tool owns. Nothing else in .env is ever written.
+// ---------------------------------------------------------------------------
+
+export const RUNTIME_GATE_KEYS = [
+  "EXECUTION_GLOBAL_KILL_SWITCH",
+  "EXECUTION_LIVE_ENTRY_ENABLED",
+  "EXECUTION_PROTECTION_READY",
+] as const;
+
+export type RuntimeGateKey = (typeof RUNTIME_GATE_KEYS)[number];
+export type GateValues = Record<RuntimeGateKey, string>;
+
+export const SAFE_GATES: GateValues = {
+  EXECUTION_GLOBAL_KILL_SWITCH: "true",
+  EXECUTION_LIVE_ENTRY_ENABLED: "false",
+  EXECUTION_PROTECTION_READY: "false",
+};
+
+export const LIVE_READY_GATES: GateValues = {
+  EXECUTION_GLOBAL_KILL_SWITCH: "false",
+  EXECUTION_LIVE_ENTRY_ENABLED: "true",
+  EXECUTION_PROTECTION_READY: "true",
+};
+
+export type DiskMode = "SAFE" | "LIVE_READY" | "INVALID";
+
+/**
+ * Which posture the three gates spell out.
+ *
+ * Anything that is neither posture is INVALID and is reported as such. It is
+ * never normalized: a half-open combination means someone edited the file by
+ * hand or a write failed partway, and quietly "fixing" it would hide that.
+ */
+export function classifyDiskMode(values: Partial<GateValues>): DiskMode {
+  const matches = (target: GateValues) =>
+    RUNTIME_GATE_KEYS.every((key) => values[key] === target[key]);
+  if (matches(SAFE_GATES)) return "SAFE";
+  if (matches(LIVE_READY_GATES)) return "LIVE_READY";
+  return "INVALID";
+}
+
+export function gatesFor(mode: Exclude<DiskMode, "INVALID">): GateValues {
+  return mode === "SAFE" ? SAFE_GATES : LIVE_READY_GATES;
+}
+
+// ---------------------------------------------------------------------------
+// Reading and rewriting .env
+// ---------------------------------------------------------------------------
+
+export type GateReadResult =
+  | { ok: true; values: GateValues }
+  | { ok: false; reason: string };
+
+const GATE_LINE = /^([A-Z0-9_]+)=(.*)$/;
+
+/**
+ * Reads the three gates out of a raw `.env`.
+ *
+ * Refuses ambiguity rather than guessing. A key that appears twice has no
+ * single answer — dotenv would take one of them and this tool would rewrite the
+ * other, leaving the file saying one thing and the runtime believing another.
+ * A missing key is equally refused: writing it in would mean inventing
+ * configuration for a real-money deployment.
+ *
+ * Only the three gate lines are ever inspected. No other line is parsed, so no
+ * secret is read into memory here.
+ */
+export function readGates(envText: string): GateReadResult {
+  const seen = new Map<RuntimeGateKey, string[]>();
+  for (const raw of envText.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    const match = GATE_LINE.exec(line);
+    if (!match) continue;
+    const key = match[1] as RuntimeGateKey;
+    if (!(RUNTIME_GATE_KEYS as readonly string[]).includes(key)) continue;
+    seen.set(key, [...(seen.get(key) ?? []), match[2].trim()]);
+  }
+
+  const missing = RUNTIME_GATE_KEYS.filter((key) => !seen.has(key));
+  if (missing.length > 0) {
+    return { ok: false, reason: `missing gate key(s): ${missing.join(", ")}` };
+  }
+  const duplicated = RUNTIME_GATE_KEYS.filter((key) => (seen.get(key)?.length ?? 0) > 1);
+  if (duplicated.length > 0) {
+    return { ok: false, reason: `duplicate gate key(s): ${duplicated.join(", ")}` };
+  }
+
+  const values = Object.fromEntries(
+    RUNTIME_GATE_KEYS.map((key) => [key, seen.get(key)![0]])
+  ) as GateValues;
+
+  // A gate that is neither "true" nor "false" is not something to overwrite
+  // silently: the operator needs to see it.
+  const invalid = RUNTIME_GATE_KEYS.filter((key) => values[key] !== "true" && values[key] !== "false");
+  if (invalid.length > 0) {
+    return { ok: false, reason: `gate key(s) hold a non-boolean value: ${invalid.join(", ")}` };
+  }
+
+  return { ok: true, values };
+}
+
+export type GateWriteResult = { ok: true; text: string } | { ok: false; reason: string };
+
+/**
+ * Produces the rewritten `.env` text with ONLY the three gate lines changed.
+ *
+ * Every other byte survives: line endings, comments, blank lines, ordering and
+ * every unrelated value. The file is rebuilt by replacing three lines in place,
+ * never by re-serializing a parsed model — a round-trip through a parser is
+ * exactly how comments and formatting get silently destroyed, and this file
+ * holds credentials nobody wants reformatted.
+ */
+export function applyGates(envText: string, target: GateValues): GateWriteResult {
+  const current = readGates(envText);
+  if (!current.ok) return current;
+
+  const lines = envText.split("\n");
+  const written = new Set<RuntimeGateKey>();
+
+  const next = lines.map((raw) => {
+    // Preserve a trailing \r so a CRLF file stays CRLF, byte for byte.
+    const hasCr = raw.endsWith("\r");
+    const body = hasCr ? raw.slice(0, -1) : raw;
+    const trimmed = body.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) return raw;
+    const match = GATE_LINE.exec(trimmed);
+    if (!match) return raw;
+    const key = match[1] as RuntimeGateKey;
+    if (!(RUNTIME_GATE_KEYS as readonly string[]).includes(key)) return raw;
+    written.add(key);
+    return `${key}=${target[key]}${hasCr ? "\r" : ""}`;
+  });
+
+  if (written.size !== RUNTIME_GATE_KEYS.length) {
+    return { ok: false, reason: "gate lines could not all be located for rewrite" };
+  }
+  return { ok: true, text: next.join("\n") };
+}
+
+/** Whether the operator credential is present, WITHOUT reading its value. */
+export function operatorTokenState(envText: string): "CONFIGURED" | "NOT CONFIGURED" {
+  for (const raw of envText.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line.startsWith("OPERATOR_API_TOKEN=")) continue;
+    // Length only. The value itself is never captured, returned or logged.
+    return line.slice("OPERATOR_API_TOKEN=".length).trim().length > 0 ? "CONFIGURED" : "NOT CONFIGURED";
+  }
+  return "NOT CONFIGURED";
+}
+
+// ---------------------------------------------------------------------------
+// Confirmation
+// ---------------------------------------------------------------------------
+
+export const LIVE_READY_CONFIRMATION = "ENABLE LIVE RUNTIME";
+
+/** Exact match, for the same reason the ARM confirmation is exact. */
+export function isLiveReadyConfirmed(typed: unknown): boolean {
+  return typed === LIVE_READY_CONFIRMATION;
+}
+
+// ---------------------------------------------------------------------------
+// Process ownership
+// ---------------------------------------------------------------------------
+
+export type LauncherRole = "backend" | "worker" | "frontend";
+export const LAUNCHER_ROLES: readonly LauncherRole[] = ["backend", "worker", "frontend"];
+
+export interface OwnedProcess {
+  role: LauncherRole;
+  pid: number;
+  /** Milliseconds since epoch. Defeats PID reuse: a recycled PID starts later. */
+  startedAtMs: number;
+}
+
+export interface RuntimeState {
+  repoRoot: string;
+  mode: Exclude<DiskMode, "INVALID">;
+  startedAtMs: number;
+  processes: OwnedProcess[];
+}
+
+/** What the OS reports about a live PID. Supplied by the CLI, faked in tests. */
+export interface ProcessProbe {
+  pid: number;
+  commandLine: string;
+  startedAtMs: number;
+}
+
+export type OwnershipVerdict =
+  | { owned: true }
+  | { owned: false; reason: "GONE" | "PID_REUSED" | "NOT_THIS_REPO" };
+
+/**
+ * Whether a recorded PID may be terminated.
+ *
+ * Three independent conditions, because killing the wrong process on someone's
+ * development machine is unacceptable and a PID alone proves nothing:
+ *
+ *  - the process still exists,
+ *  - it started when we recorded it starting (a reused PID will not),
+ *  - and its command line still points at THIS repository.
+ *
+ * Any doubt returns not-owned, and a not-owned process is reported, never
+ * killed. Failing to stop something is recoverable; killing an unrelated
+ * program is not.
+ */
+export function verifyOwnership(
+  record: OwnedProcess,
+  probe: ProcessProbe | null,
+  repoRoot: string
+): OwnershipVerdict {
+  if (!probe) return { owned: false, reason: "GONE" };
+  // A one-second tolerance: creation timestamps are reported at coarse
+  // resolution, and an exact-equality check would reject our own processes.
+  if (Math.abs(probe.startedAtMs - record.startedAtMs) > 1000) {
+    return { owned: false, reason: "PID_REUSED" };
+  }
+  const normalized = probe.commandLine.replace(/\//g, "\\").toLowerCase();
+  if (!normalized.includes(resolve(repoRoot).replace(/\//g, "\\").toLowerCase())) {
+    return { owned: false, reason: "NOT_THIS_REPO" };
+  }
+  return { owned: true };
+}
+
+// ---------------------------------------------------------------------------
+// Runtime state file — machine-local, never in source control
+// ---------------------------------------------------------------------------
+
+/**
+ * Where the launcher remembers what it started.
+ *
+ * `%LOCALAPPDATA%` rather than the repository: this is machine state, not
+ * source, and a PID file inside a git worktree is one `git add -A` away from
+ * being committed.
+ */
+export function defaultStatePath(env: NodeJS.ProcessEnv = process.env): string {
+  const base = env.LOCALAPPDATA ?? env.TEMP ?? ".";
+  return join(base, "trading-alert-dashboard", "runtime-launcher-state.json");
+}
+
+export interface StateStore {
+  read(): RuntimeState | null;
+  write(state: RuntimeState): void;
+  clear(): void;
+}
+
+export class FileStateStore implements StateStore {
+  constructor(private readonly path: string) {}
+
+  read(): RuntimeState | null {
+    let raw: string;
+    try {
+      raw = readFileSync(this.path, "utf8");
+    } catch {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(raw) as RuntimeState;
+      if (typeof parsed?.repoRoot !== "string" || !Array.isArray(parsed?.processes)) return null;
+      return parsed;
+    } catch {
+      // An unreadable file means "we do not know what is running", which is
+      // treated exactly like no file: nothing is eligible for termination.
+      return null;
+    }
+  }
+
+  /** Atomic replace: a crash mid-write can never leave a half-parsed PID list. */
+  write(state: RuntimeState): void {
+    mkdirSync(dirname(this.path), { recursive: true });
+    const temporary = `${this.path}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    renameSync(temporary, this.path);
+  }
+
+  clear(): void {
+    rmSync(this.path, { force: true });
+  }
+}
+
+/** In-memory store for tests — no filesystem, same semantics. */
+export class MemoryStateStore implements StateStore {
+  private state: RuntimeState | null = null;
+  read(): RuntimeState | null {
+    return this.state;
+  }
+  write(state: RuntimeState): void {
+    this.state = state;
+  }
+  clear(): void {
+    this.state = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Outstanding trading work
+// ---------------------------------------------------------------------------
+
+/**
+ * The DURABLE trading state, exactly as the read-only Trading Control status
+ * already reports it. Every field is `null` when it could not be read.
+ *
+ * Nothing here is a second state model: `systemState`, the authorization state
+ * and the warning codes are all produced by `TradingControlService`, and the
+ * launcher only reads them.
+ */
+export interface DurableTradingState {
+  /** SAFE_OFF | ARMED | SAFE_RECOVERY | INVALID | UNKNOWN, or null if unread. */
+  systemState: string | null;
+  activeExecutions: number | null;
+  manualIntervention: number | null;
+  /** The newest natural window's state, or null when no window exists. */
+  authorizationState: string | null;
+  /** Warning codes from the status contract, or null if unread. */
+  warnings: string[] | null;
+}
+
+export type DurableVerdict = { safe: true } | { safe: false; reason: string };
+
+/**
+ * Warnings that mean trading work still needs attention.
+ *
+ * Deliberately a subset. `RUNTIME_ATTESTATION_BLOCKED` is expected whenever the
+ * runtime is down — which is precisely when the launcher runs — and
+ * `NATURAL_AUTHORIZATION_EXPIRED` describes a window that is already closed.
+ * Treating either as a blocker would make the tool unusable without making it
+ * safer. `FILLED_WITHOUT_VERIFIED_PROTECTION` is the recovery-required signal.
+ */
+const RECOVERY_WARNINGS = ["MANUAL_INTERVENTION_REQUIRED", "FILLED_WITHOUT_VERIFIED_PROTECTION"];
+
+/**
+ * Whether the DURABLE trading state is safe for the launcher to act on.
+ *
+ * ## Why this exists
+ *
+ * Process gates and durable state are different things, and the launcher used
+ * to reason only about the first. That was a real hole: a profile left
+ * `isEnabled=true, killSwitchActive=false` — or holding an AVAILABLE natural
+ * window — is still ARMED in the database while the runtime is off. Loading
+ * LIVE-READY gates and starting the worker would make that pre-existing
+ * authorization executable again with no fresh Start Trading action on the
+ * dashboard, which is exactly the boundary the operator controls exist to keep.
+ *
+ * The same reasoning applies to shutting down: "zero active executions" is NOT
+ * "durably disarmed". The worker protects and reconciles open positions, and an
+ * armed profile with an open window can admit one at any moment.
+ *
+ * So both transitions require the same thing — the durable state the dashboard
+ * reports must be SAFE OFF and clean. An unreadable state refuses: "we could
+ * not reach the database" and "there is nothing outstanding" are different
+ * facts, and only one of them is safe to act on.
+ *
+ * This NEVER mutates anything. Reaching a safe state is the dashboard's job,
+ * through Safe Off, and the launcher deliberately cannot do it.
+ */
+export function evaluateDurableSafety(state: DurableTradingState, action: "LIVE_READY" | "SHUTDOWN"): DurableVerdict {
+  const next =
+    action === "LIVE_READY"
+      ? "Use Trading Control -> Safe Off before starting LIVE-READY."
+      : "Use Trading Control -> Safe Off and wait until the system reports SAFE OFF before stopping the runtime.";
+
+  if (
+    state.systemState === null ||
+    state.activeExecutions === null ||
+    state.manualIntervention === null ||
+    state.warnings === null
+  ) {
+    return {
+      safe: false,
+      reason: `The durable Trading Control state could not be read. It is not assumed to be safe. ${next}`,
+    };
+  }
+
+  if (state.systemState !== "SAFE_OFF") {
+    return {
+      safe: false,
+      reason: `Trading Control is not durably SAFE OFF (currently ${state.systemState}). ${next}`,
+    };
+  }
+
+  // An open window can admit a trade the moment a runtime is live, regardless
+  // of what the profile flags say right now.
+  if (state.authorizationState === "AVAILABLE") {
+    return {
+      safe: false,
+      reason: `A natural authorization window is still AVAILABLE and could admit a new trade. The durable trading state must be cleared through Trading Control first. ${next}`,
+    };
+  }
+
+  if (state.activeExecutions > 0) {
+    return {
+      safe: false,
+      reason: `${state.activeExecutions} execution(s) are still active. ${next}`,
+    };
+  }
+
+  if (state.manualIntervention > 0) {
+    return {
+      safe: false,
+      reason: `${state.manualIntervention} execution(s) require manual intervention. Resolve them in Trading Control first.`,
+    };
+  }
+
+  const recovery = state.warnings.filter((code) => RECOVERY_WARNINGS.includes(code));
+  if (recovery.length > 0) {
+    return {
+      safe: false,
+      reason: `Trading Control reports outstanding recovery work (${recovery.join(", ")}). ${next}`,
+    };
+  }
+
+  return { safe: true };
+}
+
+// ---------------------------------------------------------------------------
+// Status presentation
+// ---------------------------------------------------------------------------
+
+export interface StatusView {
+  diskMode: DiskMode;
+  diskModeWarning: string | null;
+  backend: "ON" | "OFF";
+  worker: "ON" | "OFF";
+  frontend: "ON" | "OFF";
+  ports: { backend: number; frontend: number; backendOpen: boolean; frontendOpen: boolean };
+  operatorToken: "CONFIGURED" | "NOT CONFIGURED";
+  attestation: string | null;
+}
+
+export const BACKEND_PORT = 4000;
+export const FRONTEND_PORT = 5173;
+
+export const INVALID_MODE_WARNING =
+  "The three execution gates are in an unrecognised combination. This tool will not normalize it silently — inspect the deployment configuration before starting anything.";
+
+export function presentStatus(input: {
+  diskMode: DiskMode;
+  running: Record<LauncherRole, boolean>;
+  backendPortOpen: boolean;
+  frontendPortOpen: boolean;
+  operatorToken: "CONFIGURED" | "NOT CONFIGURED";
+  attestation?: string | null;
+}): StatusView {
+  return {
+    diskMode: input.diskMode,
+    diskModeWarning: input.diskMode === "INVALID" ? INVALID_MODE_WARNING : null,
+    backend: input.running.backend ? "ON" : "OFF",
+    worker: input.running.worker ? "ON" : "OFF",
+    frontend: input.running.frontend ? "ON" : "OFF",
+    ports: {
+      backend: BACKEND_PORT,
+      frontend: FRONTEND_PORT,
+      backendOpen: input.backendPortOpen,
+      frontendOpen: input.frontendPortOpen,
+    },
+    operatorToken: input.operatorToken,
+    attestation: input.attestation ?? null,
+  };
+}
+
+/** The rendered status block. Contains counts and states only, never a value. */
+export function renderStatus(view: StatusView): string[] {
+  return [
+    "Runtime:",
+    `  Backend     ${view.backend}`,
+    `  Worker      ${view.worker}`,
+    `  Frontend    ${view.frontend}`,
+    "",
+    `Expected ports: ${view.ports.backend} ${view.ports.backendOpen ? "open" : "closed"}, ` +
+      `${view.ports.frontend} ${view.ports.frontendOpen ? "open" : "closed"}`,
+    "",
+    "Disk mode:",
+    `  ${view.diskMode}`,
+    ...(view.diskModeWarning ? ["", `  WARNING: ${view.diskModeWarning}`] : []),
+    "",
+    `Operator token: ${view.operatorToken}`,
+    ...(view.attestation ? [`Runtime attestation: ${view.attestation}`] : []),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Start guards
+// ---------------------------------------------------------------------------
+
+export type StartVerdict = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Whether a new stack may be started.
+ *
+ * A second stack would fight the first for ports 4000 and 5173 and — far worse
+ * — would publish a second runtime attestation, which the ARM interlock treats
+ * as a duplicate and refuses. Refusing here is both kinder and safer than
+ * letting two half-working stacks coexist.
+ */
+export function evaluateStartPreconditions(input: {
+  recordedProcessesAlive: number;
+  backendPortOpen: boolean;
+  frontendPortOpen: boolean;
+}): StartVerdict {
+  if (input.recordedProcessesAlive > 0) {
+    return {
+      ok: false,
+      reason: "A launcher-owned runtime is already running. Stop it first, then start the mode you want.",
+    };
+  }
+  if (input.backendPortOpen || input.frontendPortOpen) {
+    return {
+      ok: false,
+      reason:
+        "An expected port is already in use by a process this launcher does not own. Investigate before starting a second stack.",
+    };
+  }
+  return { ok: true };
+}
