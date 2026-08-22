@@ -128,7 +128,10 @@ function spawnRole(role: LauncherRole, mode: "SAFE" | "LIVE_READY"): ChildProces
 async function readRuntimeModeAttestation(
   mode: "SAFE" | "LIVE_READY"
 ): Promise<AttestationStatusView | null> {
-  const { configuredRuntimeIdentity, readRuntimeAttestationStatusOnce } = await import(
+  // DEPLOYMENT reader, not the arming interlock: this asks whether the
+  // processes loaded the mode that was just requested. SAFE is a valid answer,
+  // and the arming reader refuses SAFE by design.
+  const { configuredRuntimeIdentity, readRuntimeDeploymentAttestationStatusOnce } = await import(
     "../runtime/runtime-attestation"
   );
   const expected = expectedGateSnapshotFor(mode);
@@ -136,7 +139,7 @@ async function readRuntimeModeAttestation(
   // without turning a failure into an indefinite wait.
   for (let attempt = 0; attempt < 15; attempt += 1) {
     try {
-      const status = await readRuntimeAttestationStatusOnce({
+      const status = await readRuntimeDeploymentAttestationStatusOnce({
         identity: configuredRuntimeIdentity(),
         expected,
       });

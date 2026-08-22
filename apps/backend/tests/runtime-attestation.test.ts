@@ -9,12 +9,17 @@ import {
   createRuntimeAttestationPublisher,
   gatesAreLive,
   readRuntimeAttestationStatus,
+  readRuntimeDeploymentAttestationStatus,
   runtimeAttestationKey,
   type RuntimeAttestation,
   type RuntimeAttestationRedis,
   type RuntimeGateSnapshot,
   type RuntimeIdentity,
 } from "../src/modules/runtime/runtime-attestation";
+import {
+  expectedGateSnapshotFor,
+  verifyRuntimeMode,
+} from "../src/modules/operator/runtime-launcher";
 
 /**
  * Phase 12.4D-A.1 — the operator activation interlock.
@@ -107,6 +112,15 @@ function seed(redis: FakeRedis, records: RuntimeAttestation[]): void {
 
 const read = (redis: FakeRedis, expected: RuntimeGateSnapshot = LIVE, now: Date = AT) =>
   readRuntimeAttestationStatus({ redis, identity: IDENTITY, expected, now });
+
+/** The DEPLOYMENT question: are the requested processes running, whatever mode. */
+const readDeployment = (redis: FakeRedis, expected: RuntimeGateSnapshot = LIVE, now: Date = AT) =>
+  readRuntimeDeploymentAttestationStatus({ redis, identity: IDENTITY, expected, now });
+
+/** Seeds one healthy, fresh, unique pair in the given mode. */
+function seedHealthyPair(redis: FakeRedis, gates: RuntimeGateSnapshot): void {
+  seed(redis, [attestation("BACKEND", gates), attestation("WORKER", gates)]);
+}
 
 // ---------------------------------------------------------------------------
 // 1. The Phase-4D-A bug
@@ -566,5 +580,258 @@ describe("runtime attestation: secrets and contract", () => {
     ] as const) {
       expect(`${field}:${gatesAreLive({ ...LIVE, [field]: value })}`).toBe(`${field}:false`);
     }
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// 7. Deployment attestation vs arming attestation
+//
+// The defect these exist for: the launcher asked "did the processes load the
+// mode I requested?" through the ARMING reader, whose last clause requires the
+// live activation gates. A correctly attested SAFE runtime can never satisfy
+// that, so `Start SAFE` always failed post-start verification and tore itself
+// back down. The previous tests missed it because they handed
+// `verifyRuntimeMode` a status object with `ok: true` already set, so the real
+// reader was never composed with SAFE gates.
+//
+// Every test below drives the REAL reader over the in-memory Redis double.
+// ---------------------------------------------------------------------------
+
+describe("runtime attestation: deployment vs arming", () => {
+  it("pins the launcher's expected snapshots to the reviewed SAFE/LIVE constants", () => {
+    expect(expectedGateSnapshotFor("SAFE")).toEqual(SAFE);
+    expect(expectedGateSnapshotFor("LIVE_READY")).toEqual(LIVE);
+  });
+
+  it("1. DEPLOYMENT accepts a healthy SAFE runtime", async () => {
+    const redis = new FakeRedis();
+    seedHealthyPair(redis, SAFE);
+
+    const status = await readDeployment(redis, SAFE);
+
+    expect(status.ok).toBe(true);
+    expect(status.reasonCode).toBeNull();
+    expect(status.backend.freshCount).toBe(1);
+    expect(status.worker.freshCount).toBe(1);
+    expect(status.backend.gates).toEqual(SAFE);
+    expect(status.worker.gates).toEqual(SAFE);
+  });
+
+  it("2. DEPLOYMENT accepts a healthy LIVE runtime", async () => {
+    const redis = new FakeRedis();
+    seedHealthyPair(redis, LIVE);
+
+    const status = await readDeployment(redis, LIVE);
+
+    expect(status.ok).toBe(true);
+    expect(status.reasonCode).toBeNull();
+    expect(status.backend.gates).toEqual(LIVE);
+  });
+
+  it("3. ARMING still REFUSES that same healthy SAFE runtime", async () => {
+    const redis = new FakeRedis();
+    seedHealthyPair(redis, SAFE);
+
+    const status = await read(redis, SAFE);
+
+    // This is the guarantee the fix must not erode: SAFE is never arm-ready.
+    expect(status.ok).toBe(false);
+    expect(status.reasonCode).toBe("RUNTIME_ATTESTATION_MISMATCH");
+    expect(status.message).toContain("required to arm");
+  });
+
+  it("4. ARMING accepts a healthy LIVE runtime", async () => {
+    const redis = new FakeRedis();
+    seedHealthyPair(redis, LIVE);
+
+    const status = await read(redis, LIVE);
+
+    expect(status.ok).toBe(true);
+    expect(status.reasonCode).toBeNull();
+  });
+
+  it("the two readers differ ONLY on the live-gate requirement", async () => {
+    const redis = new FakeRedis();
+    seedHealthyPair(redis, SAFE);
+
+    const deployment = await readDeployment(redis, SAFE);
+    const arming = await read(redis, SAFE);
+
+    // Same evidence gathered; different verdict, and only because of liveness.
+    expect(deployment.backend).toEqual(arming.backend);
+    expect(deployment.worker).toEqual(arming.worker);
+    expect(deployment.ok).toBe(true);
+    expect(arming.ok).toBe(false);
+    expect(gatesAreLive(SAFE)).toBe(false);
+  });
+
+  // -- the launcher composition, end to end over the real reader -------------
+
+  it("9a. LAUNCHER verifies a SAFE runtime through the real deployment reader", async () => {
+    const redis = new FakeRedis();
+    seedHealthyPair(redis, SAFE);
+
+    const status = await readDeployment(redis, expectedGateSnapshotFor("SAFE"));
+
+    expect(verifyRuntimeMode(status, "SAFE")).toEqual({ ok: true });
+  });
+
+  it("9b. LAUNCHER verifies a LIVE_READY runtime through the real deployment reader", async () => {
+    const redis = new FakeRedis();
+    seedHealthyPair(redis, LIVE);
+
+    const status = await readDeployment(redis, expectedGateSnapshotFor("LIVE_READY"));
+
+    expect(verifyRuntimeMode(status, "LIVE_READY")).toEqual({ ok: true });
+  });
+
+  it("9c. reproduces the original defect: the ARMING reader refuses a valid SAFE start", async () => {
+    const redis = new FakeRedis();
+    seedHealthyPair(redis, SAFE);
+
+    const armingStatus = await read(redis, expectedGateSnapshotFor("SAFE"));
+    const verdict = verifyRuntimeMode(armingStatus, "SAFE");
+
+    // Exactly what the smoke test saw before the fix.
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toBe("RUNTIME_ATTESTATION_MISMATCH");
+  });
+
+  // -- 5. requested mode vs attested mode ------------------------------------
+
+  it("5a. REJECTS a LIVE runtime when SAFE was requested", async () => {
+    const redis = new FakeRedis();
+    seedHealthyPair(redis, LIVE);
+
+    const status = await readDeployment(redis, expectedGateSnapshotFor("SAFE"));
+
+    expect(status.ok).toBe(false);
+    expect(status.reasonCode).toBe("RUNTIME_ATTESTATION_MISMATCH");
+    expect(verifyRuntimeMode(status, "SAFE").ok).toBe(false);
+  });
+
+  it("5b. REJECTS a SAFE runtime when LIVE_READY was requested", async () => {
+    const redis = new FakeRedis();
+    seedHealthyPair(redis, SAFE);
+
+    const status = await readDeployment(redis, expectedGateSnapshotFor("LIVE_READY"));
+
+    expect(status.ok).toBe(false);
+    expect(status.reasonCode).toBe("RUNTIME_ATTESTATION_MISMATCH");
+    expect(verifyRuntimeMode(status, "LIVE_READY").ok).toBe(false);
+  });
+
+  it("5c. REJECTS a split runtime where only one role took the new gates", async () => {
+    const redis = new FakeRedis();
+    seed(redis, [attestation("BACKEND", SAFE), attestation("WORKER", LIVE)]);
+
+    const status = await readDeployment(redis, expectedGateSnapshotFor("SAFE"));
+
+    expect(status.ok).toBe(false);
+    expect(status.reasonCode).toBe("RUNTIME_ATTESTATION_MISMATCH");
+    expect(verifyRuntimeMode(status, "SAFE").ok).toBe(false);
+  });
+
+  it("6. BLOCKS a stale role even when its gates are the requested SAFE ones", async () => {
+    const redis = new FakeRedis();
+    const old = new Date(AT.getTime() - RUNTIME_ATTESTATION_TTL_MS - 1);
+    seed(redis, [attestation("BACKEND", SAFE), attestation("WORKER", SAFE, { lastSeenAt: old })]);
+
+    const status = await readDeployment(redis, SAFE);
+
+    expect(status.ok).toBe(false);
+    expect(status.reasonCode).toBe("RUNTIME_ATTESTATION_STALE");
+    expect(status.worker.freshCount).toBe(0);
+    expect(status.worker.staleCount).toBe(1);
+    expect(verifyRuntimeMode(status, "SAFE").ok).toBe(false);
+  });
+
+  it("7. BLOCKS a missing role rather than treating absence as SAFE", async () => {
+    const redis = new FakeRedis();
+    seed(redis, [attestation("BACKEND", SAFE)]);
+
+    const status = await readDeployment(redis, SAFE);
+
+    expect(status.ok).toBe(false);
+    expect(status.reasonCode).toBe("RUNTIME_ATTESTATION_MISSING");
+    expect(verifyRuntimeMode(status, "SAFE").ok).toBe(false);
+  });
+
+  it("8. BLOCKS two fresh instances of a role — no newest-wins in SAFE either", async () => {
+    const redis = new FakeRedis();
+    seed(redis, [
+      attestation("BACKEND", SAFE, { instanceId: "backend-1" }),
+      attestation("BACKEND", SAFE, { instanceId: "backend-2" }),
+      attestation("WORKER", SAFE),
+    ]);
+
+    const status = await readDeployment(redis, SAFE);
+
+    expect(status.ok).toBe(false);
+    expect(status.reasonCode).toBe("RUNTIME_ATTESTATION_DUPLICATE");
+    expect(verifyRuntimeMode(status, "SAFE").ok).toBe(false);
+  });
+
+  it("9d. BLOCKS a malformed record in the SAFE path", async () => {
+    const redis = new FakeRedis();
+    seed(redis, [attestation("WORKER", SAFE)]);
+    redis.store.set(runtimeAttestationKey(IDENTITY, "BACKEND", "b1"), "{not json");
+
+    const status = await readDeployment(redis, SAFE);
+
+    expect(status.ok).toBe(false);
+    expect(status.reasonCode).toBe("RUNTIME_ATTESTATION_MISMATCH");
+    expect(verifyRuntimeMode(status, "SAFE").ok).toBe(false);
+  });
+
+  it("9e. does not let another account or environment satisfy a SAFE deployment", async () => {
+    const redis = new FakeRedis();
+    seed(redis, [
+      attestation("BACKEND", SAFE, { identity: { accountIdentifier: "test-account", environment: "TESTNET" } }),
+      attestation("WORKER", SAFE, { identity: { accountIdentifier: "other-account", environment: "MAINNET" } }),
+    ]);
+
+    const status = await readDeployment(redis, SAFE);
+
+    expect(status.ok).toBe(false);
+    expect(status.reasonCode).toBe("RUNTIME_ATTESTATION_MISSING");
+    expect(verifyRuntimeMode(status, "SAFE").ok).toBe(false);
+  });
+
+  it("BLOCKS an unreadable Redis rather than reporting a healthy SAFE runtime", async () => {
+    const redis = new FakeRedis();
+    seedHealthyPair(redis, SAFE);
+    redis.failOn = "scan";
+
+    const status = await readDeployment(redis, SAFE);
+
+    expect(status.ok).toBe(false);
+    expect(status.reasonCode).toBe("RUNTIME_ATTESTATION_UNAVAILABLE");
+    expect(verifyRuntimeMode(status, "SAFE").ok).toBe(false);
+  });
+
+  it("keeps the arming reader on every execution-authority caller", () => {
+    const roots = [
+      "src/modules/execution/run-canary-controls.ts",
+      "src/modules/execution/run-canary-preflight.ts",
+      "src/modules/operator/trading-control-actions.service.ts",
+      "src/modules/operator/trading-control.service.ts",
+    ];
+    for (const rel of roots) {
+      const source = readFileSync(path.join(process.cwd(), rel), "utf8");
+      expect(`${rel}:${source.includes("readRuntimeDeploymentAttestationStatus")}`).toBe(`${rel}:false`);
+      expect(`${rel}:${source.includes("readRuntimeAttestationStatusOnce")}`).toBe(`${rel}:true`);
+    }
+  });
+
+  it("uses the deployment reader ONLY in the runtime launcher", () => {
+    const launcher = readFileSync(
+      path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"),
+      "utf8"
+    );
+    expect(launcher).toContain("readRuntimeDeploymentAttestationStatusOnce");
+    // The launcher must not silently keep an arming-reader call site around.
+    expect(launcher.includes("readRuntimeAttestationStatusOnce(")).toBe(false);
   });
 });

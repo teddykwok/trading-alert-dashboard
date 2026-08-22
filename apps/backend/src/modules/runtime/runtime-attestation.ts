@@ -328,14 +328,27 @@ function blocked(
 }
 
 /**
- * Enumerates attestations for ONE execution identity and judges them.
+ * DEPLOYMENT attestation — "are the processes I asked for actually running?"
+ *
+ * Enumerates attestations for ONE execution identity and judges them: exactly
+ * one fresh BACKEND, exactly one fresh WORKER, both correctly identified, both
+ * agreeing with each other and with the snapshot the caller expected.
+ *
+ * It deliberately does NOT ask whether those gates permit arming. SAFE is a
+ * legitimate deployment mode whose entire purpose is that it cannot arm, so
+ * requiring live gates here would make a correctly attested SAFE runtime
+ * indistinguishable from a misconfigured one — which is exactly the defect the
+ * SAFE launcher smoke test surfaced.
  *
  * Fails closed on every ambiguity, including infrastructure failure: a Redis
  * that cannot be read is reported UNAVAILABLE rather than treated as "no
  * problem found". Duplicates are refused outright — picking the newest would
  * silently authorise a topology nobody intended.
+ *
+ * Callers deciding whether trading may be ARMED must use
+ * `readRuntimeAttestationStatus`, which adds the live-gate requirement.
  */
-export async function readRuntimeAttestationStatus(
+export async function readRuntimeDeploymentAttestationStatus(
   options: ReadRuntimeAttestationOptions
 ): Promise<RuntimeAttestationStatus> {
   const now = options.now ?? new Date();
@@ -444,16 +457,33 @@ export async function readRuntimeAttestationStatus(
       worker
     );
   }
-  if (!gatesAreLive(backendGates)) {
+  return { ok: true, reasonCode: null, message: null, backend, worker };
+}
+
+/**
+ * ARMING attestation — "may this runtime participate in live activation?"
+ *
+ * Everything the deployment reader validates, plus the one requirement that
+ * separates the two questions: the running processes must have loaded the
+ * activation gates that make arming possible at all. A healthy SAFE runtime
+ * still fails here, and that is the entire point of the interlock.
+ */
+export async function readRuntimeAttestationStatus(
+  options: ReadRuntimeAttestationOptions
+): Promise<RuntimeAttestationStatus> {
+  const status = await readRuntimeDeploymentAttestationStatus(options);
+  if (!status.ok) return status;
+  // `ok` guarantees both roles carry a snapshot and that the two agree, so the
+  // backend's is representative of the pair.
+  if (!gatesAreLive(status.backend.gates as RuntimeGateSnapshot)) {
     return blocked(
       "RUNTIME_ATTESTATION_MISMATCH",
       "the running processes did not load the activation gate values required to arm.",
-      backend,
-      worker
+      status.backend,
+      status.worker
     );
   }
-
-  return { ok: true, reasonCode: null, message: null, backend, worker };
+  return status;
 }
 
 /** Narrow adapter so long-lived runtimes can pass the shared ioredis client. */
@@ -469,7 +499,8 @@ export function asAttestationRedis(client: Redis): RuntimeAttestationRedis {
  * mirrors the existing `probeRedis` pattern in canary-preflight.service.ts.
  * Long-lived runtimes use `asAttestationRedis(bullConnection)` instead.
  */
-export async function readRuntimeAttestationStatusOnce(
+async function readOnceWith(
+  read: (options: ReadRuntimeAttestationOptions) => Promise<RuntimeAttestationStatus>,
   options: Omit<ReadRuntimeAttestationOptions, "redis">
 ): Promise<RuntimeAttestationStatus> {
   const { default: IORedis } = await import("ioredis");
@@ -480,7 +511,7 @@ export async function readRuntimeAttestationStatusOnce(
   });
   try {
     await client.connect();
-    return await readRuntimeAttestationStatus({ ...options, redis: asAttestationRedis(client) });
+    return await read({ ...options, redis: asAttestationRedis(client) });
   } catch (error) {
     // Infrastructure failure is never a PASS.
     return {
@@ -493,4 +524,21 @@ export async function readRuntimeAttestationStatusOnce(
   } finally {
     client.disconnect();
   }
+}
+
+/** One-shot ARMING read. Requires the live activation gates. */
+export async function readRuntimeAttestationStatusOnce(
+  options: Omit<ReadRuntimeAttestationOptions, "redis">
+): Promise<RuntimeAttestationStatus> {
+  return readOnceWith(readRuntimeAttestationStatus, options);
+}
+
+/**
+ * One-shot DEPLOYMENT read. Validates presence, identity, freshness, uniqueness
+ * and the expected gate snapshot, without requiring those gates to be live.
+ */
+export async function readRuntimeDeploymentAttestationStatusOnce(
+  options: Omit<ReadRuntimeAttestationOptions, "redis">
+): Promise<RuntimeAttestationStatus> {
+  return readOnceWith(readRuntimeDeploymentAttestationStatus, options);
 }

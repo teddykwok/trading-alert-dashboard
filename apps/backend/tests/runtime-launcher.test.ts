@@ -745,8 +745,21 @@ describe("runtime launcher: success is never announced before verification", () 
     for (const forbidden of ["CanaryPreflightService", "readReadiness", "binance", "armNaturalWindow", "safeOff("]) {
       expect(`${forbidden}:${source.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
-    // It reuses the existing attestation reader rather than a new state model.
-    expect(source).toContain("readRuntimeAttestationStatusOnce");
+    // It reuses the shared attestation module rather than a new state model,
+    // and specifically its DEPLOYMENT reader: the arming reader requires live
+    // gates, which a legitimate SAFE runtime can never satisfy.
+    expect(source).toContain("readRuntimeDeploymentAttestationStatusOnce");
+    expect(source.includes("readRuntimeAttestationStatusOnce(")).toBe(false);
+  });
+
+  it("announces success for SAFE as well as LIVE_READY", () => {
+    const source = cli();
+    // The success line is parameterised by mode, so a verified SAFE start
+    // prints "Runtime attested SAFE." instead of being unreachable. Whether a
+    // SAFE pair actually verifies is proven against the real attestation
+    // reader in runtime-attestation.test.ts.
+    expect(source).toContain("Runtime attested ${mode}.");
+    expect(source).not.toContain('Runtime attested LIVE_READY."');
   });
 
   it("bounds the wait instead of retrying forever", () => {
