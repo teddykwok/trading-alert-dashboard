@@ -3,9 +3,15 @@ import { useState, type FormEvent, type ReactNode } from "react";
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { Card } from "../ui/Card";
+import { AllowedSymbolsEditor } from "./AllowedSymbolsEditor";
 import { classNames } from "../../utils/classNames";
 import { useTradingControl } from "../../hooks/useTradingControl";
-import type { TradingControlReadinessSnapshot, TradingControlStatusDto } from "../../api/operator";
+import {
+  START_TRADING_DURATION_CHOICES,
+  type StartTradingDuration,
+  type TradingControlReadinessSnapshot,
+  type TradingControlStatusDto,
+} from "../../api/operator";
 import {
   presentAllowedSymbols,
   presentAttestation,
@@ -19,6 +25,7 @@ import {
   presentSystemState,
 } from "../../features/operator/tradingControlPresentation";
 import {
+  START_WINDOW_MINUTES,
   TRADING_CONTROL_ACTIONS,
   describeStartContext,
   describeStartPrerequisite,
@@ -191,9 +198,10 @@ function ConfirmDialog({
   status: TradingControlStatusDto | null;
   pending: boolean;
   onCancel: () => void;
-  onConfirm: (phrase: string) => void;
+  onConfirm: (phrase: string, durationMinutes: StartTradingDuration) => void;
 }) {
   const [typed, setTyped] = useState("");
+  const [duration, setDuration] = useState<StartTradingDuration>(START_WINDOW_MINUTES);
   const context = status ? describeStartContext(status) : null;
   const satisfied = isConfirmationSatisfied(action, typed);
 
@@ -207,7 +215,11 @@ function ConfirmDialog({
           <dt>Environment</dt>
           <dd className="text-slate-200">{context.environment}</dd>
           <dt>Allowed symbols</dt>
-          <dd className="text-slate-200">{context.allowedSymbols}</dd>
+          <dd className="text-slate-200">
+            {context.allowedSymbolCount === 0
+              ? context.allowedSymbols
+              : `${context.allowedSymbolCount}: ${context.allowedSymbolsPreview}`}
+          </dd>
           <dt>Risk</dt>
           <dd className="text-slate-200">{context.riskLimit}</dd>
           <dt>Margin</dt>
@@ -219,8 +231,32 @@ function ConfirmDialog({
           <dt>Max claims</dt>
           <dd className="text-slate-200">{context.maxClaims}</dd>
           <dt>Window</dt>
-          <dd className="text-slate-200">{context.windowMinutes} minutes</dd>
+          <dd className="text-slate-200">{duration} minutes</dd>
         </dl>
+      ) : null}
+
+      {action.id === "START" ? (
+        <fieldset className="space-y-1">
+          <legend className="text-xs text-slate-400">Supervised window</legend>
+          <div className="flex gap-2">
+            {START_TRADING_DURATION_CHOICES.map((minutes) => (
+              <button
+                key={minutes}
+                type="button"
+                onClick={() => setDuration(minutes)}
+                disabled={pending}
+                aria-pressed={duration === minutes}
+                className={
+                  duration === minutes
+                    ? "rounded-lg border border-yellow-400/60 bg-yellow-500/20 px-3 py-1 text-xs text-slate-100"
+                    : "rounded-lg border border-surface-border px-3 py-1 text-xs text-slate-400"
+                }
+              >
+                {minutes} min
+              </button>
+            ))}
+          </div>
+        </fieldset>
       ) : null}
 
       {action.requiredPhrase ? (
@@ -242,7 +278,7 @@ function ConfirmDialog({
         <Button
           variant={action.destructiveLooking ? "danger" : "primary"}
           disabled={!satisfied || pending}
-          onClick={() => onConfirm(typed)}
+          onClick={() => onConfirm(typed, duration)}
         >
           {pending ? "Working…" : `Confirm ${action.label}`}
         </Button>
@@ -318,10 +354,10 @@ export function TradingControlCard() {
               status={status}
               pending={pendingAction !== null}
               onCancel={() => setConfirming(null)}
-              onConfirm={(phrase) => {
+              onConfirm={(phrase, durationMinutes) => {
                 const action = confirming;
                 setConfirming(null);
-                void runAction(action.id, phrase);
+                void runAction(action.id, phrase, durationMinutes);
               }}
             />
           ) : null}
@@ -396,6 +432,10 @@ export function TradingControlCard() {
               })}
             </div>
           </div>
+
+          {/* The durable allowlist. Its own guards are enforced server-side;
+              this only decides what is offered. */}
+          <AllowedSymbolsEditor status={status} onSaved={() => void refresh()} />
         </>
       ) : (
         <OperatorTokenForm

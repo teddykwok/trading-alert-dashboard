@@ -121,8 +121,72 @@ export interface TradingControlActionResult {
  */
 export const START_TRADING_CONFIRMATION = "START TRADING";
 
-export function postStartTrading(confirmation: string): Promise<TradingControlActionResult> {
-  return operatorApiClient.post("/api/operator/trading-control/start", { confirmation });
+/**
+ * The supervised window lengths the server accepts. Mirrored for the selector;
+ * the server validates the submitted value independently and refuses anything
+ * else, so this list decides what is OFFERED and never what is permitted.
+ */
+export const START_TRADING_DURATION_CHOICES = [15, 30, 60] as const;
+export type StartTradingDuration = (typeof START_TRADING_DURATION_CHOICES)[number];
+
+export function postStartTrading(
+  confirmation: string,
+  durationMinutes: StartTradingDuration
+): Promise<TradingControlActionResult> {
+  return operatorApiClient.post("/api/operator/trading-control/start", {
+    confirmation,
+    durationMinutes,
+  });
+}
+
+// --- Allowlist management ---------------------------------------------------
+
+export interface AllowlistRejectedEntry {
+  input: string;
+  symbol: string | null;
+  reasonCode: string;
+  detail: string;
+}
+
+export interface AllowlistCounts {
+  input: number;
+  normalized: number;
+  valid: number;
+  duplicates: number;
+  rejected: number;
+}
+
+export interface AllowlistValidationDto {
+  ok: boolean;
+  counts: AllowlistCounts;
+  accepted: string[];
+  rejected: AllowlistRejectedEntry[];
+  refusal: string | null;
+  current: string[];
+}
+
+export interface AllowlistSaveDto {
+  ok: boolean;
+  outcome: "SAVED" | "BLOCKED";
+  blockers: string[];
+  message: string;
+  allowedSymbols: string[] | null;
+  counts: AllowlistCounts | null;
+  rejected: AllowlistRejectedEntry[];
+}
+
+/** Dry run. Writes nothing, so it is safe to call in any system state. */
+export function postValidateAllowlist(symbols: string): Promise<AllowlistValidationDto> {
+  return operatorApiClient.post("/api/operator/trading-control/allowlist/validate", { symbols });
+}
+
+/**
+ * The mutation. Sends the RAW text again rather than the validated list: the
+ * server re-parses and re-validates, so there is no "already checked" claim
+ * for a client to make.
+ */
+export function postSaveAllowlist(symbols: string): Promise<AllowlistSaveDto> {
+  return operatorApiClient.post("/api/operator/trading-control/allowlist", { symbols });
 }
 
 export function postStopNewTrades(): Promise<TradingControlActionResult> {

@@ -148,6 +148,10 @@ export function isConfirmationSatisfied(action: TradingControlAction, typed: str
 export interface StartContext {
   environment: string;
   allowedSymbols: string;
+  /** How many symbols the durable policy admits. 0 would be allow-all. */
+  allowedSymbolCount: number;
+  /** Full list when short, count plus a preview when long. */
+  allowedSymbolsPreview: string;
   riskLimit: string;
   marginLimit: string;
   desiredOpen: number;
@@ -159,6 +163,25 @@ export interface StartContext {
 /** The reviewed first-live defaults, mirrored from the server for display. */
 export const START_WINDOW_MINUTES = 60;
 export const START_MAX_CLAIMS = 5;
+
+/**
+ * Beyond this many symbols the dialog shows a count and a preview instead of
+ * the whole list. Six hundred badges is not information, it is a wall.
+ */
+export const ALLOWLIST_PREVIEW_THRESHOLD = 12;
+
+/**
+ * How the allowlist reads in a panel or dialog.
+ *
+ * An empty list is rendered as an explicit warning rather than as nothing,
+ * because empty means ALL symbols to the admission engine and that is the one
+ * state an operator must never mistake for "none".
+ */
+export function describeAllowlist(symbols: readonly string[]): string {
+  if (symbols.length === 0) return "ALL (unrestricted)";
+  if (symbols.length <= ALLOWLIST_PREVIEW_THRESHOLD) return symbols.join(", ");
+  return `${symbols.slice(0, 6).join(", ")}, … (+${symbols.length - 6} more)`;
+}
 
 /**
  * The authoritative context shown before arming.
@@ -173,6 +196,8 @@ export function describeStartContext(status: TradingControlStatusDto): StartCont
     environment: status.profile?.environment ?? "UNKNOWN",
     allowedSymbols:
       status.allowedSymbols.length === 0 ? "ALL (unrestricted)" : status.allowedSymbols.join(", "),
+    allowedSymbolCount: status.allowedSymbols.length,
+    allowedSymbolsPreview: describeAllowlist(status.allowedSymbols),
     riskLimit: `${status.reservations.riskUsd} / ${status.reservations.riskLimitUsd} USD`,
     marginLimit: `${status.reservations.marginUsd} / ${status.reservations.marginLimitUsd} USD`,
     desiredOpen: status.capacity.desiredOpen,
@@ -208,4 +233,65 @@ export function presentActionResult(result: {
     headline: result.outcome,
     detail: [result.message, ...result.blockers],
   };
+}
+
+// ---------------------------------------------------------------------------
+// The allowlist editor
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the editor may offer to SAVE.
+ *
+ * Mirrors the server's rule so the button matches reality, and nothing more:
+ * the backend re-checks the same durable facts inside a transaction, so a
+ * browser that ignores this still cannot write while armed.
+ */
+export function canEditAllowlist(
+  status: Pick<TradingControlStatusDto, "systemState" | "capacity" | "manualIntervention"> | null
+): { allowed: boolean; reason: string | null } {
+  if (!status) return { allowed: false, reason: "Trading Control status has not loaded yet." };
+  if (status.systemState !== "SAFE_OFF") {
+    return {
+      allowed: false,
+      reason: `The allowlist can only be changed while SAFE OFF (system is ${status.systemState}).`,
+    };
+  }
+  if (status.capacity.totalActive > 0) {
+    return {
+      allowed: false,
+      reason: `${status.capacity.totalActive} execution(s) are still active.`,
+    };
+  }
+  if (status.manualIntervention.present) {
+    return { allowed: false, reason: "Manual intervention is outstanding." };
+  }
+  return { allowed: true, reason: null };
+}
+
+/** The counts line, in the order the operator reads them. */
+export function describeAllowlistCounts(counts: {
+  input: number;
+  normalized: number;
+  valid: number;
+  duplicates: number;
+  rejected: number;
+}): string[] {
+  return [
+    `Input:      ${counts.input}`,
+    `Normalized: ${counts.normalized}`,
+    `Valid:      ${counts.valid}`,
+    `Duplicates: ${counts.duplicates}`,
+    `Rejected:   ${counts.rejected}`,
+  ];
+}
+
+/** Groups rejections by reason so a 130-item list reads as five lines. */
+export function groupRejections(
+  rejected: readonly { reasonCode: string }[]
+): { reasonCode: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const entry of rejected) counts.set(entry.reasonCode, (counts.get(entry.reasonCode) ?? 0) + 1);
+  return [...counts.entries()]
+    .map(([reasonCode, count]) => ({ reasonCode, count }))
+    .sort((a, b) => b.count - a.count || a.reasonCode.localeCompare(b.reasonCode));
 }

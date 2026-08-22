@@ -9,6 +9,11 @@ import {
   type TradingControlActionResult,
 } from "../modules/operator/trading-control-actions.service";
 import { TradingControlService } from "../modules/operator/trading-control.service";
+import { AllowlistService } from "../modules/operator/allowlist.service";
+import type {
+  AllowlistSaveResult,
+  AllowlistValidationResult,
+} from "../modules/operator/allowlist.service";
 import { CANARY_AUTHORIZATION_MODES, type CanaryAuthorizationMode } from "../modules/execution/canary-readiness";
 import { ValidationError } from "../utils/errors";
 
@@ -55,13 +60,21 @@ export interface OperatorRoutesOptions {
   tradingControlFactory?: (prisma: PrismaClient) => TradingControlReader;
   /** Injected in tests so no real preflight, Redis read or profile write happens. */
   tradingControlActionsFactory?: (prisma: PrismaClient) => TradingControlActor;
+  /** Injected in tests so allowlist validation never reaches the exchange. */
+  allowlistFactory?: (prisma: PrismaClient) => AllowlistManager;
 }
 
 /** The mutation surface. Three actions, and deliberately nothing else. */
 export interface TradingControlActor {
-  startTrading(confirmation: unknown): Promise<TradingControlActionResult>;
+  startTrading(confirmation: unknown, durationMinutes?: unknown): Promise<TradingControlActionResult>;
   stopNewTrades(): Promise<TradingControlActionResult>;
   safeOff(): Promise<TradingControlActionResult>;
+}
+
+/** Allowlist management: one dry run, one write. Nothing else. */
+export interface AllowlistManager {
+  validate(raw: unknown): Promise<AllowlistValidationResult>;
+  save(raw: unknown): Promise<AllowlistSaveResult>;
 }
 
 /** The read-only surface the routes need. Narrow on purpose: no mutation. */
@@ -79,6 +92,8 @@ export async function operatorRoutes(
   const buildTradingControlActions =
     options.tradingControlActionsFactory ??
     ((prisma: PrismaClient) => new TradingControlActionsService(prisma));
+  const buildAllowlist =
+    options.allowlistFactory ?? ((prisma: PrismaClient) => new AllowlistService(prisma));
 
   /**
    * Every mutation answers the same way: the action's own sanitized result, and
@@ -130,8 +145,13 @@ export async function operatorRoutes(
     async (request, reply) => {
       // The confirmation phrase is validated by the service, on the server.
       // The browser dialog is a courtesy, never the boundary.
-      const body = request.body as { confirmation?: unknown } | null | undefined;
-      return runAction(request, reply, (actor) => actor.startTrading(body?.confirmation));
+      const body = request.body as
+        | { confirmation?: unknown; durationMinutes?: unknown }
+        | null
+        | undefined;
+      return runAction(request, reply, (actor) =>
+        actor.startTrading(body?.confirmation, body?.durationMinutes)
+      );
     }
   );
 
@@ -145,6 +165,33 @@ export async function operatorRoutes(
     "/api/operator/trading-control/safe-off",
     { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
     async (request, reply) => runAction(request, reply, (actor) => actor.safeOff())
+  );
+
+  // --- Allowlist management ----------------------------------------------
+  // Validation is a DRY RUN and writes nothing, so it stays available even
+  // while armed: an operator may prepare a list before deciding to go safe.
+  // Saving is a mutation and the service refuses it unless the system is
+  // SAFE_OFF and quiet — a check the browser cannot perform on its behalf.
+  app.post(
+    "/api/operator/trading-control/allowlist/validate",
+    { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
+    async (request, reply) => {
+      const body = request.body as { symbols?: unknown } | null | undefined;
+      const result = await buildAllowlist(request.server.prisma).validate(body?.symbols);
+      if (!result.ok) reply.code(422);
+      return result;
+    }
+  );
+
+  app.post(
+    "/api/operator/trading-control/allowlist",
+    { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
+    async (request, reply) => {
+      const body = request.body as { symbols?: unknown } | null | undefined;
+      const result = await buildAllowlist(request.server.prisma).save(body?.symbols);
+      if (!result.ok) reply.code(409);
+      return result;
+    }
   );
 }
 

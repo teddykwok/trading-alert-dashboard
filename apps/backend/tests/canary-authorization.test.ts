@@ -1036,6 +1036,12 @@ describe("natural authorization: runtime boundary", () => {
     // admission, spends no claim, takes no lock of its own and reaches no
     // exchange -- pinned structurally in trading-control-actions.test.ts.
     "src/modules/operator/trading-control-actions.service.ts",
+    // READS window state to REFUSE a policy write, on the same terms as
+    // trading-control.service.ts above: it never claims, prepares, revokes or
+    // arms anything. An AVAILABLE window means the allowlist must not move
+    // underneath it, which is a reason to decline -- never a reason to admit.
+    // Pinned structurally below.
+    "src/modules/operator/allowlist.service.ts",
   ];
 
   /**
@@ -1094,6 +1100,27 @@ describe("natural authorization: runtime boundary", () => {
         .map((entry) => entry.file);
       expect(`${symbol}: ${offenders.join(", ")}`).toBe(`${symbol}: `);
     }
+  });
+
+  it("lets the allowlist service read a window but never act on one", () => {
+    // The price of its place on ALLOWED: it may look, and nothing else. A
+    // write verb or a claim appearing here would mean the allowlist editor had
+    // grown into an authorization path.
+    const code = codeOf("src/modules/operator/allowlist.service.ts");
+    for (const forbidden of [
+      "claimNaturalWindow",
+      "armNaturalWindow",
+      "prepareNaturalWindow",
+      "revokeNaturalWindow",
+      "executionCanaryAuthorization.create",
+      "executionCanaryAuthorization.update",
+      "executionCanaryAuthorization.delete",
+    ]) {
+      expect(`${forbidden}:${code.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+    // The one read it is admitted for, and the one column it writes.
+    expect(code).toContain("isNaturalWindowAvailable");
+    expect(code).toContain("executionSafetyPolicy.update");
   });
 
   it("spends the claim in EXACTLY one production place", () => {

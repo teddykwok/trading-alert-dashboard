@@ -7,6 +7,10 @@ import {
   START_MAX_CLAIMS,
   START_PREREQUISITE_REASON,
   START_WINDOW_MINUTES,
+  canEditAllowlist,
+  describeAllowlist,
+  describeAllowlistCounts,
+  groupRejections,
   TRADING_CONTROL_ACTIONS,
   describeStartContext,
   describeStartPrerequisite,
@@ -15,6 +19,7 @@ import {
   isConfirmationSatisfied,
   presentActionResult,
 } from "../src/features/operator/tradingControlActions";
+import { START_TRADING_DURATION_CHOICES } from "../src/api/operator";
 import {
   START_TRADING_CONFIRMATION,
   postSafeOff,
@@ -263,6 +268,8 @@ describe("operator actions: the Start dialog shows authoritative context", () =>
     expect(context).toEqual({
       environment: "MAINNET",
       allowedSymbols: "COWUSDT",
+      allowedSymbolCount: 1,
+      allowedSymbolsPreview: "COWUSDT",
       riskLimit: "0 / 7.5 USD",
       marginLimit: "0 / 40 USD",
       desiredOpen: 3,
@@ -279,6 +286,15 @@ describe("operator actions: the Start dialog shows authoritative context", () =>
   it("never renders an unrestricted allowlist as nothing", () => {
     const context = describeStartContext(statusFixture({ allowedSymbols: [] }));
     expect(context.allowedSymbols).toBe("ALL (unrestricted)");
+    expect(context.allowedSymbolCount).toBe(0);
+    expect(context.allowedSymbolsPreview).toBe("ALL (unrestricted)");
+  });
+
+  it("summarizes a large allowlist as a count plus a preview", () => {
+    const many = Array.from({ length: 428 }, (_, i) => `SYM${i}USDT`);
+    const context = describeStartContext(statusFixture({ allowedSymbols: many }));
+    expect(context.allowedSymbolCount).toBe(428);
+    expect(context.allowedSymbolsPreview).toContain("+422 more");
   });
 });
 
@@ -486,5 +502,98 @@ describe("operator actions: structural guarantees", () => {
     for (const forbidden of ["token:", "operatorToken", "Authorization:"]) {
       expect(`${forbidden}:${api.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The operator-managed allowlist and the supervised duration selector
+// ---------------------------------------------------------------------------
+
+describe("operator actions: the allowlist editor", () => {
+  const status = (overrides: Record<string, unknown> = {}) =>
+    ({
+      systemState: "SAFE_OFF",
+      capacity: { pending: 0, open: 0, totalActive: 0, desiredOpen: 3, hardTotal: 5 },
+      manualIntervention: { present: false, count: 0 },
+      ...overrides,
+    }) as never;
+
+  it("renders an empty allowlist as UNRESTRICTED, never as nothing", () => {
+    // Empty means ALL to the admission engine; showing "none" would invert it.
+    expect(describeAllowlist([])).toBe("ALL (unrestricted)");
+  });
+
+  it("shows a short list in full", () => {
+    expect(describeAllowlist(["FHEUSDT", "BTCUSDT"])).toBe("FHEUSDT, BTCUSDT");
+  });
+
+  it("previews a long list concisely instead of hundreds of badges", () => {
+    const many = Array.from({ length: 428 }, (_, i) => `SYM${i}USDT`);
+    const rendered = describeAllowlist(many);
+    expect(rendered).toContain("+422 more");
+    expect(rendered.length).toBeLessThan(120);
+  });
+
+  it("offers editing only while SAFE OFF and quiet", () => {
+    expect(canEditAllowlist(status()).allowed).toBe(true);
+    expect(canEditAllowlist(null).allowed).toBe(false);
+    expect(canEditAllowlist(status({ systemState: "ARMED" })).allowed).toBe(false);
+    expect(canEditAllowlist(status({ systemState: "SAFE_RECOVERY" })).allowed).toBe(false);
+    expect(
+      canEditAllowlist(status({ capacity: { pending: 1, open: 0, totalActive: 1, desiredOpen: 3, hardTotal: 5 } }))
+        .allowed
+    ).toBe(false);
+    expect(canEditAllowlist(status({ manualIntervention: { present: true, count: 1 } })).allowed).toBe(false);
+  });
+
+  it("explains why editing is unavailable rather than silently disabling", () => {
+    expect(canEditAllowlist(status({ systemState: "ARMED" })).reason).toContain("SAFE OFF");
+    expect(
+      canEditAllowlist(status({ manualIntervention: { present: true, count: 2 } })).reason
+    ).toContain("Manual intervention");
+  });
+
+  it("lists the counts in the order the operator reads them", () => {
+    const lines = describeAllowlistCounts({
+      input: 572,
+      normalized: 560,
+      valid: 430,
+      duplicates: 12,
+      rejected: 130,
+    });
+    expect(lines).toHaveLength(5);
+    expect(lines[0]).toContain("572");
+    expect(lines[2]).toContain("430");
+    expect(lines.join("\n")).not.toContain("USDT");
+  });
+
+  it("groups rejections by reason so a large paste stays readable", () => {
+    const rejected = [
+      { reasonCode: "INVALID_SYNTAX" },
+      { reasonCode: "NOT_FUTURES_ELIGIBLE" },
+      { reasonCode: "NOT_FUTURES_ELIGIBLE" },
+      { reasonCode: "UNSUPPORTED_CONTRACT" },
+    ];
+    expect(groupRejections(rejected)).toEqual([
+      { reasonCode: "NOT_FUTURES_ELIGIBLE", count: 2 },
+      { reasonCode: "INVALID_SYNTAX", count: 1 },
+      { reasonCode: "UNSUPPORTED_CONTRACT", count: 1 },
+    ]);
+  });
+});
+
+describe("operator actions: the supervised duration selector", () => {
+  it("offers exactly the reviewed choices with 60 as the default", () => {
+    expect([...START_TRADING_DURATION_CHOICES]).toEqual([15, 30, 60]);
+    expect(START_WINDOW_MINUTES).toBe(60);
+    expect(START_TRADING_DURATION_CHOICES).toContain(START_WINDOW_MINUTES);
+  });
+
+  it("never offers more than the reviewed maximum", () => {
+    expect(Math.max(...START_TRADING_DURATION_CHOICES)).toBe(60);
+  });
+
+  it("keeps maxClaims server-controlled at 5", () => {
+    expect(START_MAX_CLAIMS).toBe(5);
   });
 });

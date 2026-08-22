@@ -17,8 +17,8 @@ export function TradingControlPage() {
       <header>
         <h1 className="text-lg font-semibold text-slate-100">Trading Control</h1>
         <p className="text-sm text-slate-400">
-          Operator-only view of live trading state. This page is read-only; trading actions are not
-          enabled yet.
+          Operator-only view of live trading state, the supervised activation controls, and the
+          durable symbol allowlist.
         </p>
       </header>
 

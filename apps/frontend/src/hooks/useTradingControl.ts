@@ -10,7 +10,9 @@ import {
   type TradingControlReadinessSnapshot,
   type TradingControlStatusDto,
 } from "../api/operator";
+import type { StartTradingDuration } from "../api/operator";
 import type { TradingControlActionId } from "../features/operator/tradingControlActions";
+import { START_WINDOW_MINUTES } from "../features/operator/tradingControlActions";
 import { clearOperatorToken, hasOperatorToken } from "../api/operator-token";
 import {
   authenticateOperator,
@@ -48,7 +50,11 @@ export interface TradingControlHandle {
   signOut: () => void;
   refresh: () => Promise<void>;
   checkReadiness: () => Promise<void>;
-  runAction: (id: TradingControlActionId, confirmation?: string) => Promise<void>;
+  runAction: (
+    id: TradingControlActionId,
+    confirmation?: string,
+    durationMinutes?: StartTradingDuration
+  ) => Promise<void>;
   dismissActionResult: () => void;
 }
 
@@ -175,7 +181,11 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
    * stays a question the operator asks.
    */
   const runAction = useCallback(
-    async (id: TradingControlActionId, confirmation?: string) => {
+    async (
+      id: TradingControlActionId,
+      confirmation?: string,
+      durationMinutes: StartTradingDuration = START_WINDOW_MINUTES
+    ) => {
       if (!hasOperatorToken()) return;
       if (pendingAction !== null) return;
       const mine = generation.current;
@@ -184,7 +194,7 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
       try {
         const result =
           id === "START"
-            ? await postStartTrading(confirmation ?? "")
+            ? await postStartTrading(confirmation ?? "", durationMinutes)
             : id === "STOP_NEW_TRADES"
               ? await postStopNewTrades()
               : await postSafeOff();

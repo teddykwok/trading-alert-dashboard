@@ -1,6 +1,8 @@
 import { BinanceReadOnlyClient } from "./binance.client";
 import { BinanceError } from "./binance.errors";
 import {
+  asRow,
+  asRows,
   findSymbolRow,
   isNonZeroPosition,
   maxInitialLeverage,
@@ -19,6 +21,7 @@ import {
   normalizeSymbolFilters,
 } from "./binance.normalize";
 import type {
+  BinanceSymbolFiltersDto,
   BinanceAccountSummaryDto,
   BinanceAlgoOrderDto,
   BinanceConnectionInfo,
@@ -119,6 +122,26 @@ export class BinanceReadOnlyService {
    * Symbol filters + account-specific leverage brackets. Phase 2 deliberately
    * does NOT pick or recommend a leverage — that is Phase 3's job.
    */
+  /**
+   * Every listed USDⓈ-M symbol's filters, from ONE unsigned `exchangeInfo` GET.
+   *
+   * `inspectSymbol` is the right shape for one symbol and the wrong shape for
+   * six hundred: it makes three calls each. Validating a pasted watchlist needs
+   * the same metadata for many symbols at once, so this reads the full listing
+   * a single time and lets the caller judge each symbol against the result.
+   * Read-only, unsigned, and it fetches no per-symbol leverage or account
+   * configuration because allowlist eligibility does not depend on either.
+   */
+  async listSymbolFilters(): Promise<Map<string, BinanceSymbolFiltersDto>> {
+    const exchangeInfo = await this.client.request<unknown>("exchangeInfo");
+    const index = new Map<string, BinanceSymbolFiltersDto>();
+    for (const row of asRows(asRow(exchangeInfo).symbols)) {
+      const filters = normalizeSymbolFilters(row);
+      if (filters.symbol) index.set(filters.symbol.toUpperCase(), filters);
+    }
+    return index;
+  }
+
   async inspectSymbol(symbol: string): Promise<BinanceSymbolInspectionDto> {
     const wanted = symbol.trim().toUpperCase();
 

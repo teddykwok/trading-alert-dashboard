@@ -44,7 +44,7 @@ import type {
 
 type Row = Record<string, unknown>;
 
-function asRow(value: unknown): Row {
+export function asRow(value: unknown): Row {
   return value !== null && typeof value === "object" ? (value as Row) : {};
 }
 

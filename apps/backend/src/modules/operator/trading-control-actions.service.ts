@@ -52,6 +52,38 @@ export const START_TRADING_DIRECTIONS: readonly string[] = NATURAL_DIRECTIONS;
 export const START_TRADING_TTL_MINUTES = 60;
 export const START_TRADING_MAX_CLAIMS = CANARY_NATURAL_MAX_CLAIMS;
 
+/**
+ * The supervised durations an operator may choose.
+ *
+ * A strict set rather than a range: these are the three lengths that were
+ * reviewed, so 45 is refused for the same reason 600 is. The maximum is still
+ * enforced independently by the authorization service, and nothing here can
+ * raise it — this list only narrows what the panel may ask for.
+ */
+export const START_TRADING_DURATION_CHOICES = [15, 30, 60] as const;
+export type StartTradingDuration = (typeof START_TRADING_DURATION_CHOICES)[number];
+
+/**
+ * Resolves a submitted duration, FAIL CLOSED.
+ *
+ * `undefined` means "not supplied" and takes the reviewed default. Anything
+ * else must be exactly one of the choices: a numeric string, a float, a
+ * negative, `null` or an object are all refusals rather than coercions.
+ */
+export function resolveStartTradingDuration(
+  value: unknown
+): { ok: true; minutes: number } | { ok: false; message: string } {
+  if (value === undefined) return { ok: true, minutes: START_TRADING_TTL_MINUTES };
+  const choices = START_TRADING_DURATION_CHOICES as readonly number[];
+  if (typeof value === "number" && Number.isInteger(value) && choices.includes(value)) {
+    return { ok: true, minutes: value };
+  }
+  return {
+    ok: false,
+    message: `durationMinutes must be one of ${choices.join(", ")}. Nothing was changed.`,
+  };
+}
+
 /** Typed exactly, so a near-miss is a refusal rather than a coercion. */
 export const START_TRADING_CONFIRMATION = "START TRADING";
 
@@ -145,13 +177,18 @@ export class TradingControlActionsService {
    * courtesy to the operator; it is not the boundary, because anything a
    * browser enforces can be skipped by not using a browser.
    */
-  async startTrading(confirmation: unknown): Promise<TradingControlActionResult> {
+  async startTrading(confirmation: unknown, durationMinutes?: unknown): Promise<TradingControlActionResult> {
     if (confirmation !== START_TRADING_CONFIRMATION) {
       return blocked(
         ["CONFIRMATION_REQUIRED"],
         `This action requires the exact confirmation phrase "${START_TRADING_CONFIRMATION}". Nothing was changed.`
       );
     }
+
+    // Validated before the profile is even resolved: a duration nobody
+    // reviewed must not reach preparation.
+    const duration = resolveStartTradingDuration(durationMinutes);
+    if (!duration.ok) return blocked(["DURATION_INVALID"], duration.message);
 
     const resolution = await resolveExecutionProfile(this.prisma, configuredProfileIdentity());
     if (!resolution.ok) return blocked([`${resolution.reasonCode}`], resolution.message);
@@ -206,7 +243,7 @@ export class TradingControlActionsService {
         executionProfileId: profile.id,
         allowedDirections: START_TRADING_DIRECTIONS,
         maxClaims: START_TRADING_MAX_CLAIMS,
-        ttlMinutes: START_TRADING_TTL_MINUTES,
+        ttlMinutes: duration.minutes,
         now: this.now(),
       });
     } catch (error) {

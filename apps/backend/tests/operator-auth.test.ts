@@ -246,7 +246,7 @@ describe("operator auth: structural guarantees", () => {
     expect(code).toContain("req.headers.authorization");
   });
 
-  it("guards every operator route, and exposes exactly the three reviewed mutations", () => {
+  it("guards every operator route, and exposes exactly the reviewed mutations", () => {
     const code = codeOf("src/routes/operator.routes.ts");
     const routes = code.match(/app\.(get|post|put|patch|delete)\(/g) ?? [];
     const guards = code.match(/preHandler: requireOperatorAuth/g) ?? [];
@@ -254,21 +254,23 @@ describe("operator auth: structural guarantees", () => {
     expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:${routes.length} guards:${routes.length}`);
     expect(routes.length).toBeGreaterThan(0);
 
-    // The mutation surface is enumerated, not merely counted: a fourth action
+    // The mutation surface is enumerated, not merely counted: a new action
     // cannot appear without this test naming it.
     const mutations = (code.match(/app\.post\(\s*"([^"]+)"/g) ?? []).map((entry) =>
       entry.replace(/[\s\S]*"/, "").replace(/"$/, "")
     );
     expect(code.match(/app\.(put|patch|delete)\(/g)).toBeNull();
-    expect((code.match(/app\.post\(/g) ?? []).length).toBe(3);
+    expect((code.match(/app\.post\(/g) ?? []).length).toBe(5);
     for (const expected of [
       "/api/operator/trading-control/start",
       "/api/operator/trading-control/stop-new-trades",
       "/api/operator/trading-control/safe-off",
+      "/api/operator/trading-control/allowlist/validate",
+      "/api/operator/trading-control/allowlist",
     ]) {
       expect(`${expected}:${code.includes(`"${expected}"`)}`).toBe(`${expected}:true`);
     }
-    expect(mutations.length).toBe(3);
+    expect(mutations.length).toBe(5);
 
     // And every mutation carries the strict budget, not the dashboard one.
     expect((code.match(/OPERATOR_ACTION_RATE_LIMIT/g) ?? []).length).toBeGreaterThanOrEqual(4);

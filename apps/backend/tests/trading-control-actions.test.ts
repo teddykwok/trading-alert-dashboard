@@ -458,18 +458,49 @@ describeDb("operator actions", () => {
     });
 
     it("never accepts symbols, limits or leverage from the caller", async () => {
-      // Policy is server-side authority. The action takes ONE argument.
-      expect(TradingControlActionsService.prototype.startTrading.length).toBe(1);
+      // Policy is server-side authority. The caller may supply the confirmation
+      // phrase and a supervised duration from the reviewed set — and nothing
+      // else. Neither is a symbol, a limit or a leverage.
+      expect(TradingControlActionsService.prototype.startTrading.length).toBe(2);
       const before = await prisma!.executionSafetyPolicy.findUniqueOrThrow({
         where: { executionProfileId: profileId },
       });
-      await service().startTrading(START_TRADING_CONFIRMATION);
+      await service().startTrading(START_TRADING_CONFIRMATION, 15);
       const after = await prisma!.executionSafetyPolicy.findUniqueOrThrow({
         where: { executionProfileId: profileId },
       });
       expect(after.allowedSymbols).toEqual(before.allowedSymbols);
       expect(after.maxTotalPlannedRiskUsd.toString()).toBe(before.maxTotalPlannedRiskUsd.toString());
       expect(after.maxTotalActiveTrades).toBe(before.maxTotalActiveTrades);
+      // A caller-chosen duration still cannot buy extra claims.
+      const window = await prisma!.executionCanaryAuthorization.findFirstOrThrow({
+        where: { executionProfileId: profileId },
+        orderBy: { createdAt: "desc" },
+      });
+      expect(window.maxClaims).toBe(5);
+    });
+
+    it("honours a chosen duration without letting it exceed the maximum", async () => {
+      const result = await service().startTrading(START_TRADING_CONFIRMATION, 15);
+      expect(result.ok).toBe(true);
+      const window = await prisma!.executionCanaryAuthorization.findFirstOrThrow({
+        where: { executionProfileId: profileId },
+        orderBy: { createdAt: "desc" },
+      });
+      const minutes = Math.round((window.expiresAt.getTime() - window.createdAt.getTime()) / 60000);
+      expect(minutes).toBe(15);
+      expect(window.maxClaims).toBe(5);
+    });
+
+    it("REFUSES a duration outside the reviewed choices and creates no window", async () => {
+      for (const bad of [45, 61, 1440, 0, -15, "60", null]) {
+        const result = await service().startTrading(START_TRADING_CONFIRMATION, bad);
+        expect(`${String(bad)}:${result.ok}`).toBe(`${String(bad)}:false`);
+        expect(`${String(bad)}:${result.blockers[0]}`).toBe(`${String(bad)}:DURATION_INVALID`);
+      }
+      expect(
+        await prisma!.executionCanaryAuthorization.count({ where: { executionProfileId: profileId } })
+      ).toBe(0);
     });
   });
 
@@ -756,11 +787,23 @@ describe("operator actions: structural guarantees", () => {
     expect((shared.match(/pg_advisory_xact_lock/g) ?? []).length).toBe(2);
   });
 
-  it("guards all three mutations with the strict operator budget", () => {
+  it("guards every mutation with the strict operator budget", () => {
     const routes = codeOf("src/routes/operator.routes.ts");
     const posts = (routes.match(/app\.post\(/g) ?? []).length;
     const budgets = (routes.match(/OPERATOR_ACTION_RATE_LIMIT\b/g) ?? []).length;
-    expect(posts).toBe(3);
+    // Five now: the three trading actions plus allowlist validate and save.
+    // Enumerated rather than counted loosely, so a NEW mutation cannot appear
+    // without this pin being updated deliberately.
+    expect(posts).toBe(5);
+    for (const path of [
+      "/api/operator/trading-control/start",
+      "/api/operator/trading-control/stop-new-trades",
+      "/api/operator/trading-control/safe-off",
+      "/api/operator/trading-control/allowlist/validate",
+      "/api/operator/trading-control/allowlist",
+    ]) {
+      expect(`${path}:${routes.includes(path)}`).toBe(`${path}:true`);
+    }
     // One declaration plus one spread per route: a POST that forgot the budget
     // would drop the count.
     expect(budgets).toBeGreaterThanOrEqual(posts + 1);

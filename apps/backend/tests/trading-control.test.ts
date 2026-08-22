@@ -736,11 +736,12 @@ describe("trading control: structural guarantees", () => {
     const code = codeOf("src/routes/operator.routes.ts");
     const routes = code.match(/app\.(get|post|put|patch|delete)\(/g) ?? [];
     const guards = code.match(/preHandler: requireOperatorAuth/g) ?? [];
-    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:6 guards:6`);
-    // Three GETs (probe, status, readiness) and three POSTs (the reviewed
-    // actions). Nothing else, and no PUT/PATCH/DELETE at all.
+    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:8 guards:8`);
+    // Three GETs (probe, status, readiness) and five POSTs (the three
+    // trading actions plus allowlist validate and save). The READ surface is
+    // unchanged; no PUT/PATCH/DELETE exists at all.
     expect((code.match(/app\.get\(/g) ?? []).length).toBe(3);
-    expect((code.match(/app\.post\(/g) ?? []).length).toBe(3);
+    expect((code.match(/app\.post\(/g) ?? []).length).toBe(5);
     expect(code.match(/app\.(put|patch|delete)\(/g)).toBeNull();
   });
 
