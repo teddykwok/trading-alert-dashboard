@@ -441,6 +441,25 @@ describe("symbol checks", () => {
     expect(result.decision).toBe("PASS");
   });
 
+  // The supervised commissioning allowlist is DB state, but the RULE that
+  // enforces it is this engine. Pinning the intended narrowing here proves the
+  // policy value will behave, without arming anything or touching the exchange.
+  it("admits only the commissioning symbol when the allowlist names FHEUSDT", () => {
+    const commissioning = ["FHEUSDT"];
+    const verdict = (symbol: string) =>
+      evaluate({
+        policy: policy({ allowedSymbols: commissioning }),
+        proposed: proposed({ symbol }),
+        symbolState: symbolState({ symbol }),
+      });
+
+    expect(verdict("FHEUSDT").decision).toBe("PASS");
+    expect(verdict("COWUSDT").reasonCode).toBe("SYMBOL_NOT_ALLOWED");
+    expect(verdict("BTCUSDT").reasonCode).toBe("SYMBOL_NOT_ALLOWED");
+    // An empty allowlist is ALLOW ALL, which a commissioning run must never be.
+    expect(commissioning.length).toBeGreaterThan(0);
+  });
+
   it("reports UNSUPPORTED_SYMBOL for an unlisted symbol", () => {
     const result = evaluate({ symbolState: symbolState({ exists: false }) });
     expect(reasonCodes(result)).toContain("UNSUPPORTED_SYMBOL");

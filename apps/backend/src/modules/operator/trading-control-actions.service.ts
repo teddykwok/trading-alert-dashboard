@@ -49,7 +49,7 @@ import { mapTradingSystemState, type TradingSystemState } from "./trading-contro
 
 // The reviewed first-live defaults. The browser cannot change any of them.
 export const START_TRADING_DIRECTIONS: readonly string[] = NATURAL_DIRECTIONS;
-export const START_TRADING_TTL_MINUTES = 15;
+export const START_TRADING_TTL_MINUTES = 60;
 export const START_TRADING_MAX_CLAIMS = CANARY_NATURAL_MAX_CLAIMS;
 
 /** Typed exactly, so a near-miss is a refusal rather than a coercion. */

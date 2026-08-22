@@ -157,7 +157,7 @@ export interface StartContext {
 }
 
 /** The reviewed first-live defaults, mirrored from the server for display. */
-export const START_WINDOW_MINUTES = 15;
+export const START_WINDOW_MINUTES = 60;
 export const START_MAX_CLAIMS = 5;
 
 /**

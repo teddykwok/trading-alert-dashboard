@@ -273,7 +273,7 @@ describe("operator actions: the Start dialog shows authoritative context", () =>
   });
 
   it("advertises the reviewed first-live window", () => {
-    expect(`${START_WINDOW_MINUTES}/${START_MAX_CLAIMS}`).toBe("15/5");
+    expect(`${START_WINDOW_MINUTES}/${START_MAX_CLAIMS}`).toBe("60/5");
   });
 
   it("never renders an unrestricted allowlist as nothing", () => {

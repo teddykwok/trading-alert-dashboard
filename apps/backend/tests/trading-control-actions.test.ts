@@ -40,6 +40,9 @@ const {
   START_TRADING_MAX_CLAIMS,
   START_TRADING_TTL_MINUTES,
 } = await import("../src/modules/operator/trading-control-actions.service");
+const { MAXIMUM_AUTHORIZATION_TTL_MINUTES } = await import(
+  "../src/modules/execution/natural-authorization"
+);
 const { operatorRoutes } = await import("../src/routes/operator.routes");
 const { AppError } = await import("../src/utils/errors");
 
@@ -418,7 +421,7 @@ describeDb("operator actions", () => {
   });
 
   describe("start trading: the reviewed first-live defaults", () => {
-    it("opens LONG+SHORT for 15 minutes with a 5-claim budget", async () => {
+    it("opens LONG+SHORT for 60 minutes with a 5-claim budget", async () => {
       const result = await service().startTrading(START_TRADING_CONFIRMATION);
       expect(result.ok).toBe(true);
 
@@ -430,11 +433,20 @@ describeDb("operator actions", () => {
       expect(row.maxClaims).toBe(5);
       expect(row.claimedCount).toBe(0);
       const ttlMinutes = Math.round((row.expiresAt.getTime() - row.createdAt.getTime()) / 60000);
-      expect(ttlMinutes).toBe(15);
+      expect(ttlMinutes).toBe(60);
       // And the exported constants are what the panel will advertise.
       expect(`${[...START_TRADING_DIRECTIONS].sort().join(",")}|${START_TRADING_TTL_MINUTES}|${START_TRADING_MAX_CLAIMS}`).toBe(
-        "LONG,SHORT|15|5"
+        "LONG,SHORT|60|5"
       );
+    });
+
+    it("keeps the supervised default inside the system TTL cap", () => {
+      // The cap is the safety limit; the default is a choice made under it.
+      // Raising the default past the cap must fail here, not at arming time.
+      expect(START_TRADING_TTL_MINUTES).toBeLessThanOrEqual(MAXIMUM_AUTHORIZATION_TTL_MINUTES);
+      expect(START_TRADING_TTL_MINUTES).toBeGreaterThan(0);
+      expect(MAXIMUM_AUTHORIZATION_TTL_MINUTES).toBe(60);
+      expect(START_TRADING_MAX_CLAIMS).toBe(5);
     });
 
     it("arms the profile and spends no claim", async () => {
