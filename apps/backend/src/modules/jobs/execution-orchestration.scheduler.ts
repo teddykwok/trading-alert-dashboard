@@ -35,12 +35,44 @@ import { ExecutionOrchestrator } from "../execution/execution-orchestrator";
 export const RECONCILIATION_INTERVAL_MS = 30_000;
 
 /**
+ * How long a single pass may remain in flight before the scheduler declares
+ * itself STALLED.
+ *
+ * Six intervals. A pass costs one Binance read per inspected execution plus a
+ * handful of queries, and startup recovery deliberately takes a larger batch,
+ * so a legitimately slow pass can run well past one interval. Three minutes is
+ * far outside that and far inside the time a human takes to notice.
+ */
+export const RECONCILIATION_STALL_MS = 180_000;
+
+/**
  * Reduces wasted work when a tick outlives its interval. It is NOT the
  * correctness mechanism — that is the advisory locks and optimistic version
  * checks inside the lifecycle services, which also protect against a second
  * worker process this flag knows nothing about.
+ *
+ * It is, however, load-bearing for LIVENESS, and that is what the incident on
+ * the first MAINNET commissioning exposed. The flag is cleared in a `finally`,
+ * so a pass that THROWS always releases it — but a pass that never settles
+ * never reaches the `finally` at all. The flag then stayed true forever, every
+ * later interval took the early return, and the only trace was a `debug` line
+ * nobody runs in production. The worker process stayed alive, the launcher
+ * still reported it ON, and an open position stopped being reconciled in
+ * silence.
+ *
+ * Which operation hung cannot be recovered from the incident now, but it does
+ * not need to be: nothing on this path was bounded. Binance reads carry an
+ * AbortController deadline, but the Prisma queries do not, and neither did the
+ * heartbeat that would otherwise have exposed the stall.
+ *
+ * The flag is therefore now accompanied by the time the pass started, which is
+ * all a watchdog needs to turn silent indefinite skipping into a loud, bounded,
+ * fail-closed state.
  */
 let tickInFlight = false;
+let tickStartedAtMs: number | null = null;
+let tickLabel: string | null = null;
+let lastStallReportAtMs: number | null = null;
 
 /** Built once and reused; holds no per-execution state between calls. */
 export function createExecutionOrchestrator(): ExecutionOrchestrator {
@@ -62,16 +94,132 @@ export function createExecutionOrchestrator(): ExecutionOrchestrator {
   });
 }
 
+export interface ReconciliationHealth {
+  /** False once the in-flight pass has outlived RECONCILIATION_STALL_MS. */
+  healthy: boolean;
+  inFlight: boolean;
+  /** How long the current pass has been running; 0 when none is. */
+  runningForMs: number;
+  label: string | null;
+}
+
+/**
+ * Whether reconciliation is still making progress.
+ *
+ * Computed from the in-flight timestamp on every call rather than from a flag
+ * some other timer has to set, so it is correct between intervals — the
+ * heartbeat asks five times more often than the scheduler runs.
+ */
+export function reconciliationHealth(nowMs: number = Date.now()): ReconciliationHealth {
+  const runningForMs = tickInFlight && tickStartedAtMs !== null ? Math.max(0, nowMs - tickStartedAtMs) : 0;
+  return {
+    healthy: runningForMs <= RECONCILIATION_STALL_MS,
+    inFlight: tickInFlight,
+    runningForMs,
+    label: tickLabel,
+  };
+}
+
+/**
+ * The predicate the WORKER runtime attestation publisher consults.
+ *
+ * A worker whose reconciliation has stopped must not go on advertising itself
+ * as a live runtime, because the whole purpose of that advertisement is to let
+ * an operator arm new trading over it.
+ */
+export function isReconciliationHealthy(): boolean {
+  return reconciliationHealth().healthy;
+}
+
+/**
+ * Reports an interval that found a pass already running.
+ *
+ * Below the stall bound this is ordinary and stays at `debug`. Above it the
+ * message becomes an ERROR that names the consequence, because reconciliation
+ * having stopped is not something an operator should have to enable debug
+ * logging to discover. Repeats are rate-limited to one per stall window so a
+ * wedged worker does not bury the rest of the log.
+ *
+ * The guidance deliberately does not say "restart the worker". The launcher
+ * offers no per-role restart, and in this exact state its two controls both
+ * refuse: Stop is gated on durable safety while an execution is active, and
+ * Start refuses while a launcher-owned process is alive. Naming a control that
+ * declines helps nobody mid-incident, and an operator who forced one anyway
+ * would be reaching for a second stack. So this states what is true — recovery
+ * is needed, and a second stack is not it — and leaves the how to the operator.
+ */
+function reportBusyInterval(label: string, nowMs: number): void {
+  const runningForMs = tickStartedAtMs === null ? 0 : Math.max(0, nowMs - tickStartedAtMs);
+  if (runningForMs <= RECONCILIATION_STALL_MS) {
+    logger.debug(
+      { skipped: label, running: tickLabel, runningForMs },
+      "Execution reconciliation tick still running — skipping this interval"
+    );
+    return;
+  }
+  if (lastStallReportAtMs !== null && nowMs - lastStallReportAtMs < RECONCILIATION_STALL_MS) return;
+  lastStallReportAtMs = nowMs;
+  logger.error(
+    { running: tickLabel, runningForMs, stallMs: RECONCILIATION_STALL_MS },
+    "Execution reconciliation is STALLED — the pass in flight has not settled, so no execution is " +
+      "being reconciled and open positions and their protection orders are NOT being maintained. " +
+      "This worker has withdrawn its runtime attestation, so new live activation is blocked. " +
+      "Controlled worker recovery is required; do NOT start another runtime stack while the " +
+      "launcher-owned runtime is still active."
+  );
+}
+
+/**
+ * Runs ONE pass under the single-flight guard.
+ *
+ * The guard is never released from the outside, and that is deliberate. A
+ * stalled pass may still be inside a lifecycle service, holding a Postgres
+ * advisory lock or waiting on a Binance mutation whose outcome is not yet
+ * known; starting a replacement pass over the same executions is precisely the
+ * race that could cancel protection twice or terminalize an execution whose
+ * exchange state is still moving. So a stall is escalated and made visible —
+ * it is never papered over by running another pass on top of it.
+ */
+async function runSingleFlight(label: string, run: () => Promise<void>): Promise<void> {
+  const startedAtMs = Date.now();
+
+  if (tickInFlight) {
+    reportBusyInterval(label, startedAtMs);
+    return;
+  }
+
+  tickInFlight = true;
+  tickStartedAtMs = startedAtMs;
+  tickLabel = label;
+  try {
+    await run();
+  } catch (error) {
+    logger.error(
+      { pass: label, error: error instanceof Error ? error.message.slice(0, 300) : "unknown" },
+      `Execution ${label} threw — the alert pipeline is unaffected`
+    );
+  } finally {
+    const ranForMs = Date.now() - startedAtMs;
+    tickInFlight = false;
+    tickStartedAtMs = null;
+    tickLabel = null;
+    lastStallReportAtMs = null;
+    // A stall that ends is still an incident: say so, at the same level the
+    // stall itself was reported, so the log shows both edges.
+    if (ranForMs > RECONCILIATION_STALL_MS) {
+      logger.error(
+        { pass: label, ranForMs },
+        "Execution reconciliation recovered after a stall — runtime attestation resumes on the next heartbeat"
+      );
+    }
+  }
+}
+
 /** One bounded pass. Exported so tests can drive it without a timer. */
 export async function runReconciliationTickOnce(
   orchestrator: ExecutionOrchestrator = createExecutionOrchestrator()
 ): Promise<void> {
-  if (tickInFlight) {
-    logger.debug("Execution reconciliation tick still running — skipping this interval");
-    return;
-  }
-  tickInFlight = true;
-  try {
+  await runSingleFlight("reconciliation tick", async () => {
     const result = await orchestrator.runExecutionReconciliationTick();
     if (result.inspected > 0) {
       logger.info(
@@ -79,14 +227,23 @@ export async function runReconciliationTickOnce(
         "Execution reconciliation tick completed"
       );
     }
-  } catch (error) {
-    logger.error(
-      { error: error instanceof Error ? error.message.slice(0, 300) : "unknown" },
-      "Execution reconciliation tick threw — the alert pipeline is unaffected"
-    );
-  } finally {
-    tickInFlight = false;
-  }
+  });
+}
+
+/**
+ * Startup recovery, under the SAME single-flight guard as the periodic tick.
+ *
+ * Recovery and a tick reconcile the same executions through the same services,
+ * so they were never safe to overlap; before, only the interval was guarded and
+ * a recovery still running at 30s was joined by a tick. Sharing the guard also
+ * means a recovery that never settles is caught by the same watchdog instead of
+ * being invisible, which matters most: recovery is what resolves an open
+ * position after a restart.
+ */
+export async function runStartupRecoveryOnce(orchestrator: ExecutionOrchestrator): Promise<void> {
+  await runSingleFlight("startup recovery", async () => {
+    await orchestrator.runStartupRecovery();
+  });
 }
 
 /**
@@ -99,14 +256,12 @@ export async function runReconciliationTickOnce(
 export function startExecutionOrchestrationScheduler(intervalMs = RECONCILIATION_INTERVAL_MS): NodeJS.Timeout {
   const orchestrator = createExecutionOrchestrator();
 
-  void orchestrator
-    .runStartupRecovery()
-    .catch((error) =>
-      logger.error(
-        { error: error instanceof Error ? error.message.slice(0, 300) : "unknown" },
-        "Execution startup recovery failed — periodic reconciliation will retry"
-      )
-    );
+  void runStartupRecoveryOnce(orchestrator).catch((error) =>
+    logger.error(
+      { error: error instanceof Error ? error.message.slice(0, 300) : "unknown" },
+      "Execution startup recovery failed — periodic reconciliation will retry"
+    )
+  );
 
   const timer = setInterval(() => {
     void runReconciliationTickOnce(orchestrator);
@@ -117,7 +272,10 @@ export function startExecutionOrchestrationScheduler(intervalMs = RECONCILIATION
   return timer;
 }
 
-/** Test-only: clears the overlap guard between cases. */
+/** Test-only: clears the overlap guard and its watchdog state between cases. */
 export function resetOrchestrationTickGuardForTests(): void {
   tickInFlight = false;
+  tickStartedAtMs = null;
+  tickLabel = null;
+  lastStallReportAtMs = null;
 }

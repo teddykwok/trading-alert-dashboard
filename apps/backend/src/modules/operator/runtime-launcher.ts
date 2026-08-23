@@ -755,15 +755,48 @@ export function evaluateDurableSafety(state: DurableTradingState, action: "LIVE_
 // Status presentation
 // ---------------------------------------------------------------------------
 
+/**
+ * What a role's own heartbeat says about it, as opposed to what the
+ * operating system says about its process.
+ *
+ *   HEALTHY   — exactly one fresh attestation for the role.
+ *   STALE     — the process is owned and alive, and nothing is attesting.
+ *               This is the incident state: ON without OK.
+ *   DUPLICATE — more than one fresh instance is claiming the role.
+ *   UNKNOWN   — attestation could not be read at all.
+ *   OFF       — no owned process, so there is nothing to be healthy.
+ */
+export type RoleHealth = "HEALTHY" | "STALE" | "DUPLICATE" | "UNKNOWN" | "OFF";
+
 export interface StatusView {
   diskMode: DiskMode;
   diskModeWarning: string | null;
   backend: "ON" | "OFF";
   worker: "ON" | "OFF";
   frontend: "ON" | "OFF";
+  /** Per-role heartbeat verdict. Frontend publishes none, so it has none. */
+  health: { backend: RoleHealth; worker: RoleHealth };
   ports: { backend: number; frontend: number; backendOpen: boolean; frontendOpen: boolean };
   operatorToken: "CONFIGURED" | "NOT CONFIGURED";
   attestation: string | null;
+}
+
+/**
+ * Turns process ownership plus one attestation reading into a health verdict.
+ *
+ * The two inputs are deliberately independent. Ownership answers 'is a process
+ * of mine still there?', which is all `verifyOwnership` can ever prove: a PID
+ * that exists, created when we created it, running from this repository. The
+ * attestation answers 'is that process still doing its job?'. During the first
+ * MAINNET commissioning those two answers diverged for the worker — process
+ * present, heartbeat gone, reconciliation stopped — and the tool showed only
+ * the first, which read as reassurance.
+ */
+export function judgeRoleHealth(running: boolean, view: AttestationRoleView | null): RoleHealth {
+  if (!running) return "OFF";
+  if (!view) return "UNKNOWN";
+  if (view.freshCount === 1) return "HEALTHY";
+  return view.freshCount > 1 ? "DUPLICATE" : "STALE";
 }
 
 export const BACKEND_PORT = 4000;
@@ -779,13 +812,20 @@ export function presentStatus(input: {
   frontendPortOpen: boolean;
   operatorToken: "CONFIGURED" | "NOT CONFIGURED";
   attestation?: string | null;
+  /** One attestation reading, or null when it could not be read. */
+  attestationRoles?: { backend: AttestationRoleView; worker: AttestationRoleView } | null;
 }): StatusView {
+  const roles = input.attestationRoles ?? null;
   return {
     diskMode: input.diskMode,
     diskModeWarning: input.diskMode === "INVALID" ? INVALID_MODE_WARNING : null,
     backend: input.running.backend ? "ON" : "OFF",
     worker: input.running.worker ? "ON" : "OFF",
     frontend: input.running.frontend ? "ON" : "OFF",
+    health: {
+      backend: judgeRoleHealth(input.running.backend, roles?.backend ?? null),
+      worker: judgeRoleHealth(input.running.worker, roles?.worker ?? null),
+    },
     ports: {
       backend: BACKEND_PORT,
       frontend: FRONTEND_PORT,
@@ -797,14 +837,72 @@ export function presentStatus(input: {
   };
 }
 
+/**
+ * What to tell an operator when a role is ON but is not attesting.
+ *
+ * The first version of this ended "Restart the runtime.", which is wrong under
+ * the launcher's own semantics. In precisely the state it fires — a role owned
+ * and alive, an execution still active — BOTH controls refuse:
+ *
+ *   Stop Runtime & Return SAFE    `evaluateDurableSafety(..., "SHUTDOWN")` refuses
+ *                                 while an execution is active, and stops nothing.
+ *   Start SAFE / Start LIVE-READY `evaluateStartPreconditions` refuses while a
+ *                                 launcher-owned process is alive or an expected
+ *                                 port is open.
+ *
+ * So the old line named a generic restart this tool does not offer, by way of two
+ * controls that both decline. Worse, an operator who read it as an instruction
+ * could try to force the one that is genuinely dangerous: a second Start would
+ * mean a second stack competing for the ports and publishing a duplicate
+ * attestation. The guard holds — but guidance should never lean on a guard to
+ * stop the operator doing what the guidance just told them to do.
+ *
+ * It now states the consequence, names what must not be forced, and leaves the
+ * recovery decision with the operator. This patch deliberately adds no restart
+ * mechanism and changes no guard.
+ *
+ * Role-aware on purpose: a stale BACKEND does not stop reconciliation, and the
+ * old single sentence claimed it did.
+ */
+export function describeStaleHealth(view: StatusView): string[] {
+  const stale = (["worker", "backend"] as const).filter((role) => view.health[role] === "STALE");
+  if (stale.length === 0) return [];
+
+  const names = stale.map((role) => role.toUpperCase()).join(" and ");
+  const subject = stale.length > 1 ? "processes are" : "process is";
+
+  return [
+    `  WARNING: the ${names} ${subject} running but not attesting.`,
+    ...(view.health.worker === "STALE"
+      ? [
+          "    Execution reconciliation may be impaired: open positions and their",
+          "    protection orders may not be maintained while this persists.",
+        ]
+      : []),
+    ...(view.health.backend === "STALE"
+      ? ["    Activation readiness cannot be confirmed while the backend is silent."]
+      : []),
+    "    Do NOT Start SAFE or Start LIVE-READY while this runtime is still owned:",
+    "    that would be a SECOND stack, and the launcher refuses it for that reason.",
+    "    Stop Runtime & Return SAFE is refused while an execution is active, by",
+    "    design, so neither control recovers this state on its own.",
+    "    If an execution is active, keep new trading blocked - do not arm - and",
+    "    carry out controlled worker recovery under supervision.",
+  ];
+}
+
 /** The rendered status block. Contains counts and states only, never a value. */
 export function renderStatus(view: StatusView): string[] {
+  const staleWarning = describeStaleHealth(view);
+  // Process and health are printed as SEPARATE columns on purpose. 'Worker ON'
+  // alone once meant nothing more than 'a PID we started is still there'.
   return [
     "Runtime:",
-    `  Backend     ${view.backend}`,
-    `  Worker      ${view.worker}`,
-    `  Frontend    ${view.frontend}`,
+    `  Backend     process ${view.backend}   health ${view.health.backend}`,
+    `  Worker      process ${view.worker}   health ${view.health.worker}`,
+    `  Frontend    process ${view.frontend}`,
     "",
+    ...(staleWarning.length > 0 ? [...staleWarning, ""] : []),
     `Expected ports: ${view.ports.backend} ${view.ports.backendOpen ? "open" : "closed"}, ` +
       `${view.ports.frontend} ${view.ports.frontendOpen ? "open" : "closed"}`,
     "",

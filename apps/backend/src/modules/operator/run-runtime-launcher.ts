@@ -29,6 +29,7 @@ import {
   type DiskMode,
   type LauncherRole,
   type OwnedProcess,
+  type AttestationRoleView,
   type AttestationStatusView,
   type DurableTradingState,
   type ProcessProbe,
@@ -155,6 +156,40 @@ async function readRuntimeModeAttestation(
   return null;
 }
 
+/**
+ * ONE attestation reading for the status screen.
+ *
+ * Single shot, unlike the post-start verification loop: the status menu is
+ * asking what is true now, not waiting for something to become true. The
+ * reader owns a short-lived client with a bounded connect timeout and always
+ * disconnects, so an unreachable Redis costs seconds and reports UNKNOWN
+ * rather than blocking the menu.
+ *
+ * `expected` only affects the overall verdict, which this caller ignores; the
+ * per-role fresh counts it reads are reported regardless of gate agreement.
+ */
+async function readAttestationRoles(
+  diskMode: DiskMode
+): Promise<{ backend: AttestationRoleView; worker: AttestationRoleView } | null> {
+  try {
+    const { configuredRuntimeIdentity, readRuntimeDeploymentAttestationStatusOnce } = await import(
+      "../runtime/runtime-attestation"
+    );
+    const status = await readRuntimeDeploymentAttestationStatusOnce({
+      identity: configuredRuntimeIdentity(),
+      expected: expectedGateSnapshotFor(diskMode === "LIVE_READY" ? "LIVE_READY" : "SAFE"),
+    });
+    // A Redis we could not read reports zero fresh instances for every role,
+    // which is indistinguishable from a silent runtime by count alone. Saying
+    // UNKNOWN points at the actual fault instead of blaming the processes.
+    if (status.reasonCode === "RUNTIME_ATTESTATION_UNAVAILABLE") return null;
+    return { backend: status.backend, worker: status.worker };
+  } catch {
+    // Message deliberately dropped: it can carry a Redis endpoint.
+    return null;
+  }
+}
+
 /** taskkill /T on ONE verified repo-owned root. Never a name-based sweep. */
 function terminateTree(pid: number): boolean {
   const result = spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { encoding: "utf8" });
@@ -192,9 +227,12 @@ async function currentStatus(): Promise<{ lines: string[]; diskMode: DiskMode; a
     LAUNCHER_ROLES.map((role) => [role, alive.some((entry) => entry.role === role)])
   ) as Record<LauncherRole, boolean>;
 
-  const [backendPortOpen, frontendPortOpen] = await Promise.all([
+  const [backendPortOpen, frontendPortOpen, attestationRoles] = await Promise.all([
     portOpen(BACKEND_PORT),
     portOpen(FRONTEND_PORT),
+    // Only worth asking when we believe something of ours is running; with
+    // nothing owned, OFF is already the whole answer.
+    alive.length > 0 ? readAttestationRoles(diskMode) : Promise.resolve(null),
   ]);
 
   const view = presentStatus({
@@ -203,6 +241,7 @@ async function currentStatus(): Promise<{ lines: string[]; diskMode: DiskMode; a
     backendPortOpen,
     frontendPortOpen,
     operatorToken: operatorTokenState(envText),
+    attestationRoles,
   });
 
   const lines = renderStatus(view);

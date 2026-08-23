@@ -19,13 +19,15 @@ import { ExtremeRRService } from "../extreme-rr/extreme-rr.service";
 import { bullConnection, type ExtremeRRJobData, type VisionAnalysisJobData } from "./queue";
 import { startCleanupScheduler } from "./cleanup.worker";
 import { setupRetentionSchedule } from "./retention.worker";
+import { createRuntimeAttestationPublisher } from "../runtime/runtime-attestation";
 import {
-  asAttestationRedis,
-  createRuntimeAttestationPublisher,
-} from "../runtime/runtime-attestation";
+  createAttestationRedisClient,
+  describeRedisFailure,
+} from "../runtime/attestation-redis";
 import { startExecutionNotificationScheduler } from "./execution-notification.scheduler";
 import {
   createExecutionOrchestrator,
+  isReconciliationHealthy,
   startExecutionOrchestrationScheduler,
 } from "./execution-orchestration.scheduler";
 import { BinanceMarginPlanService } from "../binance/binance-margin-plan.service";
@@ -230,16 +232,37 @@ logger.info("vision-analysis worker started, waiting for jobs...");
 // carrying the execution gates THIS process loaded. An activation command
 // refuses unless this agrees with the backend and with the command's own
 // snapshot, which is what makes a stale-.env worker impossible to arm over.
+// The heartbeat runs on its OWN bounded connection, never the BullMQ one:
+// BullMQ requires maxRetriesPerRequest=null, which is precisely the option
+// that lets a command wait forever instead of failing. See attestation-redis.
+const attestationRedis = createAttestationRedisClient({
+  onError: (detail) => logger.error({ detail }, "Runtime attestation Redis connection error"),
+});
+
 const runtimeAttestation = createRuntimeAttestationPublisher({
   role: "WORKER",
-  redis: asAttestationRedis(bullConnection),
-  onError: (error) => logger.error({ error }, "Runtime attestation heartbeat failed"),
+  redis: attestationRedis.redis,
+  // A worker whose reconciliation has stalled stops attesting, so the
+  // existing fail-closed interlock refuses to arm over it. This gates NEW
+  // activation only — protection and reconciliation of executions already
+  // admitted never consult attestation.
+  healthy: isReconciliationHealthy,
+  onWithdraw: () =>
+    logger.error(
+      {},
+      "Runtime attestation WITHDRAWN — this worker is no longer fit to be counted as a live " +
+        "runtime, so new live activation is blocked. Controlled worker recovery is required; " +
+        "do NOT start another runtime stack while the launcher-owned runtime is still active."
+    ),
+  onError: (error) =>
+    logger.error({ detail: describeRedisFailure(error) }, "Runtime attestation heartbeat failed"),
 });
 runtimeAttestation.start();
 
 process.on("SIGTERM", async () => {
   // Best effort; a crash relies on TTL expiry instead.
   await runtimeAttestation.stop();
+  await attestationRedis.close();
   clearInterval(cleanupTimer);
   clearInterval(notificationTimer);
   clearInterval(orchestrationTimer);

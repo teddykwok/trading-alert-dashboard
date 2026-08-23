@@ -40,6 +40,28 @@ export const RUNTIME_ATTESTATION_HEARTBEAT_MS = 5_000;
  */
 export const RUNTIME_ATTESTATION_TTL_MS = 15_000;
 
+/**
+ * How long ONE attestation write may take before it is abandoned.
+ *
+ * The publisher must be bounded even when the transport is not. A half-open
+ * socket accepts the write and never answers, and no ioredis retry option
+ * covers that case because no reconnect is ever triggered — so the heartbeat
+ * bounds itself.
+ *
+ * A timeout is safe HERE, and specifically is NOT safe for reconciliation,
+ * because of what an abandoned write can do if it lands late:
+ *
+ *   - it is idempotent. Every beat writes the same key with the same frozen
+ *     snapshot; only `lastSeenAt` moves.
+ *   - it cannot forge freshness. The reader judges `lastSeenAt` age against
+ *     the TTL independently of key existence, so a write that lands a minute
+ *     late arrives already stale and is counted stale.
+ *   - it mutates no trading state, holds no lock and cancels no order.
+ *
+ * Well inside the 5s beat, so a slow write is retried rather than overlapped.
+ */
+export const RUNTIME_ATTESTATION_PUBLISH_TIMEOUT_MS = 2_000;
+
 export const RUNTIME_ROLES = ["BACKEND", "WORKER"] as const;
 export type RuntimeRole = (typeof RUNTIME_ROLES)[number];
 
@@ -143,7 +165,25 @@ export interface RuntimeAttestationPublisherOptions {
   now?: () => Date;
   intervalMs?: number;
   ttlMs?: number;
+  publishTimeoutMs?: number;
   onError?: (error: unknown) => void;
+  /**
+   * Whether this process is still fit to be counted as a live runtime.
+   *
+   * Attestation answers "is a healthy runtime of this role present?", and a
+   * process whose own work has stopped is not one. When this returns false the
+   * publisher WITHDRAWS instead of publishing, and the existing fail-closed
+   * reader turns that into a refusal to arm.
+   *
+   * Withdrawing costs nothing that matters: attestation is an operator
+   * activation interlock, so it gates NEW activation only. Protection and
+   * reconciliation of already-admitted executions never consult it.
+   *
+   * Omitted by roles that have no such condition to report.
+   */
+  healthy?: () => boolean;
+  /** Called once each time the publisher transitions into withdrawal. */
+  onWithdraw?: () => void;
 }
 
 export interface RuntimeAttestationPublisher {
@@ -152,6 +192,38 @@ export interface RuntimeAttestationPublisher {
   publishOnce(): Promise<void>;
   start(): void;
   stop(): Promise<void>;
+}
+
+/** Raised when one attestation write exceeds its bound. */
+export class AttestationPublishTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`the attestation write did not complete within ${timeoutMs}ms`);
+    this.name = "AttestationPublishTimeoutError";
+  }
+}
+
+/**
+ * Bounds ONE Redis command.
+ *
+ * The abandoned command may still complete later, and that is accounted for:
+ * see the reasoning on RUNTIME_ATTESTATION_PUBLISH_TIMEOUT_MS. `Promise.race`
+ * attaches a handler to the original promise, so a late rejection is observed
+ * rather than surfacing as an unhandled rejection and killing the process.
+ */
+async function withPublishTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new AttestationPublishTimeoutError(timeoutMs)), timeoutMs);
+        // Never hold the process open for a heartbeat.
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
@@ -176,10 +248,22 @@ export function createRuntimeAttestationPublisher(
   const key = runtimeAttestationKey(identity, options.role, instanceId);
   const intervalMs = options.intervalMs ?? RUNTIME_ATTESTATION_HEARTBEAT_MS;
   const ttlMs = options.ttlMs ?? RUNTIME_ATTESTATION_TTL_MS;
+  const publishTimeoutMs = options.publishTimeoutMs ?? RUNTIME_ATTESTATION_PUBLISH_TIMEOUT_MS;
 
   let timer: NodeJS.Timeout | null = null;
+  let withdrawn = false;
 
   async function publishOnce(): Promise<void> {
+    if (options.healthy && !options.healthy()) {
+      // Stop asserting that a healthy runtime of this role is present. The key
+      // would expire on its own within the TTL; deleting it closes the window
+      // in which an operator could arm over a runtime we already know is unfit.
+      if (!withdrawn) options.onWithdraw?.();
+      withdrawn = true;
+      await withPublishTimeout(Promise.resolve(options.redis.del(key)), publishTimeoutMs);
+      return;
+    }
+    withdrawn = false;
     const payload: RuntimeAttestation = {
       schemaVersion: RUNTIME_ATTESTATION_SCHEMA_VERSION,
       role: options.role,
@@ -190,7 +274,10 @@ export function createRuntimeAttestationPublisher(
       environment: identity.environment,
       gates,
     };
-    await options.redis.set(key, JSON.stringify(payload), "PX", ttlMs);
+    await withPublishTimeout(
+      Promise.resolve(options.redis.set(key, JSON.stringify(payload), "PX", ttlMs)),
+      publishTimeoutMs
+    );
   }
 
   return {
@@ -211,9 +298,10 @@ export function createRuntimeAttestationPublisher(
         clearInterval(timer);
         timer = null;
       }
-      // Best effort only. Crash safety is the TTL's job, never this.
+      // Best effort only. Crash safety is the TTL's job, never this — and a
+      // shutdown must not be able to hang on an unresponsive Redis.
       try {
-        await options.redis.del(key);
+        await withPublishTimeout(Promise.resolve(options.redis.del(key)), publishTimeoutMs);
       } catch (error) {
         options.onError?.(error);
       }
