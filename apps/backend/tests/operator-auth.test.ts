@@ -260,17 +260,18 @@ describe("operator auth: structural guarantees", () => {
       entry.replace(/[\s\S]*"/, "").replace(/"$/, "")
     );
     expect(code.match(/app\.(put|patch|delete)\(/g)).toBeNull();
-    expect((code.match(/app\.post\(/g) ?? []).length).toBe(5);
+    expect((code.match(/app\.post\(/g) ?? []).length).toBe(6);
     for (const expected of [
       "/api/operator/trading-control/start",
       "/api/operator/trading-control/stop-new-trades",
       "/api/operator/trading-control/safe-off",
       "/api/operator/trading-control/allowlist/validate",
       "/api/operator/trading-control/allowlist",
+      "/api/operator/trading-control/source-timeframes",
     ]) {
       expect(`${expected}:${code.includes(`"${expected}"`)}`).toBe(`${expected}:true`);
     }
-    expect(mutations.length).toBe(5);
+    expect(mutations.length).toBe(6);
 
     // And every mutation carries the strict budget, not the dashboard one.
     expect((code.match(/OPERATOR_ACTION_RATE_LIMIT/g) ?? []).length).toBeGreaterThanOrEqual(4);

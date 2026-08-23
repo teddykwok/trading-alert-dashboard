@@ -55,6 +55,7 @@ async function newAlert(signal: "LONG" | "SHORT" = "LONG"): Promise<string> {
   const alert = await prisma!.alert.create({
     data: {
       symbol: "BTCUSDT", assetType: "CRYPTO", exchange: "SYNTHETIC", timeframe: "15m", price: 100,
+      sourceTimeframe: "1W",
       signal, indicatorName: `${TAG}-${seq}`, rawPayload: { note: TAG }, triggeredAt: new Date(),
     },
   });
@@ -1042,6 +1043,11 @@ describe("natural authorization: runtime boundary", () => {
     // underneath it, which is a reason to decline -- never a reason to admit.
     // Pinned structurally below.
     "src/modules/operator/allowlist.service.ts",
+    // Same justification as the allowlist beside it: changing which SIGNALS
+    // may execute underneath a window that is still AVAILABLE would let that
+    // window admit something nobody reviewed when preparing it. It reads a
+    // window to refuse itself, and does nothing else with one.
+    "src/modules/operator/source-timeframes.service.ts",
   ];
 
   /**
@@ -1107,6 +1113,7 @@ describe("natural authorization: runtime boundary", () => {
     // write verb or a claim appearing here would mean the allowlist editor had
     // grown into an authorization path.
     const code = codeOf("src/modules/operator/allowlist.service.ts");
+    const policy = codeOf("src/modules/operator/source-timeframes.service.ts");
     for (const forbidden of [
       "claimNaturalWindow",
       "armNaturalWindow",
@@ -1117,6 +1124,7 @@ describe("natural authorization: runtime boundary", () => {
       "executionCanaryAuthorization.delete",
     ]) {
       expect(`${forbidden}:${code.includes(forbidden)}`).toBe(`${forbidden}:false`);
+      expect(`policy ${forbidden}:${policy.includes(forbidden)}`).toBe(`policy ${forbidden}:false`);
     }
     // The one read it is admitted for, and the one column it writes.
     expect(code).toContain("isNaturalWindowAvailable");

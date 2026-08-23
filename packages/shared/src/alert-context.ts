@@ -116,6 +116,23 @@ export function hasLevelMetadata(context: ParsedAlertNote | null | undefined): b
   );
 }
 
+/**
+ * The ONE place a free-form string becomes a canonical source timeframe.
+ *
+ * Deliberately the same rule the note parser already applies — uppercase, then
+ * exact membership of SOURCE_TIMEFRAMES — so an operator policy and an inbound
+ * alert can never disagree about what "1w" means. Anything else is null:
+ * nothing is guessed, and a bare "W" or "D" is NOT silently promoted to "1W"
+ * or "1D", because a timeframe nobody recognised must not become one that
+ * admits a trade.
+ */
+export function normalizeSourceTimeframe(value: unknown): SourceTimeframe | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed === "") return null;
+  return matchAllowed(SOURCE_TIMEFRAMES, trimmed);
+}
+
 /** 3M/6M/12M levels get a neutral "higher timeframe" emphasis in the UI. */
 export const HIGHER_SOURCE_TIMEFRAMES: readonly SourceTimeframe[] = ["3M", "6M", "12M"];
 

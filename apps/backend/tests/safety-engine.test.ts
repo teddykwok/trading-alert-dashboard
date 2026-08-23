@@ -42,6 +42,9 @@ function proposed(overrides: Partial<ProposedExecution> = {}): ProposedExecution
     symbol: SYMBOL,
     positionSide: "LONG",
     signalTriggeredAt: SIGNAL_AT,
+    // The CHART timeframe an alert fires on is irrelevant here; this is the
+    // timeframe the LEVEL originated on, which is what eligibility judges.
+    sourceTimeframe: "1W",
     currentStatus: "PLAN_READY",
     riskBudgetUsd: "1.00",
     actualPlannedLoss: "0.98",
@@ -77,6 +80,10 @@ function policy(overrides: Partial<EffectiveSafetyPolicy> = {}): EffectiveSafety
     maxAlertAgeSeconds: 300,
     signalFutureToleranceSeconds: 5,
     allowedSymbols: [],
+    // Every supported timeframe, matching the migration default that
+    // preserves pre-feature behaviour. Note this is NOT the same emptiness
+    // convention as allowedSymbols above: [] here admits nothing.
+    allowedSourceTimeframes: ["1D", "1W", "1M", "3M", "6M", "12M"],
     ...overrides,
   };
 }
@@ -880,15 +887,24 @@ const NATURAL_AUTHORIZATION_CODES = [
 ] as const satisfies readonly SafetyReasonCode[];
 
 describe("reason code catalogue", () => {
-  it("exposes exactly the 37 stable reason codes", () => {
+  it("exposes exactly the 39 stable reason codes", () => {
     // 30 through Phase 11, plus the 7 natural-authorization codes added in
-    // Phase 12.3. The count is pinned so a code cannot be added without a
-    // deliberate edit here.
-    expect(SAFETY_REASON_CODES).toHaveLength(37);
-    expect(new Set(SAFETY_REASON_CODES).size).toBe(37);
+    // Phase 12.3, plus the 2 source-timeframe eligibility codes. The count is
+    // pinned so a code cannot be added without a deliberate edit here.
+    expect(SAFETY_REASON_CODES).toHaveLength(39);
+    expect(new Set(SAFETY_REASON_CODES).size).toBe(39);
     // The soft target is its OWN code, never folded into the hard one.
     expect(SAFETY_REASON_CODES).toContain("SOFT_OPEN_TARGET_REACHED");
     expect(SAFETY_REASON_CODES).toContain("OPEN_POSITION_LIMIT_REACHED");
+    // Likewise: a signal nobody could classify is not a signal the policy
+    // excluded, and an operator must be able to tell those apart.
+    expect(SAFETY_REASON_CODES).toContain("SOURCE_TIMEFRAME_NOT_ALLOWED");
+    expect(SAFETY_REASON_CODES).toContain("SOURCE_TIMEFRAME_UNAVAILABLE");
+    // Both TERMINAL: an ineligible signal is SKIPPED once and never revived,
+    // so widening the policy later cannot resurrect it.
+    for (const code of ["SOURCE_TIMEFRAME_NOT_ALLOWED", "SOURCE_TIMEFRAME_UNAVAILABLE"] as const) {
+      expect(classifySafetyReasonRetryability(code)).toBe("TERMINAL");
+    }
   });
 
   it("keeps authorization codes distinct from capacity codes", () => {
@@ -942,6 +958,11 @@ describe("reason code catalogue", () => {
     collect(evaluate({ proposed: proposed({ signalTriggeredAt: new Date(EVALUATED_AT.getTime() - 400_000) }) }));
     collect(evaluate({ local: local({ alreadyAdmitted: true }) }));
     collect(evaluate({ policy: policy({ allowedSymbols: ["OTHERUSDT"] }) }));
+    // Source-timeframe eligibility: the policy excludes it, and the signal
+    // never carried a recognisable one at all. Distinct codes, both emitted
+    // by the pure engine.
+    collect(evaluate({ policy: policy({ allowedSourceTimeframes: ["1M"] }) }));
+    collect(evaluate({ proposed: proposed({ sourceTimeframe: null }) }));
     collect(evaluate({ symbolState: symbolState({ exists: false }) }));
     collect(evaluate({ symbolState: symbolState({ status: "BREAK" }) }));
     collect(evaluate({ symbolState: symbolState({ contractType: "CURRENT_QUARTER" }) }));

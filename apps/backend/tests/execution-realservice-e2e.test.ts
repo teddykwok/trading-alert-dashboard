@@ -405,6 +405,7 @@ async function createExecution(
   const alert = await prisma!.alert.create({
     data: {
       symbol: SYMBOL, assetType: "CRYPTO", exchange: "SYNTHETIC", timeframe: "15m", price: 100,
+      sourceTimeframe: "1W",
       signal: direction, indicatorName: `${TAG}-${sequence}`, rawPayload: { note: TAG },
       triggeredAt: new Date(Date.now() - 30_000),
     },

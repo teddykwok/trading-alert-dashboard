@@ -46,6 +46,19 @@ export interface TradingControlStatusDto {
     workerCount: number;
   };
   allowedSymbols: string[];
+  /**
+   * The SOURCE timeframes admission will accept — the timeframe the LEVEL
+   * originated on, never the chart timeframe the alert fired on.
+   *
+   * `valid` is false when the stored policy admits nothing or carries an
+   * unrecognised value. The panel reports that rather than widening it.
+   */
+  sourceTimeframes: {
+    enforceable: string[];
+    unrecognized: string[];
+    valid: boolean;
+    supported: string[];
+  };
   authorization: {
     state: string;
     expiresAt: string;
@@ -187,6 +200,42 @@ export function postValidateAllowlist(symbols: string): Promise<AllowlistValidat
  */
 export function postSaveAllowlist(symbols: string): Promise<AllowlistSaveDto> {
   return operatorApiClient.post("/api/operator/trading-control/allowlist", { symbols });
+}
+
+export interface SourceTimeframePolicyDto {
+  stored: string[];
+  enforceable: string[];
+  unrecognized: string[];
+  valid: boolean;
+  supported: string[];
+}
+
+export interface SourceTimeframeSaveDto {
+  ok: boolean;
+  outcome: "SAVED" | "BLOCKED";
+  blockers: string[];
+  message: string;
+  allowedSourceTimeframes: string[] | null;
+  counts: { input: number; valid: number; duplicates: number; rejected: number } | null;
+  rejected: { input: string; reasonCode: string; detail: string }[];
+}
+
+/** The policy in force. A read, so it stays available in any system state. */
+export function getSourceTimeframes(): Promise<SourceTimeframePolicyDto> {
+  return operatorApiClient.get("/api/operator/trading-control/source-timeframes");
+}
+
+/**
+ * The mutation. The server re-validates the selection from scratch and
+ * re-checks the durable safe state inside its transaction, so nothing here
+ * asserts that a previous read is still true.
+ */
+export function postSourceTimeframes(
+  sourceTimeframes: readonly string[]
+): Promise<SourceTimeframeSaveDto> {
+  return operatorApiClient.post("/api/operator/trading-control/source-timeframes", {
+    sourceTimeframes: [...sourceTimeframes],
+  });
 }
 
 export function postStopNewTrades(): Promise<TradingControlActionResult> {

@@ -71,6 +71,13 @@ function statusFixture(overrides: Partial<TradingControlStatusDto> = {}): Tradin
     environmentGates: { globalKillSwitch: true, liveEntryEnabled: false, protectionReady: false },
     runtimeAttestation: { status: "PASS", reasonCode: null, message: null, backendCount: 1, workerCount: 1 },
     allowedSymbols: ["COWUSDT"],
+    // Chart timeframe is never involved: this is the LEVEL timeframe policy.
+    sourceTimeframes: {
+      enforceable: ["1W", "1M"],
+      unrecognized: [],
+      valid: true,
+      supported: ["1D", "1W", "1M", "3M", "6M", "12M"],
+    },
     authorization: {
       state: "AVAILABLE",
       expiresAt: "2026-08-21T12:10:00.000Z",

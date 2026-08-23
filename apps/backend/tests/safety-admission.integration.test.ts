@@ -183,6 +183,7 @@ async function createSyntheticAlert(suffix: string, triggeredAt = new Date()): P
       assetType: "CRYPTO",
       exchange: "SYNTHETIC",
       timeframe: "15m",
+      sourceTimeframe: "1W",
       price: 100,
       signal: "LONG",
       indicatorName: `${SYNTHETIC_TAG}-${suffix}`,

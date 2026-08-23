@@ -152,6 +152,10 @@ export interface StartContext {
   allowedSymbolCount: number;
   /** Full list when short, count plus a preview when long. */
   allowedSymbolsPreview: string;
+  /** The SOURCE timeframes the server will admit, as persisted. */
+  sourceTimeframes: string;
+  /** False when the persisted policy could not admit any signal. */
+  sourceTimeframesValid: boolean;
   riskLimit: string;
   marginLimit: string;
   desiredOpen: number;
@@ -198,6 +202,11 @@ export function describeStartContext(status: TradingControlStatusDto): StartCont
       status.allowedSymbols.length === 0 ? "ALL (unrestricted)" : status.allowedSymbols.join(", "),
     allowedSymbolCount: status.allowedSymbols.length,
     allowedSymbolsPreview: describeAllowlist(status.allowedSymbols),
+    // Straight from the server's status, exactly like every other figure
+    // here. An unsaved checkbox in the editor must never reach this dialog:
+    // the operator is confirming what the BACKEND will enforce.
+    sourceTimeframes: describeSourceTimeframes(status.sourceTimeframes),
+    sourceTimeframesValid: status.sourceTimeframes.valid,
     riskLimit: `${status.reservations.riskUsd} / ${status.reservations.riskLimitUsd} USD`,
     marginLimit: `${status.reservations.marginUsd} / ${status.reservations.marginLimitUsd} USD`,
     desiredOpen: status.capacity.desiredOpen,
@@ -236,6 +245,78 @@ export function presentActionResult(result: {
 }
 
 // ---------------------------------------------------------------------------
+// Source timeframes
+// ---------------------------------------------------------------------------
+
+/**
+ * How the in-force source-timeframe policy reads.
+ *
+ * A policy that admits nothing is rendered as an explicit warning rather than
+ * as an empty string, and NEVER as "all". Empty here means no signal can
+ * execute, which is the opposite of what empty means for the symbol
+ * allowlist — so it is spelled out instead of left to be inferred.
+ */
+export function describeSourceTimeframes(policy: {
+  enforceable: string[];
+  unrecognized: string[];
+  valid: boolean;
+}): string {
+  if (policy.enforceable.length === 0) {
+    return "NONE — no signal can execute";
+  }
+  const base = policy.enforceable.join(", ");
+  return policy.unrecognized.length > 0
+    ? `${base} (ignoring ${policy.unrecognized.length} unrecognised stored value(s))`
+    : base;
+}
+
+/**
+ * Whether the editor may offer to SAVE this selection.
+ *
+ * Two independent conditions, and the empty one is the load-bearing half:
+ * an empty selection is not a smaller policy, it is a policy that admits
+ * nothing. The backend refuses it too — this only stops the button from
+ * offering something the server would reject.
+ */
+export function canSaveSourceTimeframes(input: {
+  selection: readonly string[];
+  inForce: readonly string[];
+  editable: boolean;
+}): { allowed: boolean; reason: string | null } {
+  if (input.selection.length === 0) {
+    return {
+      allowed: false,
+      reason: "Select at least one source timeframe. An empty selection would admit no signal at all.",
+    };
+  }
+  if (!input.editable) return { allowed: false, reason: null };
+  if (sameSelection(input.selection, input.inForce)) {
+    return { allowed: false, reason: "This is already the policy in force." };
+  }
+  return { allowed: true, reason: null };
+}
+
+/** Order-insensitive comparison, so a reordered selection is not a change. */
+export function sameSelection(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const left = [...a].sort();
+  const right = [...b].sort();
+  return left.every((value, index) => value === right[index]);
+}
+
+/** Adds or removes one timeframe, preserving the supported order. */
+export function toggleSourceTimeframe(
+  selection: readonly string[],
+  timeframe: string,
+  supported: readonly string[]
+): string[] {
+  const next = new Set(selection);
+  if (next.has(timeframe)) next.delete(timeframe);
+  else next.add(timeframe);
+  return supported.filter((value) => next.has(value));
+}
+
+// ---------------------------------------------------------------------------
 // The allowlist editor
 // ---------------------------------------------------------------------------
 
@@ -247,13 +328,14 @@ export function presentActionResult(result: {
  * browser that ignores this still cannot write while armed.
  */
 export function canEditAllowlist(
-  status: Pick<TradingControlStatusDto, "systemState" | "capacity" | "manualIntervention"> | null
+  status: Pick<TradingControlStatusDto, "systemState" | "capacity" | "manualIntervention"> | null,
+  what = "The allowlist"
 ): { allowed: boolean; reason: string | null } {
   if (!status) return { allowed: false, reason: "Trading Control status has not loaded yet." };
   if (status.systemState !== "SAFE_OFF") {
     return {
       allowed: false,
-      reason: `The allowlist can only be changed while SAFE OFF (system is ${status.systemState}).`,
+      reason: `${what} can only be changed while SAFE OFF (system is ${status.systemState}).`,
     };
   }
   if (status.capacity.totalActive > 0) {
@@ -266,6 +348,19 @@ export function canEditAllowlist(
     return { allowed: false, reason: "Manual intervention is outstanding." };
   }
   return { allowed: true, reason: null };
+}
+
+/**
+ * The SAME durable rule, for the source-timeframe editor.
+ *
+ * Deliberately delegates rather than restating the conditions: both editors
+ * change which signals may become money, the backend guards them with one
+ * shared invariant, and two copies of that list would eventually disagree.
+ */
+export function canEditSourceTimeframes(
+  status: Pick<TradingControlStatusDto, "systemState" | "capacity" | "manualIntervention"> | null
+): { allowed: boolean; reason: string | null } {
+  return canEditAllowlist(status, "Source timeframes");
 }
 
 /** The counts line, in the order the operator reads them. */

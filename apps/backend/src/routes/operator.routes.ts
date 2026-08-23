@@ -10,6 +10,7 @@ import {
 } from "../modules/operator/trading-control-actions.service";
 import { TradingControlService } from "../modules/operator/trading-control.service";
 import { AllowlistService } from "../modules/operator/allowlist.service";
+import { SourceTimeframeService } from "../modules/operator/source-timeframes.service";
 import type {
   AllowlistSaveResult,
   AllowlistValidationResult,
@@ -189,6 +190,30 @@ export async function operatorRoutes(
     async (request, reply) => {
       const body = request.body as { symbols?: unknown } | null | undefined;
       const result = await buildAllowlist(request.server.prisma).save(body?.symbols);
+      if (!result.ok) reply.code(409);
+      return result;
+    }
+  );
+
+  // --- Source-timeframe eligibility ---------------------------------------
+  // Which SOURCE timeframe (the timeframe the level originated on) may create
+  // a live execution. Reading stays available while armed so an operator can
+  // always SEE what governs a live system; saving is refused unless the system
+  // is SAFE_OFF and quiet, which the browser cannot check on its behalf.
+  app.get(
+    "/api/operator/trading-control/source-timeframes",
+    { preHandler: requireOperatorAuth },
+    async (request) => new SourceTimeframeService(request.server.prisma).read()
+  );
+
+  app.post(
+    "/api/operator/trading-control/source-timeframes",
+    { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
+    async (request, reply) => {
+      const body = request.body as { sourceTimeframes?: unknown } | null | undefined;
+      const result = await new SourceTimeframeService(request.server.prisma).save(
+        body?.sourceTimeframes
+      );
       if (!result.ok) reply.code(409);
       return result;
     }

@@ -64,6 +64,7 @@ function policy(overrides: Partial<EffectiveSafetyPolicy> = {}): EffectiveSafety
     ...BASE_LIMITS,
     signalFutureToleranceSeconds: 5,
     allowedSymbols: [],
+    allowedSourceTimeframes: ["1D", "1W", "1M", "3M", "6M", "12M"],
     ...overrides,
   };
 }
@@ -75,6 +76,7 @@ function proposed(overrides: Partial<ProposedExecution> = {}): ProposedExecution
     symbol: "BTCUSDT",
     positionSide: "LONG",
     signalTriggeredAt: SIGNAL_AT,
+    sourceTimeframe: "1W",
     currentStatus: "PLAN_READY",
     riskBudgetUsd: "1.50",
     actualPlannedLoss: "1.50",

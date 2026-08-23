@@ -1,6 +1,9 @@
 import { Prisma, PrismaClient } from "@prisma/client";
 
+import { SOURCE_TIMEFRAMES } from "@trading-alert-dashboard/shared";
+
 import { env } from "../../config/env";
+import { describeStoredSelection } from "./source-timeframe-policy";
 import {
   CanaryPreflightService,
   type CanaryPreflightOptions,
@@ -176,6 +179,20 @@ export interface TradingControlStatusDto {
   environmentGates: TradingControlGatesDto;
   runtimeAttestation: TradingControlAttestationDto;
   allowedSymbols: string[];
+  /**
+   * The SOURCE timeframes that may create a live execution, as enforced.
+   *
+   * `enforceable` is what admission will actually accept; `valid` is false
+   * when the stored policy admits nothing or carries an unrecognised value.
+   * Reported rather than repaired — a configuration that cannot admit is a
+   * thing the operator must see, never something to widen into all.
+   */
+  sourceTimeframes: {
+    enforceable: string[];
+    unrecognized: string[];
+    valid: boolean;
+    supported: string[];
+  };
   authorization: TradingControlAuthorizationDto | null;
   capacity: TradingControlCapacityDto;
   reservations: TradingControlReservationsDto;
@@ -328,6 +345,13 @@ export class TradingControlService {
       hardTotal: limits.maxTotalActiveTrades,
     };
 
+    // Reported exactly as stored resolves, never repaired: a policy that
+    // admits nothing is a state the operator must SEE, and widening it to
+    // "all" here would be the one lie this control exists to prevent.
+    const storedSourceTimeframes = describeStoredSelection(
+      profileRow?.safetyPolicy?.allowedSourceTimeframes
+    );
+
     return {
       generatedAt: now.toISOString(),
       systemState,
@@ -341,6 +365,7 @@ export class TradingControlService {
       },
       runtimeAttestation: attestation,
       allowedSymbols: profileRow?.safetyPolicy?.allowedSymbols ?? [],
+      sourceTimeframes: { ...storedSourceTimeframes, supported: [...SOURCE_TIMEFRAMES] },
       authorization,
       capacity,
       reservations: {

@@ -217,6 +217,7 @@ async function newExecution(
       assetType: "CRYPTO",
       exchange: "SYNTHETIC",
       timeframe: "15m",
+      sourceTimeframe: "1W",
       price: 100,
       signal: direction,
       indicatorName: `${TAG}-${sequence}`,

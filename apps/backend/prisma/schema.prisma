@@ -486,6 +486,20 @@ model ExecutionSafetyPolicy {
   // Empty array = no additional user restriction; non-empty = allowlist only.
   allowedSymbols String[] @default([])
 
+  // Which SOURCE timeframes (the timeframe the level originated on, never the
+  // chart timeframe the retest fired on) may create a live execution.
+  //
+  // Read the emptiness rule the OPPOSITE way to allowedSymbols above. There,
+  // empty means no extra restriction; here empty admits NOTHING, because the
+  // engine asks whether the list CONTAINS the signal's timeframe and an empty
+  // list contains nothing. That asymmetry is deliberate: an allowlist that
+  // silently means all is a footgun this repository already owns once, and it
+  // is not being reproduced for execution eligibility.
+  //
+  // The default names all six supported timeframes so existing behaviour —
+  // every source timeframe was eligible — is preserved exactly.
+  allowedSourceTimeframes String[] @default(["1D", "1W", "1M", "3M", "6M", "12M"])
+
   version   Int      @default(1)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -565,6 +579,14 @@ model TradeExecution {
   // no trustworthy value; those fail closed with SIGNAL_TIME_UNAVAILABLE
   // rather than being backfilled with a fabricated timestamp.
   signalTriggeredAt DateTime?
+  // Frozen copy of Alert.sourceTimeframe — the timeframe the LEVEL originated
+  // on. Kept on the execution for the same reason signalTriggeredAt is:
+  // retention may null alertId, and an admission input that can disappear is
+  // not an admission input. Nullable because rows created before this column
+  // existed have no trustworthy value, and because an alert whose note carried
+  // no recognised sourceTf legitimately has none; both fail closed at admission
+  // with SOURCE_TIMEFRAME_UNAVAILABLE rather than being backfilled with a guess.
+  sourceTimeframe   String?
   status           TradeExecutionStatus  @default(PLAN_READY)
   version          Int                   @default(1)
   createdAt        DateTime              @default(now())

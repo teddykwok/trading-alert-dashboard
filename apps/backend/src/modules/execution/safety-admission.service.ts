@@ -313,6 +313,12 @@ export class SafetyAdmissionService {
         maxAlertAgeSeconds: policyRow?.maxAlertAgeSeconds ?? 1,
         softOpenPositionTarget: policyRow?.softOpenPositionTarget ?? 1,
         allowedSymbols: policyRow?.allowedSymbols ?? [],
+        // A profile with no policy row reaches the engine with an EMPTY list,
+        // which admits no source timeframe at all. That is the correct
+        // direction to fail: PROFILE_POLICY_UNAVAILABLE already refuses this
+        // case, and if that rule ever moved, eligibility must not be the thing
+        // that silently defaults to permissive.
+        allowedSourceTimeframes: policyRow?.allowedSourceTimeframes ?? [],
       }
     );
 
@@ -372,6 +378,7 @@ export class SafetyAdmissionService {
           symbol: execution.symbol,
           positionSide: execution.positionSide as "LONG" | "SHORT" | "BOTH",
           signalTriggeredAt: execution.signalTriggeredAt,
+          sourceTimeframe: execution.sourceTimeframe,
           currentStatus: execution.status,
           riskBudgetUsd: execution.riskBudgetUsd.toString(),
           actualPlannedLoss: execution.actualPlannedLoss.toString(),

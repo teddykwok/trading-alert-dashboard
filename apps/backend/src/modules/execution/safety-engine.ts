@@ -31,6 +31,24 @@ export const SAFETY_REASON_CODES = [
   "ALERT_STALE",
   "DUPLICATE_EXECUTION",
   "SYMBOL_NOT_ALLOWED",
+
+  // --- Source-timeframe eligibility --------------------------------------
+  //
+  // The timeframe the LEVEL originated on, never the chart timeframe the
+  // retest fired on. Two codes rather than one because the operator questions
+  // are different: NOT_ALLOWED means the signal was understood and the policy
+  // excludes it, UNAVAILABLE means the signal never carried a recognised
+  // source timeframe at all — a Pine note without `sourceTf`, an unknown
+  // value, or an execution predating the frozen column. Collapsing them would
+  // report a parsing gap as a policy decision.
+  //
+  // Both TERMINAL (neither appears in RETRYABLE_REASONS below): an ineligible
+  // signal is SKIPPED once and never revived, exactly as capacity and
+  // authorization already behave. Widening the policy later does not
+  // resurrect it; a NEW alert must arrive.
+  "SOURCE_TIMEFRAME_NOT_ALLOWED",
+  "SOURCE_TIMEFRAME_UNAVAILABLE",
+
   "UNSUPPORTED_SYMBOL",
   "SYMBOL_NOT_TRADING",
   "UNSUPPORTED_CONTRACT",
@@ -130,6 +148,12 @@ export interface ProposedExecution {
   positionSide: "LONG" | "SHORT" | "BOTH";
   /** Frozen Alert.triggeredAt; null means the provenance is unknown. */
   signalTriggeredAt: Date | null;
+  /**
+   * Frozen Alert.sourceTimeframe — the timeframe the LEVEL originated on.
+   * Never the chart timeframe. Null means no recognised value was captured,
+   * which fails closed rather than matching any policy.
+   */
+  sourceTimeframe: string | null;
   currentStatus: string;
   riskBudgetUsd: string;
   actualPlannedLoss: string;
@@ -171,6 +195,16 @@ export interface EffectiveSafetyPolicy {
   signalFutureToleranceSeconds: number;
   /** Empty = no extra restriction. */
   allowedSymbols: string[];
+  /**
+   * Which source timeframes may create a live execution.
+   *
+   * Read this the OPPOSITE way to `allowedSymbols` directly above. Empty
+   * there means no extra restriction; empty HERE admits nothing, because the
+   * rule asks whether the list contains the signal's timeframe. The
+   * asymmetry is the point — an eligibility list that silently means
+   * everything is the failure mode this control exists to prevent.
+   */
+  allowedSourceTimeframes: string[];
 }
 
 export interface LocalCapacitySnapshot {
@@ -331,6 +365,7 @@ export function resolveEffectivePolicy(
     maxAlertAgeSeconds: number;
     softOpenPositionTarget: number;
     allowedSymbols: string[];
+    allowedSourceTimeframes: string[];
   }
 ): EffectiveSafetyPolicy {
   return {
@@ -346,6 +381,17 @@ export function resolveEffectivePolicy(
     ...mergeCapacityLimits(global, profile),
     signalFutureToleranceSeconds: global.signalFutureToleranceSeconds,
     allowedSymbols: profile.allowedSymbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean),
+    // Upper-cased exactly as allowedSymbols above, and for the same reason:
+    // the canonical spelling IS upper case, so this makes a hand-edited row
+    // comparable without the engine needing to know the vocabulary.
+    //
+    // It deliberately does NOT validate membership. The engine has no
+    // business owning the timeframe vocabulary — the operator service
+    // validates what may be STORED. A stored value like "W" simply matches no
+    // signal and therefore admits nothing, which is the safe direction.
+    allowedSourceTimeframes: (profile.allowedSourceTimeframes ?? [])
+      .map((value) => String(value).trim().toUpperCase())
+      .filter(Boolean),
   };
 }
 
@@ -442,6 +488,35 @@ export function evaluateSafetyAdmission(input: SafetyEvaluationInput): SafetyDec
   }
   if (proposed.currentStatus !== "PLAN_READY") {
     fail("DUPLICATE_EXECUTION", `Only a PLAN_READY execution can be admitted (status is ${proposed.currentStatus}).`);
+  }
+
+  // --- 4b. Source-timeframe eligibility ------------------------------------
+  //
+  // Placed with the other admission rules and therefore BEFORE anything is
+  // spent: SafetyAdmissionService reaches the authorization claim and the
+  // capacity reservation only when this whole evaluation returns PASS, so an
+  // ineligible source timeframe costs no natural-window claim, no risk, no
+  // margin and no capacity slot.
+  //
+  // NOTE the missing `length > 0` guard, which the symbol allowlist above
+  // deliberately has and this deliberately does not. `includes` on an empty
+  // list is false for every input, so an empty policy refuses everything.
+  // That is the required fail-closed behaviour, not an oversight.
+  // Already canonical on the execution — it is frozen at creation through the
+  // shared normalizer — so this only guards against a legacy or absent value.
+  const sourceTimeframe = (proposed.sourceTimeframe ?? "").trim().toUpperCase();
+  if (sourceTimeframe === "") {
+    fail(
+      "SOURCE_TIMEFRAME_UNAVAILABLE",
+      "This signal carries no recognised source timeframe, so its eligibility cannot be established."
+    );
+  } else if (!policy.allowedSourceTimeframes.includes(sourceTimeframe)) {
+    fail(
+      "SOURCE_TIMEFRAME_NOT_ALLOWED",
+      `Source timeframe ${sourceTimeframe} is not enabled for execution (allowed: ${
+        policy.allowedSourceTimeframes.length > 0 ? policy.allowedSourceTimeframes.join(", ") : "none"
+      }).`
+    );
   }
 
   // --- 5. Symbol support ---------------------------------------------------

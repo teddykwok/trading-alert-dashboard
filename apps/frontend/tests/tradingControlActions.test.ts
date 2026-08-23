@@ -54,6 +54,13 @@ function statusFixture(overrides: Partial<TradingControlStatusDto> = {}): Tradin
     environmentGates: { globalKillSwitch: true, liveEntryEnabled: false, protectionReady: false },
     runtimeAttestation: { status: "PASS", reasonCode: null, message: null, backendCount: 1, workerCount: 1 },
     allowedSymbols: ["COWUSDT"],
+    // Chart timeframe is never involved: this is the LEVEL timeframe policy.
+    sourceTimeframes: {
+      enforceable: ["1W", "1M"],
+      unrecognized: [],
+      valid: true,
+      supported: ["1D", "1W", "1M", "3M", "6M", "12M"],
+    },
     authorization: null,
     capacity: { pending: 0, open: 0, totalActive: 0, desiredOpen: 3, hardTotal: 5 },
     reservations: { riskUsd: "0", riskLimitUsd: "7.5", marginUsd: "0", marginLimitUsd: "40" },
@@ -276,6 +283,10 @@ describe("operator actions: the Start dialog shows authoritative context", () =>
       hardTotal: 5,
       maxClaims: START_MAX_CLAIMS,
       windowMinutes: START_WINDOW_MINUTES,
+      // The PERSISTED eligibility policy. Enumerated exhaustively so a new
+      // figure cannot appear in the arming dialog without being reviewed here.
+      sourceTimeframes: "1W, 1M",
+      sourceTimeframesValid: true,
     });
   });
 

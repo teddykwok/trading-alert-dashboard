@@ -9,7 +9,11 @@ import type {
   TradeExecution,
   TradeExecutionStatus,
 } from "@prisma/client";
-import { EXTREME_RR_LOOKBACKS, type DynamicLeveragePlan } from "@trading-alert-dashboard/shared";
+import {
+  EXTREME_RR_LOOKBACKS,
+  normalizeSourceTimeframe,
+  type DynamicLeveragePlan,
+} from "@trading-alert-dashboard/shared";
 import { NotFoundError, ValidationError } from "../../utils/errors";
 import {
   assertDecimalString,
@@ -234,7 +238,7 @@ export class ExecutionService {
     // alertId — so the value has to live on the execution itself.
     const alert = await this.prisma.alert.findUnique({
       where: { id: input.alertId },
-      select: { triggeredAt: true },
+      select: { triggeredAt: true, sourceTimeframe: true },
     });
     if (!alert) throw new NotFoundError(`Alert ${input.alertId} not found.`);
     if (!(alert.triggeredAt instanceof Date) || Number.isNaN(alert.triggeredAt.getTime())) {
@@ -262,6 +266,12 @@ export class ExecutionService {
           positionSide: planned.positionSide,
           selectedLookback,
           signalTriggeredAt: alert.triggeredAt,
+          // Frozen for the same reason as the line above: retention may null
+          // alertId, and admission must not depend on a value that can vanish.
+          // Re-normalized rather than copied verbatim so a row written by any
+          // path is stored in the one canonical spelling admission compares
+          // against; anything unrecognised is stored as null and fails closed.
+          sourceTimeframe: normalizeSourceTimeframe(alert.sourceTimeframe),
           status: "PLAN_READY",
           version: 1,
           plannedEntryPrice: planned.plannedEntryPrice,
