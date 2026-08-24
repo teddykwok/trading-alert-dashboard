@@ -11,6 +11,7 @@ import {
 import { TradingControlService } from "../modules/operator/trading-control.service";
 import { AllowlistService } from "../modules/operator/allowlist.service";
 import { SourceTimeframeService } from "../modules/operator/source-timeframes.service";
+import { ExtremeRrLookbackService } from "../modules/operator/extreme-rr-lookback.service";
 import type {
   AllowlistSaveResult,
   AllowlistValidationResult,
@@ -213,6 +214,29 @@ export async function operatorRoutes(
       const body = request.body as { sourceTimeframes?: unknown } | null | undefined;
       const result = await new SourceTimeframeService(request.server.prisma).save(
         body?.sourceTimeframes
+      );
+      if (!result.ok) reply.code(409);
+      return result;
+    }
+  );
+
+  // --- Extreme RR lookback -------------------------------------------------
+  // How many closed candles a NEW plan searches for its extreme. Reading stays
+  // available while armed so an operator can always SEE what governs new
+  // planning; saving is refused unless the system is SAFE_OFF and quiet.
+  app.get(
+    "/api/operator/trading-control/rr-lookback",
+    { preHandler: requireOperatorAuth },
+    async (request) => new ExtremeRrLookbackService(request.server.prisma).read()
+  );
+
+  app.post(
+    "/api/operator/trading-control/rr-lookback",
+    { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
+    async (request, reply) => {
+      const body = request.body as { lookbackCandles?: unknown } | null | undefined;
+      const result = await new ExtremeRrLookbackService(request.server.prisma).save(
+        body?.lookbackCandles
       );
       if (!result.ok) reply.code(409);
       return result;

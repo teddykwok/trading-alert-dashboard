@@ -500,6 +500,18 @@ model ExecutionSafetyPolicy {
   // every source timeframe was eligible — is preserved exactly.
   allowedSourceTimeframes String[] @default(["1D", "1W", "1M", "3M", "6M", "12M"])
 
+  // How many closed candles a NEW Extreme RR plan searches for its extreme.
+  //
+  // This is the INITIAL selection for a new plan only. Every supported
+  // lookback is still calculated and frozen on the plan, and the per-alert
+  // planner can still switch between them — so changing this value never
+  // reaches a plan that already exists, and never reaches an execution.
+  //
+  // 300 is the pre-feature behaviour and therefore the default. A value
+  // outside 50/100/200/300 is invalid configuration, not a request to fall
+  // back: planning refuses rather than quietly using 300.
+  extremeRrLookbackCandles Int @default(300)
+
   version   Int      @default(1)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

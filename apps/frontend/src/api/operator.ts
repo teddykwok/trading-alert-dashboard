@@ -59,6 +59,14 @@ export interface TradingControlStatusDto {
     valid: boolean;
     supported: string[];
   };
+  /**
+   * How many closed candles a NEW Extreme RR plan will search for its extreme.
+   *
+   * `valid` is false when the stored value is not one of the supported
+   * lookbacks — the panel reports that rather than showing a number nobody
+   * stored.
+   */
+  rrLookback: { stored: number; effective: number | null; valid: boolean; supported: number[] };
   authorization: {
     state: string;
     expiresAt: string;
@@ -237,6 +245,38 @@ export function postSourceTimeframes(
     sourceTimeframes: [...sourceTimeframes],
   });
 }
+
+export interface RrLookbackPolicyDto {
+  stored: number;
+  effective: number | null;
+  valid: boolean;
+  supported: number[];
+}
+
+export interface RrLookbackSaveDto {
+  ok: boolean;
+  outcome: "SAVED" | "BLOCKED";
+  blockers: string[];
+  message: string;
+  extremeRrLookbackCandles: number | null;
+}
+
+/** The policy in force. A read, so it stays available in any system state. */
+export function getRrLookback(): Promise<RrLookbackPolicyDto> {
+  return operatorApiClient.get("/api/operator/trading-control/rr-lookback");
+}
+
+/**
+ * The mutation. The server re-validates the value and re-checks the durable
+ * safe state inside its transaction, so nothing here asserts that a previous
+ * read is still true.
+ */
+export function postRrLookback(lookbackCandles: number): Promise<RrLookbackSaveDto> {
+  return operatorApiClient.post("/api/operator/trading-control/rr-lookback", {
+    lookbackCandles,
+  });
+}
+
 
 export function postStopNewTrades(): Promise<TradingControlActionResult> {
   return operatorApiClient.post("/api/operator/trading-control/stop-new-trades");

@@ -23,10 +23,29 @@ const D = Decimal.clone({ precision: 40, toExpNeg: -30, toExpPos: 40 });
 // magic numbers in UI or backend).
 // ---------------------------------------------------------------------------
 
-export const EXTREME_RR_LOOKBACKS = [100, 200, 300] as const;
+// Ordered shortest-to-longest. ONE fetch of max(...) feeds every candidate,
+// so adding a SHORTER lookback costs no extra exchange weight: it is a
+// trailing slice of a dataset already in hand.
+export const EXTREME_RR_LOOKBACKS = [50, 100, 200, 300] as const;
 export type ExtremeRRLookback = (typeof EXTREME_RR_LOOKBACKS)[number];
 
 export const EXTREME_RR_DEFAULT_LOOKBACK: ExtremeRRLookback = 300;
+
+/**
+ * The ONE membership test for the lookback vocabulary.
+ *
+ * Deliberately narrow: it accepts a number that IS one of the supported
+ * lookbacks and nothing else. No coercion, no nearest-match, no default — a
+ * value nobody recognises must never quietly become 300, because that would
+ * plan a trade against a window the operator did not choose.
+ */
+export function isExtremeRRLookback(value: unknown): value is ExtremeRRLookback {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    (EXTREME_RR_LOOKBACKS as readonly number[]).includes(value)
+  );
+}
 
 export const EXTREME_RR_LEVERAGE_PRESETS = [5, 10, 15, 20, 25] as const;
 export type ExtremeRRLeverage = (typeof EXTREME_RR_LEVERAGE_PRESETS)[number];

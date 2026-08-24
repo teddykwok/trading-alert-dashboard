@@ -791,11 +791,11 @@ describe("operator actions: structural guarantees", () => {
     const routes = codeOf("src/routes/operator.routes.ts");
     const posts = (routes.match(/app\.post\(/g) ?? []).length;
     const budgets = (routes.match(/OPERATOR_ACTION_RATE_LIMIT\b/g) ?? []).length;
-    // Six now: the three trading actions, allowlist validate and save, and
-    // the source-timeframe policy save. Enumerated rather than counted
-    // loosely, so a NEW mutation cannot appear without this pin being updated
-    // deliberately.
-    expect(posts).toBe(6);
+    // Seven now: the three trading actions, allowlist validate and save, the
+    // source-timeframe policy save and the Extreme RR lookback save.
+    // Enumerated rather than counted loosely, so a NEW mutation cannot appear
+    // without this pin being updated deliberately.
+    expect(posts).toBe(7);
     for (const path of [
       "/api/operator/trading-control/start",
       "/api/operator/trading-control/stop-new-trades",
@@ -803,6 +803,7 @@ describe("operator actions: structural guarantees", () => {
       "/api/operator/trading-control/allowlist/validate",
       "/api/operator/trading-control/allowlist",
       "/api/operator/trading-control/source-timeframes",
+      "/api/operator/trading-control/rr-lookback",
     ]) {
       expect(`${path}:${routes.includes(path)}`).toBe(`${path}:true`);
     }

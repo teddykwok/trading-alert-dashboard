@@ -12,11 +12,14 @@ import {
  */
 export const extremeRRSelectionSchema = z
   .object({
+    // Derived from the shared vocabulary rather than enumerated by index:
+    // the previous three hand-written literals silently stopped covering the
+    // list the moment a fourth lookback was added.
     selectedLookback: z
       .union([
         z.literal(EXTREME_RR_LOOKBACKS[0]),
         z.literal(EXTREME_RR_LOOKBACKS[1]),
-        z.literal(EXTREME_RR_LOOKBACKS[2]),
+        ...EXTREME_RR_LOOKBACKS.slice(2).map((value) => z.literal(value)),
       ])
       .optional(),
     // null clears a previously saved leverage; no default is ever assumed.

@@ -72,6 +72,8 @@ function statusFixture(overrides: Partial<TradingControlStatusDto> = {}): Tradin
     runtimeAttestation: { status: "PASS", reasonCode: null, message: null, backendCount: 1, workerCount: 1 },
     allowedSymbols: ["COWUSDT"],
     // Chart timeframe is never involved: this is the LEVEL timeframe policy.
+    // The Extreme RR lookback governing NEW plans, as persisted.
+    rrLookback: { stored: 300, effective: 300, valid: true, supported: [50, 100, 200, 300] },
     sourceTimeframes: {
       enforceable: ["1W", "1M"],
       unrecognized: [],

@@ -221,17 +221,36 @@ describe("buildCandidates (direction uses only its own extreme)", () => {
 // ---------------------------------------------------------------------------
 
 describe("lookback candidates", () => {
-  it("computes 100/200/300 from trailing subsets of ONE frozen dataset", () => {
-    // Newest 100 candles high=210, the 100 before high=220, the 100 before high=230.
+  it("computes 50/100/200/300 from trailing subsets of ONE frozen dataset", () => {
+    // Newest 100 candles high=210, the 100 before high=220, the 100 before
+    // high=230 — and inside the newest 100, the last 50 only reach 205.
     const oldest = makeCandles(300, { high: "230" }).slice(0, 100);
     const middle = makeCandles(300, { high: "220" }).slice(100, 200);
     const newest = makeCandles(300, { high: "210" }).slice(200, 300);
-    const candles = [...oldest, ...middle, ...newest];
+    // Flatten the trailing 50 so the shortest window sees a LOWER extreme.
+    const candles = [...oldest, ...middle, ...newest].map((candle, index) =>
+      index >= 250 ? { ...candle, high: "205" } : candle
+    );
 
-    const [c100, c200, c300] = buildCandidates(candles, "LONG", "188", "1.5", CUTOFF);
+    const [c50, c100, c200, c300] = buildCandidates(candles, "LONG", "188", "1.5", CUTOFF);
+    expect(c50).toMatchObject({ requestedCandles: 50, actualCandles: 50, complete: true, extremePrice: "205" });
     expect(c100).toMatchObject({ requestedCandles: 100, actualCandles: 100, complete: true, extremePrice: "210" });
     expect(c200).toMatchObject({ requestedCandles: 200, actualCandles: 200, complete: true, extremePrice: "220" });
     expect(c300).toMatchObject({ requestedCandles: 300, actualCandles: 300, complete: true, extremePrice: "230" });
+
+    // The point of the whole feature: the window length changes the extreme,
+    // and therefore the take-profit, on identical data.
+    expect(c50.extremePrice).not.toBe(c300.extremePrice);
+    expect(c50.takeProfit).not.toBe(c300.takeProfit);
+  });
+
+  it("SHORT uses the lowest low, and the window length changes it too", () => {
+    const older = makeCandles(300, { low: "80" }).slice(0, 250);
+    const newest = makeCandles(300, { low: "95" }).slice(250, 300);
+    const [c50, , , c300] = buildCandidates([...older, ...newest], "SHORT", "188", "1.5", CUTOFF);
+    expect(c50).toMatchObject({ requestedCandles: 50, extremePrice: "95" });
+    expect(c300).toMatchObject({ requestedCandles: 300, extremePrice: "80" });
+    expect(c50.takeProfit).not.toBe(c300.takeProfit);
   });
 
   it("excludes any candle closing after triggeredAt", () => {
@@ -249,17 +268,20 @@ describe("lookback candidates", () => {
   });
 
   it("reports fewer-than-requested candle counts honestly", () => {
-    const [c100, c200, c300] = buildCandidates(makeCandles(150, { high: "200" }), "LONG", "188", "1.5", CUTOFF);
+    const [c50, c100, c200, c300] = buildCandidates(makeCandles(150, { high: "200" }), "LONG", "188", "1.5", CUTOFF);
+    expect(c50).toMatchObject({ actualCandles: 50, complete: true });
     expect(c100).toMatchObject({ actualCandles: 100, complete: true });
     expect(c200).toMatchObject({ actualCandles: 150, complete: false });
     expect(c300).toMatchObject({ actualCandles: 150, complete: false });
   });
 
-  it("selection schema accepts only 100/200/300 and 5/10/15/20/25", () => {
+  it("selection schema accepts only 50/100/200/300 and 5/10/15/20/25", () => {
+    // Pinned so the operator-facing vocabulary cannot change silently.
+    expect([...EXTREME_RR_LOOKBACKS]).toEqual([50, 100, 200, 300]);
     for (const lookback of EXTREME_RR_LOOKBACKS) {
       expect(extremeRRSelectionSchema.safeParse({ selectedLookback: lookback }).success).toBe(true);
     }
-    for (const bad of [50, 150, 400, "300"]) {
+    for (const bad of [49, 51, 150, 250, 301, 400, 0, -50, "300", null]) {
       expect(extremeRRSelectionSchema.safeParse({ selectedLookback: bad }).success).toBe(false);
     }
     for (const leverage of EXTREME_RR_LEVERAGE_PRESETS) {

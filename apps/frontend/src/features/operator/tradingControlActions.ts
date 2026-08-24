@@ -156,6 +156,10 @@ export interface StartContext {
   sourceTimeframes: string;
   /** False when the persisted policy could not admit any signal. */
   sourceTimeframesValid: boolean;
+  /** The candle window NEW plans will use, as persisted. */
+  rrLookback: string;
+  /** False when the persisted lookback is not a supported value. */
+  rrLookbackValid: boolean;
   riskLimit: string;
   marginLimit: string;
   desiredOpen: number;
@@ -207,6 +211,8 @@ export function describeStartContext(status: TradingControlStatusDto): StartCont
     // the operator is confirming what the BACKEND will enforce.
     sourceTimeframes: describeSourceTimeframes(status.sourceTimeframes),
     sourceTimeframesValid: status.sourceTimeframes.valid,
+    rrLookback: describeRrLookback(status.rrLookback),
+    rrLookbackValid: status.rrLookback.valid,
     riskLimit: `${status.reservations.riskUsd} / ${status.reservations.riskLimitUsd} USD`,
     marginLimit: `${status.reservations.marginUsd} / ${status.reservations.marginLimitUsd} USD`,
     desiredOpen: status.capacity.desiredOpen,
@@ -242,6 +248,59 @@ export function presentActionResult(result: {
     headline: result.outcome,
     detail: [result.message, ...result.blockers],
   };
+}
+
+// ---------------------------------------------------------------------------
+// Extreme RR lookback
+// ---------------------------------------------------------------------------
+
+/**
+ * How the in-force lookback reads.
+ *
+ * An invalid stored value is named as invalid and shows what is actually on
+ * the row. Rendering it as "300 candles" would be a lie of exactly the kind
+ * this control exists to prevent: the operator would believe a window is
+ * governing new plans when planning is in fact refusing.
+ */
+export function describeRrLookback(policy: {
+  stored: number;
+  effective: number | null;
+  valid: boolean;
+}): string {
+  if (!policy.valid || policy.effective === null) {
+    return `INVALID (${Number.isFinite(policy.stored) ? policy.stored : "unset"}) — new planning refuses`;
+  }
+  return `${policy.effective} candles`;
+}
+
+/**
+ * Whether the editor may offer to SAVE this lookback.
+ *
+ * There is no empty state to guard here — a radio group always holds exactly
+ * one of the supported values — so the only questions are whether the system
+ * permits the change and whether it IS a change.
+ */
+export function canSaveRrLookback(input: {
+  selection: number | null;
+  inForce: number | null;
+  supported: readonly number[];
+  editable: boolean;
+}): { allowed: boolean; reason: string | null } {
+  if (input.selection === null || !input.supported.includes(input.selection)) {
+    return { allowed: false, reason: "Choose one of the supported candle windows." };
+  }
+  if (!input.editable) return { allowed: false, reason: null };
+  if (input.selection === input.inForce) {
+    return { allowed: false, reason: "This is already the lookback in force." };
+  }
+  return { allowed: true, reason: null };
+}
+
+/** The SAME durable rule, for the lookback editor. */
+export function canEditRrLookback(
+  status: Pick<TradingControlStatusDto, "systemState" | "capacity" | "manualIntervention"> | null
+): { allowed: boolean; reason: string | null } {
+  return canEditAllowlist(status, "The Extreme RR lookback");
 }
 
 // ---------------------------------------------------------------------------

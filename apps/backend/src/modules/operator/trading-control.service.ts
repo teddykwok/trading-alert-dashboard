@@ -4,6 +4,7 @@ import { SOURCE_TIMEFRAMES } from "@trading-alert-dashboard/shared";
 
 import { env } from "../../config/env";
 import { describeStoredSelection } from "./source-timeframe-policy";
+import { describeStoredLookback } from "./extreme-rr-lookback.service";
 import {
   CanaryPreflightService,
   type CanaryPreflightOptions,
@@ -193,6 +194,14 @@ export interface TradingControlStatusDto {
     valid: boolean;
     supported: string[];
   };
+  /**
+   * How many closed candles a NEW Extreme RR plan will search.
+   *
+   * `valid` is false when the stored value is not a supported lookback;
+   * reported rather than repaired, because displaying 300 for a row that does
+   * not say 300 would hide exactly the misconfiguration worth seeing.
+   */
+  rrLookback: { stored: number; effective: number | null; valid: boolean; supported: number[] };
   authorization: TradingControlAuthorizationDto | null;
   capacity: TradingControlCapacityDto;
   reservations: TradingControlReservationsDto;
@@ -366,6 +375,7 @@ export class TradingControlService {
       runtimeAttestation: attestation,
       allowedSymbols: profileRow?.safetyPolicy?.allowedSymbols ?? [],
       sourceTimeframes: { ...storedSourceTimeframes, supported: [...SOURCE_TIMEFRAMES] },
+      rrLookback: describeStoredLookback(profileRow?.safetyPolicy?.extremeRrLookbackCandles),
       authorization,
       capacity,
       reservations: {

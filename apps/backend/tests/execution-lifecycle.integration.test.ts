@@ -573,7 +573,10 @@ describe("selectedLookback provenance", () => {
     const cases: Array<{ label: string; lookback?: number }> = [
       { label: "missing" },
       { label: "zero", lookback: 0 },
-      { label: "50", lookback: 50 },
+      // 50 moved from this list to the SUPPORTED vocabulary; its neighbours
+      // took its place so the boundary is still guarded from both sides.
+      { label: "49", lookback: 49 },
+      { label: "51", lookback: 51 },
       { label: "400", lookback: 400 },
       { label: "150", lookback: 150 },
     ];
@@ -589,7 +592,7 @@ describe("selectedLookback provenance", () => {
           ...(lookback === undefined ? {} : { selectedLookback: lookback }),
         }),
         label
-      ).rejects.toThrow(/selectedLookback must be one of 100, 200, 300/);
+      ).rejects.toThrow(/selectedLookback must be one of 50, 100, 200, 300/);
 
       // Failed creation leaves no execution and no event behind.
       const executions = await prisma!.tradeExecution.findMany({ where: { alertId: newAlertId } });

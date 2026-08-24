@@ -736,15 +736,16 @@ describe("trading control: structural guarantees", () => {
     const code = codeOf("src/routes/operator.routes.ts");
     const routes = code.match(/app\.(get|post|put|patch|delete)\(/g) ?? [];
     const guards = code.match(/preHandler: requireOperatorAuth/g) ?? [];
-    // Ten now: the source-timeframe policy adds one guarded GET (read stays
-    // available while armed, so the operator can always SEE what governs a
-    // live system) and one guarded POST (refused unless SAFE_OFF and quiet).
-    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:10 guards:10`);
+    // Twelve now: the source-timeframe policy and the Extreme RR lookback each
+    // add one guarded GET (read stays available while armed, so the operator
+    // can always SEE what governs a live system) and one guarded POST (refused
+    // unless SAFE_OFF and quiet).
+    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:12 guards:12`);
     // Three GETs (probe, status, readiness) and five POSTs (the three
     // trading actions plus allowlist validate and save). The READ surface is
     // unchanged; no PUT/PATCH/DELETE exists at all.
-    expect((code.match(/app\.get\(/g) ?? []).length).toBe(4);
-    expect((code.match(/app\.post\(/g) ?? []).length).toBe(6);
+    expect((code.match(/app\.get\(/g) ?? []).length).toBe(5);
+    expect((code.match(/app\.post\(/g) ?? []).length).toBe(7);
     expect(code.match(/app\.(put|patch|delete)\(/g)).toBeNull();
   });
 

@@ -2,6 +2,7 @@ import type { Alert, ExtremeRRPlan, PrismaClient } from "@prisma/client";
 import {
   EXTREME_RR_DEFAULT_LOOKBACK,
   EXTREME_RR_LOOKBACKS,
+  isExtremeRRLookback,
   buildLeverageAnalysis,
   calculateExtremeCandidate,
   calculateExtremeMoney,
@@ -19,6 +20,10 @@ import type { SnapshotCandle } from "../market-data/market-data.types";
 import { RiskTemplateRepository } from "../risk-template/risk-template.repository";
 import { inferMarketType } from "../../utils/symbol";
 import { NotFoundError, ValidationError } from "../../utils/errors";
+import {
+  configuredProfileIdentity,
+  resolveExecutionProfile,
+} from "../execution/execution-profile.service";
 import { logger } from "../../config/logger";
 import type { ExtremeRRSelectionInput } from "./extreme-rr.schema";
 
@@ -42,6 +47,52 @@ const defaultCandleFetcher: SnapshotCandleFetcher = (alert, cutoff, limit) => {
     Math.max(...EXTREME_RR_LOOKBACKS)
   );
 };
+
+/**
+ * The INITIAL `selectedLookback` a NEW plan starts on.
+ *
+ * Read from the operator's durable policy on the configured execution
+ * profile — the same single profile every other operator policy resolves to,
+ * so there is no ambiguity about which one governs a plan.
+ *
+ * Two deliberate behaviours:
+ *
+ *   - a profile or policy that cannot be resolved yields the shipped default,
+ *     because that is genuinely the pre-feature behaviour and an unconfigured
+ *     system planned at 300 before this column existed;
+ *   - a policy row that HOLDS an unsupported number THROWS. It is invalid
+ *     configuration, not a request to fall back, and quietly planning at 300
+ *     would build a trade from a window the operator never chose. Both
+ *     callers already treat a throw as a recorded, non-fatal failure, so the
+ *     alert still ingests and nothing is planned on a guess.
+ */
+export type InitialLookbackResolver = () => Promise<ExtremeRRLookback>;
+
+export async function resolveInitialLookback(prisma: PrismaClient): Promise<ExtremeRRLookback> {
+  let stored: unknown;
+  try {
+    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
+    // No profile, or no policy row, is the PRE-FEATURE situation: nothing has
+    // ever expressed a preference, and the system planned at 300 before this
+    // column existed. Being unable to READ is not the same as holding a value
+    // nobody recognises, and only the latter is a misconfiguration.
+    if (!resolution.ok) return EXTREME_RR_DEFAULT_LOOKBACK;
+    stored = resolution.profile.safetyPolicy?.extremeRrLookbackCandles;
+  } catch {
+    return EXTREME_RR_DEFAULT_LOOKBACK;
+  }
+  if (stored === undefined || stored === null) return EXTREME_RR_DEFAULT_LOOKBACK;
+  if (!isExtremeRRLookback(stored)) {
+    // Invalid configuration. Refusing here is the whole point: quietly using
+    // 300 would build a trade from a window the operator never chose, and both
+    // callers already record a throw as a non-fatal, visible failure.
+    throw new Error(
+      `The configured Extreme RR lookback (${stored}) is not one of ` +
+        `${EXTREME_RR_LOOKBACKS.join(", ")}; refusing to plan on an unrecognised window.`
+    );
+  }
+  return stored;
+}
 
 /** Stored (frozen) candidate shape — the DTO candidate minus derived money. */
 export type StoredCandidate = Omit<ExtremeRRCandidate, "money">;
@@ -124,7 +175,13 @@ export class ExtremeRRService {
 
   constructor(
     private readonly prisma: PrismaClient,
-    private readonly fetchCandles: SnapshotCandleFetcher = defaultCandleFetcher
+    private readonly fetchCandles: SnapshotCandleFetcher = defaultCandleFetcher,
+    /**
+     * Injectable for the same reason the candle fetcher is: it lets the plan
+     * geometry be tested without a database, and lets a test state the policy
+     * a plan was generated under instead of staging one.
+     */
+    private readonly resolveLookback: InitialLookbackResolver = () => resolveInitialLookback(prisma)
   ) {
     this.riskTemplates = new RiskTemplateRepository(prisma);
   }
@@ -162,7 +219,10 @@ export class ExtremeRRService {
         entryPrice: String(alert.price),
         cutoffAt: alert.triggeredAt,
         timeframe: alert.timeframe,
-        selectedLookback: EXTREME_RR_DEFAULT_LOOKBACK,
+        // The operator's in-force policy, not the shipped constant. This is
+        // the ONE moment a plan's lookback is chosen for it; from here on the
+        // row owns its own value and a later policy change cannot reach it.
+        selectedLookback: await this.resolveLookback(),
       },
     });
   }
@@ -225,6 +285,10 @@ export class ExtremeRRService {
     };
 
     try {
+      // Inside the try on purpose: an invalid persisted policy is recorded as
+      // a plan ERROR with its reason, exactly as a data-layer failure is, so
+      // nothing is planned on a fallback nobody chose.
+      const initialLookback = await this.resolveLookback();
       const candles = await this.fetchCandles(alert, cutoff, Math.max(...EXTREME_RR_LOOKBACKS));
       const candidates = buildCandidates(
         candles,
@@ -247,6 +311,10 @@ export class ExtremeRRService {
           candidates: candidates as object[],
           errorReason: null,
           generatedAt: new Date(),
+          // Only on CREATE. The update branch below deliberately omits
+          // selectedLookback so regenerating an existing plan preserves the
+          // choice that plan was made under.
+          selectedLookback: initialLookback,
         },
         update: {
           ...baseData,

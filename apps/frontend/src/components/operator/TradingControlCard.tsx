@@ -5,6 +5,7 @@ import { Button } from "../ui/Button";
 import { Card } from "../ui/Card";
 import { AllowedSymbolsEditor } from "./AllowedSymbolsEditor";
 import { SourceTimeframesEditor } from "./SourceTimeframesEditor";
+import { RrLookbackEditor } from "./RrLookbackEditor";
 import { classNames } from "../../utils/classNames";
 import { useTradingControl } from "../../hooks/useTradingControl";
 import {
@@ -30,6 +31,7 @@ import {
   TRADING_CONTROL_ACTIONS,
   describeStartContext,
   describeSourceTimeframes,
+  describeRrLookback,
   describeStartPrerequisite,
   isActionRelevant,
   isConfirmationSatisfied,
@@ -156,6 +158,11 @@ function StatusBody({
             {describeSourceTimeframes(status.sourceTimeframes)}
           </span>
         </Row>
+        <Row label="RR lookback">
+          <span className={status.rrLookback.valid ? undefined : "text-red-300"}>
+            {describeRrLookback(status.rrLookback)}
+          </span>
+        </Row>
         <Row label="Natural Window">{authorization.state}</Row>
         <Row label="TTL">{authorization.ttl}</Row>
         <Row label="Claims">{authorization.claims}</Row>
@@ -233,6 +240,13 @@ function ConfirmDialog({
               backend will actually enforce. */}
           <dd className={context.sourceTimeframesValid ? "text-slate-200" : "text-red-300"}>
             {context.sourceTimeframes}
+          </dd>
+          <dt>RR lookback</dt>
+          {/* The PERSISTED policy, never an unsaved draft from the editor
+              below: this dialog is where the operator confirms what NEW plans
+              will actually be built from. */}
+          <dd className={context.rrLookbackValid ? "text-slate-200" : "text-red-300"}>
+            {context.rrLookback}
           </dd>
           <dt>Risk</dt>
           <dd className="text-slate-200">{context.riskLimit}</dd>
@@ -454,6 +468,10 @@ export function TradingControlCard() {
           {/* Execution eligibility by signal SOURCE timeframe. Same durable
               SAFE_OFF guard as the allowlist, enforced server-side. */}
           <SourceTimeframesEditor status={status} onSaved={() => void refresh()} />
+
+          {/* The candle window NEW Extreme RR plans start on. Same durable
+              SAFE_OFF guard, enforced server-side. */}
+          <RrLookbackEditor status={status} onSaved={() => void refresh()} />
         </>
       ) : (
         <OperatorTokenForm
