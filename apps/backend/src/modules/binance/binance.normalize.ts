@@ -10,7 +10,9 @@ import type {
   BinanceMarginHistoryEntryDto,
   BinanceMarkPriceDto,
   BinancePositionSide,
+  BinanceHistoricalOrderDto,
   BinanceQueriedOrderDto,
+  BinanceUserTradeDto,
   BinanceSymbolFiltersDto,
 } from "./binance.types";
 
@@ -345,6 +347,46 @@ export function normalizeQueriedOrder(payload: unknown): BinanceQueriedOrderDto 
     closePosition: bool(row.closePosition),
     updateTimeMs: Number.isFinite(updateTime) ? updateTime : null,
   };
+}
+
+/**
+ * Normalizes GET /fapi/v1/allOrders. Always a LIST; a non-list payload is an
+ * empty result rather than a guess, because a malformed history must never
+ * read as "no history" to a caller proving absence — the caller checks the
+ * query SUCCEEDED separately.
+ */
+export function normalizeHistoricalOrders(payload: unknown): BinanceHistoricalOrderDto[] {
+  if (!Array.isArray(payload)) return [];
+  return asRows(payload).map((row) => {
+    const updateTime = Number(row.updateTime ?? row.time);
+    return {
+      orderId: row.orderId === undefined || row.orderId === null ? null : String(row.orderId),
+      clientOrderId: text(row.clientOrderId),
+      status: text(row.status),
+      side: text(row.side),
+      positionSide: row.positionSide === undefined ? null : normalizePositionSide(row.positionSide),
+      origQty: decimalString(row.origQty),
+      executedQty: decimalString(row.executedQty),
+      updateTimeMs: Number.isFinite(updateTime) ? updateTime : null,
+    };
+  });
+}
+
+/** Normalizes GET /fapi/v1/userTrades. Same list discipline as above. */
+export function normalizeUserTrades(payload: unknown): BinanceUserTradeDto[] {
+  if (!Array.isArray(payload)) return [];
+  return asRows(payload).map((row) => {
+    const time = Number(row.time);
+    return {
+      tradeId: row.id === undefined || row.id === null ? null : String(row.id),
+      orderId: row.orderId === undefined || row.orderId === null ? null : String(row.orderId),
+      side: text(row.side),
+      positionSide: row.positionSide === undefined ? null : normalizePositionSide(row.positionSide),
+      quantity: decimalString(row.qty),
+      price: decimalString(row.price),
+      timeMs: Number.isFinite(time) ? time : null,
+    };
+  });
 }
 
 /**

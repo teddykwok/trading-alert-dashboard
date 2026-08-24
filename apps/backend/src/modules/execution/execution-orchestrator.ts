@@ -95,7 +95,17 @@ export type AdmitOutcome =
 
 export interface ReconcileTickResult {
   inspected: number;
+  /**
+   * Executions for which at least one exchange mutation was DISPATCHED.
+   *
+   * Deliberately not a progress metric, and it was read as one: a stuck
+   * ENTRY_SUBMITTING re-sending the same submission logged `advanced: 1`
+   * every 30s for 75 ticks while nothing changed. Use `progressed` for
+   * "did persisted lifecycle state actually move?".
+   */
   advanced: number;
+  /** Executions whose persisted status/version actually changed this tick. */
+  progressed: number;
   mutationsDispatched: number;
   recoveryPending: number;
   failed: boolean;
@@ -223,10 +233,12 @@ export class ExecutionOrchestrator {
     const result: ReconcileTickResult = {
       inspected: 0,
       advanced: 0,
+      progressed: 0,
       mutationsDispatched: 0,
       recoveryPending: 0,
       failed: false,
     };
+    const versionsBefore = new Map<string, number>();
 
     try {
       const executions = await this.deps.prisma.tradeExecution.findMany({
@@ -253,6 +265,27 @@ export class ExecutionOrchestrator {
         );
         result.mutationsDispatched += dispatched;
         if (dispatched > 0) result.advanced += 1;
+        versionsBefore.set(execution.id, execution.version);
+      }
+
+      // Persisted movement, measured rather than inferred. ONE query for the
+      // whole batch, AFTER the loop and in its own try: an observability
+      // metric must never be able to abort the reconciliation it reports on,
+      // which is exactly what a per-execution read inside the loop did.
+      try {
+        if (versionsBefore.size > 0) {
+          const after = await this.deps.prisma.tradeExecution.findMany({
+            where: { id: { in: [...versionsBefore.keys()] } },
+            select: { id: true, version: true },
+          });
+          // Every lifecycle transition increments the version inside its own
+          // transaction, so a version that did not move means nothing moved.
+          for (const row of after) {
+            if (row.version !== versionsBefore.get(row.id)) result.progressed += 1;
+          }
+        }
+      } catch {
+        // Leaves progressed at 0 rather than failing the tick.
       }
 
       result.recoveryPending = await this.countRecoveryRequired();

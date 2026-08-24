@@ -156,6 +156,38 @@ export interface BinanceQueriedOrderDto {
 }
 
 /**
+ * One row of GET /fapi/v1/allOrders, reduced to what an absence proof needs.
+ *
+ * Deliberately narrow: identity and fill quantity only. Recovery asks "did
+ * this client order id ever exist, and did anything trade?" — never anything
+ * that would tempt a caller to reconstruct a plan from history.
+ */
+export interface BinanceHistoricalOrderDto {
+  orderId: string | null;
+  clientOrderId: string | null;
+  status: string | null;
+  side: string | null;
+  positionSide: BinancePositionSide | null;
+  origQty: string | null;
+  executedQty: string | null;
+  updateTimeMs: number | null;
+}
+
+/**
+ * One row of GET /fapi/v1/userTrades — a FILL. Its presence is disqualifying
+ * evidence for any release, so only what identifies it is carried.
+ */
+export interface BinanceUserTradeDto {
+  tradeId: string | null;
+  orderId: string | null;
+  side: string | null;
+  positionSide: BinancePositionSide | null;
+  quantity: string | null;
+  price: string | null;
+  timeMs: number | null;
+}
+
+/**
  * One conditional (Algo) protection order from GET /fapi/v1/algoOrder. Algo
  * semantics differ from standard orders: it stays "working" until it triggers
  * and only then creates an actual order, so both identities are normalized.

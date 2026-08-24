@@ -1048,6 +1048,11 @@ describe("natural authorization: runtime boundary", () => {
     // window admit something nobody reviewed when preparing it. It reads a
     // window to refuse itself, and does nothing else with one.
     "src/modules/operator/source-timeframes.service.ts",
+    // Stuck-entry recovery. It READS a window for one reason: to refuse
+    // itself while one is still AVAILABLE, because releasing capacity
+    // underneath a live window would let it admit a trade nobody reviewed.
+    // It prepares, arms, claims and revokes nothing.
+    "src/modules/execution/entry-recovery-cli.ts",
     // Same justification again: changing how a NEW plan is built underneath a
     // window that is still AVAILABLE would let it admit a trade shaped by
     // numbers nobody reviewed. It reads a window to refuse itself, nothing more.
@@ -1118,6 +1123,7 @@ describe("natural authorization: runtime boundary", () => {
     // grown into an authorization path.
     const code = codeOf("src/modules/operator/allowlist.service.ts");
     const policy = codeOf("src/modules/operator/source-timeframes.service.ts");
+    const recoveryCli = codeOf("src/modules/execution/entry-recovery-cli.ts");
     const lookback = codeOf("src/modules/operator/extreme-rr-lookback.service.ts");
     for (const forbidden of [
       "claimNaturalWindow",
@@ -1130,6 +1136,9 @@ describe("natural authorization: runtime boundary", () => {
     ]) {
       expect(`${forbidden}:${code.includes(forbidden)}`).toBe(`${forbidden}:false`);
       expect(`policy ${forbidden}:${policy.includes(forbidden)}`).toBe(`policy ${forbidden}:false`);
+      expect(`recoveryCli ${forbidden}:${recoveryCli.includes(forbidden)}`).toBe(
+        `recoveryCli ${forbidden}:false`
+      );
       expect(`lookback ${forbidden}:${lookback.includes(forbidden)}`).toBe(
         `lookback ${forbidden}:false`
       );

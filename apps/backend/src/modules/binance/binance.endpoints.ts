@@ -61,6 +61,13 @@ export const BINANCE_READ_ONLY_ENDPOINTS = {
   openAlgoOrders: { path: "/fapi/v1/openAlgoOrders", signed: true, weight: 1 },
   // Position margin change history, used only to reconcile an ambiguous ADD.
   positionMarginHistory: { path: "/fapi/v1/positionMargin/history", signed: true, weight: 1 },
+  // --- Historical evidence, used ONLY to prove absence -------------------
+  // A point-in-time Query Order answers about an id Binance still retains.
+  // Proving an entry NEVER existed additionally needs the symbol's order and
+  // trade history: without them, 'not found now' cannot be distinguished
+  // from 'existed and aged out'. Both are GET, both signed, both read-only.
+  allOrders: { path: "/fapi/v1/allOrders", signed: true, weight: 5 },
+  userTrades: { path: "/fapi/v1/userTrades", signed: true, weight: 5 },
 } as const satisfies Record<string, BinanceEndpointDefinition>;
 
 export type BinanceEndpointName = keyof typeof BINANCE_READ_ONLY_ENDPOINTS;

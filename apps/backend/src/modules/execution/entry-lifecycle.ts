@@ -482,6 +482,12 @@ export function classifyMutationOutcome(
     // code, so nothing was created. Treating this as ambiguous is what left
     // the first real canary unprotected and parked for a human.
     case "REQUEST_INVALID":
+    // Binance evaluated a well-formed request and refused it on a documented
+    // business rule (insufficient margin/balance, notional or price filter).
+    // The answer is definitive and the matching engine created nothing, so
+    // this is a rejection rather than an unknown — the distinction that lets
+    // the entry terminalize instead of being resubmitted forever.
+    case "ORDER_REJECTED":
       // The request never reached the matching engine.
       return "CONFIRMED_REJECTED";
     default:

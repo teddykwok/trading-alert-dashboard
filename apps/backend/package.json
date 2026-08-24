@@ -33,6 +33,7 @@
     "execution:show-authorization": "tsx src/modules/execution/run-show-authorization.ts",
     "execution:revoke-natural-window": "tsx src/modules/execution/run-revoke-natural-window.ts",
     "execution:arm-natural-window": "tsx src/modules/execution/run-arm-natural-window.ts",
+    "execution:entry-recovery": "tsx src/modules/execution/run-entry-recovery.ts",
     "test": "vitest run",
     "test:db:setup": "tsx scripts/setup-test-db.ts",
     "playwright:install": "playwright install chromium"

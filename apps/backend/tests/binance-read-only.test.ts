@@ -278,6 +278,10 @@ describe("read-only safety boundary", () => {
     expect(allowedReadOnlyPaths()).toEqual([
       "/fapi/v1/accountConfig",
       "/fapi/v1/algoOrder",
+      // Historical order and fill readers. Signed GETs, added so a stuck entry
+      // can PROVE it never reached the exchange instead of being retried
+      // forever — the allowlist stays provably read-only.
+      "/fapi/v1/allOrders",
       "/fapi/v1/exchangeInfo",
       "/fapi/v1/leverageBracket",
       "/fapi/v1/multiAssetsMargin",
@@ -292,6 +296,7 @@ describe("read-only safety boundary", () => {
       "/fapi/v1/premiumIndex",
       "/fapi/v1/symbolConfig",
       "/fapi/v1/time",
+      "/fapi/v1/userTrades",
       "/fapi/v3/account",
       "/fapi/v3/balance",
       "/fapi/v3/positionRisk",

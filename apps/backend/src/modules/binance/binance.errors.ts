@@ -29,6 +29,20 @@ export type BinanceErrorKind =
   // was created — distinct from MALFORMED_RESPONSE, which means WE could not
   // understand the reply and therefore know nothing.
   | "REQUEST_INVALID"
+  // Binance EVALUATED a well-formed request and refused it on a documented
+  // business rule — insufficient margin or balance, a notional filter, a
+  // price-band reject. The request reached Binance and was answered; the
+  // matching engine created nothing.
+  //
+  // Distinct from REQUEST_INVALID, which means the request was MALFORMED,
+  // and from MALFORMED_RESPONSE, which means WE could not understand the
+  // reply and therefore know nothing. Keeping the three apart is what lets a
+  // rejected entry terminalize while a genuinely ambiguous one stays parked.
+  //
+  // The defect this exists for: -2019 fell through to MALFORMED_RESPONSE, so
+  // a permanently repeatable rejection was retried ~75 times and the
+  // execution never left ENTRY_SUBMITTING, blocking every later admission.
+  | "ORDER_REJECTED"
   // Binance answered about a SPECIFIC order id and said it does not exist
   // (-2013) or refused to cancel it (-2011). Purely a label: what this means
   // for a caller depends on WHICH operation asked, so absence is decided by
@@ -171,6 +185,19 @@ export function classifyBinanceFailure(
       case -2011:
       case -2013:
         return "ORDER_NOT_FOUND";
+      // Documented BUSINESS rejections. Binance parsed and evaluated the
+      // request, then refused it — so nothing was created, exactly as with
+      // REQUEST_INVALID, but for a reason the caller could in principle fix.
+      //
+      // Enumerated one by one on purpose. An unlisted 4xx still falls through
+      // to MALFORMED_RESPONSE below and stays ambiguous, because guessing
+      // that an unknown code created nothing is exactly the assumption that
+      // could strand a real order.
+      case -2018: // BALANCE_NOT_SUFFICIENT
+      case -2019: // MARGIN_NOT_SUFFICIENT
+      case -4131: // The counterparty's best price does not meet PERCENT_PRICE
+      case -4164: // Order notional is below the symbol's minimum
+        return "ORDER_REJECTED";
       case -1000:
       case -1001:
         return "SERVER";

@@ -1088,6 +1088,22 @@ export class EntryLifecycleService {
       });
     }
 
+    // A PREVIOUS submission already came back ambiguous. Re-sending it is not
+    // recovery — it is the same unanswered question asked again, and it is what
+    // turned one unresolvable rejection into seventy-five identical attempts
+    // while the execution never left ENTRY_SUBMITTING.
+    //
+    // From here the ONLY way forward is evidence: reconcile the same client
+    // order id and let `decideReconciliation` choose. Nothing below this point
+    // may dispatch a new order for this execution.
+    if (order.submissionUnknownAt !== null) {
+      return this.reconcileEntryOrder({
+        executionId: execution.id,
+        expectedVersion: execution.version,
+        evaluatedAt,
+      });
+    }
+
     // Configuration and submission are exposure-increasing: both gates must be
     // open. Cancellation of this same order stays available regardless.
     const gate = this.checkLiveGates();

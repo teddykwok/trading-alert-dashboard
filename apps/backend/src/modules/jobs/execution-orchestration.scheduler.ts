@@ -223,7 +223,16 @@ export async function runReconciliationTickOnce(
     const result = await orchestrator.runExecutionReconciliationTick();
     if (result.inspected > 0) {
       logger.info(
-        { inspected: result.inspected, advanced: result.advanced, recoveryPending: result.recoveryPending },
+        {
+          inspected: result.inspected,
+          // `attempted` names what `advanced` always counted: dispatches, not
+          // progress. `progressed` is the one that answers whether anything
+          // actually moved — a stuck row now reads attempted>0 progressed=0
+          // instead of looking like healthy activity.
+          attempted: result.advanced,
+          progressed: result.progressed,
+          recoveryPending: result.recoveryPending,
+        },
         "Execution reconciliation tick completed"
       );
     }

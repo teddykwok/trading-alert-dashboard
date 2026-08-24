@@ -16,7 +16,9 @@ import {
   normalizeAlgoOrder,
   normalizeMarginHistory,
   normalizeMarkPrice,
+  normalizeHistoricalOrders,
   normalizeQueriedOrder,
+  normalizeUserTrades,
   normalizeSymbolConfig,
   normalizeSymbolFilters,
 } from "./binance.normalize";
@@ -27,7 +29,9 @@ import type {
   BinanceConnectionInfo,
   BinanceMarkPriceDto,
   BinancePositionDto,
+  BinanceHistoricalOrderDto,
   BinanceQueriedOrderDto,
+  BinanceUserTradeDto,
   BinanceSymbolInspectionDto,
 } from "./binance.types";
 
@@ -300,6 +304,49 @@ export class BinanceReadOnlyService {
     // More than one row for the same side is contradictory, never merged.
     if (matching.length !== 1) return null;
     return matching[0];
+  }
+
+  /**
+   * GET /fapi/v1/allOrders — the symbol's recent order history.
+   *
+   * Exists for ONE purpose: proving an entry that was never confirmed also
+   * never existed. A Query Order answering NO_SUCH_ORDER is a statement
+   * about what Binance still retains; history is what distinguishes that
+   * from an order that existed and aged out of the lookup window.
+   *
+   * Returns only the identity fields absence needs — never a raw payload.
+   */
+  async listRecentOrders(
+    symbol: string,
+    options: { limit?: number; startTimeMs?: number } = {}
+  ): Promise<BinanceHistoricalOrderDto[]> {
+    const payload = await this.client.request<unknown>("allOrders", {
+      symbol: symbol.trim().toUpperCase(),
+      // Binance caps this at 1000; the default of 500 covers any realistic
+      // recovery window without paging.
+      limit: String(options.limit ?? 500),
+      ...(options.startTimeMs === undefined ? {} : { startTime: String(options.startTimeMs) }),
+    });
+    return normalizeHistoricalOrders(payload);
+  }
+
+  /**
+   * GET /fapi/v1/userTrades — the symbol's fill history.
+   *
+   * An order can be gone from the book and still have traded. Absence is not
+   * provable without asking whether anything filled, so this is the second
+   * half of the same question, never a convenience.
+   */
+  async listRecentTrades(
+    symbol: string,
+    options: { limit?: number; startTimeMs?: number } = {}
+  ): Promise<BinanceUserTradeDto[]> {
+    const payload = await this.client.request<unknown>("userTrades", {
+      symbol: symbol.trim().toUpperCase(),
+      limit: String(options.limit ?? 500),
+      ...(options.startTimeMs === undefined ? {} : { startTime: String(options.startTimeMs) }),
+    });
+    return normalizeUserTrades(payload);
   }
 
   /** GET /fapi/v3/positionRisk, non-zero positions only. */

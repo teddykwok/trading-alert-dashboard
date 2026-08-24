@@ -2072,7 +2072,12 @@ describe("gate semantics: exposure-increasing versus risk-reducing", () => {
     // The same id was queried; nothing was resubmitted while gated.
     expect(scenario.calls).toContain(`queryOrder:${clientOrderId}`);
     expect(scenario.mutations).toHaveLength(0);
-    expect(outcome.reasonCode).toBe("LIVE_ENTRY_DISABLED");
+    // An already-ambiguous submission now reconciles BEFORE the gate check, so
+    // the reason reports what the exchange said about the order rather than
+    // that the gate was shut. Both refuse to resubmit — the assertion above is
+    // the safety property — but only this one tells the operator the order is
+    // genuinely absent, and only this path works while SAFE_RECOVERY.
+    expect(outcome.reasonCode).toBe("ENTRY_ORDER_NOT_FOUND");
     const orders = await prisma!.binanceOrder.findMany({ where: { tradeExecutionId: execution.id } });
     expect(orders).toHaveLength(1);
     expect(orders[0].clientOrderId).toBe(clientOrderId);
