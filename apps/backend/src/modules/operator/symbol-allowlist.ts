@@ -34,12 +34,24 @@ const FUTURES_SYMBOL_PATTERN = /^[A-Z0-9]{4,24}$/;
 /** Filters the planner and executor cannot work without. */
 const REQUIRED_FILTERS = ["tickSize", "stepSize", "minQty", "minNotional"] as const;
 
+/** The only collateral asset this execution profile supports. */
+const USDT_ASSET = "USDT";
+
 export const ALLOWLIST_REJECTIONS = [
   "INVALID_SYNTAX",
   "UNSUPPORTED_CONTRACT",
   "NOT_FUTURES_ELIGIBLE",
   "NOT_TRADABLE",
   "NOT_EXECUTION_ENGINE_SUPPORTED",
+  /**
+   * Deliberately the SAME name the admission engine uses for this refusal.
+   *
+   * The two layers are independent — the execution gate does not trust this
+   * one — but they enforce one product policy, and an operator who sees the
+   * code here and again in an execution journal should not have to work out
+   * whether they are looking at the same rule.
+   */
+  "USDT_ONLY_CONTRACT_REQUIRED",
 ] as const;
 
 export type AllowlistRejection = (typeof ALLOWLIST_REJECTIONS)[number];
@@ -210,6 +222,38 @@ export function judgeSymbolEligibility(
       ok: false,
       reasonCode: "UNSUPPORTED_CONTRACT",
       detail: `${symbol} contract type is ${filters.contractType}, not PERPETUAL.`,
+    };
+  }
+
+  /**
+   * USDT-only collateral, the same positive allow rule the admission engine
+   * applies. Both assets must be READ and both must be USDT.
+   *
+   * `USDCUSDT` passes and `BNBUSDC` does not, which is the case a substring or
+   * suffix test gets wrong in both directions — the base asset is irrelevant,
+   * only what the contract is quoted and margined in matters.
+   *
+   * Unlike `contractType` above, a MISSING asset is refused rather than waved
+   * through. That asymmetry is intentional: contract type has a documented
+   * default shape, whereas an unconfirmed collateral asset is exactly what
+   * this rule exists to refuse. Validation has no retry to fall back on, so
+   * "cannot confirm" must fail here, with a detail that does not accuse the
+   * contract of being something it was never shown to be.
+   */
+  const quoteAsset = (filters.quoteAsset ?? "").trim().toUpperCase();
+  const marginAsset = (filters.marginAsset ?? "").trim().toUpperCase();
+  if (quoteAsset === "" || marginAsset === "") {
+    return {
+      ok: false,
+      reasonCode: "USDT_ONLY_CONTRACT_REQUIRED",
+      detail: `${symbol} did not report both a quote asset and a margin asset, so it cannot be confirmed as a ${USDT_ASSET}-margined contract.`,
+    };
+  }
+  if (quoteAsset !== USDT_ASSET || marginAsset !== USDT_ASSET) {
+    return {
+      ok: false,
+      reasonCode: "USDT_ONLY_CONTRACT_REQUIRED",
+      detail: `${symbol} is quoted in ${quoteAsset} and margined in ${marginAsset}; only ${USDT_ASSET}-quoted, ${USDT_ASSET}-margined contracts are supported.`,
     };
   }
 

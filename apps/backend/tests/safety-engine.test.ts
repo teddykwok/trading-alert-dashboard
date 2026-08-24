@@ -121,6 +121,8 @@ function symbolState(overrides: Partial<SymbolStateSnapshot> = {}): SymbolStateS
     exists: true,
     status: "TRADING",
     contractType: "PERPETUAL",
+    quoteAsset: "USDT",
+    marginAsset: "USDT",
     hasFiltersSnapshot: true,
     hasBracketSnapshot: true,
     ...overrides,
@@ -887,12 +889,16 @@ const NATURAL_AUTHORIZATION_CODES = [
 ] as const satisfies readonly SafetyReasonCode[];
 
 describe("reason code catalogue", () => {
-  it("exposes exactly the 39 stable reason codes", () => {
+  it("exposes exactly the 40 stable reason codes", () => {
     // 30 through Phase 11, plus the 7 natural-authorization codes added in
-    // Phase 12.3, plus the 2 source-timeframe eligibility codes. The count is
-    // pinned so a code cannot be added without a deliberate edit here.
-    expect(SAFETY_REASON_CODES).toHaveLength(39);
-    expect(new Set(SAFETY_REASON_CODES).size).toBe(39);
+    // Phase 12.3, plus the 2 source-timeframe eligibility codes, plus the
+    // USDT-only collateral code. The count is pinned so a code cannot be added
+    // without a deliberate edit here.
+    expect(SAFETY_REASON_CODES).toHaveLength(40);
+    expect(new Set(SAFETY_REASON_CODES).size).toBe(40);
+    // Its own code, never folded into UNSUPPORTED_CONTRACT: "not a perpetual"
+    // and "a perpetual we do not trade" send an operator to different places.
+    expect(SAFETY_REASON_CODES).toContain("USDT_ONLY_CONTRACT_REQUIRED");
     // The soft target is its OWN code, never folded into the hard one.
     expect(SAFETY_REASON_CODES).toContain("SOFT_OPEN_TARGET_REACHED");
     expect(SAFETY_REASON_CODES).toContain("OPEN_POSITION_LIMIT_REACHED");
@@ -966,6 +972,9 @@ describe("reason code catalogue", () => {
     collect(evaluate({ symbolState: symbolState({ exists: false }) }));
     collect(evaluate({ symbolState: symbolState({ status: "BREAK" }) }));
     collect(evaluate({ symbolState: symbolState({ contractType: "CURRENT_QUARTER" }) }));
+    // Listed, TRADING and a genuine PERPETUAL — and still refused, because the
+    // contract is collateralised in something this profile cannot carry.
+    collect(evaluate({ symbolState: symbolState({ quoteAsset: "USDC", marginAsset: "USDC" }) }));
     collect(evaluate({ policy: policy({ expectedPositionMode: "ONE_WAY" }) }));
     collect(evaluate({ binance: binance({ assetMode: "MULTI_ASSET" }) }));
     collect(evaluate({ local: local({ activeSymbolSideKeys: [`${SYMBOL}:LONG`] }) }));

@@ -239,6 +239,12 @@ export function normalizeSymbolFilters(symbolRow: unknown): BinanceSymbolFilters
     symbol: text(row.symbol) ?? "",
     status: text(row.status ?? row.contractStatus),
     contractType: text(row.contractType),
+    // Read verbatim and NOT defaulted. `text()` yields null for an absent or
+    // non-string field, and null must stay null all the way to the policy:
+    // a contract whose collateral asset we could not read is unknown, not
+    // acceptable, and certainly not inferrable from the ticker's spelling.
+    quoteAsset: text(row.quoteAsset),
+    marginAsset: text(row.marginAsset),
     tickSize: decimalString(price.tickSize),
     minPrice: decimalString(price.minPrice),
     maxPrice: decimalString(price.maxPrice),

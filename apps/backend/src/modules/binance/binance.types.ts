@@ -72,6 +72,21 @@ export interface BinanceSymbolFiltersDto {
   symbol: string;
   status: string | null;
   contractType: string | null;
+  /**
+   * The asset the contract is PRICED in, exactly as exchangeInfo reports it.
+   *
+   * Null when the field was absent or unreadable. That is deliberately not the
+   * same as "not USDT": the execution policy is a positive allow rule, so a
+   * value we could not read must fail as UNKNOWN rather than be judged.
+   */
+  quoteAsset: string | null;
+  /**
+   * The asset the contract is COLLATERALISED in. Distinct from `quoteAsset` —
+   * a COIN-margined or multi-collateral contract can be quoted in one asset and
+   * margined in another, and it is the margin asset that decides whether this
+   * account can actually carry the position.
+   */
+  marginAsset: string | null;
   /** PRICE_FILTER */
   tickSize: string | null;
   minPrice: string | null;

@@ -41,6 +41,8 @@ function filters(symbol: string, overrides: Partial<BinanceSymbolFiltersDto> = {
     symbol,
     status: "TRADING",
     contractType: "PERPETUAL",
+    quoteAsset: "USDT",
+    marginAsset: "USDT",
     tickSize: "0.10",
     minPrice: "0.10",
     maxPrice: "1000000",

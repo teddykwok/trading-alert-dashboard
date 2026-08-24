@@ -186,6 +186,12 @@ class FakeExchange {
             symbol: SYMBOL,
             status: "TRADING",
             contractType: "PERPETUAL",
+            // As Binance actually reports a USDT perpetual. The execution
+            // profile trades USDT-quoted, USDT-margined contracts only, so a
+            // fixture omitting these is not a lighter fixture — it is a
+            // contract the engine is right to refuse.
+            quoteAsset: "USDT",
+            marginAsset: "USDT",
             filters: [
               { filterType: "PRICE_FILTER", tickSize: "0.01", minPrice: "0.01", maxPrice: "100000" },
               { filterType: "LOT_SIZE", stepSize: "0.001", minQty: "0.001", maxQty: "1000" },

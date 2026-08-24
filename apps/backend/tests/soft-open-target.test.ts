@@ -120,6 +120,8 @@ const symbolState = (): SymbolStateSnapshot => ({
   exists: true,
   status: "TRADING",
   contractType: "PERPETUAL",
+  quoteAsset: "USDT",
+  marginAsset: "USDT",
   hasFiltersSnapshot: true,
   hasBracketSnapshot: true,
 });

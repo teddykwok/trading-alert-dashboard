@@ -52,6 +52,25 @@ export const SAFETY_REASON_CODES = [
   "UNSUPPORTED_SYMBOL",
   "SYMBOL_NOT_TRADING",
   "UNSUPPORTED_CONTRACT",
+
+  // --- USDT-only collateral policy ---------------------------------------
+  //
+  // This execution profile trades USDⓈ-M perpetuals that are QUOTED in USDT
+  // and MARGINED in USDT, and nothing else. It is a positive allow rule: a
+  // contract is eligible only once authoritative exchange metadata confirms
+  // both assets, never because its ticker happens to end in "USDT".
+  //
+  // Separate from UNSUPPORTED_CONTRACT because the operator question differs.
+  // UNSUPPORTED_CONTRACT means "this is not a perpetual"; this means "this is
+  // a perpetual we deliberately do not trade". Reading a USDC-margined
+  // rejection as a contract-type problem would send someone looking at
+  // Binance's listing rather than at our own policy.
+  //
+  // TERMINAL — it is absent from RETRYABLE_REASONS below. The contract's
+  // collateral asset is a property of the listing, not of this attempt, so
+  // retrying could only ever produce the same answer.
+  "USDT_ONLY_CONTRACT_REQUIRED",
+
   "EXPECTED_HEDGE_MODE",
   "EXPECTED_SINGLE_ASSET_MODE",
   "EXPECTED_ISOLATED_MARGIN_TYPE",
@@ -115,6 +134,16 @@ export type SafetyReasonRetryability = "RETRYABLE" | "TERMINAL";
  * missing IMMUTABLE execution data cannot self-heal — retrying it forever
  * would just re-derive the same answer — so it produces a normal SKIP.
  */
+/**
+ * The ONLY collateral asset this execution profile supports.
+ *
+ * Deliberately a constant rather than configuration: widening it is a product
+ * decision with margin, liquidation and balance consequences, not a setting to
+ * be toggled. Anything else is unsupported regardless of what the account
+ * happens to hold.
+ */
+const USDT_ASSET = "USDT";
+
 const RETRYABLE_REASONS: readonly SafetyReasonCode[] = [
   "PROFILE_POLICY_UNAVAILABLE",
   "BINANCE_ACCOUNT_STATE_UNAVAILABLE",
@@ -237,6 +266,17 @@ export interface SymbolStateSnapshot {
   exists: boolean;
   status: string | null;
   contractType: string | null;
+  /**
+   * Quote and margin asset exactly as Binance reported them, or null when the
+   * read did not carry them.
+   *
+   * Null is NOT a soft "probably fine". The USDT-only rule is a positive
+   * allow rule, so a null here means the contract could not be confirmed
+   * eligible and the engine refuses on the UNAVAILABLE (retryable) path
+   * rather than the unsupported (terminal) one.
+   */
+  quoteAsset: string | null;
+  marginAsset: string | null;
   hasFiltersSnapshot: boolean;
   hasBracketSnapshot: boolean;
 }
@@ -534,6 +574,36 @@ export function evaluateSafetyAdmission(input: SafetyEvaluationInput): SafetyDec
       }
       if ((symbolState.contractType ?? "").toUpperCase() !== "PERPETUAL") {
         fail("UNSUPPORTED_CONTRACT", `${symbol} contract type is ${symbolState.contractType ?? "unknown"}.`);
+      }
+
+      /**
+       * USDT-only collateral. The rule the account can actually carry.
+       *
+       * Stated as a POSITIVE allow rule: both assets must be READ and must
+       * both equal USDT. Two consequences follow deliberately.
+       *
+       * 1. The ticker is never consulted. `USDCUSDT` is a USDT-quoted,
+       *    USDT-margined perpetual and is eligible; `BNBUSDC` is not. A
+       *    substring or suffix test would get both of those backwards, and a
+       *    hypothetical `XYZUSDT` absent from exchangeInfo never reaches here
+       *    at all.
+       * 2. A MISSING asset is unknown, not acceptable. It refuses on the
+       *    retryable UNAVAILABLE path, because "we could not read the
+       *    collateral asset" is a fact about this read, whereas "it is USDC"
+       *    is a fact about the listing.
+       */
+      const quoteAsset = (symbolState.quoteAsset ?? "").trim().toUpperCase();
+      const marginAsset = (symbolState.marginAsset ?? "").trim().toUpperCase();
+      if (quoteAsset === "" || marginAsset === "") {
+        fail(
+          "BINANCE_SYMBOL_STATE_UNAVAILABLE",
+          `${symbol} did not report both a quote asset and a margin asset in this read, so its eligibility could not be established.`
+        );
+      } else if (quoteAsset !== USDT_ASSET || marginAsset !== USDT_ASSET) {
+        fail(
+          "USDT_ONLY_CONTRACT_REQUIRED",
+          `${symbol} is quoted in ${quoteAsset} and margined in ${marginAsset}; this execution profile trades ${USDT_ASSET}-quoted, ${USDT_ASSET}-margined perpetuals only.`
+        );
       }
     }
   }

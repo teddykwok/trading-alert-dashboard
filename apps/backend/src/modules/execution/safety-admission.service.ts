@@ -3,6 +3,7 @@ import type { ExecutionCanaryAuthorization, PrismaClient, SafetyAdmission, Trade
 import { claimNaturalWindow, type NaturalClaimFailure } from "./canary-authorization.service";
 import { naturalWindowAdmitsDirection, naturalWindowState } from "./natural-authorization";
 import { connectorEnvironmentMatches } from "../binance/binance-environment";
+import { BinanceError } from "../binance/binance.errors";
 import { profileLockKey } from "./profile-lock";
 import { env } from "../../config/env";
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
@@ -642,11 +643,31 @@ export class SafetyAdmissionService {
         exists: true,
         status: inspection.filters.status,
         contractType: inspection.filters.contractType,
+        // Passed through verbatim, nulls included. The engine — not this
+        // reader — decides what a missing asset means.
+        quoteAsset: inspection.filters.quoteAsset,
+        marginAsset: inspection.filters.marginAsset,
         hasFiltersSnapshot: inspection.filters.tickSize !== null && inspection.filters.stepSize !== null,
         hasBracketSnapshot: inspection.brackets.length > 0,
       };
-    } catch {
-      symbolState = UNAVAILABLE_SYMBOL;
+    } catch (error) {
+      /**
+       * Two very different failures used to collapse into one.
+       *
+       * `inspectSymbol` raises UNSUPPORTED_SYMBOL when exchangeInfo returned
+       * successfully and simply had no such contract. That is an AUTHORITATIVE
+       * answer — the symbol does not exist — and it belongs on the terminal
+       * path so a bad ticker is SKIPPED once instead of being re-read forever.
+       *
+       * Any other error (timeout, 5xx, network, malformed payload) says
+       * nothing about the symbol, only that we could not look. That stays
+       * `available: false`, which the engine treats as retryable and which
+       * never spends a claim or a reservation.
+       */
+      symbolState =
+        error instanceof BinanceError && error.kind === "UNSUPPORTED_SYMBOL"
+          ? { ...UNAVAILABLE_SYMBOL, available: true, exists: false }
+          : UNAVAILABLE_SYMBOL;
     }
 
     return { binance, symbolState };
@@ -682,6 +703,9 @@ const UNAVAILABLE_SYMBOL: SymbolStateSnapshot = {
   exists: false,
   status: null,
   contractType: null,
+  // Null, never "USDT". An unread symbol must never look eligible.
+  quoteAsset: null,
+  marginAsset: null,
   hasFiltersSnapshot: false,
   hasBracketSnapshot: false,
 };

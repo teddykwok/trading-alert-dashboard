@@ -111,7 +111,15 @@ const readOnlyStub = {
     stub.calls.push(`inspectSymbol:${symbol}`);
     if (stub.failSymbol) throw new Error("stubbed connector failure");
     return {
-      filters: { symbol, status: "TRADING", contractType: "PERPETUAL", tickSize: "0.01", stepSize: "0.001" },
+      filters: {
+        symbol,
+        status: "TRADING",
+        contractType: "PERPETUAL",
+        quoteAsset: "USDT",
+        marginAsset: "USDT",
+        tickSize: "0.01",
+        stepSize: "0.001",
+      },
       brackets: [{ bracket: 1, initialLeverage: 50, notionalCap: "10000", notionalFloor: "0", maintMarginRatio: "0.01", cum: "0" }],
       maxInitialLeverage: 50,
       accountSymbolConfig: null,
