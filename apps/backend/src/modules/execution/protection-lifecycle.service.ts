@@ -235,6 +235,31 @@ function isRecoverableInterventionReason(reasonCode: string | null): boolean {
 }
 
 /**
+ * A human, for THIS execution, for THIS one intervention reason.
+ *
+ * Some interventions are correctly outside automatic recovery — retrying them
+ * on every tick would either be useless or actively harmful — but they are
+ * still recoverable once a person has looked. `TAKE_PROFIT_TRIGGER_INVALID` is
+ * the motivating case: the take profit is unplaceable because price passed the
+ * target, which no amount of retrying changes, yet the stop can be placed
+ * immediately and should be.
+ *
+ * This is deliberately NOT a widening of `RECOVERABLE_INTERVENTION_REASON_CODES`.
+ * That list governs what the worker does unattended and is unchanged; this
+ * authorizes one attempt that an operator asked for, and it must name the exact
+ * reason it is answering. A caller that passes nothing — every scheduled tick —
+ * behaves exactly as before.
+ */
+export interface OperatorRecoveryApproval {
+  /** The intervention reason the operator reviewed. Nothing else is admitted. */
+  reasonCode: ProtectionReasonCode;
+}
+
+export interface ProtectionRecoveryInput extends ProtectionLifecycleInput {
+  operatorApproval?: OperatorRecoveryApproval;
+}
+
+/**
  * How strong the evidence behind a failed STOP actually is.
  *
  * EXHAUSTED   the bounded re-query schedule genuinely ran out
@@ -531,7 +556,7 @@ export class ProtectionLifecycleService {
    * over-protection detection and coverage verification exactly as it does for
    * a never-parked execution.
    */
-  async attemptProtectionRecovery(input: ProtectionLifecycleInput): Promise<ProtectionOutcome> {
+  async attemptProtectionRecovery(input: ProtectionRecoveryInput): Promise<ProtectionOutcome> {
     const execution = await this.loadExecution(input.executionId);
 
     // Gate 1: still parked. A closure pass in the same tick may already have
@@ -558,7 +583,15 @@ export class ProtectionLifecycleService {
         protection
       );
     }
-    if (!isRecoverableInterventionReason(protection.reasonCode)) {
+    // An operator approval counts ONLY for the reason it names, and only
+    // when that is the reason actually parked on this protection row. It can
+    // never turn some other intervention into a recoverable one.
+    const operatorApproved =
+      input.operatorApproval !== undefined &&
+      protection.reasonCode !== null &&
+      input.operatorApproval.reasonCode === protection.reasonCode;
+
+    if (!isRecoverableInterventionReason(protection.reasonCode) && !operatorApproved) {
       return this.outcome(
         false,
         "MANUAL_REVIEW_REQUIRED",
@@ -645,6 +678,9 @@ export class ProtectionLifecycleService {
       eventType: "PROTECTION_RECONCILED",
       metadata: {
         interventionReason: protection.reasonCode,
+        // Distinguishes an unattended tick from a recovery a human asked for,
+        // which is the whole audit question for a parked position.
+        initiatedBy: operatorApproved ? "OPERATOR" : "SCHEDULED",
         recoveryAttempt: attempts + 1,
         maxRecoveryAttempts: MAX_RECOVERY_ATTEMPTS_PER_EPISODE,
         confirmedOpenQuantity: openQuantity,

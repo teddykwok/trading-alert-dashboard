@@ -1053,6 +1053,12 @@ describe("natural authorization: runtime boundary", () => {
     // underneath a live window would let it admit a trade nobody reviewed.
     // It prepares, arms, claims and revokes nothing.
     "src/modules/execution/entry-recovery-cli.ts",
+    // Stranded-protection recovery. Same justification as the entry recovery
+    // CLI above: it READS a window only to refuse itself while one is still
+    // AVAILABLE, because placing a stop underneath a live window means acting
+    // while new exposure could appear beside it. It prepares, arms, claims and
+    // revokes nothing.
+    "src/modules/execution/protection-recovery-cli.ts",
     // Same justification again: changing how a NEW plan is built underneath a
     // window that is still AVAILABLE would let it admit a trade shaped by
     // numbers nobody reviewed. It reads a window to refuse itself, nothing more.
@@ -1124,6 +1130,7 @@ describe("natural authorization: runtime boundary", () => {
     const code = codeOf("src/modules/operator/allowlist.service.ts");
     const policy = codeOf("src/modules/operator/source-timeframes.service.ts");
     const recoveryCli = codeOf("src/modules/execution/entry-recovery-cli.ts");
+    const protectionRecoveryCli = codeOf("src/modules/execution/protection-recovery-cli.ts");
     const lookback = codeOf("src/modules/operator/extreme-rr-lookback.service.ts");
     for (const forbidden of [
       "claimNaturalWindow",
@@ -1138,6 +1145,9 @@ describe("natural authorization: runtime boundary", () => {
       expect(`policy ${forbidden}:${policy.includes(forbidden)}`).toBe(`policy ${forbidden}:false`);
       expect(`recoveryCli ${forbidden}:${recoveryCli.includes(forbidden)}`).toBe(
         `recoveryCli ${forbidden}:false`
+      );
+      expect(`protectionRecoveryCli ${forbidden}:${protectionRecoveryCli.includes(forbidden)}`).toBe(
+        `protectionRecoveryCli ${forbidden}:false`
       );
       expect(`lookback ${forbidden}:${lookback.includes(forbidden)}`).toBe(
         `lookback ${forbidden}:false`
