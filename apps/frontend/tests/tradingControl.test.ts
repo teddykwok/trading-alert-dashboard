@@ -4,13 +4,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   TRADING_SYSTEM_STATES,
+  formatAlertAgeLimit,
   formatTtl,
   presentAllowedSymbols,
   presentAttestation,
   presentAuthorization,
   presentBlockers,
   presentCapacity,
+  humanizeReasonCode,
+  presentExecutionReason,
   presentLatestExecution,
+  presentOpenCapacity,
+  presentPendingCapacity,
   READINESS_NOT_CHECKED,
   presentReadiness,
   presentReadinessSnapshot,
@@ -88,13 +93,15 @@ function statusFixture(overrides: Partial<TradingControlStatusDto> = {}): Tradin
       claimedCount: 2,
       remainingClaims: 3,
     },
-    capacity: { pending: 1, open: 1, totalActive: 2, desiredOpen: 3, hardTotal: 5 },
+    alertAgeLimitSeconds: 300,
+    capacity: { pending: 1, open: 1, totalActive: 2, desiredOpen: 3, hardTotal: 5, maxOpen: 5, maxPending: 5 },
     reservations: { riskUsd: "2.75", riskLimitUsd: "7.50", marginUsd: "7", marginLimitUsd: "40.00" },
     latestExecution: {
       symbol: "COWUSDT",
       direction: "LONG",
       status: "PROTECTED",
       reason: "PASS",
+      sourceTimeframe: "1W",
       updatedAt: "2026-08-21T11:59:00.000Z",
     },
     manualIntervention: { present: false, count: 0 },
@@ -274,6 +281,199 @@ describe("trading control panel: capacity, risk and margin", () => {
   it("renders the latest execution, or None", () => {
     expect(presentLatestExecution(statusFixture().latestExecution)).toBe("COWUSDT LONG · PROTECTED");
     expect(presentLatestExecution(null)).toBe("None");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Why the latest execution was refused
+// ---------------------------------------------------------------------------
+
+/**
+ * A refused execution, shaped as the status endpoint sends one.
+ *
+ * SKIPPED by default because that is the state the reason line exists for; the
+ * healthy states are asserted separately below.
+ */
+function refused(overrides: Partial<NonNullable<TradingControlStatusDto["latestExecution"]>> = {}) {
+  return {
+    symbol: "ELSAUSDT",
+    direction: "SHORT",
+    status: "SKIPPED",
+    reason: "SOURCE_TIMEFRAME_NOT_ALLOWED",
+    sourceTimeframe: "1D",
+    updatedAt: "2026-08-25T03:07:04.000Z",
+    ...overrides,
+  };
+}
+
+describe("latest execution: explaining a refusal", () => {
+  it("A. names the timeframe a source-timeframe refusal was actually about", () => {
+    // The whole point of the line. Naming the rule without its subject leaves
+    // the operator to go and look up which timeframe it objected to.
+    expect(presentExecutionReason(refused(), 300)).toBe("Source timeframe 1D is not allowed");
+    expect(presentExecutionReason(refused({ sourceTimeframe: "3M" }), 300)).toBe(
+      "Source timeframe 3M is not allowed"
+    );
+  });
+
+  it("A2. stays truthful when the execution carries no source timeframe", () => {
+    // Never renders "Source timeframe null is not allowed".
+    const presented = presentExecutionReason(refused({ sourceTimeframe: null }), 300);
+    expect(presented).toBe("The signal’s source timeframe is not allowed");
+    expect(presented).not.toContain("null");
+  });
+
+  it("B. explains the USDT-only contract policy", () => {
+    const presented = presentExecutionReason(refused({ reason: "USDT_ONLY_CONTRACT_REQUIRED" }), 300);
+    expect(presented).toBe("This contract is not eligible for USDT-only execution");
+  });
+
+  it("C. explains an unsupported Binance Futures symbol", () => {
+    const presented = presentExecutionReason(refused({ reason: "UNSUPPORTED_SYMBOL" }), 300);
+    expect(presented).toBe("Symbol is not supported for Binance USDⓈ-M Futures");
+  });
+
+  it("D. states the stale-alert limit from policy rather than a hardcoded number", () => {
+    // The limit is configurable, so the copy reads it instead of asserting a
+    // duration that could quietly become wrong.
+    expect(presentExecutionReason(refused({ reason: "ALERT_STALE" }), 300)).toBe(
+      "Alert is older than the execution limit of 5 min"
+    );
+    expect(presentExecutionReason(refused({ reason: "ALERT_STALE" }), 600)).toBe(
+      "Alert is older than the execution limit of 10 min"
+    );
+    // A non-round limit stays honest rather than rounding to the nearest minute.
+    expect(presentExecutionReason(refused({ reason: "ALERT_STALE" }), 90)).toBe(
+      "Alert is older than the execution limit of 1 min 30 sec"
+    );
+    // One formatter, so the sentence and the policy row can never disagree
+    // about the same limit in front of the operator.
+    for (const seconds of [300, 600, 90, 45, 3661]) {
+      expect(presentExecutionReason(refused({ reason: "ALERT_STALE" }), seconds), String(seconds)).toContain(
+        formatAlertAgeLimit(seconds)
+      );
+    }
+  });
+
+  it("E. includes the real symbol and side for a same-symbol-side refusal", () => {
+    expect(presentExecutionReason(refused({ reason: "SYMBOL_SIDE_ALREADY_ACTIVE" }), 300)).toBe(
+      "A ELSAUSDT SHORT execution is already active"
+    );
+    expect(
+      presentExecutionReason(
+        refused({ reason: "SYMBOL_HAS_OPEN_POSITION_OR_ORDER", symbol: "ENJUSDT" })
+      )
+    ).toBe("An open Binance position or order already exists for ENJUSDT");
+  });
+
+  it("F. degrades safely for a reason code this build has never seen", () => {
+    // New codes ship with the backend, not with this file. An unknown one must
+    // read as something rather than crashing or rendering a blank line.
+    const presented = presentExecutionReason(refused({ reason: "SOME_FUTURE_POLICY_CODE" }), 300);
+    expect(presented).toBe("Some future policy code");
+    expect(presented).not.toBe("");
+  });
+
+  it("F2. never returns an empty string for any catalogued or malformed code", () => {
+    const codes = [
+      "SOURCE_TIMEFRAME_NOT_ALLOWED", "SOURCE_TIMEFRAME_UNAVAILABLE", "USDT_ONLY_CONTRACT_REQUIRED",
+      "UNSUPPORTED_SYMBOL", "SYMBOL_NOT_TRADING", "UNSUPPORTED_CONTRACT", "SYMBOL_NOT_ALLOWED",
+      "ALERT_STALE", "SIGNAL_TIME_UNAVAILABLE", "DUPLICATE_EXECUTION", "SYMBOL_SIDE_ALREADY_ACTIVE",
+      "SYMBOL_HAS_OPEN_POSITION_OR_ORDER", "OPEN_POSITION_LIMIT_REACHED", "SOFT_OPEN_TARGET_REACHED",
+      "PENDING_ENTRY_LIMIT_REACHED", "TOTAL_ACTIVE_LIMIT_REACHED", "TOTAL_RISK_LIMIT_REACHED",
+      "TOTAL_MARGIN_LIMIT_REACHED", "INSUFFICIENT_AVAILABLE_BALANCE", "MARGIN_PLAN_NOT_READY",
+      "MARGIN_PLAN_SNAPSHOT_MISSING", "UNSAFE_LIQUIDATION_BUFFER", "GLOBAL_KILL_SWITCH_ACTIVE",
+      "PROFILE_KILL_SWITCH_ACTIVE", "PROFILE_DISABLED", "PROFILE_ENVIRONMENT_MISMATCH",
+      "PROFILE_POLICY_UNAVAILABLE", "RECOVERY_REQUIRED", "EXPECTED_HEDGE_MODE",
+      "EXPECTED_SINGLE_ASSET_MODE", "EXPECTED_ISOLATED_MARGIN_TYPE", "NATURAL_AUTHORIZATION_REQUIRED",
+      "NATURAL_AUTHORIZATION_INVALID", "NATURAL_AUTHORIZATION_REVOKED", "NATURAL_AUTHORIZATION_EXPIRED",
+      "NATURAL_AUTHORIZATION_EXHAUSTED", "NATURAL_AUTHORIZATION_DIRECTION_NOT_ALLOWED",
+      "NATURAL_AUTHORIZATION_CONFLICT", "BINANCE_ACCOUNT_STATE_UNAVAILABLE",
+      "BINANCE_SYMBOL_STATE_UNAVAILABLE", "CAPACITY_CONFLICT_RETRY", "ENTRY_SUBMISSION_REJECTED",
+      "ENTRY_SUBMISSION_ABANDONED", "ENTRY_TTL_EXPIRED", "ENTRY_ORDER_NOT_FOUND",
+      "ENTRY_ORDER_IDENTITY_MISMATCH", "EXTERNAL", "totally_unknown",
+    ];
+    for (const reason of codes) {
+      const presented = presentExecutionReason(refused({ reason }), 300);
+      expect(presented, reason).toBeTruthy();
+      expect((presented ?? "").length, reason).toBeGreaterThan(3);
+      // Operator copy, never a raw enum echoed back at them.
+      expect(presented, reason).not.toBe(reason);
+    }
+  });
+
+  it("F3. degenerate input still never renders a blank Reason line", () => {
+    // The guarantee is non-blank, not eloquence: a one-character code cannot
+    // come from this backend's catalogue, and inventing a special case for it
+    // would be complexity bought for input that does not occur.
+    for (const reason of ["x", "_", "A_B"]) {
+      expect(presentExecutionReason(refused({ reason }), 300), reason).toBeTruthy();
+    }
+  });
+
+  it("G. shows NO reason for a healthy execution that is simply progressing", () => {
+    // ENTRY_PENDING sits on ENTRY_RECONCILED, which means the order is resting
+    // exactly as intended. Printing that under "Reason:" would report a problem
+    // for a trade that is working.
+    for (const status of ["ENTRY_PENDING", "ENTRY_FILLED", "PROTECTED", "PLAN_READY", "PREFLIGHT"]) {
+      expect(presentExecutionReason(refused({ status, reason: "ENTRY_RECONCILED" }), 300), status).toBeNull();
+    }
+    expect(presentExecutionReason(statusFixture().latestExecution, 300)).toBeNull();
+  });
+
+  it("G2. does show a reason for the terminal states an operator must act on", () => {
+    for (const status of ["SKIPPED", "FAILED", "MANUAL_INTERVENTION", "ENTRY_EXPIRED"]) {
+      expect(presentExecutionReason(refused({ status }), 300), status).toBeTruthy();
+    }
+  });
+
+  it("H. shows nothing when there is no execution, and leaves the empty state alone", () => {
+    expect(presentExecutionReason(null, 300)).toBeNull();
+    expect(presentLatestExecution(null)).toBe("None");
+    // A refusal with no persisted code must not render a dangling label.
+    expect(presentExecutionReason(refused({ reason: null }), 300)).toBeNull();
+    expect(presentExecutionReason(refused({ reason: "" }), 300)).toBeNull();
+  });
+
+  it("H2. leaves the headline line exactly as it was", () => {
+    // The reason is additive: the symbol/side/status line an operator already
+    // scans for must not move or change shape.
+    expect(presentLatestExecution(refused())).toBe("ELSAUSDT SHORT · SKIPPED");
+  });
+
+  it("humanizeReasonCode turns any shape into readable text", () => {
+    expect(humanizeReasonCode("SOME_NEW_CODE")).toBe("Some new code");
+    expect(humanizeReasonCode("SINGLE")).toBe("Single");
+    expect(humanizeReasonCode("   ")).toBe("Refused for an unspecified reason");
+  });
+});
+
+describe("latest execution reason: presentation only", () => {
+  it("renders the reason as a secondary line and keeps the raw code on hover", () => {
+    const card = readFileSync(
+      path.join(process.cwd(), "src/components/operator/TradingControlCard.tsx"),
+      "utf8"
+    );
+    // Secondary styling, not a new error box.
+    expect(card).toContain("Reason: {executionReason}");
+    expect(card).toContain("text-xs font-normal leading-snug text-slate-400");
+    // The raw code stays reachable without putting jargon on the card.
+    expect(card).toContain("title={status.latestExecution?.reason ?? undefined}");
+    // Rendered only when there is something to say.
+    expect(card).toContain("{executionReason && (");
+  });
+
+  it("derives its copy from persisted fields only — it parses no prose", () => {
+    const presentation = readFileSync(
+      path.join(process.cwd(), "src/features/operator/tradingControlPresentation.ts"),
+      "utf8"
+    );
+    // The backend keeps additional failed checks only as a prose sentence, and
+    // scraping that would break the moment the wording changed. The reason line
+    // is built from the structured code and context, or not at all.
+    for (const forbidden of ["sanitizedMessage", "\\bsplit(", "match(/", "indexOf("]) {
+      expect(`${forbidden}:${presentation.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
   });
 });
 
@@ -468,5 +668,139 @@ describe("trading control panel: requests", () => {
     for (const path of ["/api/executions", "/api/alerts", "https://example.com/api/operator/status"]) {
       expect(() => operatorApiClient.get(path)).toThrow(/non-operator path/);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scannability: policy, capacity and grouping
+// ---------------------------------------------------------------------------
+
+describe("trading policy: the alert age limit is shown as POLICY", () => {
+  it("A/B. formats the effective limit, never a hardcoded five minutes", () => {
+    expect(formatAlertAgeLimit(300)).toBe("5 min");
+    expect(formatAlertAgeLimit(600)).toBe("10 min");
+    expect(formatAlertAgeLimit(60)).toBe("1 min");
+  });
+
+  it("C. formats a non-round duration without lying about it", () => {
+    expect(formatAlertAgeLimit(90)).toBe("1 min 30 sec");
+    expect(formatAlertAgeLimit(45)).toBe("45 sec");
+    expect(formatAlertAgeLimit(3661)).toBe("61 min 1 sec");
+  });
+
+  it("C2. degrades safely rather than rendering a nonsense duration", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(formatAlertAgeLimit(bad), String(bad)).toBe("Not configured");
+    }
+  });
+
+  it("reads the value straight from the status feed", () => {
+    const status = statusFixture({ alertAgeLimitSeconds: 900 });
+    expect(formatAlertAgeLimit(status.alertAgeLimitSeconds)).toBe("15 min");
+  });
+
+  it("J. never labels the limit as a touch time or a signal age", () => {
+    // The timestamp the backend measures age FROM is under separate review, so
+    // the panel states the RULE and claims nothing about when a level was
+    // touched or how old any particular signal was.
+    const card = readFileSync(
+      path.join(process.cwd(), "src/components/operator/TradingControlCard.tsx"),
+      "utf8"
+    );
+    const presentation = readFileSync(
+      path.join(process.cwd(), "src/features/operator/tradingControlPresentation.ts"),
+      "utf8"
+    );
+    for (const forbidden of ["Touch time", "touchedAt", "Signal age", "triggeredAt", "seconds after touch"]) {
+      expect(`card ${forbidden}:${card.includes(forbidden)}`).toBe(`card ${forbidden}:false`);
+      expect(`presentation ${forbidden}:${presentation.includes(forbidden)}`).toBe(
+        `presentation ${forbidden}:false`
+      );
+    }
+    expect(card).toContain('<Row label="Alert Age Limit">');
+  });
+});
+
+describe("capacity: each count against the limit that governs it", () => {
+  it("H. shows open, pending and active with their own denominators", () => {
+    const capacity = statusFixture().capacity;
+    // Pending entries measured against the TOTAL-active limit would read as
+    // more headroom than the operator actually has.
+    expect(presentOpenCapacity(capacity)).toBe("1 / 5 (target 3)");
+    expect(presentPendingCapacity(capacity)).toBe("1 / 5");
+    expect(presentCapacity(capacity)).toBe("2 / 5");
+  });
+
+  it("keeps the soft target distinct from the hard limit", () => {
+    const capacity = statusFixture({
+      capacity: { pending: 2, open: 3, totalActive: 5, desiredOpen: 3, hardTotal: 5, maxOpen: 5, maxPending: 5 },
+    }).capacity;
+    const presented = presentOpenCapacity(capacity);
+    expect(presented).toContain("3 / 5");
+    expect(presented).toContain("target 3");
+  });
+
+  it("derives no totals of its own", () => {
+    // Every number on the card comes from the backend read model. A second
+    // frontend computation could disagree with admission, which is the one
+    // thing a capacity display must never do.
+    const presentation = readFileSync(
+      path.join(process.cwd(), "src/features/operator/tradingControlPresentation.ts"),
+      "utf8"
+    );
+    for (const forbidden of ["reduce(", "filter(", " + 1", "Number("]) {
+      expect(`${forbidden}:${presentation.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+  });
+});
+
+describe("trading control layout: grouped, and nothing lost", () => {
+  const card = readFileSync(
+    path.join(process.cwd(), "src/components/operator/TradingControlCard.tsx"),
+    "utf8"
+  );
+
+  it("G. groups the rows into the order an operator asks in", () => {
+    for (const title of ["System", "Trading Policy", "Authorization", "Capacity", "Latest Execution"]) {
+      expect(card).toContain(`<Section title="${title}">`);
+    }
+    // The order matters: safety first, outcome last.
+    const at = (title: string) => card.indexOf(`<Section title="${title}">`);
+    expect(at("System")).toBeLessThan(at("Trading Policy"));
+    expect(at("Trading Policy")).toBeLessThan(at("Authorization"));
+    expect(at("Authorization")).toBeLessThan(at("Capacity"));
+    expect(at("Capacity")).toBeLessThan(at("Latest Execution"));
+  });
+
+  it("G2. keeps every row that existed before the regrouping", () => {
+    for (const label of [
+      "System", "Runtime", "Attestation", "Preparation", "Live Activation",
+      "Allowed Symbols", "Source TFs", "RR lookback", "Natural Window", "TTL",
+      "Claims", "Active", "Risk", "Margin",
+    ]) {
+      expect(card, label).toContain(`<Row label="${label}">`);
+    }
+  });
+
+  it("I. keeps every safety-critical action and its confirmation flow", () => {
+    const page = readFileSync(
+      path.join(process.cwd(), "src/components/operator/TradingControlCard.tsx"),
+      "utf8"
+    );
+    // Nothing in this feature may remove or rename an operator action.
+    for (const marker of ["Check Readiness", "Blockers ("]) {
+      expect(page, marker).toContain(marker);
+    }
+  });
+
+  it("keeps the section heading quieter than the state it labels", () => {
+    // A group label must never compete with SAFE OFF or BLOCKED.
+    expect(card).toContain('className="text-[10px] font-semibold uppercase tracking-widest text-slate-500"');
+    expect(card).toContain('<Badge tone={system.tone}>{system.label}</Badge>');
+  });
+
+  it("J. lets the reason wrap instead of overflowing", () => {
+    expect(card).toContain("min-w-0 text-right text-sm text-slate-200");
+    expect(card).toContain("text-xs font-normal leading-snug text-slate-400");
   });
 });

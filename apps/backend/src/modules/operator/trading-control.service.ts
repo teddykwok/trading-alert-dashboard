@@ -156,6 +156,17 @@ export interface TradingControlCapacityDto {
   totalActive: number;
   desiredOpen: number;
   hardTotal: number;
+  /**
+   * The effective per-group limits, so the panel can show each count against
+   * the limit that actually governs it.
+   *
+   * Without these the UI has only `hardTotal` and would have to either omit a
+   * denominator or borrow the wrong one — showing pending entries out of the
+   * TOTAL-active limit reads as more headroom than the operator really has.
+   * Both come from the same min-merge the admission engine uses.
+   */
+  maxOpen: number;
+  maxPending: number;
 }
 
 export interface TradingControlReservationsDto {
@@ -170,6 +181,15 @@ export interface TradingControlLatestExecutionDto {
   direction: string;
   status: string;
   reason: string | null;
+  /**
+   * The SOURCE timeframe frozen on this execution, so the panel can say which
+   * timeframe a SOURCE_TIMEFRAME_NOT_ALLOWED refusal was actually about
+   * instead of naming the rule without its subject.
+   *
+   * Already persisted on the row and already sanitized — this exposes no new
+   * information, it only stops the panel from having to omit it.
+   */
+  sourceTimeframe: string | null;
   updatedAt: string;
 }
 
@@ -203,6 +223,13 @@ export interface TradingControlStatusDto {
    */
   rrLookback: { stored: number; effective: number | null; valid: boolean; supported: number[] };
   authorization: TradingControlAuthorizationDto | null;
+  /**
+   * The effective maximum age, in seconds, a signal may have and still be
+   * admitted. Presentation reads it as policy — it is deliberately NOT
+   * attached to an execution, because it describes the rule in force now
+   * rather than the one that judged any particular row.
+   */
+  alertAgeLimitSeconds: number;
   capacity: TradingControlCapacityDto;
   reservations: TradingControlReservationsDto;
   latestExecution: TradingControlLatestExecutionDto | null;
@@ -352,6 +379,8 @@ export class TradingControlService {
       totalActive: capacityRows.length,
       desiredOpen: limits.softOpenPositionTarget,
       hardTotal: limits.maxTotalActiveTrades,
+      maxOpen: limits.maxOpenPositions,
+      maxPending: limits.maxPendingEntries,
     };
 
     // Reported exactly as stored resolves, never repaired: a policy that
@@ -384,6 +413,7 @@ export class TradingControlService {
         marginUsd: reservedMargin.toString(),
         marginLimitUsd: limits.maxTotalIsolatedMarginUsd,
       },
+      alertAgeLimitSeconds: limits.maxAlertAgeSeconds,
       latestExecution,
       manualIntervention: { present: manualCount > 0, count: manualCount },
       warnings: buildWarnings({
@@ -463,6 +493,7 @@ export class TradingControlService {
         status: true,
         decisionReasonCode: true,
         exitReason: true,
+        sourceTimeframe: true,
         updatedAt: true,
       },
     });
@@ -474,6 +505,7 @@ export class TradingControlService {
       // Both are sanitized codes the journal already shows; neither carries
       // account detail, an order id or a credential.
       reason: row.decisionReasonCode ?? row.exitReason ?? null,
+      sourceTimeframe: row.sourceTimeframe,
       updatedAt: row.updatedAt.toISOString(),
     };
   }

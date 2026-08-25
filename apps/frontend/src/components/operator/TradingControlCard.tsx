@@ -15,12 +15,16 @@ import {
   type TradingControlStatusDto,
 } from "../../api/operator";
 import {
+  formatAlertAgeLimit,
   presentAllowedSymbols,
   presentAttestation,
   presentAuthorization,
   presentBlockers,
   presentCapacity,
+  presentExecutionReason,
   presentLatestExecution,
+  presentOpenCapacity,
+  presentPendingCapacity,
   presentReadinessSnapshot,
   presentReservation,
   presentRuntime,
@@ -52,8 +56,29 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="flex items-baseline justify-between gap-3 py-1">
       <span className="text-xs uppercase tracking-wide text-slate-400">{label}</span>
-      <span className="text-sm text-slate-200">{children}</span>
+      <span className="min-w-0 text-right text-sm text-slate-200">{children}</span>
     </div>
+  );
+}
+
+/**
+ * One labelled group of rows.
+ *
+ * The panel had grown to sixteen visually identical rows, which made state,
+ * policy, capacity and outcome all read at the same weight — everything
+ * equally important is the same as nothing being important. Grouping restores
+ * the order an operator actually asks in: is it safe, is it healthy, what is
+ * the policy, how much is used, what happened last.
+ *
+ * The heading is deliberately quieter than the values inside it: a section
+ * label must never compete with SAFE OFF or BLOCKED for attention.
+ */
+function Section({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="space-y-0.5">
+      <h3 className="text-[10px] font-semibold uppercase tracking-widest text-slate-500">{title}</h3>
+      <div className="divide-y divide-surface-border/60">{children}</div>
+    </section>
   );
 }
 
@@ -123,6 +148,7 @@ function StatusBody({
   const activation = presentReadinessSnapshot(readiness, "LIVE_ACTIVATION");
   const authorization = presentAuthorization(status.authorization);
   const blockers = readiness ? presentBlockers(readiness) : [];
+  const executionReason = presentExecutionReason(status.latestExecution, status.alertAgeLimitSeconds);
 
   return (
     <div className="space-y-3">
@@ -136,40 +162,79 @@ function StatusBody({
         </ul>
       ) : null}
 
-      <div className="divide-y divide-surface-border/60">
-        <Row label="System">
-          <Badge tone={system.tone}>{system.label}</Badge>
-        </Row>
-        <Row label="Runtime">
-          <Badge tone={runtime.tone}>{runtime.label}</Badge>
-        </Row>
-        <Row label="Attestation">
-          <Badge tone={attestation.tone}>{attestation.label}</Badge>
-        </Row>
-        <Row label="Preparation">
-          <Badge tone={preparation.tone}>{preparation.label}</Badge>
-        </Row>
-        <Row label="Live Activation">
-          <Badge tone={activation.tone}>{activation.label}</Badge>
-        </Row>
-        <Row label="Allowed Symbols">{presentAllowedSymbols(status.allowedSymbols)}</Row>
-        <Row label="Source TFs">
-          <span className={status.sourceTimeframes.valid ? undefined : "text-red-300"}>
-            {describeSourceTimeframes(status.sourceTimeframes)}
-          </span>
-        </Row>
-        <Row label="RR lookback">
-          <span className={status.rrLookback.valid ? undefined : "text-red-300"}>
-            {describeRrLookback(status.rrLookback)}
-          </span>
-        </Row>
-        <Row label="Natural Window">{authorization.state}</Row>
-        <Row label="TTL">{authorization.ttl}</Row>
-        <Row label="Claims">{authorization.claims}</Row>
-        <Row label="Active">{presentCapacity(capacity)}</Row>
-        <Row label="Risk">{presentReservation(reservations.riskUsd, reservations.riskLimitUsd)}</Row>
-        <Row label="Margin">{presentReservation(reservations.marginUsd, reservations.marginLimitUsd)}</Row>
-        <Row label="Latest Execution">{presentLatestExecution(status.latestExecution)}</Row>
+      <div className="space-y-3">
+        <Section title="System">
+          <Row label="System">
+            <Badge tone={system.tone}>{system.label}</Badge>
+          </Row>
+          <Row label="Runtime">
+            <Badge tone={runtime.tone}>{runtime.label}</Badge>
+          </Row>
+          <Row label="Attestation">
+            <Badge tone={attestation.tone}>{attestation.label}</Badge>
+          </Row>
+          <Row label="Preparation">
+            <Badge tone={preparation.tone}>{preparation.label}</Badge>
+          </Row>
+          <Row label="Live Activation">
+            <Badge tone={activation.tone}>{activation.label}</Badge>
+          </Row>
+        </Section>
+
+        <Section title="Trading Policy">
+          <Row label="Allowed Symbols">{presentAllowedSymbols(status.allowedSymbols)}</Row>
+          <Row label="Source TFs">
+            <span className={status.sourceTimeframes.valid ? undefined : "text-red-300"}>
+              {describeSourceTimeframes(status.sourceTimeframes)}
+            </span>
+          </Row>
+          <Row label="RR lookback">
+            <span className={status.rrLookback.valid ? undefined : "text-red-300"}>
+              {describeRrLookback(status.rrLookback)}
+            </span>
+          </Row>
+          {/*
+            POLICY only. This is the maximum age a signal may have and still be
+            admitted — it is NOT a reading of how old anything was, and it is
+            deliberately not labelled "signal age" or "touch time". What the
+            backend measures that age from is under separate review, so naming
+            it here would assert a meaning the data has not been shown to have.
+          */}
+          <Row label="Alert Age Limit">{formatAlertAgeLimit(status.alertAgeLimitSeconds)}</Row>
+        </Section>
+
+        <Section title="Authorization">
+          <Row label="Natural Window">{authorization.state}</Row>
+          <Row label="TTL">{authorization.ttl}</Row>
+        </Section>
+
+        <Section title="Capacity">
+          <Row label="Open">{presentOpenCapacity(capacity)}</Row>
+          <Row label="Pending">{presentPendingCapacity(capacity)}</Row>
+          <Row label="Active">{presentCapacity(capacity)}</Row>
+          <Row label="Claims">{authorization.claims}</Row>
+          <Row label="Risk">{presentReservation(reservations.riskUsd, reservations.riskLimitUsd)}</Row>
+          <Row label="Margin">{presentReservation(reservations.marginUsd, reservations.marginLimitUsd)}</Row>
+        </Section>
+
+        <Section title="Latest Execution">
+          <Row label="Outcome">
+            <span className="flex flex-col items-end gap-0.5">
+              <span>{presentLatestExecution(status.latestExecution)}</span>
+              {executionReason && (
+                // Secondary by design: the symbol and status stay the thing you
+                // scan for, and the explanation sits under them. `title` keeps
+                // the raw code one hover away without putting jargon on the card.
+                <span
+                  className="text-xs font-normal leading-snug text-slate-400"
+                  title={status.latestExecution?.reason ?? undefined}
+                >
+                  Reason: {executionReason}
+                </span>
+              )}
+            </span>
+          </Row>
+        </Section>
       </div>
 
       {blockers.length > 0 && (

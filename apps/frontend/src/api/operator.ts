@@ -75,9 +75,26 @@ export interface TradingControlStatusDto {
     claimedCount: number;
     remainingClaims: number;
   } | null;
-  capacity: { pending: number; open: number; totalActive: number; desiredOpen: number; hardTotal: number };
+  alertAgeLimitSeconds: number;
+  capacity: {
+    pending: number;
+    open: number;
+    totalActive: number;
+    desiredOpen: number;
+    hardTotal: number;
+    maxOpen: number;
+    maxPending: number;
+  };
   reservations: { riskUsd: string; riskLimitUsd: string; marginUsd: string; marginLimitUsd: string };
-  latestExecution: { symbol: string; direction: string; status: string; reason: string | null; updatedAt: string } | null;
+  latestExecution: {
+    symbol: string;
+    direction: string;
+    status: string;
+    reason: string | null;
+    /** Frozen on the execution; names the timeframe a source-TF refusal was about. */
+    sourceTimeframe: string | null;
+    updatedAt: string;
+  } | null;
   manualIntervention: { present: boolean; count: number };
   warnings: { code: string; detail: string }[];
 }
