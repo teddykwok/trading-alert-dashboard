@@ -1218,11 +1218,20 @@ export class ProtectionLifecycleService {
       minQty: inspection.filters.minQty,
       quantity: missingQuantity,
     });
-    if (!validation.valid) {
+    /**
+     * ONLY the stop decides whether protection is attempted.
+     *
+     * This used to read `!validation.valid`, which meant an unplaceable take
+     * profit withheld the stop as well. A take profit becomes unplaceable for
+     * an entirely benign reason — price reaching the target — and refusing the
+     * whole tranche for it left a filled position with no stop at all. The
+     * stop is the safety-critical leg and is now judged on its own.
+     */
+    if (!validation.stop.valid) {
       await this.alerts.raise({
         tradeExecutionId: execution.id,
         alertType: "STOP_NOT_VERIFIED",
-        reasonCode: validation.reasonCode!,
+        reasonCode: validation.stop.reasonCode!,
         details: {
           symbol: execution.symbol,
           positionSide,
@@ -1230,8 +1239,21 @@ export class ProtectionLifecycleService {
           requiredAction: "The frozen protection is incompatible with current exchange state; protect manually.",
         },
       });
-      return this.escalate(execution, validation.reasonCode!, validation.message ?? "Protection is invalid.", input);
+      return this.escalate(execution, validation.stop.reasonCode!, validation.stop.message ?? "Protection is invalid.", input);
     }
+
+    /**
+     * The stop is placeable. If the take profit is not, it is left OUT of this
+     * tranche rather than blocking it.
+     *
+     * Omitting it is not the same as pretending it succeeded: no TAKE_PROFIT
+     * order row is created, so nothing downstream can measure take-profit
+     * coverage that does not exist, `calculateCoverage` cannot report the
+     * position fully covered, and `submitTranche` raises the operator alert
+     * once the stop is actually verified.
+     */
+    const takeProfitForTranche = validation.takeProfit.valid ? takeProfitTrigger : null;
+    const takeProfitOmittedReason = validation.takeProfit.valid ? null : validation.takeProfit.reasonCode;
 
     const generation = (await this.highestGeneration(execution.id)) + 1;
     // The role -> workingType rule lives in ONE place, shared with the demo
@@ -1259,7 +1281,7 @@ export class ProtectionLifecycleService {
       const next = await tx.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
 
       for (const role of ["STOP_LOSS", "TAKE_PROFIT"] as const) {
-        const trigger = role === "STOP_LOSS" ? stopTrigger : takeProfitTrigger;
+        const trigger = role === "STOP_LOSS" ? stopTrigger : takeProfitForTranche;
         if (!trigger) continue;
         await tx.binanceOrder.create({
           data: {
@@ -1290,7 +1312,16 @@ export class ProtectionLifecycleService {
           toStatus: next.status,
           reasonCode: "PROTECTION_COVERAGE_INCOMPLETE",
           message: `Reserved protection generation ${generation} for ${missingQuantity}.`,
-          metadata: { generation, quantity: missingQuantity, workingTypeStop, workingTypeTakeProfit } as Prisma.InputJsonValue,
+          metadata: {
+            generation,
+            quantity: missingQuantity,
+            workingTypeStop,
+            workingTypeTakeProfit,
+            // Written inside the same transaction as the order rows, so the
+            // reason a leg is absent is recorded exactly once per generation.
+            takeProfitOmitted: takeProfitOmittedReason !== null,
+            takeProfitOmittedReason,
+          } as Prisma.InputJsonValue,
         },
       });
 
@@ -1397,8 +1428,44 @@ export class ProtectionLifecycleService {
 
     const takeProfit = await this.loadOrder(execution.id, "TAKE_PROFIT", generation);
     if (!takeProfit) {
-      // A plan with no take profit: a verified stop is the whole protection.
-      return this.verifyAggregateCoverage(execution, owned);
+      // Two different situations reach here, and conflating them would hide a
+      // real gap: the plan may never have had a take profit, or it had one that
+      // was not placeable when this tranche was reserved.
+      if (execution.takeProfit === null) {
+        // A plan with no take profit: a verified stop is the whole protection.
+        return this.verifyAggregateCoverage(execution, owned);
+      }
+
+      // The plan HAS a take profit that could not be placed. The stop is
+      // verified and stays exactly as it is; the missing leg is surfaced for a
+      // human rather than quietly absorbed. Coverage is measured from real
+      // orders, so the execution cannot read as fully protected either way.
+      await this.setProtectionState(
+        protection.id,
+        "PROTECTION_INCOMPLETE",
+        "TAKE_PROFIT_TRIGGER_INVALID",
+        "Stop is verified; the take profit was not placeable and is absent."
+      );
+      await this.alerts.raise({
+        tradeExecutionId: execution.id,
+        alertType: "PROTECTION_COVERAGE_INCOMPLETE",
+        reasonCode: "TAKE_PROFIT_TRIGGER_INVALID",
+        details: {
+          symbol: execution.symbol,
+          positionSide: protectionPositionSide(execution.direction as DirectionName),
+          // Spelled out so the operator sees WHICH leg holds and which does
+          // not, instead of an undifferentiated "incomplete".
+          protectionState: "STOP: VERIFIED | TAKE PROFIT: NOT PLACEABLE",
+          requiredAction: "Stop is in place; the take profit trigger is no longer valid — handle the target manually.",
+        },
+      });
+      return this.outcome(
+        false,
+        "TAKE_PROFIT_TRIGGER_INVALID",
+        "Stop is verified; the take profit was not placeable.",
+        execution,
+        await this.loadProtection(execution.id)
+      );
     }
 
     await this.setProtectionState(protection.id, "PLACING_TAKE_PROFIT", null, null);

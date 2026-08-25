@@ -285,10 +285,64 @@ export interface TriggerValidationInput {
   quantity: string;
 }
 
-export interface TriggerValidationResult {
+/** One protection leg's own verdict, independent of the other. */
+export interface ProtectionLegVerdict {
   valid: boolean;
   reasonCode: ProtectionReasonCode | null;
   message: string | null;
+}
+
+export interface TriggerValidationResult {
+  /** True only when BOTH legs are placeable. Unchanged meaning. */
+  valid: boolean;
+  /** The STOP's reason when the stop fails, otherwise the take profit's. */
+  reasonCode: ProtectionReasonCode | null;
+  message: string | null;
+  /**
+   * The legs, judged separately.
+   *
+   * The combined `valid` above is kept for callers that genuinely need "is the
+   * whole plan placeable", but it must never again be the thing that decides
+   * whether a STOP is submitted. A take profit can become unplaceable simply
+   * because the trade reached its target — price moving through it is a GOOD
+   * outcome — and treating that as a reason to withhold the stop leaves a live
+   * position with no protection at all. That is the incident this shape exists
+   * to prevent.
+   *
+   * `takeProfit.valid` is true when the plan carries no take profit: there is
+   * nothing to refuse.
+   */
+  stop: ProtectionLegVerdict;
+  takeProfit: ProtectionLegVerdict;
+}
+
+const LEG_OK: ProtectionLegVerdict = { valid: true, reasonCode: null, message: null };
+
+function legFailure(reasonCode: ProtectionReasonCode, message: string): ProtectionLegVerdict {
+  return { valid: false, reasonCode, message };
+}
+
+/**
+ * Assembles the combined verdict from the two legs.
+ *
+ * The stop is reported first when both fail, preserving exactly the reason an
+ * operator saw before this split existed.
+ */
+function combineLegs(stop: ProtectionLegVerdict, takeProfit: ProtectionLegVerdict): TriggerValidationResult {
+  const failing = !stop.valid ? stop : !takeProfit.valid ? takeProfit : null;
+  return {
+    valid: stop.valid && takeProfit.valid,
+    reasonCode: failing ? failing.reasonCode : null,
+    message: failing ? failing.message : null,
+    stop,
+    takeProfit,
+  };
+}
+
+/** Both legs share this failure: neither can be placed. */
+function bothLegsFail(reasonCode: ProtectionReasonCode, message: string): TriggerValidationResult {
+  const failure = legFailure(reasonCode, message);
+  return combineLegs(failure, failure);
 }
 
 function isMultipleOf(value: DecimalValue, step: string | null): boolean {
@@ -307,86 +361,65 @@ export function validateProtectionTriggers(input: TriggerValidationInput): Trigg
   const stop = toDecimal(input.stopTriggerPrice);
   const quantity = toDecimal(input.quantity);
 
-  if (stop === null || stop.lessThanOrEqualTo(0)) {
-    return { valid: false, reasonCode: "STOP_TRIGGER_INVALID", message: "Stop trigger price is missing or not positive." };
-  }
+  // --- Shared preconditions: a failure here blocks BOTH legs ---------------
+  //
+  // Quantity and working price are properties of the tranche, not of one
+  // trigger, so there is no leg that could still be placed if they are wrong.
   if (quantity === null || quantity.lessThanOrEqualTo(0)) {
-    return {
-      valid: false,
-      reasonCode: "PROTECTION_QUANTITY_UNSUPPORTED",
-      message: "Protection quantity is missing or not positive.",
-    };
+    return bothLegsFail("PROTECTION_QUANTITY_UNSUPPORTED", "Protection quantity is missing or not positive.");
   }
   if (!isMultipleOf(quantity, input.stepSize)) {
-    return {
-      valid: false,
-      reasonCode: "PROTECTION_QUANTITY_UNSUPPORTED",
-      message: "Protection quantity does not match the current step size.",
-    };
+    return bothLegsFail("PROTECTION_QUANTITY_UNSUPPORTED", "Protection quantity does not match the current step size.");
   }
   const minQty = toDecimal(input.minQty);
   if (minQty !== null && quantity.lessThan(minQty)) {
-    return {
-      valid: false,
-      reasonCode: "PROTECTION_QUANTITY_UNSUPPORTED",
-      message: "Protection quantity is below the current minimum quantity.",
-    };
-  }
-  if (!isMultipleOf(stop, input.tickSize)) {
-    return { valid: false, reasonCode: "PROTECTION_FILTER_MISMATCH", message: "Stop trigger does not match the tick size." };
+    return bothLegsFail("PROTECTION_QUANTITY_UNSUPPORTED", "Protection quantity is below the current minimum quantity.");
   }
 
   const working = toDecimal(input.workingPrice);
   if (working === null || working.lessThanOrEqualTo(0)) {
-    return {
-      valid: false,
-      reasonCode: "POSITION_STATE_UNAVAILABLE",
-      message: "The current working price is unavailable, so trigger direction cannot be checked.",
-    };
+    return bothLegsFail(
+      "POSITION_STATE_UNAVAILABLE",
+      "The current working price is unavailable, so trigger direction cannot be checked."
+    );
   }
 
-  // A stop that is already through the working price would fire immediately.
-  if (input.direction === "LONG" && stop.greaterThanOrEqualTo(working)) {
-    return {
-      valid: false,
-      reasonCode: "STOP_TRIGGER_INVALID",
-      message: "A LONG stop must sit below the current working price.",
-    };
-  }
-  if (input.direction === "SHORT" && stop.lessThanOrEqualTo(working)) {
-    return {
-      valid: false,
-      reasonCode: "STOP_TRIGGER_INVALID",
-      message: "A SHORT stop must sit above the current working price.",
-    };
-  }
+  // --- The STOP leg. Unchanged rules, unchanged reason codes ---------------
+  const stopVerdict = ((): ProtectionLegVerdict => {
+    if (stop === null || stop.lessThanOrEqualTo(0)) {
+      return legFailure("STOP_TRIGGER_INVALID", "Stop trigger price is missing or not positive.");
+    }
+    if (!isMultipleOf(stop, input.tickSize)) {
+      return legFailure("PROTECTION_FILTER_MISMATCH", "Stop trigger does not match the tick size.");
+    }
+    // A stop that is already through the working price would fire immediately.
+    if (input.direction === "LONG" && stop.greaterThanOrEqualTo(working)) {
+      return legFailure("STOP_TRIGGER_INVALID", "A LONG stop must sit below the current working price.");
+    }
+    if (input.direction === "SHORT" && stop.lessThanOrEqualTo(working)) {
+      return legFailure("STOP_TRIGGER_INVALID", "A SHORT stop must sit above the current working price.");
+    }
+    return LEG_OK;
+  })();
 
-  const takeProfit = toDecimal(input.takeProfitTriggerPrice);
-  if (takeProfit !== null) {
+  // --- The TAKE PROFIT leg. Unchanged rules, unchanged reason codes --------
+  const takeProfitVerdict = ((): ProtectionLegVerdict => {
+    const takeProfit = toDecimal(input.takeProfitTriggerPrice);
+    // No take profit in the plan is not a failure — there is nothing to refuse.
+    if (takeProfit === null) return LEG_OK;
     if (takeProfit.lessThanOrEqualTo(0) || !isMultipleOf(takeProfit, input.tickSize)) {
-      return {
-        valid: false,
-        reasonCode: "TAKE_PROFIT_TRIGGER_INVALID",
-        message: "Take-profit trigger is not positive or does not match the tick size.",
-      };
+      return legFailure("TAKE_PROFIT_TRIGGER_INVALID", "Take-profit trigger is not positive or does not match the tick size.");
     }
     if (input.direction === "LONG" && takeProfit.lessThanOrEqualTo(working)) {
-      return {
-        valid: false,
-        reasonCode: "TAKE_PROFIT_TRIGGER_INVALID",
-        message: "A LONG take profit must sit above the current working price.",
-      };
+      return legFailure("TAKE_PROFIT_TRIGGER_INVALID", "A LONG take profit must sit above the current working price.");
     }
     if (input.direction === "SHORT" && takeProfit.greaterThanOrEqualTo(working)) {
-      return {
-        valid: false,
-        reasonCode: "TAKE_PROFIT_TRIGGER_INVALID",
-        message: "A SHORT take profit must sit below the current working price.",
-      };
+      return legFailure("TAKE_PROFIT_TRIGGER_INVALID", "A SHORT take profit must sit below the current working price.");
     }
-  }
+    return LEG_OK;
+  })();
 
-  return { valid: true, reasonCode: null, message: null };
+  return combineLegs(stopVerdict, takeProfitVerdict);
 }
 
 // ---------------------------------------------------------------------------
