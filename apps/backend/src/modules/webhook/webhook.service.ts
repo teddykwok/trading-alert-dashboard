@@ -7,7 +7,7 @@ import { ExtremeRRService } from "../extreme-rr/extreme-rr.service";
 import { enqueueExtremeRRPlan, enqueueVisionAnalysis } from "../jobs/queue";
 import { logger } from "../../config/logger";
 import { notifyAlertDuplicate, notifyNewAlert } from "../notifications/notification.service";
-import { parseOrNowDate } from "../../utils/date";
+import { parseIsoDateStrict } from "../../utils/date";
 import { normalizeTradingSymbol } from "../../utils/symbol";
 import { UnauthorizedError, ValidationError } from "../../utils/errors";
 import { env } from "../../config/env";
@@ -127,6 +127,25 @@ export async function handleTradingViewWebhook(
   // `timeframe`, levelPrice is derived from the note on read).
   const levelContext = parseAlertNote(payload.note);
 
+  /**
+   * The moment the level was touched, and the only timestamp freshness reads.
+   *
+   * Parsed strictly and never defaulted. The schema already refuses an
+   * unparseable value, so reaching this branch means the two disagree — but it
+   * is checked again on purpose: this is the field that decides whether a
+   * signal is fresh enough to put real money behind, and it must not depend on
+   * a validator elsewhere continuing to exist. Neither `barTime` nor the
+   * receipt time may stand in for it; a recent candle is not evidence that the
+   * touch was recent.
+   */
+  const eventTriggeredAt = parseIsoDateStrict(payload.triggeredAt);
+  if (!eventTriggeredAt) {
+    throw new ValidationError(
+      "triggeredAt must be an ISO-8601 timestamp; refusing to assume a signal time.",
+      { field: "triggeredAt" }
+    );
+  }
+
   const alert = await alertsService.create({
     assetId: asset.id,
     symbol: normalizedSymbol,
@@ -138,7 +157,7 @@ export async function handleTradingViewWebhook(
     indicatorName,
     indicatorValue: payload.indicatorValue ?? null,
     rawPayload: payloadWithoutSecret,
-    triggeredAt: parseOrNowDate(payload.triggeredAt),
+    triggeredAt: eventTriggeredAt,
     eventType: levelContext.eventType,
     levelColor: levelContext.levelColor,
     sourceTimeframe: levelContext.sourceTimeframe,
