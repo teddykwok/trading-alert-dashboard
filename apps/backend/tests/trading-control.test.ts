@@ -461,7 +461,18 @@ describeDb("trading control: the status snapshot", () => {
     // EXECUTION_SOFT_OPEN_POSITION_TARGET to 1, so the env is the STRICTER side
     // and the min-merge correctly takes it. Reading 3 here would mean the panel
     // had stopped merging and started trusting the row alone.
-    expect(status.capacity).toEqual({ pending: 1, open: 1, totalActive: 2, desiredOpen: 1, hardTotal: 5 });
+    // maxOpen/maxPending are the same EFFECTIVE merge as hardTotal, exposed so
+    // the panel can show each count against the limit that governs it rather
+    // than borrowing the total-active one.
+    expect(status.capacity).toEqual({
+      pending: 1,
+      open: 1,
+      totalActive: 2,
+      desiredOpen: 1,
+      hardTotal: 5,
+      maxOpen: 5,
+      maxPending: 5,
+    });
     // The limits are the EFFECTIVE merge of the env and the profile row, and
     // the row is the side that wins ties, so they stringify exactly as the CLI
     // preflight prints them ("profile 7.5 / effective 7.5" against a global
@@ -503,6 +514,54 @@ describeDb("trading control: the status snapshot", () => {
     expect(status.latestExecution?.status).toBe("PROTECTED");
     expect(status.latestExecution?.reason).toBe("PASS");
     expect(status.latestExecution?.symbol).toBe("COWUSDT");
+  });
+
+  it("carries the context the panel needs to EXPLAIN a refusal", async () => {
+    // The panel says "Source timeframe 1D is not allowed". It can only name the
+    // timeframe if the timeframe travels with the row; without it the copy would
+    // have to state the rule without its subject.
+    const id = await createExecution("SKIPPED", "1.00", "2.00", "COWUSDT");
+    await prisma!.tradeExecution.update({
+      where: { id },
+      data: { decisionReasonCode: "SOURCE_TIMEFRAME_NOT_ALLOWED", sourceTimeframe: "1D" },
+    });
+
+    const status = await service().readStatus();
+    expect(status.latestExecution?.reason).toBe("SOURCE_TIMEFRAME_NOT_ALLOWED");
+    expect(status.latestExecution?.sourceTimeframe).toBe("1D");
+    // The freshness limit travels as POLICY, beside the source timeframes and
+    // the lookback — not inside one execution, so the panel can still show it
+    // when nothing has executed yet.
+    expect(status.alertAgeLimitSeconds).toBeGreaterThan(0);
+  });
+
+  it("reports a null source timeframe honestly rather than inventing one", async () => {
+    const id = await createExecution("SKIPPED", "1.00", "2.00", "COWUSDT");
+    await prisma!.tradeExecution.update({
+      where: { id },
+      data: { decisionReasonCode: "ALERT_STALE", sourceTimeframe: null },
+    });
+
+    const status = await service().readStatus();
+    expect(status.latestExecution?.sourceTimeframe).toBeNull();
+  });
+
+  it("adds READ-ONLY presentation fields only — no new decision or account data", async () => {
+    // The enrichment exists so the panel can word an outcome it already shows.
+    // It must not become a channel for anything else: no order ids, no prices,
+    // no quantities, no balances, no credentials.
+    const id = await createExecution("SKIPPED", "1.00", "2.00", "COWUSDT");
+    await prisma!.tradeExecution.update({ where: { id }, data: { decisionReasonCode: "ALERT_STALE" } });
+
+    const status = await service().readStatus();
+    expect(Object.keys(status.latestExecution ?? {}).sort()).toEqual([
+      "direction",
+      "reason",
+      "sourceTimeframe",
+      "status",
+      "symbol",
+      "updatedAt",
+    ]);
   });
 
   it("degrades to UNAVAILABLE rather than failing when attestation cannot be read", async () => {
