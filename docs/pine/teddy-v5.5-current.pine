@@ -19,7 +19,7 @@
 //     warna & timeframe) TIDAK diubah.
 //   - "timeframe" di JSON = timeframe CHART (format backend, mis. "1h") agar
 //     screenshot Binance memakai interval yang valid; detail level ada di "note".
-indicator("teddy v5.5 (Sinar Final)", overlay=true)
+indicator("teddy v5.5 (Sinar Final)",overlay=true,max_lines_count=500,max_labels_count=500)
 
 // =================================================================================
 // BAGIAN 1: PENGATURAN INPUT DARI PENGGUNA
