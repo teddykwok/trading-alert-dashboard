@@ -35,6 +35,7 @@
     "execution:arm-natural-window": "tsx src/modules/execution/run-arm-natural-window.ts",
     "execution:entry-recovery": "tsx src/modules/execution/run-entry-recovery.ts",
     "execution:protection-recovery": "tsx src/modules/execution/run-protection-recovery.ts",
+    "execution:prepare-shutdown": "tsx src/modules/execution/run-shutdown-drain.ts",
     "test": "vitest run",
     "test:db:setup": "tsx scripts/setup-test-db.ts",
     "playwright:install": "playwright install chromium"

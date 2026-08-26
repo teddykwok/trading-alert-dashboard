@@ -729,7 +729,13 @@ export function evaluateDurableSafety(state: DurableTradingState, action: "LIVE_
   if (state.activeExecutions > 0) {
     return {
       safe: false,
-      reason: `${state.activeExecutions} execution(s) are still active. ${next}`,
+      reason:
+        `${state.activeExecutions} execution(s) are still active. ${next}` +
+        (action === "SHUTDOWN"
+          ? " If those are pending ENTRY orders resting at the exchange, run" +
+            " `pnpm --filter @trading-alert-dashboard/backend execution:prepare-shutdown evaluate`" +
+            " to see what a drain would cancel."
+          : ""),
     };
   }
 
