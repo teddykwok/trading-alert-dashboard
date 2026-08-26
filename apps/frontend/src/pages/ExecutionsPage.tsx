@@ -20,6 +20,7 @@ import {
   presentExitReason,
   presentProtectionState,
 } from "../features/executions/executionPresentation";
+import { describeExecutionReason } from "../features/executions/executionReason";
 
 /**
  * Phase 8 — global execution journal.
@@ -223,6 +224,7 @@ export function ExecutionsPage() {
                 <th scope="col" className="px-3 py-2">Direction</th>
                 <th scope="col" className="px-3 py-2">Profile</th>
                 <th scope="col" className="px-3 py-2">Status</th>
+                <th scope="col" className="px-3 py-2">Reason</th>
                 <th scope="col" className="px-3 py-2">Protection</th>
                 <th scope="col" className="px-3 py-2">Entry planned / actual</th>
                 <th scope="col" className="px-3 py-2">Qty planned / filled</th>
@@ -262,6 +264,9 @@ export function ExecutionsPage() {
                   </td>
                   <td className="px-3 py-2">
                     <StatusBadge presentation={presentExecutionStatus(item.status)} />
+                  </td>
+                  <td className="px-3 py-2">
+                    <ExecutionReasonCell status={item.status} reasonCode={item.decisionReasonCode} symbol={item.symbol} direction={item.direction} />
                   </td>
                   <td className="px-3 py-2">
                     <StatusBadge presentation={presentProtectionState(item.protectionState)} />
@@ -338,5 +343,48 @@ function FilterField({ label, children }: { label: string; children: React.React
       <span className="text-[11px] uppercase tracking-wide text-slate-400">{label}</span>
       {children}
     </label>
+  );
+}
+
+/**
+ * Why an execution did not become an entry.
+ *
+ * The sentence comes from the backend's persisted `decisionReasonCode` through
+ * the shared vocabulary — never inferred here from the status, the symbol or
+ * the timestamps, because a guess that looks authoritative is worse than no
+ * answer at all.
+ *
+ * A healthy row shows an em dash rather than a stale explanation: an
+ * ENTRY_PENDING execution carries ENTRY_RECONCILED, which means the order is
+ * resting exactly as intended, and printing that under "Reason" would report a
+ * problem for a trade that is working.
+ *
+ * The raw code stays reachable on hover, so an operator can always get from the
+ * sentence back to the thing the engine actually recorded.
+ */
+function ExecutionReasonCell({
+  status,
+  reasonCode,
+  symbol,
+  direction,
+}: {
+  status: string;
+  reasonCode: string | null;
+  symbol: string;
+  direction: string;
+}) {
+  // No alert-age limit is passed: the executions list carries no policy
+  // context, and hardcoding one here would put a second copy of a configurable
+  // value in front of the operator. The stale-alert copy stays neutral.
+  const reason = describeExecutionReason({ status, reasonCode, symbol, direction });
+  if (!reason) return <span className="text-slate-600">—</span>;
+
+  return (
+    <span
+      className="block max-w-[22rem] truncate text-xs text-slate-300"
+      title={reasonCode ? `${reason}\n\n${reasonCode}` : reason}
+    >
+      {reason}
+    </span>
   );
 }
