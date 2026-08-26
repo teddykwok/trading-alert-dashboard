@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { parseIsoDateStrict } from "../../utils/date";
+
 /**
  * Structural validation of the raw TradingView payload. Deliberately loose
  * on `assetType`/`signal` casing/values here — enum normalization and
@@ -15,7 +17,31 @@ export const tradingViewWebhookSchema = z.object({
   signal: z.string().min(1, "signal is required"),
   indicatorName: z.string().optional(),
   indicatorValue: z.number().optional(),
-  triggeredAt: z.string().min(1, "triggeredAt is required"),
+  /**
+   * When the alert ACTUALLY fired — the moment the level was touched.
+   *
+   * Pine sends `timenow` for this, not `time`. The distinction is the whole
+   * point: `time` is the SOURCE CANDLE's opening time, so a touch at 11:07 on
+   * a 15m candle opened at 11:00 arrived already claiming to be seven minutes
+   * old and was refused as ALERT_STALE despite being delivered instantly.
+   * Freshness is judged from this field.
+   */
+  triggeredAt: z
+    .string()
+    .min(1, "triggeredAt is required")
+    // Structural, alongside "required", because an unparseable event time is
+    // no more usable than an absent one. Rejecting it here means the sender is
+    // told 422 rather than the value being quietly replaced downstream.
+    .refine((value) => parseIsoDateStrict(value) !== null, "triggeredAt must be an ISO-8601 timestamp"),
+  /**
+   * The source candle's OPENING time, kept as separate context.
+   *
+   * Optional on purpose: alerts produced by an older Pine build do not send
+   * it, and a missing bar time says nothing about whether the signal is
+   * eligible. Nothing in admission reads it — it exists so the candle context
+   * is not lost now that `triggeredAt` no longer carries it.
+   */
+  barTime: z.string().optional(),
   exchange: z.string().optional(),
   note: z.string().optional(),
   // Phase 11B.0. Present ONLY on a deliberately created canary alert. It is not

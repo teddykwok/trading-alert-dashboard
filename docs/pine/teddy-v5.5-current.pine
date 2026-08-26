@@ -120,6 +120,22 @@ f_formatPrice(value) =>
 // Payload JSON untuk POST /api/webhooks/tradingview. Field ekstra sengaja
 // TIDAK ditambahkan (validasi Zod backend membuang field tak dikenal) —
 // semua detail level/sentuhan dimasukkan ke "note".
+//
+// DUA STEMPEL WAKTU, ARTINYA BERBEDA:
+//
+//   "triggeredAt" = timenow = saat alert BENAR-BENAR terpicu (wall clock).
+//                   Inilah waktu sentuhan level yang sesungguhnya, dan inilah
+//                   yang dipakai backend untuk menilai kesegaran sinyal.
+//   "barTime"     = time    = waktu BUKA candle sumber.
+//
+// Sebelumnya "triggeredAt" mengirim `time`, sehingga sentuhan pukul 11:07 pada
+// candle 15m yang dibuka 11:00 terbaca sudah berumur 7 menit dan tertolak
+// ALERT_STALE walau webhook dikirim seketika. Untuk mode "Immediate" alert
+// memakai alert.freq_once_per_bar yang memang berjalan INTRABAR secara
+// realtime, jadi `timenow` adalah waktu peristiwa yang otoritatif; untuk mode
+// konfirmasi (once_per_bar_close) `timenow` adalah saat bar ditutup — juga
+// waktu peristiwa yang benar. `time` tetap dikirim terpisah supaya konteks
+// candle tidak hilang.
 // "indicatorValue" = input "Persentase Pergerakan Harga Minimal (%)" dalam
 // POIN PERSEN (input 15.0 -> 15, 12.5 -> 12.5), BUKAN pecahan 0.15 — dashboard
 // menampilkannya sebagai "MOVE ≥15%". Format "#.####" menjaga angka JSON tetap
@@ -134,7 +150,8 @@ f_buildWebhookJson(signal, levelPrice, note) =>
      + '"signal":"' + signal + '",'
      + '"indicatorName":"teddy v5.5",'
      + '"indicatorValue":' + str.tostring(minPercentInput * 100, "#.####") + ','
-     + '"triggeredAt":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '",'
+     + '"triggeredAt":"' + str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '",'
+     + '"barTime":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '",'
      + '"exchange":"' + exchangeInput + '",'
      + '"note":"' + note + '"'
      + '}'

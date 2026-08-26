@@ -12,7 +12,10 @@ export interface TradingViewWebhookPayload {
   signal: string;
   indicatorName?: string;
   indicatorValue?: number;
+  /** When the alert ACTUALLY fired (Pine `timenow`), not the candle's open. */
   triggeredAt: string;
+  /** The source candle's OPENING time (Pine `time`). Context only. */
+  barTime?: string;
   exchange?: string;
   note?: string;
 }
