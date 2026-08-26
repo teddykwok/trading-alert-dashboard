@@ -37,6 +37,11 @@ const BACKEND_EXECUTION_STATUSES = [
   "PLAN_READY", "PREFLIGHT", "ENTRY_SUBMITTING", "ENTRY_PENDING", "PARTIALLY_FILLED",
   "ENTRY_FILLED", "PLACING_PROTECTION", "PROTECTED", "ENTRY_EXPIRED", "CLOSED_TP",
   "CLOSED_SL", "CANCELED", "SKIPPED", "FAILED", "MANUAL_INTERVENTION", "CLOSED_EMERGENCY",
+  // Added when a position proven closed outside this system stopped being
+  // folded into CLOSED_EMERGENCY. The enum and the presentation map both
+  // carried it; only this hand-maintained mirror was left behind, so the
+  // completeness check was measuring the fixture rather than the mapping.
+  "CLOSED_EXTERNAL",
 ];
 const BACKEND_PROTECTION_STATES = [
   "UNPROTECTED", "MARGIN_CHECK", "MARGIN_ADJUSTING", "PLACING_STOP", "STOP_VERIFIED",
