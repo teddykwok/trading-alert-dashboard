@@ -260,7 +260,10 @@ describe("operator auth: structural guarantees", () => {
       entry.replace(/[\s\S]*"/, "").replace(/"$/, "")
     );
     expect(code.match(/app\.(put|patch|delete)\(/g)).toBeNull();
-    expect((code.match(/app\.post\(/g) ?? []).length).toBe(7);
+    // 9 = the 7 reviewed before, plus the two policy-limit mutations. The
+    // count is deliberately explicit: a new operator mutation must be named
+    // in the list below before this passes.
+    expect((code.match(/app\.post\(/g) ?? []).length).toBe(9);
     for (const expected of [
       "/api/operator/trading-control/start",
       "/api/operator/trading-control/stop-new-trades",
@@ -269,10 +272,17 @@ describe("operator auth: structural guarantees", () => {
       "/api/operator/trading-control/allowlist",
       "/api/operator/trading-control/source-timeframes",
       "/api/operator/trading-control/rr-lookback",
+      // Editing the durable execution LIMITS. Validate is a dry run that
+      // writes nothing; the save refuses unless the system is SAFE OFF and
+      // quiet, and writes one row — pinned in policy-editor.test.ts. Neither
+      // can reach current exposure: those numbers are counted from execution
+      // rows and have no column to set.
+      "/api/operator/trading-control/policy/validate",
+      "/api/operator/trading-control/policy",
     ]) {
       expect(`${expected}:${code.includes(`"${expected}"`)}`).toBe(`${expected}:true`);
     }
-    expect(mutations.length).toBe(7);
+    expect(mutations.length).toBe(9);
 
     // And every mutation carries the strict budget, not the dashboard one.
     expect((code.match(/OPERATOR_ACTION_RATE_LIMIT/g) ?? []).length).toBeGreaterThanOrEqual(4);

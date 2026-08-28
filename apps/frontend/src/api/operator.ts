@@ -302,3 +302,97 @@ export function postStopNewTrades(): Promise<TradingControlActionResult> {
 export function postSafeOff(): Promise<TradingControlActionResult> {
   return operatorApiClient.post("/api/operator/trading-control/safe-off");
 }
+
+// ---------------------------------------------------------------------------
+// Execution policy LIMITS
+// ---------------------------------------------------------------------------
+
+/**
+ * The limits the policy editor may write.
+ *
+ * A subset of the durable safety policy on purpose. The kill switch is a
+ * trading CONTROL owned by Start Trading / Safe Off, and the symbol allowlist
+ * has its own reviewed editor; neither is reachable from here.
+ */
+export const EDITABLE_POLICY_FIELDS = [
+  "softOpenPositionTarget",
+  "maxOpenPositions",
+  "maxPendingEntries",
+  "maxTotalActiveTrades",
+  "maxActivePerSymbolSide",
+  "maxTotalPlannedRiskUsd",
+  "maxTotalIsolatedMarginUsd",
+] as const;
+
+export type EditablePolicyField = (typeof EDITABLE_POLICY_FIELDS)[number];
+
+/**
+ * One limit, as stored and as actually enforced.
+ *
+ * The two differ because the engine takes `min(env, policy)` for every limit —
+ * the environment can only tighten. `cappedByEnv` is what lets the panel say
+ * so, instead of showing a stored number that governs nothing.
+ */
+export interface PolicyFieldDto {
+  stored: string;
+  effective: string;
+  envCeiling: string;
+  cappedByEnv: boolean;
+}
+
+export interface PolicyReadDto {
+  ok: boolean;
+  /** Optimistic-lock token; the save echoes it back. */
+  version: number | null;
+  fields: Record<EditablePolicyField, PolicyFieldDto> | null;
+  blockers: string[];
+  editable: boolean;
+  message: string;
+}
+
+export interface PolicyChangeDto {
+  field: EditablePolicyField;
+  from: string;
+  to: string;
+}
+
+export interface PolicyValidationDto {
+  ok: boolean;
+  changes: PolicyChangeDto[];
+  refusal: string | null;
+}
+
+export interface PolicySaveDto {
+  ok: boolean;
+  outcome: "SAVED" | "BLOCKED";
+  blockers: string[];
+  message: string;
+  changes: PolicyChangeDto[];
+  version: number | null;
+}
+
+/** Current limits plus whether they may be edited. Writes nothing. */
+export function fetchPolicy(): Promise<PolicyReadDto> {
+  return operatorApiClient.get<PolicyReadDto>("/api/operator/trading-control/policy");
+}
+
+/**
+ * Dry run for the review step. Writes nothing, so it is safe in any system
+ * state, and it runs the SAME validator the save runs — a draft this accepts
+ * is one the save accepts.
+ */
+export function postValidatePolicy(policy: Record<string, unknown>): Promise<PolicyValidationDto> {
+  return operatorApiClient.post("/api/operator/trading-control/policy/validate", { policy });
+}
+
+/**
+ * The mutation. Sends the draft again rather than the validated diff: the
+ * server re-validates inside its own lock, so there is no "already checked"
+ * claim for a client to make.
+ */
+export function postSavePolicy(
+  policy: Record<string, unknown>,
+  expectedVersion: number
+): Promise<PolicySaveDto> {
+  return operatorApiClient.post("/api/operator/trading-control/policy", { policy, expectedVersion });
+}

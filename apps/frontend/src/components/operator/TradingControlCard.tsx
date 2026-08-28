@@ -4,6 +4,7 @@ import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { Card } from "../ui/Card";
 import { AllowedSymbolsEditor } from "./AllowedSymbolsEditor";
+import { TradingPolicyEditor } from "./TradingPolicyEditor";
 import { SourceTimeframesEditor } from "./SourceTimeframesEditor";
 import { RrLookbackEditor } from "./RrLookbackEditor";
 import { classNames } from "../../utils/classNames";
@@ -208,13 +209,23 @@ function StatusBody({
           <Row label="TTL">{authorization.ttl}</Row>
         </Section>
 
-        <Section title="Capacity">
+        {/* OBSERVED facts, every one counted from execution rows. Read-only by
+            construction: there is no control here and no endpoint behind one
+            that could set a count, a reservation or a claim. */}
+        <Section title="Current Exposure">
           <Row label="Open">{presentOpenCapacity(capacity)}</Row>
           <Row label="Pending">{presentPendingCapacity(capacity)}</Row>
           <Row label="Active">{presentCapacity(capacity)}</Row>
           <Row label="Claims">{authorization.claims}</Row>
           <Row label="Risk">{presentReservation(reservations.riskUsd, reservations.riskLimitUsd)}</Row>
           <Row label="Margin">{presentReservation(reservations.marginUsd, reservations.marginLimitUsd)}</Row>
+        </Section>
+
+        {/* The LIMITS those facts are measured against. Editable only while the
+            server says the system is SAFE OFF and quiet — the panel asks, it
+            never decides. */}
+        <Section title="Policy Limits">
+          <TradingPolicyEditor />
         </Section>
 
         <Section title="Latest Execution">

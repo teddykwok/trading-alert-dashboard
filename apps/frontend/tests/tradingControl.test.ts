@@ -761,15 +761,29 @@ describe("trading control layout: grouped, and nothing lost", () => {
   );
 
   it("G. groups the rows into the order an operator asks in", () => {
-    for (const title of ["System", "Trading Policy", "Authorization", "Capacity", "Latest Execution"]) {
+    // "Capacity" was split in two. It used to hold observed counts AND the
+    // limits they are measured against under one heading, which is precisely
+    // the conflation the policy editor must not inherit: one half is fact and
+    // read-only, the other is settings. The rows themselves are unchanged and
+    // still pinned by G2 below.
+    for (const title of [
+      "System",
+      "Trading Policy",
+      "Authorization",
+      "Current Exposure",
+      "Policy Limits",
+      "Latest Execution",
+    ]) {
       expect(card).toContain(`<Section title="${title}">`);
     }
-    // The order matters: safety first, outcome last.
+    // The order matters: safety first, outcome last, and the limits sit
+    // immediately after the exposure they govern.
     const at = (title: string) => card.indexOf(`<Section title="${title}">`);
     expect(at("System")).toBeLessThan(at("Trading Policy"));
     expect(at("Trading Policy")).toBeLessThan(at("Authorization"));
-    expect(at("Authorization")).toBeLessThan(at("Capacity"));
-    expect(at("Capacity")).toBeLessThan(at("Latest Execution"));
+    expect(at("Authorization")).toBeLessThan(at("Current Exposure"));
+    expect(at("Current Exposure")).toBeLessThan(at("Policy Limits"));
+    expect(at("Policy Limits")).toBeLessThan(at("Latest Execution"));
   });
 
   it("G2. keeps every row that existed before the regrouping", () => {

@@ -12,6 +12,7 @@ import { TradingControlService } from "../modules/operator/trading-control.servi
 import { AllowlistService } from "../modules/operator/allowlist.service";
 import { SourceTimeframeService } from "../modules/operator/source-timeframes.service";
 import { ExtremeRrLookbackService } from "../modules/operator/extreme-rr-lookback.service";
+import { PolicyEditorService } from "../modules/operator/policy-editor.service";
 import type {
   AllowlistSaveResult,
   AllowlistValidationResult,
@@ -237,6 +238,46 @@ export async function operatorRoutes(
       const body = request.body as { lookbackCandles?: unknown } | null | undefined;
       const result = await new ExtremeRrLookbackService(request.server.prisma).save(
         body?.lookbackCandles
+      );
+      if (!result.ok) reply.code(409);
+      return result;
+    }
+  );
+
+  // --- Execution policy LIMITS --------------------------------------------
+  // Reading and validating stay available while armed so an operator can see
+  // and prepare an edit at any time; saving is refused unless the system is
+  // SAFE_OFF and quiet, exactly as the allowlist and lookback editors are.
+  //
+  // These endpoints reach LIMITS only. Current open/pending/active counts and
+  // reserved risk and margin are COUNTED from execution rows and have no
+  // column to write, so there is deliberately nothing here that could set
+  // them.
+  app.get(
+    "/api/operator/trading-control/policy",
+    { preHandler: requireOperatorAuth },
+    async (request) => new PolicyEditorService(request.server.prisma).read()
+  );
+
+  app.post(
+    "/api/operator/trading-control/policy/validate",
+    { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
+    async (request, reply) => {
+      const body = request.body as { policy?: unknown } | null | undefined;
+      const result = await new PolicyEditorService(request.server.prisma).validate(body?.policy);
+      if (!result.ok) reply.code(422);
+      return result;
+    }
+  );
+
+  app.post(
+    "/api/operator/trading-control/policy",
+    { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
+    async (request, reply) => {
+      const body = request.body as { policy?: unknown; expectedVersion?: unknown } | null | undefined;
+      const result = await new PolicyEditorService(request.server.prisma).save(
+        body?.policy,
+        body?.expectedVersion
       );
       if (!result.ok) reply.code(409);
       return result;
