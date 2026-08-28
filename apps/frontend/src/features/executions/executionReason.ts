@@ -147,6 +147,29 @@ export function describeExecutionReason(context: ExecutionReasonContext): string
     // presented as a fact.
     case "MARGIN_PLAN_NOT_READY":
       return "A safe margin and leverage plan could not be produced for this trade";
+
+    // --- Pre-execution refusals (SelectedPlanSkipReason) --------------------
+    // These come from the selected-plan executor, which decides BEFORE any
+    // execution exists. They live in this dictionary rather than a second one
+    // so the same code reads identically wherever it is shown, and the wording
+    // says "not executed" rather than "failed": nothing was ever sent to
+    // Binance on any of these paths.
+    case "PLAN_NOT_READY":
+      return "The trade plan was not ready when it was evaluated";
+    case "NO_SELECTED_CANDIDATE":
+      return "The plan had no candidate for its selected lookback";
+    case "CANDIDATE_INCOMPLETE":
+      return "The selected plan was not a complete, valid, money-carrying plan";
+    case "PROFILE_UNAVAILABLE":
+      return "The execution profile could not be resolved at evaluation time";
+    case "CANARY_AUTHORIZATION_REQUIRED":
+      return "Nothing authorized this signal at evaluation time";
+    case "CANARY_AUTHORIZATION_WRONG_SYMBOL":
+      return "The authorization on record was for a different symbol";
+    case "CANARY_AUTHORIZATION_WRONG_DIRECTION":
+      return "The authorization on record was for the other direction";
+    case "CANARY_AUTHORIZATION_ALREADY_CONSUMED":
+      return "The authorization was already bound to a different execution";
     case "MARGIN_PLAN_SNAPSHOT_MISSING":
       return "This execution is missing its frozen margin plan";
     case "UNSAFE_LIQUIDATION_BUFFER":
