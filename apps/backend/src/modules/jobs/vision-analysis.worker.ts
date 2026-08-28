@@ -6,6 +6,7 @@ import { prisma } from "../../plugins/prisma";
 import { AlertsService } from "../alerts/alerts.service";
 import { getRecentCandles } from "../market-data/market-data.service";
 import { generateAndSaveScreenshot } from "../chart-renderer/screenshot.service";
+import { ChartRenderTimeoutError } from "../chart-renderer/chart-renderer.service";
 import { analyzeChart } from "../ai-vision/ai-vision.service";
 import {
   notifyAlertFailed,
@@ -36,6 +37,9 @@ import { SelectedPlanExecutor } from "../execution/selected-plan-executor";
 
 const alertsService = new AlertsService(prisma);
 
+/** Where a vision job was when it failed. Diagnostic only, never persisted. */
+type VisionPipelineStage = "LOAD_ALERT" | "SCREENSHOT" | "AI_ANALYSIS" | "PERSIST_RESULT";
+
 /**
  * Runs the full screenshot -> AI vision pipeline for one alert. This is
  * deliberately the only place that touches screenshot generation and AI
@@ -43,10 +47,17 @@ const alertsService = new AlertsService(prisma);
  */
 async function processVisionAnalysisJob(job: Job<VisionAnalysisJobData>): Promise<void> {
   const { alertId } = job.data;
+  // Which step was in flight when it failed. The alert's own status cannot
+  // answer that: a render deadline and an AI deadline both leave it
+  // PROCESSING_SCREENSHOT or ANALYZING_WITH_AI, and a hang has no stack worth
+  // reading. Purely diagnostic - it is never persisted as state.
+  let stage: VisionPipelineStage = "LOAD_ALERT";
+  const startedAtMs = Date.now();
 
   try {
     let alert = await alertsService.getByIdOrThrow(alertId);
 
+    stage = "SCREENSHOT";
     alert = await alertsService.markProcessingScreenshot(alertId);
     await notifyAlertUpdated(alert);
 
@@ -73,6 +84,7 @@ async function processVisionAnalysisJob(job: Job<VisionAnalysisJobData>): Promis
       signal: alert.signal,
     });
 
+    stage = "AI_ANALYSIS";
     await alertsService.markScreenshotSaved(alertId, screenshotUrl);
     alert = await alertsService.markAnalyzingWithAi(alertId);
     await notifyAlertUpdated(alert);
@@ -92,6 +104,7 @@ async function processVisionAnalysisJob(job: Job<VisionAnalysisJobData>): Promis
       },
     });
 
+    stage = "PERSIST_RESULT";
     alert = await alertsService.markAnalyzed(alertId, {
       aiBias: aiResult.bias,
       aiConfidence: aiResult.confidence,
@@ -113,8 +126,33 @@ async function processVisionAnalysisJob(job: Job<VisionAnalysisJobData>): Promis
     logger.info({ alertId }, "Vision analysis job completed");
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error during vision analysis";
-    logger.error({ alertId, error }, "Vision analysis job failed");
+    const totalAttempts = job.opts.attempts ?? 1;
+    const attempt = job.attemptsMade + 1;
 
+    // Named fields, never the raw error object. A Playwright failure carries
+    // the template's absolute file:// path, and the whole point of a log an
+    // operator will paste into an issue is that it holds nothing they would
+    // then have to redact. The provider already guarantees its own messages
+    // never contain the API key.
+    logger.error(
+      {
+        alertId,
+        jobId: job.id,
+        stage,
+        attempt,
+        totalAttempts,
+        elapsedMs: Date.now() - startedAtMs,
+        timedOut: error instanceof ChartRenderTimeoutError,
+        error: message.slice(0, 300),
+      },
+      "Vision analysis job failed"
+    );
+
+    // FAILED is written on EVERY attempt, including retryable ones, so the
+    // alert can never sit in PROCESSING_SCREENSHOT or ANALYZING_WITH_AI with
+    // no explanation. A later successful retry overwrites it with ANALYZED;
+    // if attempts run out, this is already the terminal record and it carries
+    // the reason in errorMessage.
     const failedAlert = await alertsService.markFailed(alertId, message);
     await notifyAlertFailed(failedAlert);
 

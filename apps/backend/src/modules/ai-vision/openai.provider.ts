@@ -108,9 +108,18 @@ export class OpenAiVisionProvider implements AiVisionProvider {
       "Requesting OpenAI vision analysis"
     );
 
-    let response: Response;
+    // The deadline covers the RESPONSE BODY too, not just the headers.
+    //
+    // `clearTimeout` used to sit in a `finally` attached to the fetch alone, so
+    // the abort was already disarmed by the time `response.json()` read the
+    // stream. A server that returned headers and then stalled the body left
+    // this call waiting forever — and because the vision worker runs
+    // concurrency 2 while BullMQ keeps renewing a running job's lock, that is a
+    // permanently occupied slot rather than a slow request. Reading the body
+    // under the same signal is what makes AI_VISION_TIMEOUT_MS a bound on the
+    // whole exchange.
     try {
-      response = await fetch(url, {
+      const response = await fetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -120,7 +129,29 @@ export class OpenAiVisionProvider implements AiVisionProvider {
         body: JSON.stringify(body),
         signal: controller.signal,
       });
+
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => "");
+        throw new AiVisionError(
+          `OpenAI vision request failed with status ${response.status}${errorBody ? `: ${errorBody.slice(0, 300)}` : ""}`
+        );
+      }
+
+      const json = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const content = json.choices?.[0]?.message?.content;
+
+      if (!content || typeof content !== "string") {
+        throw new AiVisionError("OpenAI vision response did not contain message content");
+      }
+
+      logger.info({ provider: OPENAI_PROVIDER_NAME, symbol }, "Received OpenAI vision analysis");
+      return content;
     } catch (error) {
+      // Already shaped and already safe: a status or parse failure keeps its
+      // own message instead of being relabelled as a transport failure.
+      if (error instanceof AiVisionError) throw error;
       const message = error instanceof Error ? error.message : String(error);
       const detail =
         error instanceof Error && error.name === "AbortError"
@@ -130,24 +161,5 @@ export class OpenAiVisionProvider implements AiVisionProvider {
     } finally {
       clearTimeout(timeout);
     }
-
-    if (!response.ok) {
-      const errorBody = await response.text().catch(() => "");
-      throw new AiVisionError(
-        `OpenAI vision request failed with status ${response.status}${errorBody ? `: ${errorBody.slice(0, 300)}` : ""}`
-      );
-    }
-
-    const json = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const content = json.choices?.[0]?.message?.content;
-
-    if (!content || typeof content !== "string") {
-      throw new AiVisionError("OpenAI vision response did not contain message content");
-    }
-
-    logger.info({ provider: OPENAI_PROVIDER_NAME, symbol }, "Received OpenAI vision analysis");
-    return content;
   }
 }
