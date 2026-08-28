@@ -296,6 +296,32 @@ export interface ExtremeRRTemplateSnapshot {
   targetAmount: string;
 }
 
+/**
+ * What the selected-plan executor decided about this plan, if it ever ran.
+ *
+ * Historical, not derived. The refusal is recorded when it happens, so a plan
+ * refused at 12:00 for want of authorization still says so at 15:00 when an
+ * authorization exists again. Nothing here may be recomputed from current
+ * capacity, claims, positions, risk or runtime mode — inferring it later is
+ * precisely the unsafe behaviour this record exists to replace.
+ *
+ * `null` on the plan means no decision was ever recorded: either the executor
+ * has not run, or the alert predates this evidence being stored at all. Both
+ * are honestly "unknown" and must not be presented as a reason.
+ */
+export interface SelectedPlanOutcomeDto {
+  /** False for a pre-execution refusal; true when an execution was reached. */
+  handled: boolean;
+  /** The executor's canonical code, verbatim. Never re-interpreted. */
+  reasonCode: string | null;
+  /** The executor's own sentence, when it had one. Never a UI string. */
+  message: string | null;
+  /** Present only when handled — the execution remains authoritative for it. */
+  executionId: string | null;
+  /** When the decision was actually taken. */
+  evaluatedAt: string;
+}
+
 export interface ExtremeRRPlanDto {
   id: string;
   alertId: string;
@@ -315,6 +341,16 @@ export interface ExtremeRRPlanDto {
   /** No verified symbol leverage-limit source exists — never claimed as supported. */
   leverageLimitVerified: false;
   errorReason: string | null;
+  /**
+   * The executor's recorded verdict on this plan, or null when none exists.
+   *
+   * Carried on the plan because Alert Detail already loads the plan for exactly
+   * this question, so exposing it here needs no new endpoint and no second
+   * fetch. It stays a structured domain object rather than a formatted
+   * sentence: presentation belongs to the frontend's shared reason vocabulary,
+   * not to the API.
+   */
+  executionOutcome: SelectedPlanOutcomeDto | null;
   generatedAt: string | null;
   createdAt: string;
   updatedAt: string;

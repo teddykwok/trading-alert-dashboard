@@ -1,4 +1,4 @@
-import type { Alert, ExtremeRRPlan, PrismaClient } from "@prisma/client";
+import type { Alert, ExtremeRRPlan, PrismaClient, SelectedPlanOutcome } from "@prisma/client";
 import {
   EXTREME_RR_DEFAULT_LOOKBACK,
   EXTREME_RR_LOOKBACKS,
@@ -170,6 +170,8 @@ function decimalToString(value: unknown): string | null {
   return value === null || value === undefined ? null : String(value);
 }
 
+type PlanWithOutcome = ExtremeRRPlan & { selectedPlanOutcome?: SelectedPlanOutcome | null };
+
 export class ExtremeRRService {
   private readonly riskTemplates: RiskTemplateRepository;
 
@@ -239,7 +241,10 @@ export class ExtremeRRService {
     const alert = await this.getAlertOrThrow(alertId);
     const direction = ExtremeRRService.assertDirectional(alert);
 
-    const existing = await this.prisma.extremeRRPlan.findUnique({ where: { alertId } });
+    const existing = await this.prisma.extremeRRPlan.findUnique({
+      where: { alertId },
+      include: { selectedPlanOutcome: true },
+    });
     if (existing?.status === "READY") {
       return this.serialize(existing);
     }
@@ -329,6 +334,7 @@ export class ExtremeRRService {
           telegramNotifiedAt: null,
           telegramLastError: null,
         },
+        include: { selectedPlanOutcome: true },
       });
       return this.serialize(saved);
     } catch (error) {
@@ -348,6 +354,7 @@ export class ExtremeRRService {
           telegramNotifiedAt: null,
           telegramLastError: null,
         },
+        include: { selectedPlanOutcome: true },
       });
       return this.serialize(saved);
     }
@@ -356,7 +363,10 @@ export class ExtremeRRService {
   /** Plan for the alert, or null when none exists (e.g. pre-feature alerts). */
   async getForAlert(alertId: string): Promise<ExtremeRRPlanDto | null> {
     await this.getAlertOrThrow(alertId);
-    const plan = await this.prisma.extremeRRPlan.findUnique({ where: { alertId } });
+    const plan = await this.prisma.extremeRRPlan.findUnique({
+      where: { alertId },
+      include: { selectedPlanOutcome: true },
+    });
     return plan ? this.serialize(plan) : null;
   }
 
@@ -372,6 +382,7 @@ export class ExtremeRRService {
         ...(input.selectedLookback !== undefined ? { selectedLookback: input.selectedLookback } : {}),
         ...(input.selectedLeverage !== undefined ? { selectedLeverage: input.selectedLeverage } : {}),
       },
+      include: { selectedPlanOutcome: true },
     });
     return this.serialize(updated);
   }
@@ -382,7 +393,14 @@ export class ExtremeRRService {
    * preset) is recomputed from those frozen fields on every read — never
    * stored, never client-supplied, never derived from an account balance.
    */
-  private serialize(plan: ExtremeRRPlan): ExtremeRRPlanDto {
+  /**
+   * A stored plan, optionally with its recorded execution verdict.
+   *
+   * The relation is optional so a query that does not ask for it still type
+   * checks and simply reports no outcome — which is the truthful answer for a
+   * plan whose executor never ran.
+   */
+  private serialize(plan: PlanWithOutcome): ExtremeRRPlanDto {
     const riskAmount = decimalToString(plan.riskAmount);
     const template: ExtremeRRTemplateSnapshot | null = plan.templateName
       ? {
@@ -431,6 +449,18 @@ export class ExtremeRRService {
       precision: "UNROUNDED",
       leverageLimitVerified: false,
       errorReason: plan.errorReason,
+      // Historical evidence, passed through verbatim. Deliberately NOT derived
+      // from anything current: the whole point is that a plan refused at 12:00
+      // still says why at 15:00, whatever the system looks like by then.
+      executionOutcome: plan.selectedPlanOutcome
+        ? {
+            handled: plan.selectedPlanOutcome.handled,
+            reasonCode: plan.selectedPlanOutcome.reasonCode,
+            message: plan.selectedPlanOutcome.message,
+            executionId: plan.selectedPlanOutcome.executionId,
+            evaluatedAt: plan.selectedPlanOutcome.evaluatedAt.toISOString(),
+          }
+        : null,
       generatedAt: plan.generatedAt?.toISOString() ?? null,
       createdAt: plan.createdAt.toISOString(),
       updatedAt: plan.updatedAt.toISOString(),

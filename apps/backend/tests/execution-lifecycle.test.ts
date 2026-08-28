@@ -365,9 +365,17 @@ describe("phase 4 safety boundary", () => {
       .slice(schema.indexOf("model TradeExecution"))
       // The Phase 9 materialization ledger is derived bookkeeping, not
       // financial history: it points AT lifecycle rows and must never be able
-      // to restrict their deletion, so it alone uses Cascade. Everything that
+      // to restrict their deletion, so it uses Cascade. Everything that
       // records money or a decision is checked below.
-      .replace(/model ExecutionNotificationCheckpoint \{[\s\S]*?\n\}/, "");
+      .replace(/model ExecutionNotificationCheckpoint \{[\s\S]*?\n\}/, "")
+      // SelectedPlanOutcome is the same category, for the same reason. It is
+      // OBSERVABILITY — why a plan produced no execution. It holds no money, no
+      // order and no lifecycle state, nothing that decides anything reads it,
+      // and it hangs off an Alert and its plan rather than off a
+      // TradeExecution. If retention removes that alert, the explanation of it
+      // must go too rather than dangle, which is the opposite of the rule this
+      // guard enforces for rows that record money.
+      .replace(/model SelectedPlanOutcome \{[\s\S]*?\n\}/, "");
 
     // Alert/plan links degrade to null so retention cannot destroy history.
     expect(financial).toContain("onDelete: SetNull");

@@ -35,6 +35,7 @@ import {
 import { BinanceMarginPlanService } from "../binance/binance-margin-plan.service";
 import { ExecutionService } from "../execution/execution.service";
 import { SelectedPlanExecutor } from "../execution/selected-plan-executor";
+import { recordSelectedPlanOutcome } from "../execution/selected-plan-outcome.service";
 
 const alertsService = new AlertsService(prisma);
 
@@ -203,8 +204,34 @@ async function processExtremeRRJob(job: Job<ExtremeRRJobData>): Promise<void> {
   // problem can never fail the plan job — the persisted PLAN_READY row is
   // recovered by the reconciliation scheduler regardless.
   try {
+    const evaluatedAt = new Date();
     const outcome = await selectedPlanExecutor.handleSelectedPlan(plan, alert.symbol);
     logger.info({ alertId, outcome: outcome.handled ? outcome.reasonCode : outcome.reasonCode }, "Selected plan execution handling completed");
+
+    // Durable evidence of what was just decided, written AFTER the decision has
+    // been made and returned. Its own try/catch, deliberately: the trading
+    // decision is already final by this point, and an observability write must
+    // never be able to fail it, retry it, or let the outer handler re-run it
+    // later against different state. A lost row costs an explanation; a
+    // re-decided signal could cost a trade.
+    try {
+      await recordSelectedPlanOutcome(prisma, {
+        alertId,
+        extremeRRPlanId: plan.id,
+        outcome,
+        evaluatedAt,
+      });
+    } catch (outcomeError) {
+      logger.warn(
+        {
+          alertId,
+          planId: plan.id,
+          reasonCode: outcome.handled ? outcome.reasonCode : outcome.reasonCode,
+          error: outcomeError instanceof Error ? outcomeError.message.slice(0, 300) : "unknown",
+        },
+        "Selected plan outcome could not be persisted (decision already stands)"
+      );
+    }
   } catch (executionError) {
     logger.error({ alertId, error: executionError }, "Selected plan execution handling failed (non-fatal)");
   }

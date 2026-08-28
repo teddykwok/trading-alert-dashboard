@@ -143,6 +143,7 @@ model Alert {
   tradeJournal    TradeJournal?
   extremeRRPlan   ExtremeRRPlan?
   tradeExecutions TradeExecution[]
+  selectedPlanOutcome SelectedPlanOutcome?
 
   @@index([status])
   @@index([symbol])
@@ -290,6 +291,7 @@ model ExtremeRRPlan {
   updatedAt DateTime @updatedAt
 
   tradeExecutions TradeExecution[]
+  selectedPlanOutcome SelectedPlanOutcome?
 
   @@index([status])
 }
@@ -1218,4 +1220,65 @@ model ExecutionCanaryAuthorization {
 
   @@index([executionProfileId])
   @@index([expiresAt])
+}
+
+/// The decision the selected-plan executor reached for one alert's plan.
+///
+/// Exists because that decision was previously LOG-ONLY. Every refusal in
+/// `SelectedPlanExecutor.handleSelectedPlan` returns before any TradeExecution
+/// is created, so neither ExecutionEvent nor SafetyAdmission can hold it —
+/// both require a tradeExecutionId. Without this row an alert with a READY
+/// plan and no execution could only ever be described as "reason unavailable".
+///
+/// Observability only. Nothing reads this to decide anything: it is written
+/// AFTER the decision has already been returned, and no trading path consults
+/// it. Deleting every row here would change no trading behaviour whatsoever.
+///
+/// One row per alert. `ExtremeRRPlan.alertId` is itself unique and a READY plan
+/// is frozen (`generateForAlert` returns an existing READY plan untouched), so
+/// repeated evaluation re-decides the SAME immutable plan and must not append
+/// duplicate history. A non-READY plan may legitimately regenerate and be
+/// evaluated again; the newer decision then replaces a verdict whose subject no
+/// longer exists.
+model SelectedPlanOutcome {
+  id      String @id @default(cuid())
+  alertId String @unique
+  alert   Alert  @relation(fields: [alertId], references: [id], onDelete: Cascade)
+
+  /// The plan that was evaluated. Kept so the row can never be read as a
+  /// verdict on some later plan for the same alert.
+  /// Unique for the same reason `alertId` is: plan and alert are already 1:1
+  /// (`ExtremeRRPlan.alertId` is unique, and its row id is stable across
+  /// regeneration because generation upserts by alertId). Constraining both
+  /// makes "one verdict per plan" an invariant the database enforces rather
+  /// than something every writer has to remember.
+  extremeRRPlanId String        @unique
+  extremeRRPlan   ExtremeRRPlan @relation(fields: [extremeRRPlanId], references: [id], onDelete: Cascade)
+
+  /// False for a pre-execution refusal; true when an execution was reached.
+  handled Boolean
+
+  /// The canonical code the executor returned, stored verbatim. A
+  /// SelectedPlanSkipReason when handled=false, otherwise the admission
+  /// reason code. Never re-interpreted here.
+  reasonCode String?
+
+  /// The executor's own sentence. Never a formatted UI string, never an error
+  /// object, and never anything derived from the environment.
+  message String?
+
+  /// Set only when handled=true. Intentionally NOT a foreign key: this row is
+  /// a historical record, and it must survive independently of the execution
+  /// it mentions.
+  executionId String?
+
+  /// When the decision was actually made. The whole point of the model: the
+  /// dashboard reports what was true THEN, never what is true now.
+  evaluatedAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([reasonCode])
+  @@index([evaluatedAt])
 }

@@ -75,9 +75,9 @@ export function AlertExecutionPanel({ alert }: { alert: Alert }) {
   if (!execution) {
     return (
       <Card className="p-4">
-        <h2 className="text-sm font-semibold text-slate-200">No execution record</h2>
+        <h2 className="text-sm font-semibold text-slate-200">Not executed</h2>
         <p className="mt-1 text-sm text-slate-400">
-          No execution was created for this alert.
+          No execution was created for this alert, so no order was ever sent to the exchange.
         </p>
         <dl className="mt-3 grid gap-x-8 md:grid-cols-2">
           <FieldRow label="Reason">{describeMissingExecution(alert, plan)}</FieldRow>
@@ -198,6 +198,35 @@ function describeMissingExecution(alert: Alert, plan: ExtremeRRPlanDto | null) {
       </span>
     );
   }
+  // The plan was READY. If the executor recorded a refusal, that recorded
+  // verdict is the answer — it is what was true when the decision was made,
+  // which is exactly what cannot be reconstructed afterwards.
+  const outcome = plan.executionOutcome;
+  if (outcome && !outcome.handled) {
+    const reason =
+      describeExecutionReason({
+        // A pre-execution refusal has no execution status of its own. SKIPPED
+        // is passed purely so the shared vocabulary treats the code as a
+        // refusal worth wording; nothing here creates or implies an execution.
+        status: "SKIPPED",
+        reasonCode: outcome.reasonCode,
+        symbol: alert.symbol,
+        direction: alert.signal,
+      }) ?? outcome.message;
+
+    return (
+      <span className="text-slate-300" title={outcome.reasonCode ?? undefined}>
+        {reason}
+        {/* The shared formatter, never a locally constructed date. This panel
+            is deliberately barred from date construction: that ban is what
+            stops a reason being reconstructed from timing, and merely
+            displaying a stored evaluatedAt must not become the exception that
+            erodes it. */}
+        <span className="text-slate-500"> (evaluated <TimestampValue value={outcome.evaluatedAt} />)</span>
+      </span>
+    );
+  }
+
   return (
     <span className="text-slate-400">
       Reason unavailable — the plan was READY but no pre-execution decision is persisted for this alert.
