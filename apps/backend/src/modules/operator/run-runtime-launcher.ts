@@ -32,9 +32,25 @@ import {
   type AttestationRoleView,
   type AttestationStatusView,
   type DurableTradingState,
+  judgeRoleHealth,
   type ProcessProbe,
+  type RoleHealth,
   type RuntimeState,
 } from "./runtime-launcher";
+import {
+  EMPTY_RESTART_BUDGET,
+  WORKER_RESTART_STABILIZATION_MS,
+  WORKER_SUPERVISION_INTERVAL_MS,
+  decideWorkerSupervision,
+  executeWorkerRestart,
+  observeWorkerHealth,
+  recordRestartAttempt,
+  renderSupervisionState,
+  runSupervisionSingleFlight,
+  withReplacedWorker,
+  type RestartBudget,
+  type SupervisionDecision,
+} from "./worker-supervision";
 
 /**
  * The local Windows runtime launcher — CLI and adapters.
@@ -248,6 +264,149 @@ async function currentStatus(): Promise<{ lines: string[]; diskMode: DiskMode; a
   if (!gates.ok) lines.push("", `  Gate file problem: ${gates.reason}`);
   for (const note of disowned) lines.push("", `  ${note}`);
   return { lines, diskMode, aliveCount: alive.length };
+}
+
+/**
+ * ONE supervision observation: ownership plus health, for both roles.
+ *
+ * Reuses `liveProcesses`, `readAttestationRoles` and `judgeRoleHealth` exactly
+ * as the status screen does, so supervision can never disagree with what the
+ * operator is being shown.
+ */
+async function observeRuntimeForSupervision(): Promise<{
+  state: RuntimeState | null;
+  workerRecord: OwnedProcess | null;
+  workerHealth: RoleHealth;
+  backendHealth: RoleHealth;
+}> {
+  const state = store.read();
+  const { alive } = liveProcesses(state);
+  const running = (role: LauncherRole) => alive.some((entry) => entry.role === role);
+
+  const envText = readEnvText();
+  const gates = readGates(envText);
+  const diskMode: DiskMode = gates.ok ? classifyDiskMode(gates.values) : "INVALID";
+  const roles = alive.length > 0 ? await readAttestationRoles(diskMode) : null;
+
+  return {
+    state,
+    workerRecord: state?.processes.find((entry) => entry.role === "worker") ?? null,
+    workerHealth: judgeRoleHealth(running("worker"), roles?.worker ?? null),
+    backendHealth: judgeRoleHealth(running("backend"), roles?.backend ?? null),
+  };
+}
+
+/**
+ * ONE supervision pass: observe, decide, and act only if the decision says so.
+ *
+ * Held under the single-flight guard so two overlapping passes cannot each
+ * conclude "no worker" and each start one.
+ *
+ * The launcher deliberately spawns the replacement with the mode already
+ * RECORDED in runtime state. Restarting a worker is infrastructure recovery,
+ * not an operator decision to trade: no gate is written, no `.env` byte moves,
+ * and a SAFE runtime comes back SAFE.
+ */
+async function superviseWorkerOnce(budget: RestartBudget): Promise<{
+  budget: RestartBudget;
+  decision: SupervisionDecision;
+}> {
+  const observed = await observeRuntimeForSupervision();
+  const nowMs = Date.now();
+  const observedBudget = observeWorkerHealth(budget, observed.workerHealth, nowMs);
+
+  const decision = decideWorkerSupervision({
+    record: observed.workerRecord,
+    ownership: observed.workerRecord
+      ? verifyOwnership(
+          observed.workerRecord,
+          probeProcesses([observed.workerRecord.pid]).get(observed.workerRecord.pid) ?? null,
+          observed.state?.repoRoot ?? REPO_ROOT
+        )
+      : null,
+    workerHealth: observed.workerHealth,
+    backendHealth: observed.backendHealth,
+    budget: observedBudget,
+    nowMs,
+    hasRuntimeState: observed.state !== null,
+  });
+
+  if (decision.action === "NONE" || !observed.state) {
+    return { budget: observedBudget, decision };
+  }
+
+  const state = observed.state;
+  const attemptNumber = observedBudget.attempts + 1;
+  const result = executeWorkerRestart(decision, state, attemptNumber, {
+    probe: (pid) => probeProcesses([pid]).get(pid) ?? null,
+    terminate: (pid) => terminateTree(pid),
+    spawnWorker: () => {
+      // The RECORDED mode, never a fresh choice. `windowsSpawnPlan` pins the
+      // three gates into the child environment, so this reproduces exactly the
+      // posture the stack was started in.
+      const child = spawnRole("worker", state.mode);
+      if (typeof child.pid !== "number") return null;
+      child.unref();
+      return child.pid;
+    },
+    log: (line) => console.log(`  ${line}`),
+  });
+
+  // Only the worker record is replaced; the backend and frontend records are
+  // left exactly as they were, so the launcher can still stop them.
+  if (result.outcome === "RESTARTED" && result.record) {
+    store.write(withReplacedWorker(state, result.record));
+  }
+
+  return { budget: recordRestartAttempt(observedBudget, nowMs), decision };
+}
+
+/**
+ * The supervision loop.
+ *
+ * ## Scope, stated plainly
+ *
+ * This supervises the worker for as long as the launcher is running it. It is
+ * NOT a Windows service and it does not survive this console closing. That is
+ * a deliberate limit: the launcher is what owns the process records, and a new
+ * always-on daemon is a bigger change than this fix is allowed to make.
+ *
+ * The loop is interruptible with Ctrl+C and reports every tick, so an operator
+ * can watch a recovery happen rather than trusting that one did.
+ */
+async function superviseWorker(ask: (question: string) => Promise<string>): Promise<void> {
+  console.log("");
+  console.log("Worker supervision watches the WORKER role only.");
+  console.log("It never changes a deployment gate, never arms, and never touches an");
+  console.log("authorization window. A SAFE runtime stays SAFE.");
+  console.log("");
+  console.log("It runs only while this launcher is open. Press Ctrl+C to stop it.");
+  console.log("");
+  const answer = (await ask("Start supervising the worker? (y/N) ")).trim().toLowerCase();
+  if (answer !== "y") {
+    console.log("Nothing was changed.");
+    return;
+  }
+
+  let budget = EMPTY_RESTART_BUDGET;
+  for (;;) {
+    const pass = await runSupervisionSingleFlight(() => superviseWorkerOnce(budget));
+    if (pass.ran) {
+      budget = pass.result.budget;
+      const stamp = new Date().toISOString().slice(11, 19);
+      for (const line of renderSupervisionState(pass.result.decision, budget)) {
+        console.log(`[${stamp}] ${line}`);
+      }
+      if (pass.result.decision.state === "WORKER_RECOVERY_FAILED") {
+        console.log("");
+        console.log("Automatic worker recovery has STOPPED. Nothing further will be restarted.");
+        console.log("Investigate the worker before starting anything else, and do NOT start a");
+        console.log("second stack while this runtime is still owned.");
+        return;
+      }
+    }
+    await sleep(WORKER_SUPERVISION_INTERVAL_MS);
+  }
 }
 
 /**
@@ -524,7 +683,8 @@ async function main(): Promise<void> {
       console.log("2. Start SAFE");
       console.log("3. Start LIVE-READY");
       console.log("4. Stop Runtime & Return SAFE");
-      console.log("5. Exit");
+      console.log("5. Supervise Worker (auto-restart the worker role)");
+      console.log("6. Exit");
       console.log("");
 
       const choice = (await ask("Choose: ")).trim();
@@ -532,7 +692,8 @@ async function main(): Promise<void> {
       else if (choice === "2") await startRuntime("SAFE");
       else if (choice === "3") await startLiveReady(ask);
       else if (choice === "4") await stopRuntime();
-      else if (choice === "5") break;
+      else if (choice === "5") await superviseWorker(ask);
+      else if (choice === "6") break;
       else console.log("Unrecognised choice. Nothing was changed.");
     }
   } finally {
