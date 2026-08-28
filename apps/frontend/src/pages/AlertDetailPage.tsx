@@ -277,6 +277,16 @@ export function AlertDetailPage() {
           <TradeJournalPanel alertId={alert.id} />
         </TabPanel>
 
+        {/*
+          The Execution tab was declared in WORKFLOW_TABS and its panel was
+          imported, but no TabPanel ever rendered it — so clicking "Execution"
+          showed an empty area. That is why an alert with no execution looked
+          like it had simply vanished from the pipeline.
+        */}
+        <TabPanel id="execution" activeId={activeTab}>
+          <AlertExecutionPanel alert={alert} />
+        </TabPanel>
+
         <TabPanel id="ai" activeId={activeTab}>
           <AiOpinionPanel alert={alert} />
         </TabPanel>
