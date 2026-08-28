@@ -1063,6 +1063,12 @@ describe("natural authorization: runtime boundary", () => {
     // window that is still AVAILABLE would let it admit a trade shaped by
     // numbers nobody reviewed. It reads a window to refuse itself, nothing more.
     "src/modules/operator/extreme-rr-lookback.service.ts",
+    // OPERATOR POLICY LIMITS (Phase 12.6). Admitted on exactly the terms the
+    // allowlist editor is: it READS the newest window only to decide whether
+    // limits may be changed at all, and refuses the edit while one is
+    // AVAILABLE. It never claims, prepares, revokes or arms, and the single
+    // row it writes is ExecutionSafetyPolicy — asserted immediately below.
+    "src/modules/operator/policy-editor.service.ts",
   ];
 
   /**
@@ -1132,6 +1138,7 @@ describe("natural authorization: runtime boundary", () => {
     const recoveryCli = codeOf("src/modules/execution/entry-recovery-cli.ts");
     const protectionRecoveryCli = codeOf("src/modules/execution/protection-recovery-cli.ts");
     const lookback = codeOf("src/modules/operator/extreme-rr-lookback.service.ts");
+    const policyEditor = codeOf("src/modules/operator/policy-editor.service.ts");
     for (const forbidden of [
       "claimNaturalWindow",
       "armNaturalWindow",
@@ -1151,6 +1158,20 @@ describe("natural authorization: runtime boundary", () => {
       );
       expect(`lookback ${forbidden}:${lookback.includes(forbidden)}`).toBe(
         `lookback ${forbidden}:false`
+      );
+      expect(`policyEditor ${forbidden}:${policyEditor.includes(forbidden)}`).toBe(
+        `policyEditor ${forbidden}:false`
+      );
+    }
+    // The policy editor's own price of admission: it may look at a window to
+    // decide whether editing is allowed, and the ONLY row it writes is the
+    // safety policy. An execution write or an authorization write appearing
+    // here would mean the limits editor had grown into a trading path.
+    expect(policyEditor).toContain("isNaturalWindowAvailable");
+    expect(policyEditor).toContain("executionSafetyPolicy.updateMany");
+    for (const forbidden of ["tradeExecution.update", "tradeExecution.create", "tradeExecution.delete"]) {
+      expect(`policyEditor ${forbidden}:${policyEditor.includes(forbidden)}`).toBe(
+        `policyEditor ${forbidden}:false`
       );
     }
     // The one read it is admitted for, and the one column it writes.

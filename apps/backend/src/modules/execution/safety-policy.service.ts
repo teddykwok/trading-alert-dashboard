@@ -150,6 +150,29 @@ export class SafetyPolicyService {
   }
 
   /**
+   * The SAME validation a write runs, returning the NORMALIZED values.
+   *
+   * `assertValidValues` answers "is this acceptable?" and throws away the
+   * coerced result, which is all a dry run needs. The Trading Control policy
+   * editor needs the coerced values too — it writes them inside its own
+   * advisory-locked transaction, so it cannot call `updateForProfile` and must
+   * not re-derive the decimal trimming and integer coercion itself. A second
+   * normalizer would be a second set of rules to keep in step.
+   *
+   * Validation is identical: same field checks, same merged invariants, same
+   * refusal messages. This adds no rule and relaxes none.
+   */
+  normalizeAndValidate(
+    values: SafetyPolicyValues,
+    existing: ExecutionSafetyPolicy
+  ): Record<string, unknown> {
+    const data = this.validate(values);
+    if (Object.keys(data).length === 0) throw new ValidationError("No safety policy values were supplied.");
+    this.assertMergedInvariants(existing, data);
+    return data;
+  }
+
+  /**
    * The cross-field capacity invariants, evaluated on the row that would
    * RESULT from a partial update.
    *

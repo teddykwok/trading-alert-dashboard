@@ -795,16 +795,20 @@ describe("trading control: structural guarantees", () => {
     const code = codeOf("src/routes/operator.routes.ts");
     const routes = code.match(/app\.(get|post|put|patch|delete)\(/g) ?? [];
     const guards = code.match(/preHandler: requireOperatorAuth/g) ?? [];
-    // Twelve now: the source-timeframe policy and the Extreme RR lookback each
-    // add one guarded GET (read stays available while armed, so the operator
-    // can always SEE what governs a live system) and one guarded POST (refused
-    // unless SAFE_OFF and quiet).
-    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:12 guards:12`);
-    // Three GETs (probe, status, readiness) and five POSTs (the three
-    // trading actions plus allowlist validate and save). The READ surface is
-    // unchanged; no PUT/PATCH/DELETE exists at all.
-    expect((code.match(/app\.get\(/g) ?? []).length).toBe(5);
-    expect((code.match(/app\.post\(/g) ?? []).length).toBe(7);
+    // Fifteen now. The source-timeframe policy, the Extreme RR lookback and the
+    // execution policy limits each add one guarded GET — read stays available
+    // while armed, so the operator can always SEE what governs a live system —
+    // and the policy limits add two guarded POSTs: a dry run that writes
+    // nothing, and a save refused unless SAFE_OFF and quiet.
+    //
+    // Every route still opts into the guard; that equality is the point, not
+    // the number.
+    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:15 guards:15`);
+    // Six GETs and nine POSTs, and still no PUT/PATCH/DELETE anywhere. The
+    // READ surface stays read-only: the added GET reports limits and their env
+    // ceilings, and reaches no exposure counter it could write.
+    expect((code.match(/app\.get\(/g) ?? []).length).toBe(6);
+    expect((code.match(/app\.post\(/g) ?? []).length).toBe(9);
     expect(code.match(/app\.(put|patch|delete)\(/g)).toBeNull();
   });
 
