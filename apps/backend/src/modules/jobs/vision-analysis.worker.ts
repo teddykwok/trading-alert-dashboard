@@ -25,6 +25,7 @@ import {
   describeRedisFailure,
 } from "../runtime/attestation-redis";
 import { startExecutionNotificationScheduler } from "./execution-notification.scheduler";
+import { startAlertQueueRecoveryScheduler } from "./alert-queue-recovery.scheduler";
 import {
   createExecutionOrchestrator,
   isReconciliationHealthy,
@@ -210,6 +211,14 @@ const cleanupTimer = startCleanupScheduler();
 // a Telegram outage cannot affect any job this worker runs.
 const notificationTimer = startExecutionNotificationScheduler();
 
+// Startup sweep, then a bounded periodic one, for alerts that were persisted
+// but whose vision job was never created — the webhook enqueues AFTER the row
+// is committed, so a Redis blip strands the alert and a redelivery inside the
+// duplicate-suppression window only bumps its counter. Periodic as well as at
+// startup on purpose: Redis recovering restarts nothing, so a startup-only
+// sweep would leave those alerts waiting for a restart that may never happen.
+const alertRecoveryTimer = startAlertQueueRecoveryScheduler();
+
 // Phase 11A.1: startup execution recovery, then bounded periodic reconciliation.
 // Every mutation still travels through the Phase 6/7 gates, so with the live
 // gates closed this registers work that dispatches nothing.
@@ -266,6 +275,7 @@ process.on("SIGTERM", async () => {
   clearInterval(cleanupTimer);
   clearInterval(notificationTimer);
   clearInterval(orchestrationTimer);
+  clearInterval(alertRecoveryTimer);
   await worker.close();
   await extremeRRWorker.close();
   await retentionWorker?.close();
