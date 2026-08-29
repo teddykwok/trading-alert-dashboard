@@ -76,6 +76,27 @@ export interface TradingControlStatusDto {
     remainingClaims: number;
   } | null;
   alertAgeLimitSeconds: number;
+  /**
+   * Cumulative SESSION accounting, deliberately separate from `capacity`.
+   *
+   * `capacity` is how much is open right now; this is how many trades the
+   * session has opened out of how many it may. Merging them would put a fact
+   * and a running total under one heading — the confusion the old CLAIMS row
+   * created.
+   */
+  session: {
+    id: string;
+    status: string;
+    tradeBudget: number | null;
+    unlimited: boolean;
+    openedCount: number;
+    reservedCount: number;
+    remaining: number | null;
+    startedAt: string;
+    expiresAt: string;
+    endedAt: string | null;
+    remainingTtlSeconds: number;
+  } | null;
   capacity: {
     pending: number;
     open: number;
@@ -164,16 +185,53 @@ export const START_TRADING_CONFIRMATION = "START TRADING";
  * the server validates the submitted value independently and refuses anything
  * else, so this list decides what is OFFERED and never what is permitted.
  */
-export const START_TRADING_DURATION_CHOICES = [15, 30, 60] as const;
+export const START_TRADING_DURATION_CHOICES = [60, 360, 720, 1440] as const;
 export type StartTradingDuration = (typeof START_TRADING_DURATION_CHOICES)[number];
 
+/** The trade-budget presets offered beside a custom field. */
+export const START_TRADING_BUDGET_CHOICES = [10, 50, 100, 200, 300] as const;
+
+/**
+ * What the server permits for a NEW session.
+ *
+ * `unlimitedPermitted` is the server's own answer, derived from the execution
+ * profile AND the connector URL. The panel renders it; it never decides it. A
+ * UI label saying "paper" is a claim, not evidence.
+ */
+export interface SessionCapabilityDto {
+  unlimitedPermitted: boolean;
+  profileEnvironment: string;
+  connectorEnvironment: string;
+  reason: string;
+  durationPresetMinutes: number[];
+  maxDurationMinutes: number;
+  budgetPresets: number[];
+  maxTradeBudget: number;
+}
+
+export function fetchSessionCapability(): Promise<SessionCapabilityDto> {
+  return operatorApiClient.get<SessionCapabilityDto>(
+    "/api/operator/trading-control/session-capability"
+  );
+}
+
+/**
+ * Opens a session.
+ *
+ * `unlimited` is a REQUEST, not an instruction: the server refuses it unless it
+ * can itself prove the environment is non-live, and refuses outright rather
+ * than downgrading to a finite budget.
+ */
 export function postStartTrading(
   confirmation: string,
-  durationMinutes: StartTradingDuration
+  durationMinutes: number,
+  tradeBudget?: number,
+  unlimited?: boolean
 ): Promise<TradingControlActionResult> {
   return operatorApiClient.post("/api/operator/trading-control/start", {
     confirmation,
     durationMinutes,
+    ...(unlimited ? { unlimited: true } : tradeBudget !== undefined ? { tradeBudget } : {}),
   });
 }
 

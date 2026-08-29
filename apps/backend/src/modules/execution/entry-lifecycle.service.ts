@@ -29,6 +29,7 @@ import {
   type LocalOrderStatusName,
   type MutationOutcome,
 } from "./entry-lifecycle";
+import { applySessionAccountingForStatus } from "./trading-session.service";
 
 /**
  * Phase 6 — LIMIT entry lifecycle orchestration.
@@ -632,6 +633,16 @@ export class EntryLifecycleService {
       if (updated.count === 0) return null;
 
       const next = await tx.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+
+      // A PREFLIGHT execution that never reserved an order never reached the
+      // exchange, so its session slot goes back to the budget. Conditional on
+      // the slot still being RESERVED, so a repeated pass moves nothing.
+      await applySessionAccountingForStatus(tx, {
+        tradeExecutionId: execution.id,
+        status: next.status,
+        firstFillAt: next.firstFillAt,
+        now: input.evaluatedAt,
+      });
       await tx.executionEvent.create({
         data: {
           tradeExecutionId: execution.id,
@@ -1381,6 +1392,31 @@ export class EntryLifecycleService {
 
       const next = await tx.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
 
+      /**
+       * --- Session accounting --------------------------------------------
+       *
+       * This is the ONE place `firstFillAt` is written in the whole codebase,
+       * which makes it the one place a trade can first obtain exposure. Every
+       * discovery path converges here — the normal reconcile, startup
+       * recovery, an offline fill found after a restart, and a cancel that
+       * lost the race to a fill — so hooking it once covers all of them
+       * rather than hooking four callers and hoping a fifth is never added.
+       *
+       * Reads the COMMITTED row rather than the local flags: `next` is what
+       * the database now holds, so this cannot disagree with the status it is
+       * accounting for.
+       *
+       * Both operations are conditional on the slot still being RESERVED, so
+       * a retried reconcile or a repeated recovery pass moves nothing the
+       * second time.
+       */
+      await applySessionAccountingForStatus(tx, {
+        tradeExecutionId: execution.id,
+        status: next.status,
+        firstFillAt: next.firstFillAt,
+        now: input.evaluatedAt,
+      });
+
       await tx.binanceOrder.update({
         where: { id: order.id },
         data: {
@@ -1477,6 +1513,19 @@ export class EntryLifecycleService {
       if (updated.count === 0) return null;
 
       const next = await tx.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+
+      // A rejected submission never reached the order book, so it never had
+      // exposure and its session slot goes back to the budget. This is the ONE
+      // terminal path that does not funnel through `reconcileEntryOrder` —
+      // every other fill or expiry discovery does — so without this hook a
+      // rejection would silently leak a slot for the life of the session.
+      await applySessionAccountingForStatus(tx, {
+        tradeExecutionId: execution.id,
+        status: next.status,
+        firstFillAt: next.firstFillAt,
+        now: evaluatedAt,
+      });
+
       await tx.binanceOrder.update({ where: { id: order.id }, data: { status: "REJECTED" } });
       await tx.executionEvent.create({
         data: {

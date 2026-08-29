@@ -118,6 +118,14 @@ export const SAFETY_REASON_CODES = [
   "NATURAL_AUTHORIZATION_EXHAUSTED",
   "NATURAL_AUTHORIZATION_DIRECTION_NOT_ALLOWED",
   "NATURAL_AUTHORIZATION_CONFLICT",
+  // --- Session trade budget ------------------------------------------------
+  // Distinct codes on purpose. Reusing NATURAL_AUTHORIZATION_EXHAUSTED would
+  // tell the operator their authorization ran out when in fact the session's
+  // trade budget did — a different fact with a different remedy.
+  "SESSION_REQUIRED",
+  "SESSION_EXPIRED",
+  "SESSION_REVOKED",
+  "SESSION_BUDGET_EXHAUSTED",
 ] as const;
 export type SafetyReasonCode = (typeof SAFETY_REASON_CODES)[number];
 

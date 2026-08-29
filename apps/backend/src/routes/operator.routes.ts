@@ -13,6 +13,13 @@ import { AllowlistService } from "../modules/operator/allowlist.service";
 import { SourceTimeframeService } from "../modules/operator/source-timeframes.service";
 import { ExtremeRrLookbackService } from "../modules/operator/extreme-rr-lookback.service";
 import { PolicyEditorService } from "../modules/operator/policy-editor.service";
+import { resolveSessionCapability } from "../modules/operator/session-capability";
+import {
+  SESSION_BUDGET_PRESETS,
+  SESSION_DURATION_PRESET_MINUTES,
+  SESSION_MAX_DURATION_MINUTES,
+  SESSION_MAX_TRADE_BUDGET,
+} from "../modules/execution/trading-session";
 import type {
   AllowlistSaveResult,
   AllowlistValidationResult,
@@ -69,7 +76,12 @@ export interface OperatorRoutesOptions {
 
 /** The mutation surface. Three actions, and deliberately nothing else. */
 export interface TradingControlActor {
-  startTrading(confirmation: unknown, durationMinutes?: unknown): Promise<TradingControlActionResult>;
+  startTrading(
+    confirmation: unknown,
+    durationMinutes?: unknown,
+    tradeBudget?: unknown,
+    unlimited?: unknown
+  ): Promise<TradingControlActionResult>;
   stopNewTrades(): Promise<TradingControlActionResult>;
   safeOff(): Promise<TradingControlActionResult>;
 }
@@ -115,6 +127,27 @@ export async function operatorRoutes(
     return result;
   };
 
+  // What the panel may OFFER for a new session. Read-only, and the SERVER's
+  // answer: the browser never decides whether unlimited is permitted, it only
+  // renders what this says.
+  app.get(
+    "/api/operator/trading-control/session-capability",
+    { preHandler: requireOperatorAuth },
+    async () => {
+      const capability = resolveSessionCapability();
+      return {
+        unlimitedPermitted: capability.unlimitedPermitted,
+        profileEnvironment: capability.profileEnvironment,
+        connectorEnvironment: capability.connectorEnvironment,
+        reason: capability.reason,
+        durationPresetMinutes: [...SESSION_DURATION_PRESET_MINUTES],
+        maxDurationMinutes: SESSION_MAX_DURATION_MINUTES,
+        budgetPresets: [...SESSION_BUDGET_PRESETS],
+        maxTradeBudget: SESSION_MAX_TRADE_BUDGET,
+      };
+    }
+  );
+
   app.get("/api/operator/auth-check", { preHandler: requireOperatorAuth }, async () => ({
     authenticated: true,
   }));
@@ -149,11 +182,16 @@ export async function operatorRoutes(
       // The confirmation phrase is validated by the service, on the server.
       // The browser dialog is a courtesy, never the boundary.
       const body = request.body as
-        | { confirmation?: unknown; durationMinutes?: unknown }
+        | {
+            confirmation?: unknown;
+            durationMinutes?: unknown;
+            tradeBudget?: unknown;
+            unlimited?: unknown;
+          }
         | null
         | undefined;
       return runAction(request, reply, (actor) =>
-        actor.startTrading(body?.confirmation, body?.durationMinutes)
+        actor.startTrading(body?.confirmation, body?.durationMinutes, body?.tradeBudget, body?.unlimited)
       );
     }
   );

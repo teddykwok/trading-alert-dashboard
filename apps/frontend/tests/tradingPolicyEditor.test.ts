@@ -54,13 +54,17 @@ describe("A-F. current exposure is separate and read-only", () => {
   });
 
   it("B-F. every observed value is still a plain Row, with no input beside it", () => {
-    const exposure = card.slice(
-      card.indexOf('<Section title="Current Exposure">'),
-      card.indexOf('<Section title="Policy Limits">')
-    );
-    for (const label of ["Open", "Pending", "Active", "Claims", "Risk", "Margin"]) {
+    // Bounded to the Current Exposure section itself: the Authorization
+    // internals section now sits between it and Policy Limits, and sweeping
+    // that in would make this assert about the wrong block.
+    const exposureStart = card.indexOf('<Section title="Current Exposure">');
+    const exposure = card.slice(exposureStart, card.indexOf("</Section>", exposureStart));
+    // "Claims" is deliberately absent: it moved to its own Authorization
+    // section, because it never measured trade progress.
+    for (const label of ["Open", "Pending", "Active", "Risk", "Margin"]) {
       expect(exposure, label).toContain(`<Row label="${label}">`);
     }
+    expect(exposure).not.toContain('<Row label="Claims">');
     // Facts are rendered, never edited: no field, no control, no handler.
     for (const forbidden of ["<input", "<select", "onChange", "Button"]) {
       expect(`exposure ${forbidden}:${exposure.includes(forbidden)}`).toBe(`exposure ${forbidden}:false`);
@@ -192,12 +196,24 @@ describe("the env ceiling is reported, not hidden", () => {
 // ---------------------------------------------------------------------------
 
 describe("Q-R. scope", () => {
-  it("Q. no Session Trade Budget UI was added", () => {
-    for (const source of [editorCode, codeOf(card), codeOf(api)]) {
-      for (const forbidden of ["sessionTradeBudget", "Session Trade", "tradesRemaining", "Unlimited"]) {
-        expect(`${forbidden}:${source.includes(forbidden)}`).toBe(`${forbidden}:false`);
-      }
+  it("Q. the Session Trade Budget stays out of the POLICY EDITOR", () => {
+    // This guard originally said "not added" — Phase 2 has since arrived, and
+    // the card and API legitimately carry session UI now. What must remain
+    // true is narrower and more durable: a session is a lifecycle window an
+    // operator opens and closes, a policy limit is a standing rule, and the
+    // EDITOR must not learn to set one from the other.
+    for (const forbidden of [
+      "sessionTradeBudget",
+      "tradeBudget",
+      "tradesRemaining",
+      "Unlimited",
+      "openedCount",
+      "reservedCount",
+    ]) {
+      expect(`${forbidden}:${editorCode.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
+    // And the editable set is still limits only.
+    expect([...EDITABLE_POLICY_FIELDS]).not.toContain("tradeBudget" as never);
   });
 
   it("Q2. no daily loss limit UI was added", () => {

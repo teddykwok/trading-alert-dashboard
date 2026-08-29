@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
@@ -11,6 +11,9 @@ import { classNames } from "../../utils/classNames";
 import { useTradingControl } from "../../hooks/useTradingControl";
 import {
   START_TRADING_DURATION_CHOICES,
+  START_TRADING_BUDGET_CHOICES,
+  fetchSessionCapability,
+  type SessionCapabilityDto,
   type StartTradingDuration,
   type TradingControlReadinessSnapshot,
   type TradingControlStatusDto,
@@ -74,6 +77,57 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
  * The heading is deliberately quieter than the values inside it: a section
  * label must never compete with SAFE OFF or BLOCKED for attention.
  */
+/** Selected / unselected choice-button styling, named so the JSX stays readable. */
+const CHOICE_ON =
+  "rounded-lg border border-yellow-400/60 bg-yellow-500/20 px-3 py-1 text-xs text-slate-100";
+const CHOICE_OFF = "rounded-lg border border-surface-border px-3 py-1 text-xs text-slate-400";
+
+/**
+ * A duration in operator units.
+ *
+ * Sessions are now hours long, and "1440 min" is a number an operator has to
+ * decode. Exact minutes are kept for anything that is not a whole hour, so a
+ * custom 90 reads as "90 min" rather than being rounded into a lie.
+ */
+export function formatSessionDuration(minutes: number): string {
+  if (!Number.isFinite(minutes) || minutes <= 0) return `${minutes} min`;
+  if (minutes % 60 !== 0) return `${minutes} min`;
+  const hours = minutes / 60;
+  return hours === 1 ? "1 hour" : `${hours} hours`;
+}
+
+/** Whole seconds as `17h 42m`, or `0m` once a session has ended. */
+export function formatRemaining(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0m";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
+/**
+ * Session progress, in the operator's terms.
+ *
+ * `Opened` is trades that actually obtained exposure — which is what the
+ * budget counts and what CLAIMS never did. Unlimited renders as a word, never
+ * as a number, because there is no denominator to show.
+ */
+export function presentSessionProgress(session: {
+  openedCount: number;
+  tradeBudget: number | null;
+  unlimited: boolean;
+}): string {
+  return session.unlimited || session.tradeBudget === null
+    ? `${session.openedCount}`
+    : `${session.openedCount} / ${session.tradeBudget}`;
+}
+
+export function presentSessionRemaining(session: {
+  remaining: number | null;
+  unlimited: boolean;
+}): string {
+  return session.unlimited || session.remaining === null ? "Unlimited" : String(session.remaining);
+}
+
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="space-y-0.5">
@@ -209,6 +263,23 @@ function StatusBody({
           <Row label="TTL">{authorization.ttl}</Row>
         </Section>
 
+        {/* CUMULATIVE session accounting, deliberately its own section.
+            "Opened" counts trades that actually obtained exposure, which is
+            what the budget bounds — and what CLAIMS never measured. Kept apart
+            from Current Exposure because one is a running total and the other
+            is a fact about right now. */}
+        {status.session ? (
+          <Section title="Session">
+            <Row label="Status">{status.session.status}</Row>
+            <Row label="Time remaining">
+              {formatRemaining(status.session.remainingTtlSeconds)}
+            </Row>
+            <Row label="Opened">{presentSessionProgress(status.session)}</Row>
+            <Row label="Reserved">{status.session.reservedCount}</Row>
+            <Row label="Remaining">{presentSessionRemaining(status.session)}</Row>
+          </Section>
+        ) : null}
+
         {/* OBSERVED facts, every one counted from execution rows. Read-only by
             construction: there is no control here and no endpoint behind one
             that could set a count, a reservation or a claim. */}
@@ -216,9 +287,19 @@ function StatusBody({
           <Row label="Open">{presentOpenCapacity(capacity)}</Row>
           <Row label="Pending">{presentPendingCapacity(capacity)}</Row>
           <Row label="Active">{presentCapacity(capacity)}</Row>
-          <Row label="Claims">{authorization.claims}</Row>
           <Row label="Risk">{presentReservation(reservations.riskUsd, reservations.riskLimitUsd)}</Row>
           <Row label="Margin">{presentReservation(reservations.marginUsd, reservations.marginLimitUsd)}</Row>
+        </Section>
+
+        {/* Authorization internals, and labelled as such.
+            This row used to read "Claims 5 / 5" beside the exposure counts,
+            where it looked like trade progress — and it never was: a claim is
+            spent at ADMISSION and is never refunded, so an entry that never
+            filled still burned one. Session > Opened is the operator-facing
+            progress now; this stays only as low-level evidence of the
+            authorization window, under a heading that says so. */}
+        <Section title="Authorization (internal)">
+          <Row label="Window claims">{authorization.claims}</Row>
         </Section>
 
         {/* The LIMITS those facts are measured against. Editable only while the
@@ -288,11 +369,48 @@ function ConfirmDialog({
   status: TradingControlStatusDto | null;
   pending: boolean;
   onCancel: () => void;
-  onConfirm: (phrase: string, durationMinutes: StartTradingDuration) => void;
+  onConfirm: (
+    phrase: string,
+    durationMinutes: number,
+    tradeBudget: number | undefined,
+    unlimited: boolean
+  ) => void;
 }) {
   const [typed, setTyped] = useState("");
-  const [duration, setDuration] = useState<StartTradingDuration>(START_WINDOW_MINUTES);
+  const [duration, setDuration] = useState<number>(START_WINDOW_MINUTES);
+  const [customDuration, setCustomDuration] = useState("");
+  const [budget, setBudget] = useState<number>(START_TRADING_BUDGET_CHOICES[0]);
+  const [customBudget, setCustomBudget] = useState("");
+  const [unlimited, setUnlimited] = useState(false);
+  const [capability, setCapability] = useState<SessionCapabilityDto | null>(null);
   const context = status ? describeStartContext(status) : null;
+
+  // The SERVER's own answer about what may be offered. Asked once when the
+  // dialog opens; a failure leaves it null, which HIDES Unlimited — the safe
+  // direction, because the panel must never enable it on a guess.
+  useEffect(() => {
+    if (action.id !== "START") return undefined;
+    let cancelled = false;
+    void fetchSessionCapability()
+      .then((next) => {
+        if (!cancelled) setCapability(next);
+      })
+      .catch(() => {
+        if (!cancelled) setCapability(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [action.id]);
+
+  // A custom value wins over the preset when it parses. The SERVER validates
+  // whatever is sent, so this only decides what gets sent.
+  const parsedDuration = Number(customDuration);
+  const resolvedDuration =
+    customDuration !== "" && Number.isFinite(parsedDuration) ? parsedDuration : duration;
+  const parsedBudget = Number(customBudget);
+  const resolvedBudget =
+    customBudget !== "" && Number.isFinite(parsedBudget) ? parsedBudget : budget;
   const satisfied = isConfirmationSatisfied(action, typed);
 
   return (
@@ -340,27 +458,116 @@ function ConfirmDialog({
       ) : null}
 
       {action.id === "START" ? (
-        <fieldset className="space-y-1">
-          <legend className="text-xs text-slate-400">Supervised window</legend>
-          <div className="flex gap-2">
-            {START_TRADING_DURATION_CHOICES.map((minutes) => (
-              <button
-                key={minutes}
-                type="button"
-                onClick={() => setDuration(minutes)}
+        <>
+          <fieldset className="space-y-1">
+            <legend className="text-xs text-slate-400">Duration</legend>
+            <div className="flex flex-wrap gap-2">
+              {START_TRADING_DURATION_CHOICES.map((minutes) => (
+                <button
+                  key={minutes}
+                  type="button"
+                  onClick={() => {
+                    setDuration(minutes);
+                    setCustomDuration("");
+                  }}
+                  disabled={pending}
+                  aria-pressed={customDuration === "" && duration === minutes}
+                  className={customDuration === "" && duration === minutes ? CHOICE_ON : CHOICE_OFF}
+                >
+                  {formatSessionDuration(minutes)}
+                </button>
+              ))}
+              <input
+                aria-label="Custom duration in minutes"
+                placeholder="Custom min"
+                value={customDuration}
+                inputMode="numeric"
                 disabled={pending}
-                aria-pressed={duration === minutes}
-                className={
-                  duration === minutes
-                    ? "rounded-lg border border-yellow-400/60 bg-yellow-500/20 px-3 py-1 text-xs text-slate-100"
-                    : "rounded-lg border border-surface-border px-3 py-1 text-xs text-slate-400"
-                }
-              >
-                {minutes} min
-              </button>
-            ))}
-          </div>
-        </fieldset>
+                onChange={(event) => setCustomDuration(event.target.value)}
+                className="w-28 rounded-lg border border-surface-border bg-surface px-2 py-1 text-xs text-slate-200"
+              />
+            </div>
+          </fieldset>
+
+          <fieldset className="space-y-1">
+            <legend className="text-xs text-slate-400">
+              Trade budget - trades that actually open
+            </legend>
+            <div className="flex flex-wrap gap-2">
+              {START_TRADING_BUDGET_CHOICES.map((count) => (
+                <button
+                  key={count}
+                  type="button"
+                  onClick={() => {
+                    setBudget(count);
+                    setCustomBudget("");
+                    setUnlimited(false);
+                  }}
+                  disabled={pending}
+                  aria-pressed={!unlimited && customBudget === "" && budget === count}
+                  className={
+                    !unlimited && customBudget === "" && budget === count ? CHOICE_ON : CHOICE_OFF
+                  }
+                >
+                  {count}
+                </button>
+              ))}
+              <input
+                aria-label="Custom trade budget"
+                placeholder="Custom"
+                value={customBudget}
+                inputMode="numeric"
+                disabled={pending || unlimited}
+                onChange={(event) => {
+                  setCustomBudget(event.target.value);
+                  setUnlimited(false);
+                }}
+                className="w-24 rounded-lg border border-surface-border bg-surface px-2 py-1 text-xs text-slate-200"
+              />
+              {/* Offered ONLY when the server says so. The panel renders the
+                  server's answer and never decides that "paper" means
+                  unlimited is safe, so a live account never sees this. */}
+              {capability?.unlimitedPermitted ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUnlimited(true);
+                    setCustomBudget("");
+                  }}
+                  disabled={pending}
+                  aria-pressed={unlimited}
+                  className={unlimited ? CHOICE_ON : CHOICE_OFF}
+                >
+                  Unlimited
+                </button>
+              ) : null}
+            </div>
+            {capability && !capability.unlimitedPermitted ? (
+              <p className="text-[11px] text-slate-500" data-testid="unlimited-blocked">
+                {capability.reason}
+              </p>
+            ) : null}
+          </fieldset>
+
+          {/* Review: the values about to be sent, beside the standing policy
+              they will run under. Displayed, never edited - the Policy Editor
+              owns those and is SAFE-only. */}
+          <dl
+            className="grid grid-cols-2 gap-x-3 gap-y-0.5 rounded border border-surface-border p-2 text-xs text-slate-400"
+            data-testid="start-review"
+          >
+            <dt>Duration</dt>
+            <dd className="text-slate-200">{formatSessionDuration(resolvedDuration)}</dd>
+            <dt>Trade budget</dt>
+            <dd className="text-slate-200">
+              {unlimited ? "Unlimited" : `${resolvedBudget} opened trades`}
+            </dd>
+            <dt>Max active</dt>
+            <dd className="text-slate-200">{context ? context.hardTotal : "-"}</dd>
+            <dt>Max risk</dt>
+            <dd className="text-slate-200">{context ? context.riskLimit : "-"}</dd>
+          </dl>
+        </>
       ) : null}
 
       {action.requiredPhrase ? (
@@ -382,7 +589,7 @@ function ConfirmDialog({
         <Button
           variant={action.destructiveLooking ? "danger" : "primary"}
           disabled={!satisfied || pending}
-          onClick={() => onConfirm(typed, duration)}
+          onClick={() => onConfirm(typed, resolvedDuration, unlimited ? undefined : resolvedBudget, unlimited)}
         >
           {pending ? "Working…" : `Confirm ${action.label}`}
         </Button>
@@ -458,10 +665,10 @@ export function TradingControlCard() {
               status={status}
               pending={pendingAction !== null}
               onCancel={() => setConfirming(null)}
-              onConfirm={(phrase, durationMinutes) => {
+              onConfirm={(phrase, durationMinutes, tradeBudget, unlimited) => {
                 const action = confirming;
                 setConfirming(null);
-                void runAction(action.id, phrase, durationMinutes);
+                void runAction(action.id, phrase, durationMinutes, tradeBudget, unlimited);
               }}
             />
           ) : null}

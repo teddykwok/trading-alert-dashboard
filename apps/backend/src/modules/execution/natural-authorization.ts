@@ -26,14 +26,23 @@ import type { CanaryDirection, ExecutionCanaryAuthorization } from "@prisma/clie
 /**
  * The single source of truth for the maximum life of ANY authorization window.
  *
- * 60 minutes, matching the bound `execution:prepare-canary` already enforces on
- * exact authorizations. It is stated here as a named constant because the
- * natural path is the first to need it in the SERVICE layer — the exact path
- * still checks it in the CLI. Deliberately not "reuse or longer": a window
- * nobody is watching should shut on its own, and natural mode is the mode that
- * admits more than one trade.
+ * 24 hours. It was 60 minutes, and the reasoning for that bound was sound at
+ * the time: "a window nobody is watching should shut on its own, and natural
+ * mode is the mode that admits more than one trade."
+ *
+ * What changed is the second half. A natural window is no longer the thing that
+ * bounds how much trading happens — a TradingSession is, and it counts trades
+ * that actually obtained exposure rather than admissions. So the window's TTL
+ * now bounds only how long PERMISSION lasts, while the trade budget bounds how
+ * much can be done with it. A 24-hour window with a budget of 100 cannot open a
+ * 101st trade however long it lives.
+ *
+ * 24 hours and not longer: that is the horizon this feature was asked for and
+ * the longest one whose consequences were traced. A multi-day unattended window
+ * is a separate policy decision, not a larger number, so `validateSessionDuration`
+ * refuses beyond it.
  */
-export const MAXIMUM_AUTHORIZATION_TTL_MINUTES = 60;
+export const MAXIMUM_AUTHORIZATION_TTL_MINUTES = 24 * 60;
 
 /** Every direction a natural window may name. There is no wildcard. */
 export const NATURAL_DIRECTIONS = ["LONG", "SHORT"] as const satisfies readonly CanaryDirection[];
@@ -149,6 +158,46 @@ export function naturalWindowState(
 export function isNaturalWindowOpen(authorization: ExecutionCanaryAuthorization, now: Date): boolean {
   const state = naturalWindowState(authorization, now);
   return state === "AVAILABLE" || state === "EXHAUSTED";
+}
+
+/**
+ * Whether this window's quantitative bound comes from a TradingSession.
+ *
+ * A SESSION-BACKED window answers only permission questions — is it live, is
+ * the direction admitted, has it been revoked. HOW MANY trades it may produce
+ * is the session's budget, counted in trades that actually obtained exposure.
+ *
+ * A LEGACY window (no session link) keeps the historical `maxClaims` behaviour
+ * untouched: a cumulative, never-refunded cap on ADMISSIONS.
+ *
+ * The distinction is a stored link, never an inference, so a legacy window and
+ * a new session coexisting on one profile can never be confused for each other.
+ */
+export function isSessionBackedWindow(
+  authorization: Pick<ExecutionCanaryAuthorization, "tradingSessionId">
+): boolean {
+  return authorization.tradingSessionId !== null;
+}
+
+/**
+ * The window state that admission should ACT on.
+ *
+ * Identical to `naturalWindowState` for a legacy window. For a session-backed
+ * one it never reports EXHAUSTED, because `claimedCount` is not that window's
+ * budget — the session is, and a claim is never spent against it. Without this
+ * a 100-trade session would still stop at the fifth ADMISSION, which is the
+ * precise bug sessions exist to remove.
+ *
+ * Every other state is unchanged: revoked is revoked, expired is expired, and
+ * a malformed row is still INVALID.
+ */
+export function effectiveNaturalWindowState(
+  authorization: ExecutionCanaryAuthorization,
+  now: Date
+): NaturalWindowState {
+  const state = naturalWindowState(authorization, now);
+  if (state === "EXHAUSTED" && isSessionBackedWindow(authorization)) return "AVAILABLE";
+  return state;
 }
 
 /** Open AND still holding budget: the only state a new claim may be attempted from. */

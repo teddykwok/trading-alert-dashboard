@@ -790,7 +790,13 @@ describe("trading control layout: grouped, and nothing lost", () => {
     for (const label of [
       "System", "Runtime", "Attestation", "Preparation", "Live Activation",
       "Allowed Symbols", "Source TFs", "RR lookback", "Natural Window", "TTL",
-      "Claims", "Active", "Risk", "Margin",
+      "Active", "Risk", "Margin",
+      // "Claims" moved OUT of Current Exposure and into its own
+      // "Authorization (internal)" section as "Window claims". It never
+      // measured trade progress — a claim is spent at admission and never
+      // refunded — and standing beside the exposure counts it read as though
+      // it did. Session > Opened is the operator-facing progress now.
+      "Window claims",
     ]) {
       expect(card, label).toContain(`<Row label="${label}">`);
     }

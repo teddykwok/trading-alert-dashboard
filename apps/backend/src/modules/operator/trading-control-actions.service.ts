@@ -3,6 +3,10 @@ import type { PrismaClient } from "@prisma/client";
 import { CanaryAuthorizationService, NaturalWindowValidationError } from "../execution/canary-authorization.service";
 import { CanaryPreflightService } from "../execution/canary-preflight.service";
 import { CANARY_NATURAL_MAX_CLAIMS } from "../execution/canary-readiness";
+import { validateSessionBudget, validateSessionDuration } from "../execution/trading-session";
+import { resolveSessionCapability } from "./session-capability";
+import { revokeCurrentSession } from "../execution/trading-session.service";
+import { logger } from "../../config/logger";
 import { configuredProfileIdentity, resolveExecutionProfile } from "../execution/execution-profile.service";
 import { armNaturalWindow } from "../execution/natural-arm";
 import { NATURAL_DIRECTIONS, describeNaturalWindow } from "../execution/natural-authorization";
@@ -53,35 +57,77 @@ export const START_TRADING_TTL_MINUTES = 60;
 export const START_TRADING_MAX_CLAIMS = CANARY_NATURAL_MAX_CLAIMS;
 
 /**
- * The supervised durations an operator may choose.
+ * The trade budget a session gets when the caller does not choose one.
  *
- * A strict set rather than a range: these are the three lengths that were
- * reviewed, so 45 is refused for the same reason 600 is. The maximum is still
- * enforced independently by the authorization service, and nothing here can
- * raise it — this list only narrows what the panel may ask for.
+ * Deliberately the historical claim budget. Before sessions, a Start Trading
+ * with no budget argument produced a window that could admit five executions;
+ * it now produces a session that can OPEN five trades. That is the same
+ * posture expressed in better units — and a caller who never mentions a budget
+ * is never silently given a larger one.
  */
-export const START_TRADING_DURATION_CHOICES = [15, 30, 60] as const;
+export const START_TRADING_DEFAULT_TRADE_BUDGET = CANARY_NATURAL_MAX_CLAIMS;
+
+/**
+ * The durations the panel offers as one-click choices.
+ *
+ * The historical 15/30/60 set has become 1h/6h/12h/24h, and the set is no
+ * longer exhaustive: a CUSTOM duration is accepted too. What makes that safe is
+ * that presets and custom values now run through the SAME validator
+ * (`validateSessionDuration`), which enforces the 24-hour ceiling. A preset is
+ * a convenience, never a second code path that could admit what custom cannot.
+ */
+export const START_TRADING_DURATION_CHOICES = [60, 6 * 60, 12 * 60, 24 * 60] as const;
 export type StartTradingDuration = (typeof START_TRADING_DURATION_CHOICES)[number];
 
 /**
  * Resolves a submitted duration, FAIL CLOSED.
  *
- * `undefined` means "not supplied" and takes the reviewed default. Anything
- * else must be exactly one of the choices: a numeric string, a float, a
- * negative, `null` or an object are all refusals rather than coercions.
+ * `undefined` means "not supplied" and takes the reviewed default. Everything
+ * else — preset or custom — is judged by the session validator, so a numeric
+ * string, a float, a negative or a value past 24 hours are refusals rather than
+ * coercions.
  */
 export function resolveStartTradingDuration(
   value: unknown
 ): { ok: true; minutes: number } | { ok: false; message: string } {
   if (value === undefined) return { ok: true, minutes: START_TRADING_TTL_MINUTES };
-  const choices = START_TRADING_DURATION_CHOICES as readonly number[];
-  if (typeof value === "number" && Number.isInteger(value) && choices.includes(value)) {
-    return { ok: true, minutes: value };
+  if (typeof value !== "number") {
+    return { ok: false, message: "durationMinutes must be a number of minutes. Nothing was changed." };
   }
-  return {
-    ok: false,
-    message: `durationMinutes must be one of ${choices.join(", ")}. Nothing was changed.`,
-  };
+  const verdict = validateSessionDuration(value);
+  return verdict.ok
+    ? { ok: true, minutes: verdict.minutes }
+    : { ok: false, message: `${verdict.reason} Nothing was changed.` };
+}
+
+/**
+ * Resolves a submitted trade budget, FAIL CLOSED.
+ *
+ * `unlimitedPermitted` is decided by the SERVER from the execution
+ * environment. A request for unlimited that the server cannot justify is
+ * refused outright rather than downgraded to a finite budget — quietly trading
+ * a different configuration from the one asked for is worse than refusing.
+ */
+export function resolveStartTradingBudget(
+  value: unknown,
+  unlimited: unknown
+): { ok: true; tradeBudget: number | null; unlimited: boolean } | { ok: false; message: string } {
+  // Not supplied means "the reviewed default", exactly as an unsupplied
+  // duration does. The default is the HISTORICAL budget, so a caller that says
+  // nothing about trades gets precisely the posture it got before sessions
+  // existed — this feature widens what an operator may ASK for, it does not
+  // quietly widen what an existing caller receives.
+  if (value === undefined && unlimited === undefined) {
+    return { ok: true, tradeBudget: START_TRADING_DEFAULT_TRADE_BUDGET, unlimited: false };
+  }
+  const capability = resolveSessionCapability();
+  const verdict = validateSessionBudget(value, {
+    unlimited,
+    unlimitedPermitted: capability.unlimitedPermitted,
+  });
+  return verdict.ok
+    ? { ok: true, tradeBudget: verdict.tradeBudget, unlimited: verdict.unlimited }
+    : { ok: false, message: `${verdict.reason} Nothing was changed.` };
 }
 
 /** Typed exactly, so a near-miss is a refusal rather than a coercion. */
@@ -177,7 +223,12 @@ export class TradingControlActionsService {
    * courtesy to the operator; it is not the boundary, because anything a
    * browser enforces can be skipped by not using a browser.
    */
-  async startTrading(confirmation: unknown, durationMinutes?: unknown): Promise<TradingControlActionResult> {
+  async startTrading(
+    confirmation: unknown,
+    durationMinutes?: unknown,
+    tradeBudget?: unknown,
+    unlimited?: unknown
+  ): Promise<TradingControlActionResult> {
     if (confirmation !== START_TRADING_CONFIRMATION) {
       return blocked(
         ["CONFIRMATION_REQUIRED"],
@@ -222,6 +273,13 @@ export class TradingControlActionsService {
       );
     }
 
+    // Validated before anything is prepared, for the same reason the duration
+    // is: a budget nobody reviewed must not reach session creation. The
+    // unlimited rule is decided here from the SERVER's own view of the
+    // execution environment, never from what the browser claimed.
+    const budget = resolveStartTradingBudget(tradeBudget, unlimited);
+    if (!budget.ok) return blocked(["SESSION_BUDGET_INVALID"], budget.message);
+
     // This process's own env snapshot proves nothing about what the RUNNING
     // backend and worker loaded. Read before any write.
     const attestation = await this.readAttestation();
@@ -236,6 +294,66 @@ export class TradingControlActionsService {
       };
     }
 
+    // --- The session, BEFORE the window it will back ------------------------
+    //
+    // Ordering is the whole safety argument, and it used to run the other way.
+    // The window was prepared and ARMED first and linked afterwards, which
+    // left a committed state of: armed profile + usable NATURAL window +
+    // tradingSessionId null. A crash there produced a window indistinguishable
+    // from a LEGACY one — and a legacy window admits up to maxClaims trades
+    // with no session at all, the exact opposite of what a session-backed
+    // start promises.
+    //
+    // Creating the session first turns every crash window into a safe one:
+    //
+    //   after this write  session exists, NO window   -> admits nothing;
+    //                     admission requires an authorization
+    //   after prepare     window exists ALREADY LINKED, profile not armed
+    //                     -> admits nothing; kill switch still engaged
+    //   after arm         the intended state
+    //
+    // At no point does a USABLE window exist with a null link.
+    //
+    // Any older ACTIVE session is retired in the same transaction, so a
+    // profile never carries two. It cannot strand a live window: preparation
+    // below refuses outright while an active authorization exists, so at this
+    // point no window is pointing at the session being retired.
+    const session = await this.prisma.$transaction(async (tx) => {
+      await tx.tradingSession.updateMany({
+        where: { executionProfileId: profile.id, status: "ACTIVE" },
+        data: { status: "REVOKED", endedAt: this.now(), version: { increment: 1 } },
+      });
+      return tx.tradingSession.create({
+        data: {
+          executionProfileId: profile.id,
+          status: "ACTIVE",
+          tradeBudget: budget.tradeBudget,
+          unlimited: budget.unlimited,
+          expiresAt: new Date(this.now().getTime() + duration.minutes * 60_000),
+        },
+      });
+    });
+
+    /**
+     * Retires the session this call just opened.
+     *
+     * Only ever reached on a path that leaves NOTHING armed, so it is cleanup
+     * rather than a rollback of a reviewed primitive. A failure to clean up is
+     * swallowed on purpose: an orphan ACTIVE session with no armed profile and
+     * no window can admit nothing, and letting cleanup failure mask the
+     * refusal being reported would be the worse outcome.
+     */
+    const abandonSession = async () => {
+      try {
+        await this.prisma.tradingSession.updateMany({
+          where: { id: session.id, status: "ACTIVE" },
+          data: { status: "REVOKED", endedAt: this.now(), version: { increment: 1 } },
+        });
+      } catch {
+        // Intentionally ignored; see above.
+      }
+    };
+
     // --- Prepare ONE window with the reviewed service -----------------------
     let window;
     try {
@@ -244,9 +362,12 @@ export class TradingControlActionsService {
         allowedDirections: START_TRADING_DIRECTIONS,
         maxClaims: START_TRADING_MAX_CLAIMS,
         ttlMinutes: duration.minutes,
+        // Linked at CREATION, never afterwards.
+        tradingSessionId: session.id,
         now: this.now(),
       });
     } catch (error) {
+      await abandonSession();
       // Preparation refuses an already-active window by design; that refusal is
       // the reviewed exclusivity rule, not an error to work around.
       const reason =
@@ -278,6 +399,9 @@ export class TradingControlActionsService {
     const authorization = await this.describeAuthorization(window.id);
 
     if (!result.ok) {
+      // Nothing is armed on this path, so the session opened above is retired.
+      // The WINDOW is deliberately left alone — see below.
+      await abandonSession();
       // The reviewed semantics, reported honestly: preparation is NOT rolled
       // back, so a window now exists while the profile is still safe. Inventing
       // a cross-operation rollback here would be a new behaviour nobody has
@@ -296,6 +420,25 @@ export class TradingControlActionsService {
       };
     }
 
+    // The window was created already carrying this session's id, so there is
+    // no linking step left to fail, and nothing to reconcile here.
+    //
+    // `alreadyArmed` describes the PROFILE, not the window: it means the kill
+    // switch was already released, so arming had no state to change. The
+    // window prepared moments ago is still the live one — preparation refuses
+    // outright while another active authorization exists — so this session is
+    // the session backing it, and reporting an older one instead would point
+    // the operator at a session no window is bound to.
+    logger.info(
+      {
+        sessionId: session.id,
+        durationMinutes: duration.minutes,
+        tradeBudget: budget.tradeBudget,
+        unlimited: budget.unlimited,
+      },
+      "Trading session opened"
+    );
+
     return {
       ok: true,
       outcome: result.alreadyArmed ? "ALREADY_ARMED" : "ARMED",
@@ -307,7 +450,9 @@ export class TradingControlActionsService {
       blockers: [],
       message: result.alreadyArmed
         ? "The profile was already armed; nothing was changed."
-        : "Armed. No signal was sent, no execution was created and no claim was spent.",
+        : `Armed for ${duration.minutes} minutes with a budget of ${
+            budget.unlimited ? "unlimited" : budget.tradeBudget
+          } opened trade(s). No signal was sent and no execution was created.`,
     };
   }
 
@@ -325,6 +470,12 @@ export class TradingControlActionsService {
     const profile = resolution.profile;
 
     const outcome = await closeCanaryWindowOperation(this.prisma, profile.id);
+    // The session ends with the same control that blocks admission, so there
+    // is no second "stop" an operator has to remember. Ending it prohibits new
+    // RESERVATIONS; it erases no history and touches no live execution —
+    // openedCount stays exactly where it is, and slots already reserved still
+    // resolve normally as their entries fill or expire.
+    await revokeCurrentSession(this.prisma, profile.id, this.now());
     const state = await this.describeProfile(profile.id);
 
     return {
@@ -356,6 +507,11 @@ export class TradingControlActionsService {
     const profile = resolution.profile;
 
     const outcome = await disarmCanaryOperation(this.prisma, profile.id);
+    // Safe Off ends the session for the same reason it revokes the window:
+    // both are permission to start something new, and neither disturbs work
+    // already running. Existing executions keep their protection and
+    // reconciliation, and their reserved slots still resolve normally.
+    await revokeCurrentSession(this.prisma, profile.id, this.now());
     const state = await this.describeProfile(profile.id);
 
     return {

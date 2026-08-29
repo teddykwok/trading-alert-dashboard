@@ -189,6 +189,18 @@ export interface PrepareNaturalWindowInput {
   maxClaims: number;
   ttlMinutes?: number;
   now?: Date;
+  /**
+   * The session this window authorizes for, set AT CREATION.
+   *
+   * Passed here rather than linked afterwards so a session-backed window is
+   * never briefly indistinguishable from a legacy one. A window created
+   * unlinked and updated a moment later has a committed window in between —
+   * and if the process dies there, that row reads as LEGACY and would admit
+   * trades under `maxClaims` with no session at all.
+   *
+   * Omitted for a legacy window, which is exactly what null continues to mean.
+   */
+  tradingSessionId?: string | null;
 }
 
 /** Raised when a proposed natural window could never be a valid one. */
@@ -580,6 +592,9 @@ export class CanaryAuthorizationService {
           maxClaims: input.maxClaims,
           claimedCount: 0,
           version: 1,
+          // Born linked, or born legacy. There is deliberately no third state
+          // in which a window exists and its session arrives later.
+          tradingSessionId: input.tradingSessionId ?? null,
           expiresAt: new Date(now.getTime() + ttlMinutes * 60_000),
         },
       });
