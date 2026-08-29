@@ -53,7 +53,9 @@ export interface TradingControlHandle {
   runAction: (
     id: TradingControlActionId,
     confirmation?: string,
-    durationMinutes?: StartTradingDuration
+    durationMinutes?: number,
+    tradeBudget?: number,
+    unlimited?: boolean
   ) => Promise<void>;
   dismissActionResult: () => void;
 }
@@ -184,7 +186,12 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
     async (
       id: TradingControlActionId,
       confirmation?: string,
-      durationMinutes: StartTradingDuration = START_WINDOW_MINUTES
+      durationMinutes: number = START_WINDOW_MINUTES,
+      // Undefined means "the server's reviewed default", which is the
+      // historical budget — an existing caller that says nothing about trades
+      // is never silently widened.
+      tradeBudget?: number,
+      unlimited?: boolean
     ) => {
       if (!hasOperatorToken()) return;
       if (pendingAction !== null) return;
@@ -194,7 +201,7 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
       try {
         const result =
           id === "START"
-            ? await postStartTrading(confirmation ?? "", durationMinutes)
+            ? await postStartTrading(confirmation ?? "", durationMinutes, tradeBudget, unlimited)
             : id === "STOP_NEW_TRADES"
               ? await postStopNewTrades()
               : await postSafeOff();

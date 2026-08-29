@@ -277,8 +277,12 @@ describe("allowlist: the FHE commissioning list", () => {
 // ---------------------------------------------------------------------------
 
 describe("start trading: supervised duration", () => {
-  it("offers exactly 15, 30 and 60 minutes", () => {
-    expect([...START_TRADING_DURATION_CHOICES]).toEqual([15, 30, 60]);
+  it("offers the session durations: 1h, 6h, 12h and 24h", () => {
+    // Was 15/30/60. The presets are now session lengths, and the set is no
+    // longer exhaustive — a CUSTOM duration is accepted too. What keeps that
+    // safe is that presets and custom values run through the SAME validator,
+    // so a preset is a convenience rather than a second code path.
+    expect([...START_TRADING_DURATION_CHOICES]).toEqual([60, 360, 720, 1440]);
   });
 
   it("accepts each reviewed choice", () => {
@@ -291,8 +295,18 @@ describe("start trading: supervised duration", () => {
     expect(resolveStartTradingDuration(undefined)).toEqual({ ok: true, minutes: 60 });
   });
 
-  it("REFUSES anything outside the reviewed choices", () => {
-    for (const value of [0, -15, 45, 61, 90, 1440, 15.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+  it("ACCEPTS a custom duration inside the 24-hour ceiling", () => {
+    // The deliberate change: 45 and 90 used to be refused for not being one of
+    // three reviewed lengths. A custom duration is now a feature, bounded by
+    // the ceiling rather than by an enumeration.
+    for (const value of [1, 45, 90, 1439, 1440]) {
+      expect(`${value}:${resolveStartTradingDuration(value).ok}`).toBe(`${value}:true`);
+    }
+  });
+
+  it("REFUSES a duration past the 24-hour ceiling, or a malformed one", () => {
+    // Beyond 24 hours is a separate policy decision, not a larger number.
+    for (const value of [0, -15, 1441, 2880, 15.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       const verdict = resolveStartTradingDuration(value);
       expect(`${String(value)}:${verdict.ok}`).toBe(`${String(value)}:false`);
     }
@@ -306,6 +320,6 @@ describe("start trading: supervised duration", () => {
   });
 
   it("never offers a duration above the reviewed maximum", () => {
-    expect(Math.max(...START_TRADING_DURATION_CHOICES)).toBe(60);
+    expect(Math.max(...START_TRADING_DURATION_CHOICES)).toBe(24 * 60);
   });
 });

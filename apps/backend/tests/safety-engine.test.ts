@@ -889,13 +889,18 @@ const NATURAL_AUTHORIZATION_CODES = [
 ] as const satisfies readonly SafetyReasonCode[];
 
 describe("reason code catalogue", () => {
-  it("exposes exactly the 40 stable reason codes", () => {
+  it("exposes exactly the 44 stable reason codes", () => {
     // 30 through Phase 11, plus the 7 natural-authorization codes added in
     // Phase 12.3, plus the 2 source-timeframe eligibility codes, plus the
-    // USDT-only collateral code. The count is pinned so a code cannot be added
-    // without a deliberate edit here.
-    expect(SAFETY_REASON_CODES).toHaveLength(40);
-    expect(new Set(SAFETY_REASON_CODES).size).toBe(40);
+    // USDT-only collateral code, plus the 4 session-budget codes. The count is
+    // pinned so a code cannot be added without a deliberate edit here.
+    //
+    // The session codes are separate from the authorization ones on purpose:
+    // NATURAL_AUTHORIZATION_EXHAUSTED would tell an operator their permission
+    // ran out when in fact the session's TRADE BUDGET did, which is a different
+    // fact with a different remedy.
+    expect(SAFETY_REASON_CODES).toHaveLength(44);
+    expect(new Set(SAFETY_REASON_CODES).size).toBe(44);
     // Its own code, never folded into UNSUPPORTED_CONTRACT: "not a perpetual"
     // and "a perpetual we do not trade" send an operator to different places.
     expect(SAFETY_REASON_CODES).toContain("USDT_ONLY_CONTRACT_REQUIRED");
@@ -1003,10 +1008,26 @@ describe("reason code catalogue", () => {
     //   NATURAL_AUTHORIZATION_*   read and claimed under the profile advisory
     //                             lock, which the pure engine has no access to
     //                             — it stays free of any authorization concept
+    //   SESSION_*                 the trade budget is reserved in the same
+    //                             transaction as the claim, for the same
+    //                             reason: it is a durable counter guarded by a
+    //                             conditional UPDATE, and the pure engine has
+    //                             no database. Keeping it out preserves the
+    //                             engine's purity exactly as authorization did.
     //
     // Everything else must be reachable from the engine, so a code cannot be
     // added to the catalogue and then never emitted by anything.
-    const serviceOnly = new Set<SafetyReasonCode>(["CAPACITY_CONFLICT_RETRY", ...NATURAL_AUTHORIZATION_CODES]);
+    const SESSION_CODES: SafetyReasonCode[] = [
+      "SESSION_REQUIRED",
+      "SESSION_EXPIRED",
+      "SESSION_REVOKED",
+      "SESSION_BUDGET_EXHAUSTED",
+    ];
+    const serviceOnly = new Set<SafetyReasonCode>([
+      "CAPACITY_CONFLICT_RETRY",
+      ...NATURAL_AUTHORIZATION_CODES,
+      ...SESSION_CODES,
+    ]);
     const pureCodes = SAFETY_REASON_CODES.filter((code) => !serviceOnly.has(code));
     expect([...emitted].sort()).toEqual([...pureCodes].sort());
   });

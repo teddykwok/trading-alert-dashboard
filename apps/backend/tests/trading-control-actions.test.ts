@@ -298,6 +298,7 @@ describeDb("operator actions", () => {
   });
 
   afterAll(async () => {
+    // Authorizations point AT their session (RESTRICT), so they go first.
     await prisma!.executionCanaryAuthorization.deleteMany({ where: { executionProfileId: profileId } });
     const ids = (
       await prisma!.tradeExecution.findMany({ where: { executionProfileId: profileId }, select: { id: true } })
@@ -306,6 +307,14 @@ describeDb("operator actions", () => {
       await prisma!.executionEvent.deleteMany({ where: { tradeExecutionId: { in: ids } } });
       await prisma!.tradeExecution.deleteMany({ where: { id: { in: ids } } });
     }
+    // Start Trading now opens a session beside the window, and both the session
+    // and its slots reference the profile ON DELETE RESTRICT — so they come out
+    // before the profile can. Without this the teardown aborts and the profile
+    // survives into the next run as a unique-constraint collision.
+    await prisma!.tradingSessionSlot.deleteMany({
+      where: { tradingSession: { executionProfileId: profileId } },
+    });
+    await prisma!.tradingSession.deleteMany({ where: { executionProfileId: profileId } });
     await prisma!.executionSafetyPolicy.deleteMany({ where: { executionProfileId: profileId } });
     await prisma!.executionProfile.deleteMany({ where: { id: profileId } });
     await prisma!.$disconnect();
@@ -445,7 +454,10 @@ describeDb("operator actions", () => {
       // Raising the default past the cap must fail here, not at arming time.
       expect(START_TRADING_TTL_MINUTES).toBeLessThanOrEqual(MAXIMUM_AUTHORIZATION_TTL_MINUTES);
       expect(START_TRADING_TTL_MINUTES).toBeGreaterThan(0);
-      expect(MAXIMUM_AUTHORIZATION_TTL_MINUTES).toBe(60);
+      // 24 hours since Phase 2. The window's TTL now bounds how long PERMISSION
+      // lasts; how much trading it can produce is bounded by the session's
+      // trade budget, which counts trades that actually obtained exposure.
+      expect(MAXIMUM_AUTHORIZATION_TTL_MINUTES).toBe(24 * 60);
       expect(START_TRADING_MAX_CLAIMS).toBe(5);
     });
 
@@ -461,7 +473,11 @@ describeDb("operator actions", () => {
       // Policy is server-side authority. The caller may supply the confirmation
       // phrase and a supervised duration from the reviewed set — and nothing
       // else. Neither is a symbol, a limit or a leverage.
-      expect(TradingControlActionsService.prototype.startTrading.length).toBe(2);
+      // Four now: confirmation, duration, trade budget and the unlimited flag.
+      // Still nothing that names a symbol, a limit or a leverage — those remain
+      // server-side authority, and the unlimited flag is a REQUEST the server
+      // refuses unless it can itself prove the environment is non-live.
+      expect(TradingControlActionsService.prototype.startTrading.length).toBe(4);
       const before = await prisma!.executionSafetyPolicy.findUniqueOrThrow({
         where: { executionProfileId: profileId },
       });
@@ -492,8 +508,11 @@ describeDb("operator actions", () => {
       expect(window.maxClaims).toBe(5);
     });
 
-    it("REFUSES a duration outside the reviewed choices and creates no window", async () => {
-      for (const bad of [45, 61, 1440, 0, -15, "60", null]) {
+    it("REFUSES a duration outside the permitted range and creates no window", async () => {
+      // 45, 61 and 1440 are now LEGAL: a custom duration is a Phase-2 feature,
+      // bounded by the 24-hour ceiling rather than by an enumeration. What is
+      // still refused is anything past that ceiling, and anything malformed.
+      for (const bad of [1441, 2880, 0, -15, "60", null]) {
         const result = await service().startTrading(START_TRADING_CONFIRMATION, bad);
         expect(`${String(bad)}:${result.ok}`).toBe(`${String(bad)}:false`);
         expect(`${String(bad)}:${result.blockers[0]}`).toBe(`${String(bad)}:DURATION_INVALID`);

@@ -449,6 +449,7 @@ model ExecutionProfile {
 
   @@unique([exchange, environment, accountIdentifier])
   @@index([isEnabled])
+  tradingSessions   TradingSession[]
 }
 
 // Phase 5 — per-profile safety and capacity limits.
@@ -1146,6 +1147,124 @@ enum CanaryAuthorizationType {
 /// A row failing its own mode's invariants is a defect, never a hint that it
 /// meant the other mode. Exact-mode readers assert the three required fields
 /// and refuse the row otherwise — see `isExactAuthorization`.
+/// Whether a session may still admit new trades.
+///
+/// EXHAUSTED and EXPIRED are deliberately distinct: one means the budget is
+/// spent while time remains, the other means time ran out while budget
+/// remained. Collapsing them would tell the operator the wrong thing about
+/// what to change.
+enum TradingSessionStatus {
+  ACTIVE
+  EXHAUSTED
+  EXPIRED
+  REVOKED
+}
+
+/// Where one session slot is in its life.
+///
+/// RESERVED is held from admission until the entry proves what it did.
+/// OPENED is terminal and never returns to the pool — a closed position does
+/// not give its trade back. RELEASED is terminal too, and only reachable when
+/// the entry died having never touched the exchange.
+enum SessionSlotState {
+  RESERVED
+  OPENED
+  RELEASED
+}
+
+/// A bounded window of automated trading, measured in trades that actually
+/// obtained exposure.
+///
+/// ## Why this is not `maxClaims`
+///
+/// `ExecutionCanaryAuthorization.claimedCount` is spent at ADMISSION and is
+/// never refunded, so five claims buy five admissions rather than five
+/// positions — an entry that never fills consumes budget permanently. That is
+/// the exact behaviour the 2026-08-26 session showed, where one claim died on
+/// an entry that never filled and the window still read 5/5.
+///
+/// A session counts differently: a slot is RESERVED at admission and only
+/// becomes OPENED when the execution first obtains non-zero exposure. An entry
+/// that expires, is cancelled or fails without ever filling RELEASES its slot
+/// back to the budget.
+///
+/// ## What it is not
+///
+/// It is not a concurrency limit and not a loss limit. `ExecutionSafetyPolicy`
+/// remains authoritative for simultaneous exposure, risk and margin; a session
+/// budget of 100 with maxTotalActiveTrades 5 means at most 100 trades in
+/// sequence, never more than 5 at once. Every existing gate still runs.
+model TradingSession {
+  id                 String           @id @default(cuid())
+  executionProfileId String
+  executionProfile   ExecutionProfile @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)
+
+  status TradingSessionStatus @default(ACTIVE)
+
+  /// The finite number of trades that may obtain exposure. Null ONLY when
+  /// `unlimited` is true, which the server permits solely for an objectively
+  /// non-live environment — there is no unlimited real-money session.
+  tradeBudget Int?
+
+  /// Deliberately explicit rather than inferred from a null budget: an
+  /// unlimited session is a decision someone made, not a missing value.
+  unlimited Boolean @default(false)
+
+  /// Executions that have obtained exposure at least once. Monotonic — a
+  /// position closing does not decrement it.
+  openedCount Int @default(0)
+
+  /// Slots held by entries that can still fill. Rises at admission and falls
+  /// on release or on conversion to opened.
+  reservedCount Int @default(0)
+
+  startedAt DateTime @default(now())
+  expiresAt DateTime
+  endedAt   DateTime?
+
+  /// Optimistic-lock counter, matching ExecutionSafetyPolicy.version.
+  version Int @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  slots          TradingSessionSlot[]
+  authorizations ExecutionCanaryAuthorization[]
+
+  @@index([executionProfileId, status])
+  @@index([expiresAt])
+}
+
+/// One execution's claim on one session slot.
+///
+/// The unique constraint on `tradeExecutionId` is the idempotency mechanism,
+/// and it is enforced by the database rather than by any caller: an execution
+/// cannot reserve twice, and first-fill accounting can run from every recovery
+/// path without ever counting the same execution again.
+model TradingSessionSlot {
+  id               String           @id @default(cuid())
+  tradingSessionId String
+  tradingSession   TradingSession   @relation(fields: [tradingSessionId], references: [id], onDelete: Restrict)
+
+  /// One slot per execution, forever. This is what makes both the conversion
+  /// to OPENED and the RELEASE safe to attempt repeatedly.
+  tradeExecutionId String @unique
+
+  state SessionSlotState @default(RESERVED)
+
+  reservedAt DateTime  @default(now())
+  /// Set once, from the execution's own firstFillAt. Never moved.
+  openedAt   DateTime?
+  releasedAt DateTime?
+  /// Why the slot went back to the pool. Never a credential or a raw error.
+  releaseReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tradingSessionId, state])
+}
+
 model ExecutionCanaryAuthorization {
   id                 String           @id @default(cuid())
   executionProfileId String
@@ -1184,6 +1303,19 @@ model ExecutionCanaryAuthorization {
   /// not had directions chosen for it cannot widen anything.
   allowedDirections CanaryDirection[] @default([])
 
+  /// The session this window authorizes for, when it has one.
+  ///
+  /// This is what makes a window SESSION-BACKED, and it is a durable link
+  /// rather than an inference: "is there an active session for this profile?"
+  /// would be ambiguous the moment a legacy window and a new session coexist.
+  ///
+  /// Null means LEGACY — a window prepared before sessions existed, or by a
+  /// path that does not open one. A legacy window keeps the historical
+  /// `maxClaims` behaviour exactly; a session-backed one is bounded by its
+  /// session's trade budget instead, and spends no claim at all.
+  tradingSessionId String?
+  tradingSession   TradingSession? @relation(fields: [tradingSessionId], references: [id], onDelete: Restrict)
+
   /// NATURAL_WINDOW only — the CUMULATIVE number of admitted executions this
   /// window may ever produce, across its whole lifetime.
   ///
@@ -1220,6 +1352,7 @@ model ExecutionCanaryAuthorization {
 
   @@index([executionProfileId])
   @@index([expiresAt])
+  @@index([tradingSessionId])
 }
 
 /// The decision the selected-plan executor reached for one alert's plan.

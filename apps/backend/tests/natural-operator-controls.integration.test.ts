@@ -192,7 +192,7 @@ describeDb("prepare-natural-window: dry run", () => {
       ["--directions=LONG", "--max-claims=0"],
       ["--directions=LONG", "--max-claims=-1"],
       ["--directions=LONG", "--max-claims=2.5"],
-      ["--directions=LONG", "--max-claims=5", "--ttl-minutes=61"],
+      ["--directions=LONG", "--max-claims=5", "--ttl-minutes=1441"],
       ["--directions=LONG", "--max-claims=5", "--ttl-minutes=0"],
     ]) {
       captured = [];

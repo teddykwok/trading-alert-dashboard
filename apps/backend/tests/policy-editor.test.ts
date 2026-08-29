@@ -552,15 +552,32 @@ describe("K. the write is behind the existing operator guard", () => {
 // Session Trade Budget stays out of scope
 // ===========================================================================
 
-describe("the Session Trade Budget is not in this branch", () => {
-  maybe()("no session field, counter or budget exists anywhere in the feature", () => {
-    for (const source of [SERVICE_CODE, codeOf(ROUTES_SOURCE)]) {
-      for (const forbidden of ["sessionTradeBudget", "tradesRemaining", "sessionOpened", "unlimited"]) {
-        expect(`${forbidden}:${source.toLowerCase().includes(forbidden.toLowerCase())}`).toBe(
-          `${forbidden}:false`
-        );
-      }
+describe("the Session Trade Budget stays out of the POLICY EDITOR", () => {
+  maybe()("the policy editor still knows nothing about sessions", () => {
+    // This guard originally said "not in this branch", and Phase 2 has since
+    // arrived — the routes file now legitimately carries session capability and
+    // an unlimited flag. What must remain true is narrower and more durable:
+    // the POLICY EDITOR is about durable limits and has no session concept.
+    //
+    // Keeping the ban on the editor alone is what stops the two from merging.
+    // A session is a bounded window an operator opens and closes; a policy
+    // limit is a standing rule. Editing one from the other would blur a
+    // SAFE-only write with a control that runs while trading.
+    for (const forbidden of [
+      "sessionTradeBudget",
+      "tradesRemaining",
+      "sessionOpened",
+      "unlimited",
+      "tradingSession",
+      "openedCount",
+      "reservedCount",
+    ]) {
+      expect(`${forbidden}:${SERVICE_CODE.toLowerCase().includes(forbidden.toLowerCase())}`).toBe(
+        `${forbidden}:false`
+      );
     }
+    // And the editable set is still limits only — no session field crept in.
+    expect([...EDITABLE_POLICY_FIELDS]).not.toContain("tradeBudget" as never);
   });
 
   maybe()("nor a daily loss limit", () => {

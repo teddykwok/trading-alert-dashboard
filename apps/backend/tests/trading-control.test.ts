@@ -803,11 +803,14 @@ describe("trading control: structural guarantees", () => {
     //
     // Every route still opts into the guard; that equality is the point, not
     // the number.
-    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:15 guards:15`);
+    // Sixteen now: session capability adds ONE guarded GET. It reports what the
+    // panel may offer — the duration and budget presets, and whether unlimited
+    // is permitted — and writes nothing.
+    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:16 guards:16`);
     // Six GETs and nine POSTs, and still no PUT/PATCH/DELETE anywhere. The
     // READ surface stays read-only: the added GET reports limits and their env
     // ceilings, and reaches no exposure counter it could write.
-    expect((code.match(/app\.get\(/g) ?? []).length).toBe(6);
+    expect((code.match(/app\.get\(/g) ?? []).length).toBe(7);
     expect((code.match(/app\.post\(/g) ?? []).length).toBe(9);
     expect(code.match(/app\.(put|patch|delete)\(/g)).toBeNull();
   });

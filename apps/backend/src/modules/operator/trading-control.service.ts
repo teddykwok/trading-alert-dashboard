@@ -23,6 +23,7 @@ import {
 } from "../execution/capacity-status";
 import type { TradeExecutionStatusName } from "../execution/execution-status";
 import { mergeCapacityLimits } from "../execution/safety-engine";
+import { findCurrentSession, toSessionView } from "../execution/trading-session.service";
 import { configuredProfileIdentity, resolveExecutionProfile } from "../execution/execution-profile.service";
 import { describeNaturalWindow } from "../execution/natural-authorization";
 import {
@@ -150,6 +151,26 @@ export interface TradingControlAuthorizationDto {
   remainingClaims: number;
 }
 
+export interface TradingControlSessionDto {
+  id: string;
+  /** ACTIVE | EXHAUSTED | EXPIRED | REVOKED, derived at read time. */
+  status: string;
+  /** Null when unlimited — which is not a number and must not render as one. */
+  tradeBudget: number | null;
+  unlimited: boolean;
+  /** Trades that obtained exposure. Monotonic; a close never gives one back. */
+  openedCount: number;
+  /** Slots held by entries that can still fill. */
+  reservedCount: number;
+  /** budget - opened - reserved. Null when unlimited. */
+  remaining: number | null;
+  startedAt: string;
+  expiresAt: string;
+  endedAt: string | null;
+  /** Seconds until expiry; 0 once it has ended. */
+  remainingTtlSeconds: number;
+}
+
 export interface TradingControlCapacityDto {
   pending: number;
   open: number;
@@ -230,6 +251,18 @@ export interface TradingControlStatusDto {
    * rather than the one that judged any particular row.
    */
   alertAgeLimitSeconds: number;
+  /**
+   * The trading SESSION — cumulative accounting, deliberately separate from
+   * `capacity`.
+   *
+   * `capacity` answers "how much is open right now"; this answers "how many
+   * trades has this session opened, out of how many it may". Merging them
+   * would put a fact and a running total under one heading, which is exactly
+   * the confusion the old CLAIMS row created.
+   *
+   * Null when no session has ever been started for this profile.
+   */
+  session: TradingControlSessionDto | null;
   capacity: TradingControlCapacityDto;
   reservations: TradingControlReservationsDto;
   latestExecution: TradingControlLatestExecutionDto | null;
@@ -335,6 +368,29 @@ export class TradingControlService {
     // shared helper exists to prevent.
     const limits = effectiveLimits(profileRow?.safetyPolicy ?? null);
 
+    // Read-only. The status endpoint never writes session accounting, so an
+    // operator refreshing the panel cannot move a counter.
+    const sessionRow = profileRow ? await findCurrentSession(this.prisma, profileRow.id) : null;
+    const sessionView = sessionRow ? toSessionView(sessionRow, now) : null;
+    const sessionDto: TradingControlSessionDto | null = sessionView
+      ? {
+          id: sessionView.id,
+          status: sessionView.status,
+          tradeBudget: sessionView.tradeBudget,
+          unlimited: sessionView.unlimited,
+          openedCount: sessionView.openedCount,
+          reservedCount: sessionView.reservedCount,
+          remaining: sessionView.remaining,
+          startedAt: sessionView.startedAt.toISOString(),
+          expiresAt: sessionView.expiresAt.toISOString(),
+          endedAt: sessionView.endedAt?.toISOString() ?? null,
+          remainingTtlSeconds: Math.max(
+            0,
+            Math.floor((sessionView.expiresAt.getTime() - now.getTime()) / 1000)
+          ),
+        }
+      : null;
+
     const capacityRows = profileRow
       ? await this.prisma.tradeExecution.findMany({
           where: {
@@ -406,6 +462,7 @@ export class TradingControlService {
       sourceTimeframes: { ...storedSourceTimeframes, supported: [...SOURCE_TIMEFRAMES] },
       rrLookback: describeStoredLookback(profileRow?.safetyPolicy?.extremeRrLookbackCandles),
       authorization,
+      session: sessionDto,
       capacity,
       reservations: {
         riskUsd: reservedRisk.toString(),

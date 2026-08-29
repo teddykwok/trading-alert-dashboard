@@ -1,6 +1,8 @@
 import { Prisma } from "@prisma/client";
 import type { ExecutionCanaryAuthorization, PrismaClient, SafetyAdmission, TradeExecution } from "@prisma/client";
 import { claimNaturalWindow, type NaturalClaimFailure } from "./canary-authorization.service";
+import { reserveSessionSlot } from "./trading-session.service";
+import { effectiveNaturalWindowState, isSessionBackedWindow } from "./natural-authorization";
 import { naturalWindowAdmitsDirection, naturalWindowState } from "./natural-authorization";
 import { connectorEnvironmentMatches } from "../binance/binance-environment";
 import { BinanceError } from "../binance/binance.errors";
@@ -213,7 +215,13 @@ export async function resolveAdmissionAuthorization(
     );
   }
 
-  switch (naturalWindowState(window, evaluatedAt)) {
+  // `effectiveNaturalWindowState`, not `naturalWindowState`: for a
+  // SESSION-BACKED window the claim counter is not its budget, so EXHAUSTED is
+  // not a state it can be in. The session's trade budget bounds it instead,
+  // and that is checked below where the slot is reserved. For a LEGACY window
+  // the two functions are identical, so nothing about the historical path
+  // changes.
+  switch (effectiveNaturalWindowState(window, evaluatedAt)) {
     case "INVALID":
       return refuse("NATURAL_AUTHORIZATION_INVALID", "The natural window contradicts its own declared mode.");
     case "REVOKED":
@@ -422,9 +430,52 @@ export class SafetyAdmissionService {
 
         if (!authorization.ok) {
           result = refuseForAuthorization(result, authorization.reasonCode, authorization.message);
+        } else if (authorization.mode === "NATURAL" && isSessionBackedWindow(authorization.window)) {
+          /**
+           * --- SESSION-BACKED: the session is the budget ------------------
+           *
+           * No claim is spent, deliberately. A claim is a cumulative,
+           * never-refunded cap on ADMISSIONS, and this window's bound is a
+           * refundable cap on TRADES — spending both would stop a 100-trade
+           * session at its fifth admission, which is the exact bug sessions
+           * exist to remove.
+           *
+           * `claimedCount` therefore stays 0 on these rows. That is not an
+           * omission: `isNaturalWindow` refuses any row whose claimedCount
+           * exceeds maxClaims, so incrementing past the pinned 5 would make
+           * the window INVALID and refuse everything. Zero claims spent is
+           * both the honest record and the only valid one.
+           *
+           * `maxClaims` stays at its pinned value so the reviewed arming
+           * checks in `natural-arm.ts` and `canary-readiness.ts` continue to
+           * pass unchanged — this feature removes no arming guard.
+           *
+           * The reservation rides in THIS transaction under THIS profile lock,
+           * so it commits or rolls back with the capacity reservation below,
+           * and it fails CLOSED: a session that is missing, revoked, expired
+           * or exhausted refuses the trade rather than falling back to
+           * unlimited admissions.
+           */
+          claimedWindowId = authorization.window.id;
+          const reservation = await reserveSessionSlot(tx, {
+            executionProfileId: execution.executionProfileId,
+            tradingSessionId: authorization.window.tradingSessionId,
+            tradeExecutionId: execution.id,
+            now: input.evaluatedAt,
+          });
+          if (!reservation.reserved) {
+            result = refuseForAuthorization(result, reservation.reasonCode, reservation.message);
+          }
         } else if (authorization.mode === "NATURAL") {
-          // The claim rides in THIS transaction, under THIS profile lock, so
-          // it commits or rolls back with the capacity reservation below.
+          /**
+           * --- LEGACY: unchanged ------------------------------------------
+           *
+           * A window with no session link keeps the historical behaviour
+           * exactly: one cumulative, never-refunded claim per admission,
+           * bounded by maxClaims. No session is consulted, and none is
+           * required — a pre-session window must not start refusing because a
+           * feature it predates now exists.
+           */
           const claim = await claimNaturalWindow(tx, {
             authorizationId: authorization.window.id,
             expectedVersion: authorization.window.version,
@@ -433,6 +484,7 @@ export class SafetyAdmissionService {
           });
           if (claim.ok) {
             claimedWindowId = authorization.window.id;
+
           } else {
             // Fail closed. Under the lock a conflict means something changed
             // the window from outside the admission path, which is exactly the
