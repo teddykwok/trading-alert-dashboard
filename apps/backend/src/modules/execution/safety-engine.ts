@@ -384,6 +384,53 @@ export function mergeCapacityLimits(
   };
 }
 
+/**
+ * The count limits whose RELATIONSHIPS decide whether a policy is reachable.
+ *
+ * Separate from `SafetyCapacityLimits` because only these four constrain one
+ * another; money ceilings and alert age stand alone.
+ */
+export interface PolicyReachabilityLimits {
+  maxOpenPositions: number;
+  maxPendingEntries: number;
+  maxTotalActiveTrades: number;
+  softOpenPositionTarget: number;
+}
+
+/**
+ * The canonical reachability rules for a set of limits, as violation messages.
+ *
+ * ONE rule set, deliberately. `SafetyPolicyService` throws the first of these
+ * when an operator writes a policy row, and canary readiness reports them as
+ * findings against the EFFECTIVE limits. Stating them twice is how the two
+ * would eventually disagree about what a valid policy is.
+ *
+ * Checking the effective values is not the same check as validating the row.
+ * A row can be internally consistent and still merge into an unreachable
+ * combination: env `maxOpenPositions` 3 against a row of 8 gives an effective
+ * 3, while a soft target of 5 survives an env soft of 20 — leaving a soft gate
+ * above the hard cap that can never fire. Only the merged view shows that.
+ *
+ * Returns every violation rather than the first, so a caller reporting
+ * findings does not have to re-run the check to discover the next one.
+ */
+export function policyReachabilityViolations(limits: PolicyReachabilityLimits): string[] {
+  const violations: string[] = [];
+  if (limits.maxTotalActiveTrades < limits.maxOpenPositions) {
+    violations.push("maxTotalActiveTrades must be >= maxOpenPositions.");
+  }
+  if (limits.maxTotalActiveTrades < limits.maxPendingEntries) {
+    violations.push("maxTotalActiveTrades must be >= maxPendingEntries.");
+  }
+  // A soft target above the hard cap is unreachable: the hard limit rejects
+  // first and the soft gate never fires, so the policy claims behaviour it
+  // does not implement.
+  if (limits.softOpenPositionTarget > limits.maxOpenPositions) {
+    violations.push("softOpenPositionTarget must be <= maxOpenPositions.");
+  }
+  return violations;
+}
+
 export function resolveEffectivePolicy(
   global: {
     killSwitchActive: boolean;

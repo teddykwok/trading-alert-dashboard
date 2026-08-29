@@ -2,7 +2,11 @@ import { Prisma } from "@prisma/client";
 // The SAME min-merge admission applies, so preflight and execution can never
 // disagree about what the effective policy is.
 import type { NaturalWindowState } from "./natural-authorization";
-import { mergeCapacityLimits, type SafetyCapacityLimits } from "./safety-engine";
+import {
+  mergeCapacityLimits,
+  policyReachabilityViolations,
+  type SafetyCapacityLimits,
+} from "./safety-engine";
 
 /**
  * Phase 11A — pure live-canary readiness evaluation.
@@ -99,50 +103,49 @@ export const BLOCKER_SCOPE: Record<Exclude<CanaryReadinessCode, "CANARY_READY">,
 };
 
 /**
- * The exact policy the natural canary requires.
+ * ## Why there is no pinned policy constant here any more
  *
- * This is a READINESS CONTRACT, not the runtime capacity engine. Nothing here
- * limits a live trade: admission enforces `min(env global, profile row)` through
- * `mergeCapacityLimits`, and this constant is only compared against those two
- * so an operator cannot activate under limits nobody reviewed. Changing it
- * changes what preflight DEMANDS, never what execution ALLOWS.
+ * Readiness used to hold an exact envelope — 3 soft / 5 hard / 7.50 / 40.00 —
+ * and demand that the env global, the profile row AND the effective merge all
+ * equal it. That was the right guard when those numbers were the only reviewed
+ * configuration and the only way to change them was an operator CLI.
  *
- * Every pinned value is judged on THREE sides — env global, profile row and the
- * effective merge — and all three must equal it, so a stale row cannot hide
- * behind a correct global.
+ * The Trading Policy Editor replaced that premise. An operator now selects the
+ * operational limits deliberately, behind SAFE OFF, operator authentication,
+ * validation and an optimistic-lock version, and the environment holds the
+ * hard ceiling the dashboard cannot exceed. Under that model the three-sided
+ * equality check is no longer a safety property — it is a copy of one
+ * historical configuration, and it blocks every later one. A policy of 5/8/8/8
+ * under an env ceiling of 20/20/20/20 is strictly inside the reviewed bounds
+ * and was still refused as EFFECTIVE_POLICY_MISMATCH.
  *
- * Phase 12.4A moved this from the historical one-slot $1.50 contract to the
- * reviewed 3-soft/5-hard envelope the live profile has held since policy
- * version 3. The MAINNET row was NOT touched; only this code expectation moved
- * to match it, which is what unblocks CANARY_BLOCKED_POLICY.
+ * So readiness now judges the EFFECTIVE policy on its merits:
+ *
+ *  1. it must be readable at all (a missing row proves nothing);
+ *  2. every effective limit must be usable — a zero admits nothing;
+ *  3. no effective limit may exceed its env ceiling, which is what keeps the
+ *     environment a hard ceiling rather than a suggestion;
+ *  4. the effective limits must be mutually reachable, by the SAME rules
+ *     `SafetyPolicyService` enforces when the row is written.
+ *
+ * What was NOT relaxed: the effective values judged here are the ones
+ * `mergeCapacityLimits` produces, which is the identical function admission
+ * calls. Readiness and execution cannot disagree about the limits.
+ *
+ * `CANARY_NATURAL_MAX_CLAIMS` below is a different concept and is unchanged.
  */
-export const CANARY_POLICY = {
-  maxOpenPositions: 5,
-  maxPendingEntries: 5,
-  maxTotalActiveTrades: 5,
-  maxActivePerSymbolSide: 1,
-  // SOFT 3 under a HARD 5. New admission stops at three open positions while
-  // the account can still safely hold five, so a fill that beats a cancellation
-  // is never invalidated. See softOpenPositionTarget on ExecutionSafetyPolicy.
-  softOpenPositionTarget: 3,
-  // Five $1.50 plans reserve 5 x 1.50 = 7.50 of planned risk, and five MAXIMUM
-  // isolated margins at the 5.333333 multiplier reserve 5 x 7.9999995 =
-  // 39.9999975, which 40.00 covers. Both are AGGREGATE admission ceilings and
-  // are never an input to per-plan sizing.
-  maxTotalPlannedRiskUsd: "7.50",
-  maxTotalIsolatedMarginUsd: "40.00",
-} as const;
 
 /**
  * The cumulative claim budget the FIRST supervised natural canary is pinned to.
  *
- * Deliberately a SEPARATE constant rather than derived from
- * `CANARY_POLICY.maxTotalActiveTrades`, even though both are 5 today. They mean
- * different things: `maxTotalActiveTrades` bounds how many trades may be open
- * AT ONCE, while `maxClaims` bounds how many may ever be admitted from one
- * window. A future canary could legitimately pair five concurrent slots with a
- * larger cumulative budget, and deriving one from the other would silently
- * couple them.
+ * Deliberately a SEPARATE constant, never derived from a capacity limit.
+ * They mean different things: `maxTotalActiveTrades` bounds how many trades
+ * may be open AT ONCE, while `maxClaims` bounds how many may ever be admitted
+ * from one window. Coupling them would make a change to the operational
+ * policy silently move the claim budget of every window.
+ *
+ * Untouched by the move away from a pinned capacity envelope: this is a
+ * property of the AUTHORIZATION, not of the safety policy.
  *
  * Defined once, here, so no second module hard-codes the number.
  */
@@ -178,7 +181,7 @@ export interface LocalExecutionState {
   recoveryRequiredCount: number | null;
 }
 
-/** Exactly the limits CANARY_POLICY pins, on one side of the merge. */
+/** The capacity envelope readiness judges, on one side of the merge. */
 export interface CanaryPolicyLimits {
   maxOpenPositions: number;
   maxPendingEntries: number;
@@ -208,13 +211,27 @@ export interface PolicyState {
   profile: CanaryPolicyLimits | null;
 }
 
-/** Which side of the merge a mismatch came from. Carried in the finding detail. */
+/**
+ * Why the effective policy is not fit to activate under. Carried in the detail.
+ *
+ * The four historical sources — GLOBAL_POLICY_MISMATCH,
+ * PROFILE_POLICY_MISMATCH, PROFILE_POLICY_CLAMPS_REQUIRED_CANARY_LIMIT and
+ * EFFECTIVE_POLICY_MISMATCH — existed only to say WHICH side differed from the
+ * pinned envelope. With no pinned envelope there is nothing to differ from, so
+ * they are gone rather than kept as names for a different meaning.
+ */
 export const POLICY_MISMATCH_SOURCES = [
-  "GLOBAL_POLICY_MISMATCH",
-  "PROFILE_POLICY_MISMATCH",
-  "PROFILE_POLICY_CLAMPS_REQUIRED_CANARY_LIMIT",
-  "EFFECTIVE_POLICY_MISMATCH",
   "PROFILE_POLICY_UNAVAILABLE",
+  /** A limit that admits nothing, so the profile could never trade. */
+  "EFFECTIVE_POLICY_UNUSABLE",
+  /**
+   * The merge produced a value above its env ceiling. `mergeCapacityLimits`
+   * makes this unreachable today; it is asserted anyway, because the day it
+   * becomes reachable is the day readiness and admission have split.
+   */
+  "EFFECTIVE_POLICY_EXCEEDS_ENV_CEILING",
+  /** The effective limits contradict each other, so part of them is dead. */
+  "EFFECTIVE_POLICY_INCONSISTENT",
 ] as const;
 export type PolicyMismatchSource = (typeof POLICY_MISMATCH_SOURCES)[number];
 
@@ -310,16 +327,32 @@ export interface CanaryPreflightResult {
   summary: CanaryReadinessCode;
 }
 
-function equalDecimal(left: string, right: string): boolean {
+/** A money ceiling that can actually reserve something. */
+function isPositiveDecimal(value: string): boolean {
   try {
-    return new D(left).equals(new D(right));
+    return new D(value).greaterThan(0);
+  } catch {
+    // Unparseable is never "probably fine".
+    return false;
+  }
+}
+
+/** Decimal-exact `left <= right`; a bad value fails closed. */
+function decimalAtMost(left: string, right: string): boolean {
+  try {
+    return new D(left).lessThanOrEqualTo(new D(right));
   } catch {
     return false;
   }
 }
 
-/** The limits the canary pins, in a fixed order for stable reporting. */
-export const CANARY_PINNED_LIMITS = [
+/**
+ * The limits readiness validates, in a fixed order for stable reporting.
+ *
+ * Named for what it now does. These are no longer PINNED to fixed values —
+ * each is judged against its env ceiling and its siblings.
+ */
+export const CANARY_VALIDATED_LIMITS = [
   "maxOpenPositions",
   "maxPendingEntries",
   "maxTotalActiveTrades",
@@ -327,14 +360,14 @@ export const CANARY_PINNED_LIMITS = [
   "softOpenPositionTarget",
   "maxTotalPlannedRiskUsd",
   "maxTotalIsolatedMarginUsd",
-] as const satisfies ReadonlyArray<keyof CanaryPolicyLimits & keyof typeof CANARY_POLICY>;
+] as const satisfies ReadonlyArray<keyof CanaryPolicyLimits>;
 
 /**
- * Pads the pinned limits into the shape the shared merge consumes.
+ * Pads the validated limits into the shape the shared merge consumes.
  *
- * `maxAlertAgeSeconds` is min-merged by admission but is NOT pinned by the
- * canary, so it is filled with a neutral value here and never read back. The
- * point is to reuse the real arithmetic for the six that ARE pinned rather
+ * `maxAlertAgeSeconds` is min-merged by admission but is not part of the
+ * capacity envelope readiness judges, so it is filled with a neutral value
+ * here and never read back. The point is to reuse the real arithmetic rather
  * than restate `Math.min` in a second place.
  */
 function withMergeDefaults(limits: CanaryPolicyLimits): SafetyCapacityLimits {
@@ -342,7 +375,7 @@ function withMergeDefaults(limits: CanaryPolicyLimits): SafetyCapacityLimits {
 }
 
 /**
- * The effective pinned limits, for callers that want to DISPLAY the merge
+ * The effective limits, for callers that want to DISPLAY the merge
  * (the preflight CLI) without restating the arithmetic.
  */
 export function effectiveCanaryLimits(
@@ -457,15 +490,16 @@ export function evaluateCanaryPreflight(input: CanaryPreflightInput): CanaryPref
   }
 
   // --- Policy --------------------------------------------------------------
-  // Every pinned limit is judged on THREE values, not one: the env global, the
-  // profile row, and the effective min-merge admission will actually apply.
-  // All three must equal the pinned canary value.
+  // The EFFECTIVE policy is what admission will apply, so the effective policy
+  // is what is judged. It is produced by `mergeCapacityLimits` — the same
+  // function `resolveEffectivePolicy` calls on the admission path — so there
+  // is one definition of the limits and readiness cannot approve a value
+  // execution would not use.
   //
-  // Requiring the ROW to match, not merely the effective result, is deliberate:
-  // a row wider than the canary (row 10 while global is 8) produces a correct
-  // effective 8 today, but the moment the global is relaxed the row stops
-  // clamping and the canary silently runs under a limit nobody reviewed. A
-  // pinned canary has to be reproducible from its own configuration.
+  // The env global keeps its role as a HARD CEILING: it is one side of that
+  // merge, so an operator-selected row can only ever tighten it. The row is
+  // deliberately NOT required to equal any fixed envelope; the Trading Policy
+  // Editor is what reviews it, behind SAFE OFF and operator authentication.
   if (input.policy.profile === null) {
     add(
       "CANARY_BLOCKED_POLICY",
@@ -477,28 +511,53 @@ export function evaluateCanaryPreflight(input: CanaryPreflightInput): CanaryPref
     const row = input.policy.profile;
     const effective = effectiveCanaryLimits(global, row);
 
-    for (const name of CANARY_PINNED_LIMITS) {
-      const required = CANARY_POLICY[name];
-      const same = (value: number | string) =>
-        typeof required === "number" ? value === required : equalDecimal(String(value), required);
+    const report = (source: PolicyMismatchSource, detail: string) =>
+      add("CANARY_BLOCKED_POLICY", `${source}: ${detail}`);
 
-      const globalOk = same(global[name]);
-      const rowOk = same(row[name]);
-      const effectiveOk = same(effective[name]);
-      if (globalOk && rowOk && effectiveOk) continue;
+    for (const name of CANARY_VALIDATED_LIMITS) {
+      const effectiveValue = effective[name];
+      const ceiling = global[name];
+      const context =
+        `${name} global ${String(ceiling)}, row ${String(row[name])}, ` +
+        `effective ${String(effectiveValue)}`;
 
-      // Name the side that is actually wrong. The clamp case is called out
-      // separately because it is the one an env-only check used to miss.
-      let source: PolicyMismatchSource;
-      if (!globalOk && !rowOk) source = "EFFECTIVE_POLICY_MISMATCH";
-      else if (!globalOk) source = "GLOBAL_POLICY_MISMATCH";
-      else if (!effectiveOk) source = "PROFILE_POLICY_CLAMPS_REQUIRED_CANARY_LIMIT";
-      else source = "PROFILE_POLICY_MISMATCH";
+      // A limit of zero is not a strict policy, it is a profile that can never
+      // admit anything. Reported as a policy problem rather than left to
+      // surface later as an unexplained refusal on every single alert.
+      const usable =
+        typeof effectiveValue === "number"
+          ? Number.isSafeInteger(effectiveValue) && effectiveValue >= 1
+          : isPositiveDecimal(effectiveValue);
+      if (!usable) {
+        report("EFFECTIVE_POLICY_UNUSABLE", `${context}; this admits nothing.`);
+        continue;
+      }
 
-      add(
-        "CANARY_BLOCKED_POLICY",
-        `${source}: ${name} global ${String(global[name])}, row ${String(row[name])}, ` +
-          `effective ${String(effective[name])}; the canary requires ${String(required)}.`
+      // The min-merge cannot produce this, which is the point of asserting it.
+      // If it ever does, readiness and admission have stopped agreeing and the
+      // environment has stopped being a ceiling.
+      const withinCeiling =
+        typeof effectiveValue === "number"
+          ? effectiveValue <= (ceiling as number)
+          : decimalAtMost(String(effectiveValue), String(ceiling));
+      if (!withinCeiling) {
+        report(
+          "EFFECTIVE_POLICY_EXCEEDS_ENV_CEILING",
+          `${context}; the environment ceiling must never be exceeded.`
+        );
+      }
+    }
+
+    // The relationships, on the MERGED values. A row can be internally valid
+    // and still merge into a combination where part of it is dead — an env
+    // that clamps maxOpenPositions below a surviving softOpenPositionTarget,
+    // for instance. Same rules the policy write path enforces.
+    for (const violation of policyReachabilityViolations(effective)) {
+      report(
+        "EFFECTIVE_POLICY_INCONSISTENT",
+        `${violation} Effective: open ${effective.maxOpenPositions}, ` +
+          `pending ${effective.maxPendingEntries}, total ${effective.maxTotalActiveTrades}, ` +
+          `soft ${effective.softOpenPositionTarget}.`
       );
     }
   }

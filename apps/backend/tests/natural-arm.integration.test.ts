@@ -562,18 +562,83 @@ describeDb("arm-natural-window: minimum remaining lifetime", () => {
 describeDb("arm-natural-window: policy and allowlist", () => {
   const safe = { isEnabled: false, killSwitchActive: true };
 
-  it("refuses when the persisted limits are no longer the reviewed envelope", async () => {
-    const window = await makeWindow();
+  it("ARMS under a policy the environment will clamp", async () => {
+    // Previously refused as POLICY_ENVELOPE_MISMATCH because the row was not
+    // the historical 40.00. A row above the env ceiling is not dangerous: the
+    // min-merge means it cannot lift anything, so admission still applies the
+    // env value. Refusing it only stopped the operator scaling the policy.
     await prisma!.executionSafetyPolicy.update({
       where: { executionProfileId: profileId },
       data: { maxTotalIsolatedMarginUsd: "400.00" },
     });
+    const window = await makeWindow();
+
+    argv(`--id=${window.id}`, "--confirm-arm");
+    const { armNaturalCanary } = await loadControls();
+    await armNaturalCanary();
+
+    expect(output()).not.toContain("POLICY_ENVELOPE_MISMATCH");
+    expect(await profileState()).toEqual({ isEnabled: true, killSwitchActive: false });
+  });
+
+  it("ARMS under a scaled operational policy inside the env ceiling", async () => {
+    // 5 / 8 / 8 / 8 / 15 / 80 — the configuration the Trading Policy Editor
+    // produces and the old pin refused outright.
+    await prisma!.executionSafetyPolicy.update({
+      where: { executionProfileId: profileId },
+      data: {
+        softOpenPositionTarget: 5,
+        maxOpenPositions: 8,
+        maxPendingEntries: 8,
+        maxTotalActiveTrades: 8,
+        maxTotalPlannedRiskUsd: "15.00",
+        maxTotalIsolatedMarginUsd: "80.00",
+      },
+    });
+    const window = await makeWindow();
+
+    argv(`--id=${window.id}`, "--confirm-arm");
+    const { armNaturalCanary } = await loadControls();
+    await armNaturalCanary();
+
+    expect(output()).not.toContain("POLICY_ENVELOPE_MISMATCH");
+    expect(await profileState()).toEqual({ isEnabled: true, killSwitchActive: false });
+  });
+
+  it("REFUSES a persisted policy that could never admit a trade", async () => {
+    // What the envelope check is actually for now: a row that admits nothing
+    // must not open a live window. Written directly, because the reviewed
+    // policy service would have refused to persist it.
+    await prisma!.executionSafetyPolicy.update({
+      where: { executionProfileId: profileId },
+      data: { maxOpenPositions: 0 },
+    });
+    const window = await makeWindow();
 
     argv(`--id=${window.id}`, "--confirm-arm");
     const { armNaturalCanary } = await loadControls();
     await armNaturalCanary();
 
     expect(output()).toContain("POLICY_ENVELOPE_MISMATCH");
+    expect(output()).toContain("admits nothing");
+    expect(await profileState()).toEqual(safe);
+  });
+
+  it("REFUSES a persisted policy whose limits contradict each other", async () => {
+    // A soft target above the hard cap: the hard limit rejects first and the
+    // soft gate never fires, so part of the policy is dead.
+    await prisma!.executionSafetyPolicy.update({
+      where: { executionProfileId: profileId },
+      data: { maxOpenPositions: 2, maxTotalActiveTrades: 5, softOpenPositionTarget: 4 },
+    });
+    const window = await makeWindow();
+
+    argv(`--id=${window.id}`, "--confirm-arm");
+    const { armNaturalCanary } = await loadControls();
+    await armNaturalCanary();
+
+    expect(output()).toContain("POLICY_ENVELOPE_MISMATCH");
+    expect(output()).toContain("softOpenPositionTarget must be <= maxOpenPositions.");
     expect(await profileState()).toEqual(safe);
   });
 

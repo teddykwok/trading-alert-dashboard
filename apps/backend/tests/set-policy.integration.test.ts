@@ -166,7 +166,7 @@ describeDb("execution:set-policy — dry run", () => {
     expect(process.exitCode).toBeUndefined();
   });
 
-  it("reports current, proposed, global, effective-now and effective-after", async () => {
+  it("reports current, proposed, env ceiling, effective-now and effective-after", async () => {
     process.argv = ["node", "set-policy", "--max-total-isolated-margin-usd=8.00"];
     const { cli } = await loadCli();
     await cli.setPolicy();
@@ -174,15 +174,15 @@ describeDb("execution:set-policy — dry run", () => {
     const text = output();
     expect(text).toMatch(/current row\s+5/);
     expect(text).toMatch(/proposed row\s+8/);
-    expect(text).toMatch(/global \(env\)\s+8\.00/);
-    // The whole reason this branch exists: 8.00 global clamped to 5.00 by the
+    expect(text).toMatch(/env ceiling\s+8\.00/);
+    // The whole reason this branch exists: 8.00 ceiling clamped to 5.00 by the
     // row today, and 8.00 after the change.
     expect(text).toMatch(/effective now\s+5/);
     expect(text).toMatch(/effective after\s+8/);
-    // Phase 12.4A raised CANARY_POLICY to the 3/5 envelope, so the canary now
-      // requires 40.00 here. The env global (8.00) and the row (5.00) above are
-      // unrelated to that pin and are unchanged.
-      expect(text).toMatch(/canary requires\s+40\.00/);
+    // There is deliberately no "canary requires" column any more. Readiness
+    // no longer pins the limits to a fixed envelope, so printing one would
+    // report a requirement that does not exist.
+    expect(text).not.toContain("canary requires");
   });
 
   it("names MAINNET before any confirmation", async () => {
@@ -536,9 +536,10 @@ describeDb("execution:set-policy — capacity flags", () => {
     await cli.setPolicy();
 
     const text = output();
-    expect(text).toMatch(/global \(env\)\s+1/);
+    expect(text).toMatch(/env ceiling\s+1/);
     expect(text).toMatch(/proposed row\s+5/);
     // Effective stays 1 — the operator must not read this as "capacity 5".
+    // The env ceiling is still absolute; only the readiness PIN was relaxed.
     expect(text).toMatch(/effective after\s+1/);
   });
 

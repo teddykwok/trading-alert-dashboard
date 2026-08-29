@@ -5,8 +5,8 @@ import { describe, expect, it } from "vitest";
 import {
   BLOCKER_SCOPE,
   CANARY_NATURAL_MAX_CLAIMS,
-  CANARY_POLICY,
   CANARY_READINESS_CODES,
+  CANARY_VALIDATED_LIMITS,
   effectiveCanaryLimits,
   evaluateCanaryPreflight,
   type CanaryPolicyLimits,
@@ -26,7 +26,12 @@ import {
 
 const BACKEND = process.cwd();
 
-/** Exactly the pinned canary values, used for BOTH sides of the merge. */
+/**
+ * A workable envelope, used for BOTH sides of the merge unless a case narrows
+ * one side. These are the numbers readiness historically PINNED; they are kept
+ * as the fixture because they remain a perfectly valid policy, not because
+ * anything still demands them.
+ */
 const CANARY_LIMITS: CanaryPolicyLimits = {
   maxOpenPositions: 5,
   maxPendingEntries: 5,
@@ -127,6 +132,17 @@ const OPEN_WINDOW = {
 
 const codesOf = (input: CanaryPreflightInput) =>
   evaluateCanaryPreflight(input).findings.map((finding) => finding.code);
+
+/** Just the policy findings, which most of the policy cases assert on. */
+const policyFindings = (input: CanaryPreflightInput) =>
+  evaluateCanaryPreflight(input).findings.filter((finding) => finding.code === "CANARY_BLOCKED_POLICY");
+
+/** Read once: several cases assert on what the readiness module does NOT contain. */
+const READINESS_SOURCE = readFileSync(
+  path.join(BACKEND, "src/modules/execution/canary-readiness.ts"),
+  "utf8"
+);
+const ENV_EXAMPLE = readFileSync(path.join(BACKEND, ".env.example"), "utf8");
 
 // ---------------------------------------------------------------------------
 // Scope separation
@@ -247,168 +263,264 @@ describe("Binance readiness", () => {
 // ---------------------------------------------------------------------------
 
 describe("canary policy", () => {
-  it("requires exactly the reviewed 3-soft / 5-hard natural canary policy", () => {
-    expect(CANARY_POLICY).toEqual({
-      maxOpenPositions: 5,
-      maxPendingEntries: 5,
-      maxTotalActiveTrades: 5,
-      maxActivePerSymbolSide: 1,
-      // SOFT 3 under HARD 5: new admission stops at three open positions while
-      // the account can still hold five, so a fill that beats a cancellation is
-      // never invalidated.
-      softOpenPositionTarget: 3,
-      // Five $1.50 plans reserve 7.50 of planned risk...
-      maxTotalPlannedRiskUsd: "7.50",
-      // ...and five MAXIMUM isolated margins at 5.333333 reserve 39.9999975,
-      // which 40.00 covers. Both are AGGREGATE admission ceilings.
-      maxTotalIsolatedMarginUsd: "40.00",
-    });
+  it("no longer pins an exact envelope", () => {
+    // The historical 3 / 5 / 5 / 5 / 7.50 / 40 contract is gone, deliberately.
+    // Its job — "an operator must not activate under limits nobody reviewed" —
+    // now belongs to the Trading Policy Editor, which reviews an edit behind
+    // SAFE OFF, operator authentication, validation and a version lock. What
+    // is left here judges the EFFECTIVE policy on its merits.
+    expect(READINESS_SOURCE).not.toContain("export const CANARY_POLICY");
   });
 
   it("pins the natural claim budget separately from concurrent capacity", () => {
-    // Equal today, but deliberately not derived from one another: maxClaims is
-    // CUMULATIVE, maxTotalActiveTrades is CONCURRENT.
+    // Untouched by this change. maxClaims is CUMULATIVE and belongs to the
+    // authorization window, not to the capacity policy.
     expect(CANARY_NATURAL_MAX_CLAIMS).toBe(5);
   });
 
-  it("keeps the aggregate margin ceiling at or above the recommended per-plan ceiling", () => {
-    // Admission reserves maximumIsolatedMargin, so a canary policy below the
-    // per-plan ceiling could never admit even one trade. Both numbers are read
-    // from their real homes rather than restated here.
-    const example = readFileSync(path.join(process.cwd(), ".env.example"), "utf8");
-    const value = (key: string) => example.match(new RegExp(`^${key}=(.*)$`, "m"))![1].trim();
-    const perPlanCeiling =
-      Number(value("EXECUTION_MAX_TOTAL_PLANNED_RISK_USD")) * Number(value("BINANCE_MAX_MARGIN_MULTIPLIER"));
-    expect(perPlanCeiling).toBeLessThanOrEqual(Number(CANARY_POLICY.maxTotalIsolatedMarginUsd));
-
-    // Phase 12.4A deliberately BROKE the old equality with .env.example.
-    //
-    // The shipped example stays at the conservative one-trade defaults, because
-    // that is what a fresh clone should inherit: capacity 1 and a 8.00 ceiling
-    // admit a single trade and nothing more. CANARY_POLICY is now the 3/5
-    // envelope the canary DEMANDS an operator raise those globals to, on
-    // purpose. Asserting they are equal would force every new clone to ship the
-    // wider limits, which is exactly the fail-open the defaults exist to
-    // prevent — so the assertion below pins the RELATIONSHIP instead.
-    expect(Number(value("EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD"))).toBeLessThanOrEqual(
-      Number(CANARY_POLICY.maxTotalIsolatedMarginUsd)
-    );
-    expect(Number(value("EXECUTION_MAX_TOTAL_PLANNED_RISK_USD"))).toBeLessThanOrEqual(
-      Number(CANARY_POLICY.maxTotalPlannedRiskUsd)
-    );
+  it("validates every capacity limit the merge produces, and only those", () => {
+    expect([...CANARY_VALIDATED_LIMITS]).toEqual([
+      "maxOpenPositions",
+      "maxPendingEntries",
+      "maxTotalActiveTrades",
+      "maxActivePerSymbolSide",
+      "softOpenPositionTarget",
+      "maxTotalPlannedRiskUsd",
+      "maxTotalIsolatedMarginUsd",
+    ]);
   });
 
-  it("blocks a widened open, pending or active limit on the GLOBAL side", () => {
-    for (const key of ["maxOpenPositions", "maxPendingEntries", "maxTotalActiveTrades"] as const) {
-      expect(codesOf(baseline(withLimits({ [key]: 2 }, {}))), key).toContain("CANARY_BLOCKED_POLICY");
+  it("accepts the shipped .env.example defaults as a valid policy", () => {
+    // A fresh clone ships conservative one-trade defaults. Under the old pin
+    // those very defaults were a CANARY_BLOCKED_POLICY; they are simply a
+    // small, valid, self-consistent policy.
+    const value = (key: string) => ENV_EXAMPLE.match(new RegExp(`^${key}=(.*)$`, "m"))![1].trim();
+    const shipped: CanaryPolicyLimits = {
+      maxOpenPositions: Number(value("EXECUTION_MAX_OPEN_POSITIONS")),
+      maxPendingEntries: Number(value("EXECUTION_MAX_PENDING_ENTRIES")),
+      maxTotalActiveTrades: Number(value("EXECUTION_MAX_TOTAL_ACTIVE_TRADES")),
+      maxActivePerSymbolSide: Number(value("EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE")),
+      softOpenPositionTarget: Number(value("EXECUTION_SOFT_OPEN_POSITION_TARGET")),
+      maxTotalPlannedRiskUsd: value("EXECUTION_MAX_TOTAL_PLANNED_RISK_USD"),
+      maxTotalIsolatedMarginUsd: value("EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD"),
+    };
+    expect(codesOf(baseline(withLimits(shipped, shipped)))).not.toContain("CANARY_BLOCKED_POLICY");
+  });
+
+  it("blocks a count limit that admits nothing", () => {
+    for (const key of [
+      "maxOpenPositions",
+      "maxPendingEntries",
+      "maxTotalActiveTrades",
+      "maxActivePerSymbolSide",
+    ] as const) {
+      const finding = policyFindings(baseline(withLimits({ [key]: 0 }, { [key]: 0 }))).find((entry) =>
+        entry.detail.includes(key)
+      );
+      expect(finding, key).toBeDefined();
+      expect(finding!.detail, key).toContain("EFFECTIVE_POLICY_UNUSABLE");
     }
   });
 
-  it("blocks planned risk above 1.50", () => {
-    expect(codesOf(baseline(withLimits({ maxTotalPlannedRiskUsd: "3.00" }, {})))).toContain("CANARY_BLOCKED_POLICY");
+  it("blocks a zero money ceiling, which could never reserve a plan", () => {
+    for (const key of ["maxTotalPlannedRiskUsd", "maxTotalIsolatedMarginUsd"] as const) {
+      const finding = policyFindings(baseline(withLimits({ [key]: "0" }, { [key]: "0" }))).find((entry) =>
+        entry.detail.includes(key)
+      );
+      expect(finding, key).toBeDefined();
+      expect(finding!.detail, key).toContain("EFFECTIVE_POLICY_UNUSABLE");
+    }
   });
 
-  it("compares risk as an exact decimal, not a string", () => {
+  it("compares money as an exact decimal, not a string", () => {
     // "7.5" and "7.50" are the same budget, on BOTH sides of the merge.
     expect(
       codesOf(baseline(withLimits({ maxTotalPlannedRiskUsd: "7.5" }, { maxTotalPlannedRiskUsd: "7.5" })))
     ).not.toContain("CANARY_BLOCKED_POLICY");
   });
+
+  it("keeps the aggregate margin ceiling at or above the recommended per-plan ceiling", () => {
+    // Admission reserves maximumIsolatedMargin, so an aggregate ceiling below
+    // the per-plan one could never admit even a single trade. Read from their
+    // real homes rather than restated here. Unchanged by this fix: a property
+    // of the shipped example, not of the readiness contract.
+    const value = (key: string) => ENV_EXAMPLE.match(new RegExp(`^${key}=(.*)$`, "m"))![1].trim();
+    const perPlanCeiling =
+      Number(value("EXECUTION_MAX_TOTAL_PLANNED_RISK_USD")) * Number(value("BINANCE_MAX_MARGIN_MULTIPLIER"));
+    expect(perPlanCeiling).toBeLessThanOrEqual(Number(value("EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD")));
+  });
 });
 
 // ---------------------------------------------------------------------------
-// Policy: global vs profile row vs effective
+// Policy: the env ceiling, the row, and the effective merge
 // ---------------------------------------------------------------------------
 
 /**
- * The gap this closes: readiness used to judge the ENV alone. With the env at
- * 8.00 and a profile row still at 5.00, admission enforces min(8, 5) = 5.00 —
- * so a canary pinned to 8.00 would have reported READY while being unable to
- * admit its own plan. All three values are now judged.
+ * The model these tests pin down:
+ *
+ *   ENV        absolute hard ceiling the dashboard cannot exceed
+ *   ROW        the operator-selected operational policy
+ *   EFFECTIVE  min(row, env) — what admission actually applies
+ *
+ * Readiness judges EFFECTIVE. It does not require the row to equal the env,
+ * and it does not require either to equal any historical envelope.
  */
-describe("canary policy — merge sources", () => {
-  const marginFinding = (input: Parameters<typeof evaluateCanaryPreflight>[0]) =>
-    evaluateCanaryPreflight(input).findings.find(
-      (finding) => finding.code === "CANARY_BLOCKED_POLICY" && finding.detail.includes("maxTotalIsolatedMarginUsd")
-    );
+describe("canary policy — the effective merge", () => {
+  /** ENV 20 / 20 / 20 / 20 / 1 / 30 / 160 — the live hard ceiling. */
+  const ENV_CEILING: CanaryPolicyLimits = {
+    maxOpenPositions: 20,
+    maxPendingEntries: 20,
+    maxTotalActiveTrades: 20,
+    maxActivePerSymbolSide: 1,
+    softOpenPositionTarget: 20,
+    maxTotalPlannedRiskUsd: "30.00",
+    maxTotalIsolatedMarginUsd: "160.00",
+  };
 
-  it("1. global 8 / row 8 / effective 8 → no policy blocker", () => {
-    expect(codesOf(baseline())).not.toContain("CANARY_BLOCKED_POLICY");
-  });
+  /** The operator's scaled operational policy: 5 / 8 / 8 / 8 / 1 / 15 / 80. */
+  const SCALED_POLICY: CanaryPolicyLimits = {
+    maxOpenPositions: 8,
+    maxPendingEntries: 8,
+    maxTotalActiveTrades: 8,
+    maxActivePerSymbolSide: 1,
+    softOpenPositionTarget: 5,
+    maxTotalPlannedRiskUsd: "15.00",
+    maxTotalIsolatedMarginUsd: "80.00",
+  };
 
-  it("2. global 40 / row 5 / effective 5 → BLOCKED, naming the row as the clamp", () => {
-    const finding = marginFinding(baseline(withLimits({}, { maxTotalIsolatedMarginUsd: "5.00" })));
-    expect(finding).toBeDefined();
-    expect(finding!.detail).toContain("PROFILE_POLICY_CLAMPS_REQUIRED_CANARY_LIMIT");
-    expect(finding!.detail).toContain("global 40.00");
-    expect(finding!.detail).toContain("row 5.00");
-    expect(finding!.detail).toContain("effective 5.00");
-    expect(finding!.detail).toContain("requires 40.00");
-  });
-
-  it("3. global 5 / row 40 / effective 5 → BLOCKED, naming the global", () => {
-    const finding = marginFinding(baseline(withLimits({ maxTotalIsolatedMarginUsd: "5.00" }, {})));
-    expect(finding).toBeDefined();
-    expect(finding!.detail).toContain("GLOBAL_POLICY_MISMATCH");
-    expect(finding!.detail).toContain("global 5.00");
-    expect(finding!.detail).toContain("row 40.00");
-    expect(finding!.detail).toContain("effective 5.00");
-  });
-
-  it("4. global 40 / row 50 / effective 40 → BLOCKED even though effective is correct", () => {
-    // Decision, made explicitly rather than by omission: the ROW must also be
-    // exact. A row wider than the canary yields a correct effective value only
-    // for as long as the global keeps clamping it; relax the global later and
-    // the canary silently runs under a limit nobody reviewed. A pinned canary
-    // has to be reproducible from its own configuration.
-    const finding = marginFinding(baseline(withLimits({}, { maxTotalIsolatedMarginUsd: "50.00" })));
-    expect(finding).toBeDefined();
-    expect(finding!.detail).toContain("PROFILE_POLICY_MISMATCH");
-    expect(finding!.detail).toContain("row 50.00");
-    expect(finding!.detail).toContain("effective 40.00");
-  });
-
-  it("4b. both sides wrong in the same direction is reported as an EFFECTIVE mismatch", () => {
-    const finding = marginFinding(
-      baseline(withLimits({ maxTotalIsolatedMarginUsd: "5.00" }, { maxTotalIsolatedMarginUsd: "5.00" }))
-    );
-    expect(finding!.detail).toContain("EFFECTIVE_POLICY_MISMATCH");
-  });
-
-  it("5. a count mismatch in the profile row blocks", () => {
-    for (const key of ["maxOpenPositions", "maxPendingEntries", "maxTotalActiveTrades", "maxActivePerSymbolSide"] as const) {
-      const codes = codesOf(baseline(withLimits({}, { [key]: 2 })));
-      expect(codes, key).toContain("CANARY_BLOCKED_POLICY");
-    }
-  });
-
-  it("6. a planned-risk mismatch in the profile row blocks", () => {
-    const codes = codesOf(baseline(withLimits({}, { maxTotalPlannedRiskUsd: "0.50" })));
-    expect(codes).toContain("CANARY_BLOCKED_POLICY");
-  });
-
-  it("7. every value exact on both sides → no policy blocker", () => {
-    const result = evaluateCanaryPreflight(baseline());
+  // TEST A ------------------------------------------------------------------
+  it("A. a scaled policy below the env ceiling raises NO policy blocker", () => {
+    // The exact configuration the old pin refused, verbatim from the report:
+    //   maxOpenPositions global 20, row 8, effective 8; canary requires 5
+    const result = evaluateCanaryPreflight(baseline(withLimits(ENV_CEILING, SCALED_POLICY)));
     expect(result.findings.filter((finding) => finding.code === "CANARY_BLOCKED_POLICY")).toHaveLength(0);
+    // And the whole preparation side is clear, not merely this one code.
     expect(result.preparationReady).toBe(true);
   });
 
-  it("fails closed when the profile policy row cannot be read", () => {
-    const finding = evaluateCanaryPreflight(baseline(withLimits({}, null))).findings.find(
-      (entry) => entry.code === "CANARY_BLOCKED_POLICY"
-    );
-    expect(finding).toBeDefined();
-    expect(finding!.detail).toContain("PROFILE_POLICY_UNAVAILABLE");
+  it("A2. the historical numbers are absent from the readiness contract", () => {
+    // A regression guard with teeth: reintroduce a required-value comparison
+    // and these reappear in the module.
+    expect(READINESS_SOURCE).not.toContain('"7.50"');
+    expect(READINESS_SOURCE).not.toContain('"40.00"');
   });
 
-  it("8. leaves kill switches and gates as separate blockers", () => {
-    // A policy mismatch must not absorb, mask or rename the gate blockers.
-    const result = evaluateCanaryPreflight(baseline(withLimits({}, { maxTotalIsolatedMarginUsd: "5.00" })));
+  // TEST B ------------------------------------------------------------------
+  it("B. the env remains a HARD ceiling that a wider row cannot lift", () => {
+    const tooWide: CanaryPolicyLimits = {
+      ...SCALED_POLICY,
+      maxOpenPositions: 50,
+      maxPendingEntries: 50,
+      maxTotalActiveTrades: 50,
+      maxTotalPlannedRiskUsd: "500.00",
+      maxTotalIsolatedMarginUsd: "5000.00",
+    };
+    const effective = effectiveCanaryLimits(ENV_CEILING, tooWide);
+    expect(effective.maxOpenPositions).toBe(20);
+    expect(effective.maxPendingEntries).toBe(20);
+    expect(effective.maxTotalActiveTrades).toBe(20);
+    expect(effective.maxTotalPlannedRiskUsd).toBe("30.00");
+    expect(effective.maxTotalIsolatedMarginUsd).toBe("160.00");
+
+    // A row above the ceiling is not itself an error — it simply cannot lift
+    // anything, so readiness reports no policy blocker and the CAPPED values
+    // are what governs.
+    expect(codesOf(baseline(withLimits(ENV_CEILING, tooWide)))).not.toContain("CANARY_BLOCKED_POLICY");
+  });
+
+  // TEST C ------------------------------------------------------------------
+  it("C. the historical 3 / 5 / 5 / 5 / 7.50 / 40 policy still works as before", () => {
+    const result = evaluateCanaryPreflight(baseline(withLimits(CANARY_LIMITS, CANARY_LIMITS)));
+    expect(result.findings.filter((finding) => finding.code === "CANARY_BLOCKED_POLICY")).toHaveLength(0);
+    expect(result.preparationReady).toBe(true);
+
+    // And it still works as the ROW under the wider live env ceiling.
+    expect(codesOf(baseline(withLimits(ENV_CEILING, CANARY_LIMITS)))).not.toContain("CANARY_BLOCKED_POLICY");
+  });
+
+  it("an env STRICTER than the row governs, and is not a blocker", () => {
+    // global 5 / row 40 / effective 5. The old pin called this
+    // GLOBAL_POLICY_MISMATCH; a strict environment is the system working.
+    expect(
+      policyFindings(baseline(withLimits({ maxTotalIsolatedMarginUsd: "5.00" }, { maxTotalIsolatedMarginUsd: "40.00" })))
+    ).toHaveLength(0);
+  });
+
+  it("a row STRICTER than the env governs, and is not a blocker", () => {
+    // global 40 / row 5 / effective 5. The old pin called this
+    // PROFILE_POLICY_CLAMPS_REQUIRED_CANARY_LIMIT.
+    expect(
+      policyFindings(baseline(withLimits({ maxTotalIsolatedMarginUsd: "40.00" }, { maxTotalIsolatedMarginUsd: "5.00" })))
+    ).toHaveLength(0);
+  });
+
+  it("blocks an effective policy whose limits contradict each other", () => {
+    // The env clamps maxOpenPositions to 3 while a soft target of 5 survives
+    // its own env ceiling of 20. The ROW alone looks valid; only the MERGED
+    // view shows a soft gate above the hard cap, which can never fire. This is
+    // the case write-time row validation structurally cannot see.
+    const finding = policyFindings(
+      baseline(
+        withLimits(
+          { ...ENV_CEILING, maxOpenPositions: 3 },
+          { ...SCALED_POLICY, maxOpenPositions: 8, softOpenPositionTarget: 5 }
+        )
+      )
+    )[0];
+    expect(finding).toBeDefined();
+    expect(finding.detail).toContain("EFFECTIVE_POLICY_INCONSISTENT");
+    expect(finding.detail).toContain("softOpenPositionTarget must be <= maxOpenPositions.");
+  });
+
+  it("reports the same reachability rules the policy write path enforces", () => {
+    // One rule set, not two. Readiness imports it rather than restating it.
+    expect(READINESS_SOURCE).toContain("policyReachabilityViolations");
+    const service = readFileSync(path.join(BACKEND, "src/modules/execution/safety-policy.service.ts"), "utf8");
+    expect(service).toContain("policyReachabilityViolations");
+  });
+
+  it("names the env ceiling, the row and the effective value in every detail", () => {
+    const finding = policyFindings(baseline(withLimits({ maxOpenPositions: 0 }, { maxOpenPositions: 0 })))[0];
+    expect(finding.detail).toContain("global 0");
+    expect(finding.detail).toContain("row 0");
+    expect(finding.detail).toContain("effective 0");
+  });
+
+  it("fails closed when the profile policy row cannot be read", () => {
+    const finding = policyFindings(baseline(withLimits({}, null)))[0];
+    expect(finding).toBeDefined();
+    expect(finding.detail).toContain("PROFILE_POLICY_UNAVAILABLE");
+  });
+
+  // TEST D ------------------------------------------------------------------
+  it("D. leaves kill switches and gates as separate blockers", () => {
+    // A policy problem must not absorb, mask or rename the gate blockers.
+    const result = evaluateCanaryPreflight(baseline(withLimits({ maxOpenPositions: 0 }, { maxOpenPositions: 0 })));
     expect(result.findings.map((finding) => finding.code)).toContain("CANARY_BLOCKED_KILL_SWITCH_STATE");
     expect(result.liveActivationBlockers.map((finding) => finding.code)).toContain("CANARY_BLOCKED_GATE_STATE");
     // The policy problem is a PREPARATION blocker, the gates are not.
     expect(result.preparationBlockers.map((finding) => finding.code)).toContain("CANARY_BLOCKED_POLICY");
     expect(result.preparationBlockers.map((finding) => finding.code)).not.toContain("CANARY_BLOCKED_GATE_STATE");
+  });
+
+  it("D2. a scaled policy clears NO unrelated readiness blocker", () => {
+    // The whole point of this fix is that only the policy pin was relaxed.
+    const scaled = withLimits(ENV_CEILING, SCALED_POLICY);
+    expect(codesOf(baseline({ ...scaled, binance: { ...baseline().binance, connected: false } }))).toContain(
+      "CANARY_BLOCKED_BINANCE"
+    );
+    expect(
+      codesOf(baseline({ ...scaled, local: { ...baseline().local, recoveryRequiredCount: 1 } }))
+    ).toContain("CANARY_BLOCKED_RECOVERY_REQUIRED");
+    expect(
+      codesOf(baseline({ ...scaled, authorization: { ...baseline().authorization, exactPrepared: false } }))
+    ).toContain("CANARY_BLOCKED_AUTHORIZATION");
+    expect(
+      codesOf(baseline({ ...scaled, infrastructure: { ...baseline().infrastructure, databaseReady: false } }))
+    ).toContain("CANARY_BLOCKED_DATABASE");
+    expect(
+      codesOf(baseline({ ...scaled, gates: { ...baseline().gates, globalKillSwitch: false } }))
+    ).toContain("CANARY_BLOCKED_KILL_SWITCH_STATE");
   });
 
   it("reuses the admission min-merge rather than its own arithmetic", () => {
@@ -848,7 +960,7 @@ describe("per-plan margin envelope reporting", () => {
     // They are still reported, just not as a per-plan margin: the four-way
     // policy comparison above owns them.
     const policySection = code.slice(0, code.indexOf("Per-plan margin envelope"));
-    expect(policySection).toContain("CANARY_PINNED_LIMITS");
+    expect(policySection).toContain("CANARY_VALIDATED_LIMITS");
     expect(policySection).toContain("effectiveCanaryLimits");
   });
 

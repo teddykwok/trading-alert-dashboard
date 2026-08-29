@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client";
 import type { ExecutionSafetyPolicy, PrismaClient } from "@prisma/client";
 import { NotFoundError, ValidationError } from "../../utils/errors";
 import { OptimisticLockError } from "./execution.service";
+import { policyReachabilityViolations } from "./safety-engine";
 
 /**
  * Per-profile safety policy administration — INTERNAL ONLY.
@@ -188,19 +189,12 @@ export class SafetyPolicyService {
       maxTotalActiveTrades: pick("maxTotalActiveTrades"),
       softOpenPositionTarget: pick("softOpenPositionTarget"),
     };
-    if (merged.maxTotalActiveTrades < merged.maxOpenPositions) {
-      throw new ValidationError("maxTotalActiveTrades must be >= maxOpenPositions.");
-    }
-    if (merged.maxTotalActiveTrades < merged.maxPendingEntries) {
-      throw new ValidationError("maxTotalActiveTrades must be >= maxPendingEntries.");
-    }
-    // A soft target above the hard cap is unreachable: the hard limit would
-    // reject first and the soft gate would never fire, so the row would claim
-    // a policy it does not implement. Checked on the MERGED result, so lowering
-    // maxOpenPositions alone cannot strand an existing soft target above it.
-    if (merged.softOpenPositionTarget > merged.maxOpenPositions) {
-      throw new ValidationError("softOpenPositionTarget must be <= maxOpenPositions.");
-    }
+    // The rules themselves live in the safety engine, so this write path and
+    // canary readiness judge a policy by the same definition of "reachable".
+    // Checked on the MERGED result, so lowering maxOpenPositions alone cannot
+    // strand an existing soft target above it.
+    const [violation] = policyReachabilityViolations(merged);
+    if (violation) throw new ValidationError(violation);
   }
 
   private validate(values: SafetyPolicyValues): Record<string, unknown> {

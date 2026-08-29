@@ -1,7 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { CanaryPreflightService } from "./canary-preflight.service";
-import { CANARY_PINNED_LIMITS, CANARY_POLICY, effectiveCanaryLimits } from "./canary-readiness";
+import { CANARY_VALIDATED_LIMITS, effectiveCanaryLimits } from "./canary-readiness";
 import { CanaryAuthorizationService, describeAuthorizationWindow } from "./canary-authorization.service";
 import { describeNaturalWindow } from "./natural-authorization";
 import type { CanaryAuthorizationMode } from "./canary-readiness";
@@ -146,20 +146,21 @@ async function main(): Promise<void> {
     line("openPositionCount", local.openPositionCount);
     line("recoveryRequiredCount", local.recoveryRequiredCount);
 
-    // Every pinned limit on all three values. A correct global hiding a stale
-    // profile row is exactly the failure this layout exists to make visible.
-    section("Policy (global / profile row / effective / required)");
+    // Every limit on all three values. A correct global hiding a stale profile
+    // row is exactly the failure this layout exists to make visible. The env
+    // global IS the ceiling, so it is printed as such rather than alongside a
+    // separate "required" column that no longer exists.
+    section("Policy (env ceiling / profile row / effective)");
     if (policy.profile === null) {
       line("profile policy row", "UNREADABLE — effective policy cannot be proven");
     }
     // Effective comes from the SHARED merge, never recomputed here.
     const effective = policy.profile === null ? null : effectiveCanaryLimits(policy.global, policy.profile);
-    for (const name of CANARY_PINNED_LIMITS) {
+    for (const name of CANARY_VALIDATED_LIMITS) {
       console.log(`  ${name}`);
-      line("    global", policy.global[name]);
-      line("    profile", policy.profile ? policy.profile[name] : null);
+      line("    env ceiling", policy.global[name]);
+      line("    profile row", policy.profile ? policy.profile[name] : null);
       line("    effective", effective ? effective[name] : null);
-      line("    required", CANARY_POLICY[name]);
     }
 
     section("Per-plan margin envelope (env only — not min-merged)");
