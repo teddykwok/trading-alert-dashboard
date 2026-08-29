@@ -509,10 +509,11 @@ describeDb("operator actions", () => {
     });
 
     it("REFUSES a duration outside the permitted range and creates no window", async () => {
-      // 45, 61 and 1440 are now LEGAL: a custom duration is a Phase-2 feature,
-      // bounded by the 24-hour ceiling rather than by an enumeration. What is
-      // still refused is anything past that ceiling, and anything malformed.
-      for (const bad of [1441, 2880, 0, -15, "60", null]) {
+      // 45, 61, 1440 and 43200 are LEGAL: a custom duration is bounded by the
+      // 30-day ceiling rather than by an enumeration. What is still refused is
+      // anything past that ceiling, and anything malformed. A numeric string
+      // stays a refusal — this repository never coerces operator input.
+      for (const bad of [43_201, 44_640, 0, -15, "43200", "60", null]) {
         const result = await service().startTrading(START_TRADING_CONFIRMATION, bad);
         expect(`${String(bad)}:${result.ok}`).toBe(`${String(bad)}:false`);
         expect(`${String(bad)}:${result.blockers[0]}`).toBe(`${String(bad)}:DURATION_INVALID`);

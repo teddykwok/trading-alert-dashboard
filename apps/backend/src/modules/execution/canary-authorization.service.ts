@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import type { CanaryDirection, ExecutionCanaryAuthorization, PrismaClient } from "@prisma/client";
 import {
-  MAXIMUM_AUTHORIZATION_TTL_MINUTES,
+  maximumAuthorizationTtlMinutes,
   isNaturalWindow,
   isNaturalWindowOpen,
   naturalWindowAdmitsDirection,
@@ -565,10 +565,19 @@ export class CanaryAuthorizationService {
         "maxClaims must be a whole number of at least 1. There is deliberately no unlimited mode."
       );
     }
+    // The ceiling depends on what BOUNDS this window. A session-backed window
+    // is bounded by its session's finite trade budget, so it may live as long
+    // as the session; a legacy window has only time, so it keeps the 24-hour
+    // cap it has always had.
+    const sessionBacked = (input.tradingSessionId ?? null) !== null;
+    const maximumTtlMinutes = maximumAuthorizationTtlMinutes(sessionBacked);
     const ttlMinutes = input.ttlMinutes ?? DEFAULT_AUTHORIZATION_TTL_MINUTES;
-    if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0 || ttlMinutes > MAXIMUM_AUTHORIZATION_TTL_MINUTES) {
+    if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0 || ttlMinutes > maximumTtlMinutes) {
       throw new NaturalWindowValidationError(
-        `ttlMinutes must be between 1 and ${MAXIMUM_AUTHORIZATION_TTL_MINUTES}. A window nobody is watching must shut on its own.`
+        `ttlMinutes must be between 1 and ${maximumTtlMinutes}. ` +
+          (sessionBacked
+            ? "A window may not outlive the longest session it could authorize."
+            : "A window nobody is watching must shut on its own.")
       );
     }
 

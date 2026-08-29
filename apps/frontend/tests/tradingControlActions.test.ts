@@ -601,17 +601,19 @@ describe("operator actions: the allowlist editor", () => {
 
 describe("operator actions: the supervised duration selector", () => {
   it("offers exactly the reviewed choices with 60 as the default", () => {
-    // Session lengths since Phase 2, and no longer exhaustive: a CUSTOM
-    // duration is accepted beside them, bounded by the 24-hour ceiling rather
-    // than by an enumeration. Presets and custom values share one validator on
-    // the server, so a preset is a convenience and never a second code path.
-    expect([...START_TRADING_DURATION_CHOICES]).toEqual([60, 360, 720, 1440]);
+    // Session lengths since Phase 2, and not exhaustive: a CUSTOM duration is
+    // accepted beside them, bounded by the 30-day ceiling rather than by an
+    // enumeration. Presets and custom values share one validator on the
+    // server, so a preset is a convenience and never a second code path.
+    expect([...START_TRADING_DURATION_CHOICES]).toEqual([60, 360, 720, 1440, 4320, 10080, 43200]);
+    // The DEFAULT is deliberately still one hour. Widening what an operator
+    // may ask for must not widen what an unchanged caller receives.
     expect(START_WINDOW_MINUTES).toBe(60);
     expect(START_TRADING_DURATION_CHOICES).toContain(START_WINDOW_MINUTES);
   });
 
   it("never offers more than the reviewed maximum", () => {
-    expect(Math.max(...START_TRADING_DURATION_CHOICES)).toBe(24 * 60);
+    expect(Math.max(...START_TRADING_DURATION_CHOICES)).toBe(30 * 24 * 60);
   });
 
   it("keeps maxClaims server-controlled at 5", () => {

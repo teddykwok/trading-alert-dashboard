@@ -24,25 +24,50 @@ import type { CanaryDirection, ExecutionCanaryAuthorization } from "@prisma/clie
  */
 
 /**
- * The single source of truth for the maximum life of ANY authorization window.
+ * The maximum life of a window that has NOTHING counting its trades.
  *
  * 24 hours. It was 60 minutes, and the reasoning for that bound was sound at
  * the time: "a window nobody is watching should shut on its own, and natural
  * mode is the mode that admits more than one trade."
  *
- * What changed is the second half. A natural window is no longer the thing that
- * bounds how much trading happens — a TradingSession is, and it counts trades
- * that actually obtained exposure rather than admissions. So the window's TTL
- * now bounds only how long PERMISSION lasts, while the trade budget bounds how
- * much can be done with it. A 24-hour window with a budget of 100 cannot open a
- * 101st trade however long it lives.
- *
- * 24 hours and not longer: that is the horizon this feature was asked for and
- * the longest one whose consequences were traced. A multi-day unattended window
- * is a separate policy decision, not a larger number, so `validateSessionDuration`
- * refuses beyond it.
+ * This value is deliberately UNCHANGED by the move to 30-day sessions. It
+ * governs the LEGACY natural window — one prepared by the operator CLI with no
+ * `tradingSessionId` — and a legacy window really is bounded only by
+ * `maxClaims` and by time. Nothing else stops it, so time has to.
  */
 export const MAXIMUM_AUTHORIZATION_TTL_MINUTES = 24 * 60;
+
+/**
+ * The maximum life of a SESSION-BACKED window: 30 days.
+ *
+ * Longer than the legacy bound because a different thing is doing the
+ * bounding. A session-backed window spends no claims at all; every admission
+ * through it reserves a slot in a TradingSession whose trade budget is finite
+ * and, on a live account, mandatory. The window says trading is PERMITTED and
+ * until when; the session says how many trades that permission may produce.
+ *
+ * So the risk a 24-hour cap was protecting against — an unattended window
+ * quietly admitting trade after trade — is already answered by the budget, and
+ * a 30-day cap does not reopen it. A 30-day window backed by a budget of 300
+ * cannot open a 301st trade.
+ *
+ * It must be AT LEAST the maximum session duration, or a long session would
+ * silently stop trading when its window expired first. That relationship is
+ * asserted in the tests rather than left to two constants agreeing by luck.
+ */
+export const MAXIMUM_SESSION_BACKED_AUTHORIZATION_TTL_MINUTES = 30 * 24 * 60;
+
+/**
+ * The TTL ceiling that applies to a window, given what backs it.
+ *
+ * One function rather than two call-site conditionals, so no caller can pick
+ * the wrong ceiling and no future caller has to remember the rule exists.
+ */
+export function maximumAuthorizationTtlMinutes(sessionBacked: boolean): number {
+  return sessionBacked
+    ? MAXIMUM_SESSION_BACKED_AUTHORIZATION_TTL_MINUTES
+    : MAXIMUM_AUTHORIZATION_TTL_MINUTES;
+}
 
 /** Every direction a natural window may name. There is no wildcard. */
 export const NATURAL_DIRECTIONS = ["LONG", "SHORT"] as const satisfies readonly CanaryDirection[];
