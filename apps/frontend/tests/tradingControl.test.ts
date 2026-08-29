@@ -230,7 +230,13 @@ describe("trading control panel: window TTL and claims", () => {
     [45, "45s"],
     [60, "1m 0s"],
     [600, "10m 0s"],
-    [3661, "61m 1s"],
+    // Sub-hour output is unchanged, to the second. Past an hour the units step
+    // up, because a session-backed window may now live thirty days and
+    // "43200m 0s" is not a countdown anyone can read.
+    [3661, "1h 1m"],
+    [86_400, "1d 0h"],
+    [30 * 86_400, "30d 0h"],
+    [30 * 86_400 - 3600, "29d 23h"],
   ])("formats %s seconds as %s", (seconds, expected) => {
     expect(formatTtl(seconds)).toBe(expected);
   });

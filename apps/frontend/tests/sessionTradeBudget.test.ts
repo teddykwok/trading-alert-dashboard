@@ -48,14 +48,31 @@ const cardCode = codeOf(card);
 // ---------------------------------------------------------------------------
 
 describe("A-D. duration and budget choices", () => {
-  it("A. offers 1h, 6h, 12h and 24h", () => {
-    expect([...START_TRADING_DURATION_CHOICES]).toEqual([60, 360, 720, 1440]);
+  it("A. offers 1h, 6h, 12h, 24h, 3d, 7d and 30d", () => {
+    // TEST L. Every choice the panel renders, and the label it renders it as.
+    // "43200" is a number an operator has to decode; "30 days" is the decision
+    // they are making.
+    expect([...START_TRADING_DURATION_CHOICES]).toEqual([60, 360, 720, 1440, 4320, 10080, 43200]);
     expect(START_TRADING_DURATION_CHOICES.map(formatSessionDuration)).toEqual([
       "1 hour",
       "6 hours",
       "12 hours",
       "24 hours",
+      "3 days",
+      "7 days",
+      "30 days",
     ]);
+  });
+
+  it("A2. renders whole days as days and everything else honestly", () => {
+    // 1440 keeps its long-standing label rather than becoming "1 day":
+    // the preset row reads 1h / 6h / 12h / 24h / 3d / 7d / 30d.
+    expect(formatSessionDuration(1440)).toBe("24 hours");
+    expect(formatSessionDuration(2880)).toBe("2 days");
+    expect(formatSessionDuration(43_200)).toBe("30 days");
+    // Not a whole day, so it is NOT rounded into a lie.
+    expect(formatSessionDuration(2000)).toBe("2000 min");
+    expect(formatSessionDuration(1500)).toBe("25 hours");
   });
 
   it("B. offers 10 / 50 / 100 / 200 / 300", () => {
@@ -209,6 +226,12 @@ describe("K-P. the Session section", () => {
     expect(formatRemaining(600)).toBe("10m");
     expect(formatRemaining(0)).toBe("0m");
     expect(formatRemaining(-5)).toBe("0m");
+    // TEST L, the long end. A 30-day countdown in `719h 42m` tells an operator
+    // less than `29d 23h` does, so days take over once there are any.
+    expect(formatRemaining(30 * 86_400)).toBe("30d 0h");
+    expect(formatRemaining(30 * 86_400 - 60)).toBe("29d 23h");
+    expect(formatRemaining(6 * 86_400 + 14 * 3600)).toBe("6d 14h");
+    expect(formatRemaining(23 * 3600 + 42 * 60)).toBe("23h 42m");
   });
 
   it("the section is absent when no session has ever been started", () => {

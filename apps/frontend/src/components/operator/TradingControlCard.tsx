@@ -82,24 +82,43 @@ const CHOICE_ON =
   "rounded-lg border border-yellow-400/60 bg-yellow-500/20 px-3 py-1 text-xs text-slate-100";
 const CHOICE_OFF = "rounded-lg border border-surface-border px-3 py-1 text-xs text-slate-400";
 
+const HOUR_MINUTES = 60;
+const DAY_MINUTES = 24 * HOUR_MINUTES;
+
 /**
  * A duration in operator units.
  *
- * Sessions are now hours long, and "1440 min" is a number an operator has to
- * decode. Exact minutes are kept for anything that is not a whole hour, so a
- * custom 90 reads as "90 min" rather than being rounded into a lie.
+ * Sessions run from an hour to thirty days, and neither "1440 min" nor
+ * "720 hours" is a number an operator should have to decode. Whole days read
+ * as days, whole hours as hours, and anything else keeps its exact minutes —
+ * so a custom 90 reads as "90 min" rather than being rounded into a lie, and
+ * a custom 2000 reads as "2000 min" rather than as a fictitious "1 day".
  */
 export function formatSessionDuration(minutes: number): string {
   if (!Number.isFinite(minutes) || minutes <= 0) return `${minutes} min`;
-  if (minutes % 60 !== 0) return `${minutes} min`;
-  const hours = minutes / 60;
+  // Days only from TWO days up. A single day stays "24 hours", which is the
+  // label this panel has always used for 1440 and the one the preset row
+  // reads best in: 1h / 6h / 12h / 24h / 3d / 7d / 30d.
+  if (minutes % DAY_MINUTES === 0 && minutes >= 2 * DAY_MINUTES) {
+    return `${minutes / DAY_MINUTES} days`;
+  }
+  if (minutes % HOUR_MINUTES !== 0) return `${minutes} min`;
+  const hours = minutes / HOUR_MINUTES;
   return hours === 1 ? "1 hour" : `${hours} hours`;
 }
 
-/** Whole seconds as `17h 42m`, or `0m` once a session has ended. */
+/**
+ * Whole seconds as `29d 23h`, `17h 42m`, or `0m` once a session has ended.
+ *
+ * The two largest units only. A 30-day session counting down in `719h 42m`
+ * tells an operator less than `29d 23h` does, and appending minutes to a
+ * figure in days is noise at that scale.
+ */
 export function formatRemaining(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return "0m";
-  const hours = Math.floor(seconds / 3600);
+  const days = Math.floor(seconds / 86_400);
+  const hours = Math.floor((seconds % 86_400) / 3600);
+  if (days > 0) return `${days}d ${hours}h`;
   const minutes = Math.floor((seconds % 3600) / 60);
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 }
@@ -453,7 +472,11 @@ function ConfirmDialog({
           <dt>Max claims</dt>
           <dd className="text-slate-200">{context.maxClaims}</dd>
           <dt>Window</dt>
-          <dd className="text-slate-200">{duration} minutes</dd>
+          {/* The authorization window opens for exactly the session duration,
+              so it reads in the same units and reflects a typed custom value
+              rather than the preset it replaced. "43200 minutes" is a number
+              an operator has to decode; "30 days" is the decision they made. */}
+          <dd className="text-slate-200">{formatSessionDuration(resolvedDuration)}</dd>
         </dl>
       ) : null}
 

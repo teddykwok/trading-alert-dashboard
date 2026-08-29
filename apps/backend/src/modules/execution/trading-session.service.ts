@@ -87,7 +87,19 @@ export async function findCurrentSession(
 ): Promise<TradingSession | null> {
   return db.tradingSession.findFirst({
     where: { executionProfileId },
-    orderBy: { startedAt: "desc" },
+    // Ordered by `createdAt`, NOT `startedAt`.
+    //
+    // Both are written at the same moment, but only one of them is beyond an
+    // application's reach: `createdAt` is `@default(now())` and is never set by
+    // any caller, so it is the DATABASE's clock. `startedAt` is supplied by
+    // Start Trading, so that a session's expiry and its window's expiry can be
+    // derived from one instant — which means a backend whose clock had stepped
+    // backwards could write a new session with a `startedAt` earlier than an
+    // older one and make "newest" wrong.
+    //
+    // Ordering on the database's own clock keeps that impossible, and costs
+    // nothing: the two values differ by milliseconds on every row.
+    orderBy: { createdAt: "desc" },
   });
 }
 
@@ -361,10 +373,19 @@ export async function revokeCurrentSession(
   executionProfileId: string,
   now: Date
 ): Promise<{ revoked: boolean; sessionId: string | null }> {
-  const session = await findCurrentSession(db, executionProfileId);
-  if (!session || session.status !== "ACTIVE") {
-    return { revoked: false, sessionId: session?.id ?? null };
-  }
+  // Asks for the ACTIVE session directly rather than for the newest one and
+  // then checking whether it happens to be active.
+  //
+  // Start Trading guarantees at most one ACTIVE session per profile, so these
+  // are the same row — but the first phrasing cannot be wrong even if that
+  // guarantee were ever broken or if two rows sorted unexpectedly, and this is
+  // the path Stop New Trades and Safe Off depend on.
+  const session = await db.tradingSession.findFirst({
+    where: { executionProfileId, status: "ACTIVE" },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!session) return { revoked: false, sessionId: null };
+
   const moved = await db.tradingSession.updateMany({
     where: { id: session.id, status: "ACTIVE" },
     data: { status: "REVOKED", endedAt: now, version: { increment: 1 } },

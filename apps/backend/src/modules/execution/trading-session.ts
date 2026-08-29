@@ -28,19 +28,42 @@ import type { TradingSession, TradingSessionStatus } from "@prisma/client";
 // Duration
 // ---------------------------------------------------------------------------
 
+/** Minutes in a day, so the multi-day presets read as what they are. */
+const DAY_MINUTES = 24 * 60;
+
 /** The operator-facing duration presets, in minutes. */
-export const SESSION_DURATION_PRESET_MINUTES = [60, 6 * 60, 12 * 60, 24 * 60] as const;
+export const SESSION_DURATION_PRESET_MINUTES = [
+  60,
+  6 * 60,
+  12 * 60,
+  DAY_MINUTES,
+  3 * DAY_MINUTES,
+  7 * DAY_MINUTES,
+  30 * DAY_MINUTES,
+] as const;
 
 /**
- * The longest session this phase permits.
+ * The longest session permitted: 30 days.
  *
- * 24 hours, because that is the horizon the feature was asked for and the
- * longest one whose consequences have been traced. Anything beyond it is a
- * separate policy decision — a multi-day unattended window is a different risk
- * conversation, not a bigger number — so it is refused rather than quietly
- * allowed.
+ * It was 24 hours, and the reasoning then was that "a multi-day unattended
+ * window is a different risk conversation, not a bigger number". That
+ * conversation has now happened, and what makes 30 days safe is that a session
+ * is not what bounds how much trading occurs:
+ *
+ *  - the TRADE BUDGET bounds it, in trades that actually obtained exposure,
+ *    and remains finite and mandatory on a live account;
+ *  - `ExecutionSafetyPolicy` still bounds concurrency, aggregate risk and
+ *    margin, and a session relaxes none of it;
+ *  - Stop New Trades, Safe Off, the kill switch and authorization revocation
+ *    all end admission immediately, whatever duration remains.
+ *
+ * So duration decides how long PERMISSION may last, not how much may happen
+ * during it. A 30-day session with a budget of 300 cannot open a 301st trade.
+ *
+ * Still FINITE, deliberately. This is not auto-renewal and not an unlimited
+ * mode: one session, one fixed start, one fixed expiry, at most 30 days apart.
  */
-export const SESSION_MAX_DURATION_MINUTES = 24 * 60;
+export const SESSION_MAX_DURATION_MINUTES = 30 * DAY_MINUTES;
 
 /** The shortest session worth starting. One minute; below that is a typo. */
 export const SESSION_MIN_DURATION_MINUTES = 1;
@@ -87,8 +110,8 @@ export function validateSessionDuration(raw: unknown): SessionDurationVerdict {
     return {
       ok: false,
       reason:
-        `Session duration must not exceed ${SESSION_MAX_DURATION_MINUTES} minutes (24 hours). ` +
-        "A longer unattended window is a separate policy decision, not a larger number.",
+        `Session duration must not exceed ${SESSION_MAX_DURATION_MINUTES} minutes (30 days). ` +
+        "A session is finite by design; there is no renewal and no unlimited duration.",
     };
   }
   return { ok: true, minutes };

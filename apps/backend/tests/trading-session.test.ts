@@ -35,6 +35,15 @@ const { prisma: testDatabase, available } = await connectTestDatabase();
 const prisma: PrismaClient | null = testDatabase;
 
 const BACKEND = path.resolve(__dirname, "..");
+
+/**
+ * The largest value a signed 32-bit integer holds.
+ *
+ * Named because it is the bound that MATTERS for timer APIs and int columns,
+ * and because 30-day durations sit on different sides of it depending on the
+ * unit. C4, C5 and C6 below say which side each one is on.
+ */
+const INT32_MAX = 2 ** 31 - 1;
 const codeOf = (source: string) =>
   source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
@@ -54,6 +63,7 @@ const {
   SESSION_BUDGET_PRESETS,
   SESSION_DURATION_PRESET_MINUTES,
   SESSION_MAX_DURATION_MINUTES,
+  SESSION_MIN_DURATION_MINUTES,
   SESSION_MAX_TRADE_BUDGET,
   releasesSessionSlot,
   sessionAdmissionState,
@@ -158,20 +168,135 @@ afterAll(async () => {
 // ===========================================================================
 
 describe("A-E. session shape, durations and budgets", () => {
-  it("B. offers 1h, 6h, 12h and 24h", () => {
-    expect([...SESSION_DURATION_PRESET_MINUTES]).toEqual([60, 360, 720, 1440]);
+  it("B. offers 1h, 6h, 12h, 24h, 3d, 7d and 30d", () => {
+    expect([...SESSION_DURATION_PRESET_MINUTES]).toEqual([60, 360, 720, 1440, 4320, 10080, 43200]);
     for (const minutes of SESSION_DURATION_PRESET_MINUTES) {
       expect(validateSessionDuration(minutes), String(minutes)).toEqual({ ok: true, minutes });
     }
   });
 
-  it("C. accepts a custom duration and refuses past 24 hours", () => {
-    for (const good of [1, 45, 90, 1439, SESSION_MAX_DURATION_MINUTES]) {
+  it("A. accepts the 30-day preset", () => {
+    // TEST A. The headline of this change, asserted on its own so a
+    // regression names itself rather than hiding inside the preset list.
+    expect(validateSessionDuration(43_200)).toEqual({ ok: true, minutes: 43_200 });
+    expect(SESSION_MAX_DURATION_MINUTES).toBe(30 * 24 * 60);
+  });
+
+  it("B2. accepts the intermediate multi-day presets", () => {
+    expect(validateSessionDuration(4_320)).toEqual({ ok: true, minutes: 4_320 }); // 3 days
+    expect(validateSessionDuration(10_080)).toEqual({ ok: true, minutes: 10_080 }); // 7 days
+  });
+
+  it("C. accepts a custom duration up to 30 days and refuses past it", () => {
+    // TEST B: 43200 custom accepted. TEST C: 43201 refused.
+    for (const good of [1, 45, 90, 1439, 1440, 2880, 43_199, SESSION_MAX_DURATION_MINUTES]) {
       expect(`${good}:${validateSessionDuration(good).ok}`).toBe(`${good}:true`);
     }
-    for (const bad of [0, -1, 1441, 2880, 1.5, Number.NaN, "60", null, {}]) {
+    for (const bad of [0, -1, 43_201, 44_640, 1.5, Number.NaN, "43200", "60", null, {}]) {
       expect(`${String(bad)}:${validateSessionDuration(bad).ok}`).toBe(`${String(bad)}:false`);
     }
+  });
+
+  it("C3. refuses the boundary by ONE minute, in both directions", () => {
+    expect(validateSessionDuration(SESSION_MAX_DURATION_MINUTES).ok).toBe(true);
+    expect(validateSessionDuration(SESSION_MAX_DURATION_MINUTES + 1).ok).toBe(false);
+    expect(validateSessionDuration(SESSION_MIN_DURATION_MINUTES).ok).toBe(true);
+    expect(validateSessionDuration(SESSION_MIN_DURATION_MINUTES - 1).ok).toBe(false);
+  });
+
+  it("C4. a 30-day duration survives every integer bound it passes through", () => {
+    // §13: no implicit smaller bound — stated per unit, because the units do
+    // NOT all behave the same and an earlier summary of this test said they
+    // did. See C5 for the one that genuinely does not fit.
+    const minutes = SESSION_MAX_DURATION_MINUTES;
+    const seconds = minutes * 60;
+    const millis = minutes * 60_000;
+
+    // MINUTES and SECONDS both fit a signed 32-bit integer comfortably, which
+    // is what matters for any int-typed column or field carrying them.
+    expect(minutes).toBeLessThan(INT32_MAX);
+    expect(seconds).toBeLessThan(INT32_MAX);
+
+    // MILLISECONDS are a safe JavaScript Number — this is the property the
+    // arithmetic in this repository actually relies on.
+    expect(Number.isSafeInteger(millis)).toBe(true);
+
+    // And the resulting instant is a valid Date, not an Invalid Date.
+    const expiresAt = new Date(Date.UTC(2026, 0, 1) + millis);
+    expect(Number.isNaN(expiresAt.getTime())).toBe(false);
+    expect(expiresAt.toISOString()).toBe("2026-01-31T00:00:00.000Z");
+  });
+
+  it("C5. 30 days in MILLISECONDS exceeds the signed 32-bit timer range", () => {
+    // The correction. A previous summary of C4 claimed 30-day milliseconds
+    // were "far inside safe-integer and 32-bit bounds". The first half is
+    // true; the second is false, and by a wide margin:
+    //
+    //   30 days        = 2,592,000,000 ms
+    //   signed 32-bit  = 2,147,483,647 ms  (~24.855 days)
+    //
+    // This is not a near miss — the ceiling sits five days below the new
+    // maximum, and above the OLD 24-hour one, which is exactly why the hazard
+    // did not exist before this feature and does now.
+    const millis = SESSION_MAX_DURATION_MINUTES * 60_000;
+    expect(millis).toBe(2_592_000_000);
+    expect(INT32_MAX).toBe(2_147_483_647);
+    expect(millis).toBeGreaterThan(INT32_MAX);
+
+    // Where that bites is `setTimeout`/`setInterval`, whose delay is coerced
+    // to a signed 32-bit integer: a delay this large does not wait 30 days, it
+    // overflows and fires almost immediately. So a 30-day value must never be
+    // used as a single timer delay — see C6, which proves nothing does.
+    expect(INT32_MAX / 86_400_000).toBeLessThan(30);
+
+    // Still a safe Number, so ARITHMETIC on it is exact. Only the timer APIs
+    // narrow it.
+    expect(Number.isSafeInteger(millis)).toBe(true);
+    expect(millis).toBeLessThan(Number.MAX_SAFE_INTEGER);
+  });
+
+  it("C6. expiry is decided by comparison, never by scheduling a timer", () => {
+    // The invariant that makes C5 harmless: no session-duration value is ever
+    // handed to a timer. Expiry is `expiresAt <= now`, evaluated on read.
+    //
+    // Asserted structurally against the two modules that own the decision, so
+    // that a future change introducing `setTimeout(expiresAt - Date.now())`
+    // fails here rather than in production on day 25.
+    for (const rel of [
+      "../src/modules/execution/trading-session.ts",
+      "../src/modules/execution/trading-session.service.ts",
+      "../src/modules/operator/trading-control-actions.service.ts",
+    ]) {
+      const source = readFileSync(path.resolve(__dirname, rel), "utf8");
+      expect(source, rel).not.toMatch(/setTimeout|setInterval|setImmediate/);
+    }
+
+    // And behaviourally: the decision is a pure function of a supplied `now`,
+    // so a 30-day session expires because time passed, not because anything
+    // fired. `now` is an argument precisely so no clock has to be waited on.
+    const startedAt = new Date("2026-01-01T00:00:00.000Z");
+    const session = {
+      status: "ACTIVE" as const,
+      expiresAt: new Date(startedAt.getTime() + SESSION_MAX_DURATION_MINUTES * 60_000),
+      tradeBudget: 300,
+      unlimited: false,
+      openedCount: 0,
+      reservedCount: 0,
+    };
+
+    // Day 25 — past the signed 32-bit millisecond ceiling, where a single
+    // overflowed timer would already have misfired days earlier.
+    const dayTwentyFive = new Date(startedAt.getTime() + 25 * 86_400_000);
+    expect(dayTwentyFive.getTime() - startedAt.getTime()).toBeGreaterThan(INT32_MAX);
+    expect(sessionAdmissionState(session, dayTwentyFive).admits).toBe(true);
+
+    // One second past expiry, and only then.
+    const justBefore = new Date(session.expiresAt.getTime() - 1_000);
+    expect(sessionAdmissionState(session, justBefore).admits).toBe(true);
+    const justAfter = new Date(session.expiresAt.getTime() + 1_000);
+    const verdict = sessionAdmissionState(session, justAfter);
+    expect(verdict.admits).toBe(false);
+    if (!verdict.admits) expect(verdict.reasonCode).toBe("SESSION_EXPIRED");
   });
 
   it("C2. presets and custom values share ONE validator", () => {

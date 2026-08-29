@@ -184,8 +184,12 @@ export const START_TRADING_CONFIRMATION = "START TRADING";
  * The supervised window lengths the server accepts. Mirrored for the selector;
  * the server validates the submitted value independently and refuses anything
  * else, so this list decides what is OFFERED and never what is permitted.
+ *
+ * 1h / 6h / 12h / 24h / 3d / 7d / 30d. 30 days is the ceiling for a custom
+ * value too — a session is finite by design, with one fixed start and one
+ * fixed expiry, and nothing here renews it.
  */
-export const START_TRADING_DURATION_CHOICES = [60, 360, 720, 1440] as const;
+export const START_TRADING_DURATION_CHOICES = [60, 360, 720, 1440, 4320, 10080, 43200] as const;
 export type StartTradingDuration = (typeof START_TRADING_DURATION_CHOICES)[number];
 
 /** The trade-budget presets offered beside a custom field. */

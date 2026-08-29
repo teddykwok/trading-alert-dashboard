@@ -3,7 +3,11 @@ import type { PrismaClient } from "@prisma/client";
 import { CanaryAuthorizationService, NaturalWindowValidationError } from "../execution/canary-authorization.service";
 import { CanaryPreflightService } from "../execution/canary-preflight.service";
 import { CANARY_NATURAL_MAX_CLAIMS } from "../execution/canary-readiness";
-import { validateSessionBudget, validateSessionDuration } from "../execution/trading-session";
+import {
+  SESSION_DURATION_PRESET_MINUTES,
+  validateSessionBudget,
+  validateSessionDuration,
+} from "../execution/trading-session";
 import { resolveSessionCapability } from "./session-capability";
 import { revokeCurrentSession } from "../execution/trading-session.service";
 import { logger } from "../../config/logger";
@@ -70,13 +74,16 @@ export const START_TRADING_DEFAULT_TRADE_BUDGET = CANARY_NATURAL_MAX_CLAIMS;
 /**
  * The durations the panel offers as one-click choices.
  *
- * The historical 15/30/60 set has become 1h/6h/12h/24h, and the set is no
- * longer exhaustive: a CUSTOM duration is accepted too. What makes that safe is
- * that presets and custom values now run through the SAME validator
- * (`validateSessionDuration`), which enforces the 24-hour ceiling. A preset is
+ * The historical 15/30/60 set is now 1h/6h/12h/24h/3d/7d/30d, and the set is
+ * not exhaustive: a CUSTOM duration is accepted too. What makes that safe is
+ * that presets and custom values run through the SAME validator
+ * (`validateSessionDuration`), which enforces the 30-day ceiling. A preset is
  * a convenience, never a second code path that could admit what custom cannot.
+ *
+ * Derived from the session module's presets rather than restated, so the panel
+ * cannot offer a duration the validator would refuse.
  */
-export const START_TRADING_DURATION_CHOICES = [60, 6 * 60, 12 * 60, 24 * 60] as const;
+export const START_TRADING_DURATION_CHOICES = SESSION_DURATION_PRESET_MINUTES;
 export type StartTradingDuration = (typeof START_TRADING_DURATION_CHOICES)[number];
 
 /**
@@ -84,7 +91,7 @@ export type StartTradingDuration = (typeof START_TRADING_DURATION_CHOICES)[numbe
  *
  * `undefined` means "not supplied" and takes the reviewed default. Everything
  * else — preset or custom — is judged by the session validator, so a numeric
- * string, a float, a negative or a value past 24 hours are refusals rather than
+ * string, a float, a negative or a value past 30 days are refusals rather than
  * coercions.
  */
 export function resolveStartTradingDuration(
@@ -318,10 +325,27 @@ export class TradingControlActionsService {
     // profile never carries two. It cannot strand a live window: preparation
     // below refuses outright while an active authorization exists, so at this
     // point no window is pointing at the session being retired.
+    //
+    // ONE instant, read once, used by BOTH writes.
+    //
+    // The session and its authorization used to derive their expiry from
+    // separate `this.now()` reads. At an hour that drift was invisible; the
+    // rule it broke was not, and the rule matters more the longer a session
+    // runs: the window says trading is permitted and until when, so a window
+    // that expires even a moment before its session stops admission while the
+    // session still reports time remaining. Deriving both from `startedAt`
+    // makes them equal by construction rather than by luck.
+    //
+    // `startedAt` is also written explicitly rather than left to the column's
+    // `now()` default, so `expiresAt - startedAt` IS the requested duration
+    // and does not straddle two clocks.
+    const startedAt = this.now();
+    const expiresAt = new Date(startedAt.getTime() + duration.minutes * 60_000);
+
     const session = await this.prisma.$transaction(async (tx) => {
       await tx.tradingSession.updateMany({
         where: { executionProfileId: profile.id, status: "ACTIVE" },
-        data: { status: "REVOKED", endedAt: this.now(), version: { increment: 1 } },
+        data: { status: "REVOKED", endedAt: startedAt, version: { increment: 1 } },
       });
       return tx.tradingSession.create({
         data: {
@@ -329,7 +353,8 @@ export class TradingControlActionsService {
           status: "ACTIVE",
           tradeBudget: budget.tradeBudget,
           unlimited: budget.unlimited,
-          expiresAt: new Date(this.now().getTime() + duration.minutes * 60_000),
+          startedAt,
+          expiresAt,
         },
       });
     });
@@ -364,7 +389,10 @@ export class TradingControlActionsService {
         ttlMinutes: duration.minutes,
         // Linked at CREATION, never afterwards.
         tradingSessionId: session.id,
-        now: this.now(),
+        // The SAME instant the session was measured from, so the window's
+        // expiry lands exactly on the session's rather than milliseconds
+        // before it.
+        now: startedAt,
       });
     } catch (error) {
       await abandonSession();

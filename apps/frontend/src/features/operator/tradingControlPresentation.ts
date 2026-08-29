@@ -77,9 +77,21 @@ export function presentReadiness(ready: boolean, scope: "PREPARATION" | "LIVE_AC
   return { label: "BLOCKED", tone: scope === "PREPARATION" ? "red" : "yellow" };
 }
 
+/**
+ * The authorization countdown, in the largest two units that fit.
+ *
+ * Seconds-level precision is what a short supervised window needs, and it is
+ * preserved exactly for anything under an hour. A session-backed window can
+ * now live thirty days, and "43200m 0s" is not a countdown anyone can read, so
+ * longer windows step up to hours and days.
+ */
 export function formatTtl(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return "0s";
   const whole = Math.floor(seconds);
+  const days = Math.floor(whole / 86_400);
+  if (days > 0) return `${days}d ${Math.floor((whole % 86_400) / 3600)}h`;
+  const hours = Math.floor(whole / 3600);
+  if (hours > 0) return `${hours}h ${Math.floor((whole % 3600) / 60)}m`;
   const minutes = Math.floor(whole / 60);
   const rest = whole % 60;
   return minutes > 0 ? `${minutes}m ${rest}s` : `${rest}s`;
