@@ -1158,6 +1158,10 @@ enum TradingSessionStatus {
   EXHAUSTED
   EXPIRED
   REVOKED
+  /// Admissions are stopped by the operator, and the session is otherwise
+  /// intact: same id, same budget, same counts, same expiry. The ONLY
+  /// non-terminal stopped state, and the only one Resume accepts.
+  PAUSED
 }
 
 /// Where one session slot is in its life.

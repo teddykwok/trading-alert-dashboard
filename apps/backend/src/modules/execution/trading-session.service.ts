@@ -3,6 +3,7 @@ import type { PrismaClient, TradingSession } from "@prisma/client";
 
 import {
   derivedSessionStatus,
+  isResumableSession,
   releasesSessionSlot,
   remainingSessionBudget,
   sessionAdmissionState,
@@ -78,6 +79,145 @@ export function toSessionView(session: TradingSession, now: Date): SessionView {
     expiresAt: session.expiresAt,
     endedAt: session.endedAt,
   };
+}
+
+export type SessionTransitionOutcome =
+  | { ok: true; session: TradingSession; alreadyThere: boolean }
+  | { ok: false; reasonCode: SessionTransitionRefusal; message: string };
+
+export type SessionTransitionRefusal =
+  | "NO_SESSION"
+  | "SESSION_TERMINAL"
+  | "SESSION_NOT_PAUSED"
+  | "SESSION_CHANGED";
+
+/**
+ * ACTIVE -> PAUSED, for the session the operator is actually running.
+ *
+ * What it does NOT do is the point. No execution is touched, no exchange order
+ * is cancelled, no position is closed, no count is reset and no timestamp
+ * moves: `openedCount`, `reservedCount`, `tradeBudget`, `startedAt` and
+ * `expiresAt` all survive verbatim, and the row keeps its id. Pausing is a
+ * statement about ADMISSION and nothing else, so entries already on the book
+ * fill or expire exactly as they would have, and their slots settle normally.
+ *
+ * Idempotent: pausing an already-paused session reports `alreadyThere` rather
+ * than failing, so a double click cannot turn into an error the operator has to
+ * interpret during an incident.
+ *
+ * The CAS is on `status` alone, and deliberately NOT on `version`.
+ *
+ * `version` is not a stable "nobody touched this" token for a session: every
+ * successful reservation increments it, because the reservation UPDATE bumps
+ * it along with `reservedCount`. Including it here meant a BUSY session could
+ * not be paused at all — a trade admitted between the read and the write moved
+ * the version and the pause lost the race, which is precisely backwards. The
+ * busier the session, the more an operator needs the pause to land.
+ *
+ * `status` is the right predicate because it is what this transition is about.
+ * Postgres evaluates it under the row lock the UPDATE takes, so a concurrent
+ * revoke either happens first (and the pause correctly finds nothing ACTIVE to
+ * pause) or second (and revoking a paused session is exactly what Safe Off
+ * does anyway). Admission is already blocked by the kill switch the caller
+ * engaged before reaching here, so nothing is admitted during the window
+ * either way.
+ */
+export async function pauseSession(
+  db: Db,
+  executionProfileId: string,
+  now: Date
+): Promise<SessionTransitionOutcome> {
+  const session = await findCurrentSession(db, executionProfileId);
+  if (!session) {
+    return { ok: false, reasonCode: "NO_SESSION", message: "There is no trading session to pause." };
+  }
+  if (session.status === "PAUSED") {
+    return { ok: true, session, alreadyThere: true };
+  }
+  // Judged on the DERIVED status: a session whose clock or budget ran out is
+  // already over, and pausing it would imply it could be resumed.
+  const derived = derivedSessionStatus(session, now);
+  if (derived !== "ACTIVE") {
+    return {
+      ok: false,
+      reasonCode: "SESSION_TERMINAL",
+      message: `The trading session is ${derived}, so there is nothing to pause.`,
+    };
+  }
+
+  const moved = await db.tradingSession.updateMany({
+    where: { id: session.id, status: "ACTIVE" },
+    data: { status: "PAUSED", version: { increment: 1 } },
+  });
+  if (moved.count === 0) {
+    return {
+      ok: false,
+      reasonCode: "SESSION_CHANGED",
+      message: "The trading session changed while it was being paused. Nothing was changed.",
+    };
+  }
+  const after = await db.tradingSession.findUniqueOrThrow({ where: { id: session.id } });
+  return { ok: true, session: after, alreadyThere: false };
+}
+
+/**
+ * PAUSED -> ACTIVE, on the SAME row.
+ *
+ * There is deliberately no session id parameter and no creation path: this
+ * updates the row that already exists or it refuses. Nothing here can mint a
+ * session, extend an expiry, or move a count, so "resume" cannot become "start
+ * a new session with the old one's name".
+ *
+ * A session that expired or exhausted itself while paused is refused as
+ * TERMINAL. `isResumableSession` reads the derived status precisely so that a
+ * stale PAUSED column cannot promise a resume the clock has already taken.
+ */
+export async function resumeSession(
+  db: Db,
+  executionProfileId: string,
+  now: Date
+): Promise<SessionTransitionOutcome> {
+  const session = await findCurrentSession(db, executionProfileId);
+  if (!session) {
+    return { ok: false, reasonCode: "NO_SESSION", message: "There is no trading session to resume." };
+  }
+  if (session.status === "ACTIVE" && derivedSessionStatus(session, now) === "ACTIVE") {
+    return { ok: true, session, alreadyThere: true };
+  }
+  if (session.status !== "PAUSED") {
+    return {
+      ok: false,
+      reasonCode: "SESSION_NOT_PAUSED",
+      message: `The trading session is ${derivedSessionStatus(session, now)}, not paused, so it cannot be resumed.`,
+    };
+  }
+  if (!isResumableSession(session, now)) {
+    return {
+      ok: false,
+      reasonCode: "SESSION_TERMINAL",
+      message:
+        `The trading session is ${derivedSessionStatus(session, now)} and cannot be resumed. ` +
+        "Start a new session instead.",
+    };
+  }
+
+  // Same reasoning as the pause: `status` is the predicate, not `version`.
+  // Nothing can reserve against a PAUSED session, so its version is quiet
+  // here — but the two transitions are written the same way on purpose, so
+  // neither grows a race the other does not have.
+  const moved = await db.tradingSession.updateMany({
+    where: { id: session.id, status: "PAUSED" },
+    data: { status: "ACTIVE", version: { increment: 1 } },
+  });
+  if (moved.count === 0) {
+    return {
+      ok: false,
+      reasonCode: "SESSION_CHANGED",
+      message: "The trading session changed while it was being resumed. Nothing was changed.",
+    };
+  }
+  const after = await db.tradingSession.findUniqueOrThrow({ where: { id: session.id } });
+  return { ok: true, session: after, alreadyThere: false };
 }
 
 /** The newest session for a profile, whatever its state. */
@@ -380,14 +520,19 @@ export async function revokeCurrentSession(
   // are the same row — but the first phrasing cannot be wrong even if that
   // guarantee were ever broken or if two rows sorted unexpectedly, and this is
   // the path Stop New Trades and Safe Off depend on.
+  // ACTIVE **or PAUSED**. A paused session is a stopped-but-resumable one, so
+  // if Safe Off left it alone it would still be sitting there afterwards
+  // waiting to be resumed — which is precisely the resurrection Safe Off must
+  // not permit. Revoking both is what keeps Safe Off strictly stronger than
+  // Pause.
   const session = await db.tradingSession.findFirst({
-    where: { executionProfileId, status: "ACTIVE" },
+    where: { executionProfileId, status: { in: ["ACTIVE", "PAUSED"] } },
     orderBy: { createdAt: "desc" },
   });
   if (!session) return { revoked: false, sessionId: null };
 
   const moved = await db.tradingSession.updateMany({
-    where: { id: session.id, status: "ACTIVE" },
+    where: { id: session.id, status: { in: ["ACTIVE", "PAUSED"] } },
     data: { status: "REVOKED", endedAt: now, version: { increment: 1 } },
   });
   return { revoked: moved.count > 0, sessionId: session.id };

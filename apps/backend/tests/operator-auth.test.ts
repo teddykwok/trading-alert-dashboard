@@ -260,13 +260,18 @@ describe("operator auth: structural guarantees", () => {
       entry.replace(/[\s\S]*"/, "").replace(/"$/, "")
     );
     expect(code.match(/app\.(put|patch|delete)\(/g)).toBeNull();
-    // 9 = the 7 reviewed before, plus the two policy-limit mutations. The
-    // count is deliberately explicit: a new operator mutation must be named
-    // in the list below before this passes.
-    expect((code.match(/app\.post\(/g) ?? []).length).toBe(9);
+    // 11 = the 9 reviewed before, plus pause and resume. The count is
+    // deliberately explicit: a new operator mutation must be named in the list
+    // below before this passes.
+    expect((code.match(/app\.post\(/g) ?? []).length).toBe(11);
     for (const expected of [
       "/api/operator/trading-control/start",
       "/api/operator/trading-control/stop-new-trades",
+      // Pause and resume are guarded and rate-limited exactly as stop is.
+      // Pause takes no body; resume requires its confirmation phrase, which
+      // the service checks rather than the route.
+      "/api/operator/trading-control/pause-new-trades",
+      "/api/operator/trading-control/resume-new-trades",
       "/api/operator/trading-control/safe-off",
       "/api/operator/trading-control/allowlist/validate",
       "/api/operator/trading-control/allowlist",
@@ -282,7 +287,7 @@ describe("operator auth: structural guarantees", () => {
     ]) {
       expect(`${expected}:${code.includes(`"${expected}"`)}`).toBe(`${expected}:true`);
     }
-    expect(mutations.length).toBe(9);
+    expect(mutations.length).toBe(11);
 
     // And every mutation carries the strict budget, not the dashboard one.
     expect((code.match(/OPERATOR_ACTION_RATE_LIMIT/g) ?? []).length).toBeGreaterThanOrEqual(4);

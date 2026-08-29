@@ -21,6 +21,7 @@ import {
 } from "../src/features/operator/tradingControlActions";
 import { START_TRADING_DURATION_CHOICES } from "../src/api/operator";
 import {
+  RESUME_TRADING_CONFIRMATION,
   START_TRADING_CONFIRMATION,
   postSafeOff,
   postStartTrading,
@@ -87,27 +88,105 @@ afterEach(() => {
 // The action table
 // ---------------------------------------------------------------------------
 
-describe("operator actions: the three controls", () => {
-  it("offers exactly Start Trading, Stop New Trades and Safe Off", () => {
+describe("operator actions: the five controls", () => {
+  it("offers exactly Start, Pause, Resume, Stop and Safe Off", () => {
     expect(TRADING_CONTROL_ACTIONS.map((action) => action.label)).toEqual([
       "Start Trading",
+      "Pause New Trades",
+      "Resume New Trades",
       "Stop New Trades",
       "Safe Off",
     ]);
   });
 
-  it("requires a typed phrase for Start and for nothing else", () => {
-    // Start is the only one that opens the account to admission, so it is the
-    // only one that earns the highest-friction confirmation.
+  it("requires a typed phrase for the two that OPEN admission, and nothing else", () => {
+    // Start and Resume are the only actions that let new trades be admitted,
+    // so they are the only ones that earn the highest-friction confirmation.
+    // Pause, Stop and Safe Off only ever reduce risk, and an operator reaching
+    // for one during an incident should not have to type first.
     expect(findAction("START").requiredPhrase).toBe(START_TRADING_CONFIRMATION);
+    expect(findAction("RESUME_NEW_TRADES").requiredPhrase).toBe(RESUME_TRADING_CONFIRMATION);
+    expect(findAction("PAUSE_NEW_TRADES").requiredPhrase).toBeNull();
     expect(findAction("STOP_NEW_TRADES").requiredPhrase).toBeNull();
     expect(findAction("SAFE_OFF").requiredPhrase).toBeNull();
+  });
+
+  // TEST P -------------------------------------------------------------------
+  it("P. offers Pause on an ACTIVE session and Resume on a PAUSED one", () => {
+    const active = { status: "ACTIVE", resumable: false };
+    const paused = { status: "PAUSED", resumable: true };
+
+    // ARMED with a live session: Pause, not Resume.
+    expect(isActionRelevant("PAUSE_NEW_TRADES", "ARMED", active)).toBe(true);
+    expect(isActionRelevant("RESUME_NEW_TRADES", "ARMED", active)).toBe(false);
+
+    // Paused: the kill switch is engaged, so the profile reads SAFE_RECOVERY.
+    // Resume, not Pause.
+    expect(isActionRelevant("RESUME_NEW_TRADES", "SAFE_RECOVERY", paused)).toBe(true);
+    expect(isActionRelevant("PAUSE_NEW_TRADES", "SAFE_RECOVERY", paused)).toBe(false);
+
+    // Safe Off stays reachable beside Resume — a paused session must always be
+    // terminable without resuming it first.
+    expect(isActionRelevant("SAFE_OFF", "SAFE_RECOVERY", paused)).toBe(true);
+  });
+
+  it("P2. never offers Resume for a terminal or absent session", () => {
+    // The server's own verdict is the gate. A status string that says PAUSED
+    // while `resumable` is false — a session that expired or exhausted itself
+    // while paused — must not surface the button.
+    for (const session of [
+      null,
+      { status: "REVOKED", resumable: false },
+      { status: "EXPIRED", resumable: false },
+      { status: "EXHAUSTED", resumable: false },
+      { status: "ACTIVE", resumable: false },
+      { status: "PAUSED", resumable: false },
+    ]) {
+      const label = session ? session.status : "none";
+      expect(`${label}:${isActionRelevant("RESUME_NEW_TRADES", "SAFE_RECOVERY", session)}`).toBe(
+        `${label}:false`
+      );
+    }
+  });
+
+  it("P3. never offers Pause once there is nothing resumable to pause", () => {
+    // Pausing an expired or exhausted session would promise a resume that
+    // cannot happen, so it is not offered.
+    for (const status of ["EXPIRED", "EXHAUSTED", "REVOKED", "PAUSED"]) {
+      expect(`${status}:${isActionRelevant("PAUSE_NEW_TRADES", "ARMED", { status, resumable: false })}`).toBe(
+        `${status}:false`
+      );
+    }
+    // And not when there is no session at all.
+    expect(isActionRelevant("PAUSE_NEW_TRADES", "ARMED", null)).toBe(false);
+  });
+
+  it("P4. Start stays offered while a session is paused", () => {
+    // Starting a NEW session is a legitimate choice during a pause — the
+    // server ends the paused one rather than running two — so the panel must
+    // not hide it.
+    expect(isActionRelevant("START", "SAFE_RECOVERY", { status: "PAUSED", resumable: true })).toBe(true);
+  });
+
+  it("P5. describes Pause as keeping the session and Stop as ending it", () => {
+    // The distinction the whole feature exists for. An operator must be able
+    // to tell these apart from the dialog alone.
+    const pause = findAction("PAUSE_NEW_TRADES").description;
+    expect(pause).toContain("KEEPS the session");
+    expect(pause).toContain("nothing is cancelled");
+    expect(findAction("STOP_NEW_TRADES").description).toContain("ENDS the session");
+
+    // And Resume must promise no reset of any kind.
+    const resume = findAction("RESUME_NEW_TRADES").description;
+    expect(resume).toContain("SAME paused session");
+    expect(resume).toContain("original expiry");
+    expect(resume).toContain("Nothing is reset");
   });
 
   it("does not describe Stop or Safe Off as closing positions", () => {
     // The most dangerous possible misunderstanding on this panel: believing a
     // button flattened the account when it only blocked new entries.
-    for (const id of ["STOP_NEW_TRADES", "SAFE_OFF"] as const) {
+    for (const id of ["STOP_NEW_TRADES", "SAFE_OFF", "PAUSE_NEW_TRADES"] as const) {
       const text = findAction(id).description.toLowerCase();
       for (const forbidden of ["closes your position", "flatten", "market close", "liquidat"]) {
         expect(`${id}:${forbidden}:${text.includes(forbidden)}`).toBe(`${id}:${forbidden}:false`);

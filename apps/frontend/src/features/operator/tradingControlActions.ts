@@ -1,8 +1,8 @@
 import type { TradingControlStatusDto, TradingSystemState } from "../../api/operator";
-import { START_TRADING_CONFIRMATION } from "../../api/operator";
+import { RESUME_TRADING_CONFIRMATION, START_TRADING_CONFIRMATION } from "../../api/operator";
 
 /**
- * The three operator actions, as pure descriptions.
+ * The five operator actions, as pure descriptions.
  *
  * Everything the confirmation dialog says, and every rule about when a button
  * is offered, lives here so it can be asserted directly. The component is a
@@ -14,7 +14,21 @@ import { START_TRADING_CONFIRMATION } from "../../api/operator";
  * environment gates and the advisory lock regardless.
  */
 
-export type TradingControlActionId = "START" | "STOP_NEW_TRADES" | "SAFE_OFF";
+export type TradingControlActionId =
+  | "START"
+  | "PAUSE_NEW_TRADES"
+  | "RESUME_NEW_TRADES"
+  | "STOP_NEW_TRADES"
+  | "SAFE_OFF";
+
+/**
+ * What the panel needs to know about the current session to decide what to
+ * offer. A subset of the status DTO, so these rules can be tested without one.
+ */
+export interface SessionOfferState {
+  status: string;
+  resumable: boolean;
+}
 
 export interface TradingControlAction {
   id: TradingControlActionId;
@@ -38,10 +52,29 @@ export const TRADING_CONTROL_ACTIONS: readonly TradingControlAction[] = [
     destructiveLooking: true,
   },
   {
+    id: "PAUSE_NEW_TRADES",
+    label: "Pause New Trades",
+    description:
+      "Pauses new entries and KEEPS the session: the same budget, counts and expiry are waiting when you resume. Existing positions continue to be managed — nothing is cancelled and no position is closed.",
+    // No phrase. Pausing only ever makes the system safer, and an operator
+    // reaching for it during an incident should not have to type first.
+    requiredPhrase: null,
+    destructiveLooking: false,
+  },
+  {
+    id: "RESUME_NEW_TRADES",
+    label: "Resume New Trades",
+    description:
+      "Reopens new entries on the SAME paused session — the same budget, the same opened count and the original expiry. Nothing is reset and no new session is created. The server re-checks runtime health, readiness and current exposure first.",
+    // Reopening live admission carries the same friction as starting.
+    requiredPhrase: RESUME_TRADING_CONFIRMATION,
+    destructiveLooking: true,
+  },
+  {
     id: "STOP_NEW_TRADES",
     label: "Stop New Trades",
     description:
-      "Blocks new entries. Existing positions continue to be managed: nothing is cancelled and no position is closed.",
+      "Blocks new entries and ENDS the session — it cannot be resumed. Existing positions continue to be managed: nothing is cancelled and no position is closed.",
     requiredPhrase: null,
     destructiveLooking: false,
   },
@@ -70,17 +103,34 @@ export function findAction(id: TradingControlActionId): TradingControlAction {
  * Start on a system that is already armed, or offering Stop on one where
  * nothing can be admitted anyway.
  */
-export function isActionRelevant(id: TradingControlActionId, state: TradingSystemState): boolean {
+export function isActionRelevant(
+  id: TradingControlActionId,
+  state: TradingSystemState,
+  session: SessionOfferState | null = null
+): boolean {
   switch (id) {
     case "START":
-      // Nothing to start when already armed.
+      // Nothing to start when already armed. Deliberately still offered while
+      // a session is paused: starting a NEW session is a legitimate choice,
+      // and the server ends the paused one rather than running two.
       return state !== "ARMED";
     case "STOP_NEW_TRADES":
       // Only meaningful while admission is possible.
       return state === "ARMED";
+    case "PAUSE_NEW_TRADES":
+      // Admission has to be possible for pausing it to mean anything, and the
+      // session has to be one that can come back — pausing an expired or
+      // exhausted session would promise a resume that cannot happen.
+      return state === "ARMED" && session?.status === "ACTIVE";
+    case "RESUME_NEW_TRADES":
+      // The server's own verdict, not a status string compared here. It
+      // already rules out revoked, expired and exhausted, so a terminal
+      // session can never surface this button.
+      return session?.resumable === true;
     case "SAFE_OFF":
       // Meaningful whenever the profile is still enabled, which includes the
-      // recovery state where work is being wound down.
+      // recovery state where work is being wound down — and a paused session
+      // sits in exactly that state, so Safe Off stays reachable beside Resume.
       return state === "ARMED" || state === "SAFE_RECOVERY" || state === "INVALID";
     default:
       return false;
@@ -219,6 +269,66 @@ export function describeStartContext(status: TradingControlStatusDto): StartCont
     hardTotal: status.capacity.hardTotal,
     maxClaims: START_MAX_CLAIMS,
     windowMinutes: START_WINDOW_MINUTES,
+  };
+}
+
+/**
+ * What an operator is shown before reopening admission on a paused session.
+ *
+ * Everything here is read from the authoritative status, exactly as the start
+ * context is: the panel restates the server's numbers and computes no verdict
+ * of its own. Resume is refused or allowed by the backend regardless of what
+ * this says.
+ *
+ * The session identifier is deliberately SHORTENED. It is shown so an operator
+ * can tell one session from another in a log or a support conversation, which
+ * a short prefix does; the full id is not a secret but it is not useful on a
+ * button-sized line either.
+ */
+export interface ResumeContext {
+  sessionShortId: string;
+  sessionStatus: string;
+  /** Trades that obtained exposure, over the budget. Never reset by a resume. */
+  opened: string;
+  reserved: number;
+  remaining: string;
+  /** The ORIGINAL expiry. Resume does not extend it. */
+  expiresAt: string;
+  timeRemaining: string;
+  open: number;
+  pending: number;
+  active: string;
+  riskLimit: string;
+  marginLimit: string;
+  desiredOpen: number;
+  hardTotal: number;
+}
+
+export function describeResumeContext(
+  status: TradingControlStatusDto,
+  formatRemaining: (seconds: number) => string
+): ResumeContext | null {
+  const session = status.session;
+  if (!session) return null;
+  return {
+    sessionShortId: session.id.slice(0, 8),
+    sessionStatus: session.status,
+    opened:
+      session.unlimited || session.tradeBudget === null
+        ? `${session.openedCount}`
+        : `${session.openedCount} / ${session.tradeBudget}`,
+    reserved: session.reservedCount,
+    remaining:
+      session.unlimited || session.remaining === null ? "Unlimited" : String(session.remaining),
+    expiresAt: session.expiresAt,
+    timeRemaining: formatRemaining(session.remainingTtlSeconds),
+    open: status.capacity.open,
+    pending: status.capacity.pending,
+    active: `${status.capacity.totalActive} / ${status.capacity.hardTotal}`,
+    riskLimit: `${status.reservations.riskUsd} / ${status.reservations.riskLimitUsd} USD`,
+    marginLimit: `${status.reservations.marginUsd} / ${status.reservations.marginLimitUsd} USD`,
+    desiredOpen: status.capacity.desiredOpen,
+    hardTotal: status.capacity.hardTotal,
   };
 }
 

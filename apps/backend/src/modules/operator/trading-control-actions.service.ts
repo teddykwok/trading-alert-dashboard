@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import type { PrismaClient } from "@prisma/client";
 
 import { CanaryAuthorizationService, NaturalWindowValidationError } from "../execution/canary-authorization.service";
@@ -5,11 +6,25 @@ import { CanaryPreflightService } from "../execution/canary-preflight.service";
 import { CANARY_NATURAL_MAX_CLAIMS } from "../execution/canary-readiness";
 import {
   SESSION_DURATION_PRESET_MINUTES,
+  derivedSessionStatus,
   validateSessionBudget,
   validateSessionDuration,
 } from "../execution/trading-session";
+import {
+  OPEN_POSITION_STATUSES,
+  PENDING_ENTRY_STATUSES,
+  TOTAL_ACTIVE_STATUSES,
+} from "../execution/capacity-status";
+import type { TradeExecutionStatusName } from "../execution/execution-status";
+import { evaluateResumeReadiness } from "../execution/resume-readiness";
+import { env } from "../../config/env";
 import { resolveSessionCapability } from "./session-capability";
-import { revokeCurrentSession } from "../execution/trading-session.service";
+import {
+  findCurrentSession,
+  pauseSession,
+  resumeSession,
+  revokeCurrentSession,
+} from "../execution/trading-session.service";
 import { logger } from "../../config/logger";
 import { configuredProfileIdentity, resolveExecutionProfile } from "../execution/execution-profile.service";
 import { armNaturalWindow } from "../execution/natural-arm";
@@ -140,6 +155,15 @@ export function resolveStartTradingBudget(
 /** Typed exactly, so a near-miss is a refusal rather than a coercion. */
 export const START_TRADING_CONFIRMATION = "START TRADING";
 
+/**
+ * Resume reopens LIVE admission, so it is confirmed exactly as starting is.
+ *
+ * Pause deliberately has NO confirmation phrase. It only ever makes the system
+ * safer, and an operator reaching for it during an incident should not have to
+ * type anything to stop new trades.
+ */
+export const RESUME_TRADING_CONFIRMATION = "RESUME TRADING";
+
 export type TradingControlActionOutcome =
   | "ARMED"
   | "ALREADY_ARMED"
@@ -147,7 +171,11 @@ export type TradingControlActionOutcome =
   | "SAFE_OFF"
   | "SAFE_RECOVERY"
   | "BLOCKED"
-  | "WINDOW_PREPARED_NOT_ARMED";
+  | "WINDOW_PREPARED_NOT_ARMED"
+  | "PAUSED"
+  | "ALREADY_PAUSED"
+  | "RESUMED"
+  | "ALREADY_ACTIVE";
 
 export interface ActionProfileDto {
   /** Environment only; the account identifier never leaves the server. */
@@ -343,8 +371,11 @@ export class TradingControlActionsService {
     const expiresAt = new Date(startedAt.getTime() + duration.minutes * 60_000);
 
     const session = await this.prisma.$transaction(async (tx) => {
+      // ACTIVE **or PAUSED**. Starting a new session must not leave a paused
+      // one behind: it would still be resumable, and resuming it would put a
+      // second session's authorization beside the new one's.
       await tx.tradingSession.updateMany({
-        where: { executionProfileId: profile.id, status: "ACTIVE" },
+        where: { executionProfileId: profile.id, status: { in: ["ACTIVE", "PAUSED"] } },
         data: { status: "REVOKED", endedAt: startedAt, version: { increment: 1 } },
       });
       return tx.tradingSession.create({
@@ -555,6 +586,329 @@ export class TradingControlActionsService {
         outcome.outstanding > 0
           ? "Disarmed for new work. Outstanding executions remain managed, so the profile was NOT disabled and nothing was cancelled."
           : "Safe off. The profile is disabled and the kill switch is engaged.",
+    };
+  }
+
+  /**
+   * PAUSE NEW TRADES — stop admitting, keep the session.
+   *
+   * The difference from Stop New Trades is one word in the session write:
+   * PAUSED rather than REVOKED. Everything else is identical, and identical on
+   * purpose — the kill switch is engaged through the same reviewed primitive,
+   * nothing is cancelled, nothing is closed, and every execution already on the
+   * book keeps its normal lifecycle.
+   *
+   * TWO gates end up closed, which is deliberate rather than redundant:
+   *
+   *   - the kill switch, which blocks admission for every mode including
+   *     legacy and EXACT_SIGNAL;
+   *   - the session status, which `reserveSessionSlot`'s conditional UPDATE
+   *     requires to be ACTIVE before it will take a slot.
+   *
+   * Either alone would stop new trades. Together they mean a partial failure
+   * of this method still stops them: the kill switch lands first, so a crash
+   * before the session write leaves admission blocked and the session still
+   * ACTIVE — visible, recoverable, and never permissive.
+   */
+  async pauseNewTrades(): Promise<TradingControlActionResult> {
+    const resolution = await resolveExecutionProfile(this.prisma, configuredProfileIdentity());
+    if (!resolution.ok) return blocked([`${resolution.reasonCode}`], resolution.message);
+    const profile = resolution.profile;
+
+    // Kill switch FIRST. Pausing is a safety action, so the half that makes
+    // the system safer must not wait on the half that is bookkeeping.
+    const outcome = await closeCanaryWindowOperation(this.prisma, profile.id);
+    const paused = await pauseSession(this.prisma, profile.id, this.now());
+    const state = await this.describeProfile(profile.id);
+
+    if (!paused.ok) {
+      // Admission is ALREADY blocked by the kill switch above, so this is a
+      // reporting failure rather than a safety one. Said plainly rather than
+      // dressed up as success: the operator asked for a resumable pause and
+      // did not get one, and Start Trading is now the way forward.
+      return {
+        ok: false,
+        outcome: "BLOCKED",
+        systemState: state.systemState,
+        profile: state.profile,
+        authorization: null,
+        outstandingExecutions: outcome.active,
+        authorizationsRevoked: null,
+        blockers: [`${paused.reasonCode}: ${paused.message}`],
+        message:
+          "New admission is blocked and nothing was cancelled, but the session could not be " +
+          "paused, so it cannot be resumed. Use Start Trading for a new session, or Safe Off.",
+      };
+    }
+
+    return {
+      ok: true,
+      outcome: paused.alreadyThere ? "ALREADY_PAUSED" : "PAUSED",
+      systemState: state.systemState,
+      profile: state.profile,
+      authorization: null,
+      outstandingExecutions: outcome.active,
+      authorizationsRevoked: null,
+      blockers: [],
+      message:
+        outcome.active > 0 || outcome.recovery > 0
+          ? "New trades are paused. Live executions remain managed — nothing was cancelled or closed, and protection and reconciliation continue. Resume when ready."
+          : "New trades are paused. No live execution remains. Resume when ready.",
+    };
+  }
+
+  /**
+   * RESUME NEW TRADES — reopen admission for the SAME session.
+   *
+   * Not a lighter Start Trading. Start mints a session and demands a clean
+   * account; Resume mints nothing and expects a busy one. The session it
+   * reopens is the row that is already there, with its original id, budget,
+   * counts and expiry — this method has no path that can create a session,
+   * move an expiry, or change a count.
+   *
+   * The order is: prove everything, arm, then unpause. Arming last is what
+   * makes a crash safe, and the reasoning is worth stating because the obvious
+   * order is wrong:
+   *
+   *   crash after arm, before unpause -> profile armed, session PAUSED.
+   *     `reserveSessionSlot` requires ACTIVE, so nothing is admitted, and
+   *     pressing Resume again completes the transition.
+   *   crash after unpause, before arm -> session ACTIVE, kill switch engaged.
+   *     Nothing is admitted either, but the session no longer reads PAUSED, so
+   *     Resume would refuse and the operator would be stuck with a session
+   *     that looks live and cannot trade.
+   *
+   * The first is recoverable and the second is a trap, so the session write
+   * goes last.
+   */
+  async resumeNewTrades(confirmation: unknown): Promise<TradingControlActionResult> {
+    if (confirmation !== RESUME_TRADING_CONFIRMATION) {
+      return blocked(
+        ["CONFIRMATION_REQUIRED"],
+        `Resume requires the exact confirmation phrase "${RESUME_TRADING_CONFIRMATION}". Nothing was changed.`
+      );
+    }
+
+    const resolution = await resolveExecutionProfile(this.prisma, configuredProfileIdentity());
+    if (!resolution.ok) return blocked([`${resolution.reasonCode}`], resolution.message);
+    const profile = resolution.profile;
+
+    const session = await findCurrentSession(this.prisma, profile.id);
+    if (!session) {
+      return blocked(
+        ["NO_SESSION"],
+        "There is no trading session to resume. Use Start Trading to begin a new one."
+      );
+    }
+    // Checked BEFORE any work, and again inside `resumeSession` under a CAS.
+    // This one produces the operator-facing message; that one is the guard.
+    //
+    // ACTIVE is allowed through deliberately, so a second Resume is a no-op
+    // rather than an error: it re-runs every check and every guard, finds
+    // nothing to change, and reports ALREADY_ACTIVE. Only a TERMINAL session
+    // is refused here — those are the ones a resume would have to resurrect.
+    const derived = derivedSessionStatus(session, this.now());
+    if (derived !== "PAUSED" && derived !== "ACTIVE") {
+      return blocked(
+        [`SESSION_${derived}`],
+        `The trading session is ${derived} and cannot be resumed. Use Start Trading to begin a new one.`
+      );
+    }
+
+    const blockers: string[] = [];
+
+    // Environment gates are NOT database state; nothing here writes them.
+    if (!this.environmentArmed()) {
+      blockers.push(
+        "ENVIRONMENT_GATES_NOT_ARMED: the activation gates are not in the required state. Edit .env and restart the runtime first."
+      );
+    }
+
+    // The whole point of the motivating incident. A worker that went stale is
+    // exactly why the operator paused, so Resume must prove the runtime came
+    // back rather than assume it. Never a bypass.
+    const attestation = await this.readAttestation();
+    if (!attestation.ok) blockers.push(`${attestation.reasonCode}: ${attestation.message}`);
+
+    // The same evidence Start Trading gathers, judged by the RESUME rule.
+    //
+    // EVERY finding is handed over, both scopes, deliberately. The evaluator
+    // owns the decision about which ones a resume may pass, and one of them —
+    // the engaged kill switch — is the normal posture of a paused profile and
+    // is released by the arming below. Filtering here instead would put half
+    // that decision in this file and make it look like a scope question.
+    const preflight = await this.preflight.run("NATURAL_WINDOW");
+    const readiness = evaluateResumeReadiness({
+      findings: preflight.findings,
+      globalLimits: {
+        maxOpenPositions: env.EXECUTION_MAX_OPEN_POSITIONS,
+        maxPendingEntries: env.EXECUTION_MAX_PENDING_ENTRIES,
+        maxTotalActiveTrades: env.EXECUTION_MAX_TOTAL_ACTIVE_TRADES,
+        maxActivePerSymbolSide: env.EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE,
+        softOpenPositionTarget: env.EXECUTION_SOFT_OPEN_POSITION_TARGET,
+        maxTotalPlannedRiskUsd: env.EXECUTION_MAX_TOTAL_PLANNED_RISK_USD,
+        maxTotalIsolatedMarginUsd: env.EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD,
+      },
+      profileLimits: await this.readProfileLimits(profile.id),
+      exposure: await this.readExposure(profile.id),
+    });
+    blockers.push(...readiness.blockers);
+
+    // The window that already backs THIS session, found by the session's own
+    // id rather than by "the newest window": a stale window belonging to an
+    // older session must never be the one re-armed.
+    const window = await this.prisma.executionCanaryAuthorization.findFirst({
+      where: {
+        executionProfileId: profile.id,
+        authorizationType: "NATURAL_WINDOW",
+        tradingSessionId: session.id,
+        revokedAt: null,
+        expiresAt: { gt: this.now() },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+    if (!window) {
+      blockers.push(
+        "RESUME_BLOCKED_AUTHORIZATION: this session has no live authorization window. " +
+          "It was revoked or has expired, so admission cannot be reopened for it."
+      );
+    }
+
+    const policy = await this.prisma.executionSafetyPolicy.findUnique({
+      where: { executionProfileId: profile.id },
+    });
+    if (!policy) blockers.push("POLICY_MISSING: the profile has no safety policy row.");
+
+    if (blockers.length > 0 || !window || !policy) {
+      const state = await this.describeProfile(profile.id);
+      return {
+        ...blocked(blockers, "Resume refused. Nothing was changed and the session is still paused."),
+        systemState: state.systemState,
+        profile: state.profile,
+      };
+    }
+
+    // Re-arms the EXISTING window through the reviewed primitive, so every
+    // arming guard applies again: window version, policy version, allowlist,
+    // remaining TTL and the pinned maxClaims are all re-read under the profile
+    // advisory lock and compared by CAS. No new authorization is created, so
+    // the session keeps the window it was born with and the session-backed
+    // rule that it spends NO claims is untouched.
+    const armed = await this.prisma.$transaction((tx) =>
+      armNaturalWindow(tx, {
+        executionProfileId: profile.id,
+        authorizationId: window.id,
+        expectedWindowVersion: window.version,
+        expectedPolicyVersion: policy.version,
+        expectedAllowedSymbols: policy.allowedSymbols,
+      })
+    );
+    if (!armed.ok) {
+      const state = await this.describeProfile(profile.id);
+      return {
+        ...blocked(
+          [`${armed.reasonCode}: ${armed.message}`],
+          "Resume refused while re-arming. The profile was NOT armed and the session is still paused."
+        ),
+        systemState: state.systemState,
+        profile: state.profile,
+      };
+    }
+
+    const resumed = await resumeSession(this.prisma, profile.id, this.now());
+    const state = await this.describeProfile(profile.id);
+    if (!resumed.ok) {
+      // Armed, but the session did not move. Admission stays closed because
+      // the session gate is the one that refuses, so this is safe — and
+      // pressing Resume again re-runs the whole thing idempotently.
+      return {
+        ...blocked(
+          [`${resumed.reasonCode}: ${resumed.message}`],
+          "Resume did not complete: the session was not reopened, so no new trade is admitted. Try again, or use Safe Off."
+        ),
+        systemState: state.systemState,
+        profile: state.profile,
+      };
+    }
+
+    logger.info(
+      {
+        sessionId: resumed.session.id,
+        openedCount: resumed.session.openedCount,
+        reservedCount: resumed.session.reservedCount,
+        expiresAt: resumed.session.expiresAt.toISOString(),
+        alreadyActive: resumed.alreadyThere,
+      },
+      "operator resumed new trades on the existing trading session"
+    );
+
+    return {
+      ok: true,
+      outcome: resumed.alreadyThere ? "ALREADY_ACTIVE" : "RESUMED",
+      systemState: state.systemState,
+      profile: state.profile,
+      authorization: await this.describeAuthorization(window.id),
+      outstandingExecutions: null,
+      authorizationsRevoked: null,
+      blockers: [],
+      message:
+        `New trades resumed on the existing session. Budget and expiry are unchanged: ` +
+        `${resumed.session.openedCount} opened, ${resumed.session.reservedCount} reserved, ` +
+        `expiring ${resumed.session.expiresAt.toISOString()}.`,
+    };
+  }
+
+  /** This profile's stored limits, in the shape the resume evaluator wants. */
+  private async readProfileLimits(profileId: string) {
+    const row = await this.prisma.executionSafetyPolicy.findUnique({
+      where: { executionProfileId: profileId },
+    });
+    if (!row) return null;
+    return {
+      maxOpenPositions: row.maxOpenPositions,
+      maxPendingEntries: row.maxPendingEntries,
+      maxTotalActiveTrades: row.maxTotalActiveTrades,
+      maxActivePerSymbolSide: row.maxActivePerSymbolSide,
+      softOpenPositionTarget: row.softOpenPositionTarget,
+      maxTotalPlannedRiskUsd: row.maxTotalPlannedRiskUsd.toString(),
+      maxTotalIsolatedMarginUsd: row.maxTotalIsolatedMarginUsd.toString(),
+    };
+  }
+
+  /**
+   * What this profile is carrying right now.
+   *
+   * Counted from `TradeExecution` using the SAME status groups the capacity
+   * engine and the status panel use, so "active" means one thing everywhere.
+   * Deliberately NOT Binance's open-order count: protection legs are orders
+   * but are not executions, and an account with one position under a TP and an
+   * SL shows three orders and one active trade.
+   */
+  private async readExposure(profileId: string) {
+    const rows = await this.prisma.tradeExecution.findMany({
+      where: {
+        executionProfileId: profileId,
+        status: { in: TOTAL_ACTIVE_STATUSES as unknown as Prisma.EnumTradeExecutionStatusFilter["in"] },
+      },
+      select: { status: true, riskBudgetUsd: true, maximumIsolatedMargin: true },
+    });
+    let openPositionCount = 0;
+    let pendingEntryCount = 0;
+    let reservedRisk = new Prisma.Decimal(0);
+    let reservedMargin = new Prisma.Decimal(0);
+    for (const row of rows) {
+      const status = row.status as TradeExecutionStatusName;
+      if (OPEN_POSITION_STATUSES.includes(status)) openPositionCount += 1;
+      if (PENDING_ENTRY_STATUSES.includes(status)) pendingEntryCount += 1;
+      reservedRisk = reservedRisk.plus(row.riskBudgetUsd);
+      reservedMargin = reservedMargin.plus(row.maximumIsolatedMargin);
+    }
+    return {
+      openPositionCount,
+      pendingEntryCount,
+      totalActiveCount: rows.length,
+      reservedRiskUsd: reservedRisk.toString(),
+      reservedMaximumMarginUsd: reservedMargin.toString(),
     };
   }
 

@@ -92,6 +92,12 @@ export interface TradingControlStatusDto {
     openedCount: number;
     reservedCount: number;
     remaining: number | null;
+    /**
+     * Whether Resume may be offered. Decided by the SERVER: a session that
+     * expired or exhausted itself while paused is not resumable however its
+     * stored status reads, and the browser has no clock worth trusting for it.
+     */
+    resumable: boolean;
     startedAt: string;
     expiresAt: string;
     endedAt: string | null;
@@ -179,6 +185,14 @@ export interface TradingControlActionResult {
  * so this is a courtesy to the operator rather than the security boundary.
  */
 export const START_TRADING_CONFIRMATION = "START TRADING";
+
+/**
+ * Resume reopens LIVE admission, so it carries the same friction as starting.
+ *
+ * Pause deliberately has no phrase: it only ever makes the system safer, and
+ * an operator reaching for it mid-incident should not have to type first.
+ */
+export const RESUME_TRADING_CONFIRMATION = "RESUME TRADING";
 
 /**
  * The supervised window lengths the server accepts. Mirrored for the selector;
@@ -359,6 +373,15 @@ export function postRrLookback(lookbackCandles: number): Promise<RrLookbackSaveD
 
 export function postStopNewTrades(): Promise<TradingControlActionResult> {
   return operatorApiClient.post("/api/operator/trading-control/stop-new-trades");
+}
+
+/** Pause sends no body: there is no phrase to confirm. */
+export function postPauseNewTrades(): Promise<TradingControlActionResult> {
+  return operatorApiClient.post("/api/operator/trading-control/pause-new-trades");
+}
+
+export function postResumeNewTrades(confirmation: string): Promise<TradingControlActionResult> {
+  return operatorApiClient.post("/api/operator/trading-control/resume-new-trades", { confirmation });
 }
 
 export function postSafeOff(): Promise<TradingControlActionResult> {
