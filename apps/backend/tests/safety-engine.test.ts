@@ -889,18 +889,23 @@ const NATURAL_AUTHORIZATION_CODES = [
 ] as const satisfies readonly SafetyReasonCode[];
 
 describe("reason code catalogue", () => {
-  it("exposes exactly the 44 stable reason codes", () => {
+  it("exposes exactly the 45 stable reason codes", () => {
     // 30 through Phase 11, plus the 7 natural-authorization codes added in
     // Phase 12.3, plus the 2 source-timeframe eligibility codes, plus the
-    // USDT-only collateral code, plus the 4 session-budget codes. The count is
-    // pinned so a code cannot be added without a deliberate edit here.
+    // USDT-only collateral code, plus the 4 session-budget codes, plus
+    // SESSION_PAUSED. The count is pinned so a code cannot be added without a
+    // deliberate edit here.
     //
     // The session codes are separate from the authorization ones on purpose:
     // NATURAL_AUTHORIZATION_EXHAUSTED would tell an operator their permission
     // ran out when in fact the session's TRADE BUDGET did, which is a different
     // fact with a different remedy.
-    expect(SAFETY_REASON_CODES).toHaveLength(44);
-    expect(new Set(SAFETY_REASON_CODES).size).toBe(44);
+    //
+    // SESSION_PAUSED is separate from SESSION_REVOKED for the same reason, and
+    // it is the distinction the whole pause/resume feature rests on: revoked
+    // means start a new session, paused means resume this one.
+    expect(SAFETY_REASON_CODES).toHaveLength(45);
+    expect(new Set(SAFETY_REASON_CODES).size).toBe(45);
     // Its own code, never folded into UNSUPPORTED_CONTRACT: "not a perpetual"
     // and "a perpetual we do not trade" send an operator to different places.
     expect(SAFETY_REASON_CODES).toContain("USDT_ONLY_CONTRACT_REQUIRED");
@@ -1022,6 +1027,10 @@ describe("reason code catalogue", () => {
       "SESSION_EXPIRED",
       "SESSION_REVOKED",
       "SESSION_BUDGET_EXHAUSTED",
+      // Emitted by the reservation, like its siblings: a paused session is
+      // refused by a conditional UPDATE requiring `status = 'ACTIVE'`, which
+      // the pure engine has no database to run.
+      "SESSION_PAUSED",
     ];
     const serviceOnly = new Set<SafetyReasonCode>([
       "CAPACITY_CONFLICT_RETRY",

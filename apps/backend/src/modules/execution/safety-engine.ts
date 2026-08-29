@@ -126,6 +126,8 @@ export const SAFETY_REASON_CODES = [
   "SESSION_EXPIRED",
   "SESSION_REVOKED",
   "SESSION_BUDGET_EXHAUSTED",
+  /** Admissions stopped by the operator; the session itself is intact. */
+  "SESSION_PAUSED",
 ] as const;
 export type SafetyReasonCode = (typeof SAFETY_REASON_CODES)[number];
 

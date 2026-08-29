@@ -83,6 +83,8 @@ export interface TradingControlActor {
     unlimited?: unknown
   ): Promise<TradingControlActionResult>;
   stopNewTrades(): Promise<TradingControlActionResult>;
+  pauseNewTrades(): Promise<TradingControlActionResult>;
+  resumeNewTrades(confirmation: unknown): Promise<TradingControlActionResult>;
   safeOff(): Promise<TradingControlActionResult>;
 }
 
@@ -200,6 +202,29 @@ export async function operatorRoutes(
     "/api/operator/trading-control/stop-new-trades",
     { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
     async (request, reply) => runAction(request, reply, (actor) => actor.stopNewTrades())
+  );
+
+  /**
+   * Pause takes no body and no confirmation phrase.
+   *
+   * It only ever makes the system safer, and an operator reaching for it while
+   * something is going wrong should not have to type anything first. Operator
+   * authentication and the action rate limit still apply, exactly as for stop.
+   */
+  app.post(
+    "/api/operator/trading-control/pause-new-trades",
+    { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
+    async (request, reply) => runAction(request, reply, (actor) => actor.pauseNewTrades())
+  );
+
+  /** Resume reopens LIVE admission, so it is confirmed exactly as start is. */
+  app.post(
+    "/api/operator/trading-control/resume-new-trades",
+    { preHandler: requireOperatorAuth, ...OPERATOR_ACTION_RATE_LIMIT },
+    async (request, reply) => {
+      const body = request.body as { confirmation?: unknown } | null | undefined;
+      return runAction(request, reply, (actor) => actor.resumeNewTrades(body?.confirmation));
+    }
   );
 
   app.post(

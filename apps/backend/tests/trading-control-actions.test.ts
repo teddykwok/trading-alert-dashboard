@@ -811,14 +811,17 @@ describe("operator actions: structural guarantees", () => {
     const routes = codeOf("src/routes/operator.routes.ts");
     const posts = (routes.match(/app\.post\(/g) ?? []).length;
     const budgets = (routes.match(/OPERATOR_ACTION_RATE_LIMIT\b/g) ?? []).length;
-    // Nine now: the three trading actions, allowlist validate and save, the
-    // source-timeframe policy save, the Extreme RR lookback save, and the two
-    // policy-limit mutations. Enumerated rather than counted loosely, so a NEW
-    // mutation cannot appear without this pin being updated deliberately.
-    expect(posts).toBe(9);
+    // Eleven now: the three trading actions, PAUSE and RESUME, allowlist
+    // validate and save, the source-timeframe policy save, the Extreme RR
+    // lookback save, and the two policy-limit mutations. Enumerated rather
+    // than counted loosely, so a NEW mutation cannot appear without this pin
+    // being updated deliberately.
+    expect(posts).toBe(11);
     for (const path of [
       "/api/operator/trading-control/start",
       "/api/operator/trading-control/stop-new-trades",
+      "/api/operator/trading-control/pause-new-trades",
+      "/api/operator/trading-control/resume-new-trades",
       "/api/operator/trading-control/safe-off",
       "/api/operator/trading-control/allowlist/validate",
       "/api/operator/trading-control/allowlist",

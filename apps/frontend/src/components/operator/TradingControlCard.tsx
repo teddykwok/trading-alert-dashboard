@@ -37,6 +37,7 @@ import {
 import {
   START_WINDOW_MINUTES,
   TRADING_CONTROL_ACTIONS,
+  describeResumeContext,
   describeStartContext,
   describeSourceTimeframes,
   describeRrLookback,
@@ -403,6 +404,9 @@ function ConfirmDialog({
   const [unlimited, setUnlimited] = useState(false);
   const [capability, setCapability] = useState<SessionCapabilityDto | null>(null);
   const context = status ? describeStartContext(status) : null;
+  // Built from the same authoritative status. Null whenever there is no
+  // session, which is also when Resume is not offered at all.
+  const resumeContext = status ? describeResumeContext(status, formatRemaining) : null;
 
   // The SERVER's own answer about what may be offered. Asked once when the
   // dialog opens; a failure leaves it null, which HIDES Unlimited — the safe
@@ -436,6 +440,43 @@ function ConfirmDialog({
     <div className="space-y-2 rounded-lg border border-yellow-500/40 bg-yellow-500/10 p-3">
       <p className="text-sm font-semibold text-slate-100">{action.label}</p>
       <p className="text-xs text-slate-300">{action.description}</p>
+
+      {/* Resume review: the session that will CONTINUE, and the exposure it
+          will continue under. Every figure comes from the server's status —
+          the panel restates, it never recomputes, and it never predicts the
+          verdict the backend is about to reach. */}
+      {action.id === "RESUME_NEW_TRADES" && resumeContext ? (
+        <dl
+          className="grid grid-cols-2 gap-x-3 gap-y-0.5 rounded border border-surface-border p-2 text-xs text-slate-400"
+          data-testid="resume-review"
+        >
+          <dt>Session</dt>
+          <dd className="text-slate-200">
+            {resumeContext.sessionShortId} ({resumeContext.sessionStatus})
+          </dd>
+          <dt>Opened</dt>
+          <dd className="text-slate-200">{resumeContext.opened}</dd>
+          <dt>Reserved</dt>
+          <dd className="text-slate-200">{resumeContext.reserved}</dd>
+          <dt>Remaining budget</dt>
+          <dd className="text-slate-200">{resumeContext.remaining}</dd>
+          <dt>Time remaining</dt>
+          {/* The ORIGINAL expiry. Resuming does not extend it by one second. */}
+          <dd className="text-slate-200">{resumeContext.timeRemaining}</dd>
+          <dt>Open / pending</dt>
+          <dd className="text-slate-200">
+            {resumeContext.open} / {resumeContext.pending}
+          </dd>
+          <dt>Active</dt>
+          <dd className="text-slate-200">{resumeContext.active}</dd>
+          <dt>Desired open</dt>
+          <dd className="text-slate-200">{resumeContext.desiredOpen}</dd>
+          <dt>Risk</dt>
+          <dd className="text-slate-200">{resumeContext.riskLimit}</dd>
+          <dt>Margin</dt>
+          <dd className="text-slate-200">{resumeContext.marginLimit}</dd>
+        </dl>
+      ) : null}
 
       {action.id === "START" && context ? (
         <dl className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs text-slate-400">
@@ -739,7 +780,12 @@ export function TradingControlCard() {
 
             <div className="flex flex-wrap gap-2">
               {TRADING_CONTROL_ACTIONS.map((action) => {
-                const relevant = status ? isActionRelevant(action.id, status.systemState) : false;
+                // The session is passed in because Pause and Resume depend on it,
+                // not merely on the system state: a paused profile and a
+                // stopped one look identical from `systemState` alone.
+                const relevant = status
+                  ? isActionRelevant(action.id, status.systemState, status.session)
+                  : false;
                 // Start additionally needs the deployment prerequisite. Stop and
                 // Safe Off do NOT: they only ever reduce risk, and must stay
                 // reachable no matter what state the runtime is in.

@@ -153,8 +153,17 @@ export interface TradingControlAuthorizationDto {
 
 export interface TradingControlSessionDto {
   id: string;
-  /** ACTIVE | EXHAUSTED | EXPIRED | REVOKED, derived at read time. */
+  /** ACTIVE | PAUSED | EXHAUSTED | EXPIRED | REVOKED, derived at read time. */
   status: string;
+  /**
+   * Whether Resume is offerable RIGHT NOW.
+   *
+   * Decided by the server, never by the panel comparing strings. A session
+   * that expired or exhausted itself while paused is not resumable however its
+   * stored status reads, and the browser has no clock worth trusting for that
+   * question.
+   */
+  resumable: boolean;
   /** Null when unlimited — which is not a number and must not render as one. */
   tradeBudget: number | null;
   unlimited: boolean;
@@ -381,6 +390,11 @@ export class TradingControlService {
           openedCount: sessionView.openedCount,
           reservedCount: sessionView.reservedCount,
           remaining: sessionView.remaining,
+          // Equivalent to isResumableSession by construction, and derived from
+          // the same value the panel displays so the flag and the label can
+          // never disagree: derivedSessionStatus reports PAUSED only after
+          // ruling out revoked, expired and exhausted.
+          resumable: sessionView.status === "PAUSED",
           startedAt: sessionView.startedAt.toISOString(),
           expiresAt: sessionView.expiresAt.toISOString(),
           endedAt: sessionView.endedAt?.toISOString() ?? null,

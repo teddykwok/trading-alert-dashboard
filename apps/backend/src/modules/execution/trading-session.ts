@@ -164,7 +164,41 @@ export type SessionAdmissionRefusal =
   | "SESSION_REQUIRED"
   | "SESSION_EXPIRED"
   | "SESSION_REVOKED"
-  | "SESSION_BUDGET_EXHAUSTED";
+  | "SESSION_BUDGET_EXHAUSTED"
+  | "SESSION_PAUSED";
+
+/**
+ * The statuses a session may be stopped in, and what that means.
+ *
+ * PAUSED is the ONLY non-terminal one. REVOKED, EXPIRED and EXHAUSTED are
+ * ends: the budget, the clock or the operator finished the session, and the
+ * next step is a NEW session rather than a continuation of this one.
+ *
+ * That distinction is the whole safety argument for Resume. Resuming a paused
+ * session continues something the operator already reviewed — same budget,
+ * same expiry, same counts. "Resuming" a terminal one would be resurrection:
+ * it would have to invent a new expiry or a new budget, which is Start
+ * Trading's job and carries Start Trading's clean-state requirement.
+ */
+export const TERMINAL_SESSION_STATUSES = ["REVOKED", "EXPIRED", "EXHAUSTED"] as const;
+
+/**
+ * Whether this session can be resumed RIGHT NOW.
+ *
+ * Deliberately judged from `derivedSessionStatus` rather than from the stored
+ * column, so a session that expired or exhausted itself WHILE PAUSED is not
+ * resumable even though its column still says PAUSED. Nothing sweeps those
+ * rows, so the stored value alone would be a stale promise.
+ */
+export function isResumableSession(
+  session: Pick<
+    TradingSession,
+    "status" | "expiresAt" | "tradeBudget" | "unlimited" | "openedCount" | "reservedCount"
+  >,
+  now: Date
+): boolean {
+  return derivedSessionStatus(session, now) === "PAUSED";
+}
 
 /**
  * Whether a session may admit a new trade right now, and if not, why.
@@ -191,7 +225,19 @@ export function sessionAdmissionState(
   if (session.status === "EXPIRED" || session.expiresAt <= now) {
     return { admits: false, reasonCode: "SESSION_EXPIRED", message: "The trading session has ended." };
   }
-  if (session.unlimited) return { admits: true };
+  // PAUSED is reported AFTER expiry and budget, and before nothing else,
+  // because the operator's next action is what these codes are for. A paused
+  // session that also expired needs a NEW session, not a Resume — so expiry
+  // wins. A paused session with budget left needs Resume, and says so.
+  //
+  // Note this is the second gate, not the only one: `reserveSessionSlot`'s
+  // conditional UPDATE already requires `status = 'ACTIVE'`, so a paused
+  // session cannot reserve even if some future caller skipped this function.
+  if (session.unlimited) {
+    return session.status === "PAUSED"
+      ? { admits: false, reasonCode: "SESSION_PAUSED", message: PAUSED_MESSAGE }
+      : { admits: true };
+  }
 
   const budget = session.tradeBudget;
   if (budget === null) {
@@ -209,8 +255,14 @@ export function sessionAdmissionState(
       message: `The session's trade budget of ${budget} is fully used or reserved.`,
     };
   }
+  if (session.status === "PAUSED") {
+    return { admits: false, reasonCode: "SESSION_PAUSED", message: PAUSED_MESSAGE };
+  }
   return { admits: true };
 }
+
+const PAUSED_MESSAGE =
+  "New trades are paused. The session is intact — resume it to admit again.";
 
 /** Slots still available. Null means unlimited, which is not a number. */
 export function remainingSessionBudget(
@@ -239,6 +291,11 @@ export function derivedSessionStatus(
   if (session.expiresAt <= now) return "EXPIRED";
   const remaining = remainingSessionBudget(session);
   if (remaining !== null && remaining <= 0) return "EXHAUSTED";
+  // PAUSED is reported LAST of the stopped states, so it is reported only when
+  // the session is genuinely resumable. That makes "status === PAUSED" a
+  // sufficient condition for offering Resume, in the panel and in the service,
+  // rather than something each caller has to re-qualify.
+  if (session.status === "PAUSED") return "PAUSED";
   return "ACTIVE";
 }
 

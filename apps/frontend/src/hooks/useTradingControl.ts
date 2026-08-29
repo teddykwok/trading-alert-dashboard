@@ -3,6 +3,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   fetchTradingControlReadiness,
   fetchTradingControlStatus,
+  postPauseNewTrades,
+  postResumeNewTrades,
   postSafeOff,
   postStartTrading,
   postStopNewTrades,
@@ -199,12 +201,28 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
       setPendingAction(id);
       setActionError(null);
       try {
-        const result =
-          id === "START"
-            ? await postStartTrading(confirmation ?? "", durationMinutes, tradeBudget, unlimited)
-            : id === "STOP_NEW_TRADES"
-              ? await postStopNewTrades()
-              : await postSafeOff();
+        // One switch rather than a nested ternary: five actions is past the
+        // point where the chain reads as a decision instead of a puzzle.
+        let result;
+        switch (id) {
+          case "START":
+            result = await postStartTrading(confirmation ?? "", durationMinutes, tradeBudget, unlimited);
+            break;
+          case "PAUSE_NEW_TRADES":
+            result = await postPauseNewTrades();
+            break;
+          case "RESUME_NEW_TRADES":
+            // The phrase is forwarded verbatim; the SERVER compares it. An
+            // empty string is a refusal there, not a bypass here.
+            result = await postResumeNewTrades(confirmation ?? "");
+            break;
+          case "STOP_NEW_TRADES":
+            result = await postStopNewTrades();
+            break;
+          default:
+            result = await postSafeOff();
+            break;
+        }
         if (generation.current !== mine) return;
         setActionResult(result);
         setReadiness(null);
