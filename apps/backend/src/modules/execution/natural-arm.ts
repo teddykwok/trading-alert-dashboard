@@ -2,9 +2,10 @@ import { Prisma } from "@prisma/client";
 import type { ExecutionCanaryAuthorization, ExecutionSafetyPolicy } from "@prisma/client";
 
 import { CANARY_PREPARE_LOCK_NAMESPACE, MINIMUM_REMAINING_LIFETIME_MS } from "./canary-authorization.service";
-import { CANARY_NATURAL_MAX_CLAIMS, CANARY_PINNED_LIMITS, CANARY_POLICY } from "./canary-readiness";
+import { CANARY_NATURAL_MAX_CLAIMS } from "./canary-readiness";
 import { naturalWindowState, normalizeNaturalDirections } from "./natural-authorization";
 import { profileLockKey } from "./profile-lock";
+import { policyReachabilityViolations } from "./safety-engine";
 
 /**
  * Phase 12.4C — the authoritative half of natural activation.
@@ -155,15 +156,57 @@ export function evaluateNaturalWindowForArm(
   return null;
 }
 
-/** The persisted limits must still be exactly the reviewed envelope. */
-export function policyMatchesReviewedEnvelope(policy: ExecutionSafetyPolicy): boolean {
-  return CANARY_PINNED_LIMITS.every((name) => {
-    const required = CANARY_POLICY[name];
-    const actual = policy[name];
-    // Decimal-exact for the money limits; never a float comparison.
-    if (typeof required === "string") return new Prisma.Decimal(required).equals(actual as Prisma.Decimal);
-    return required === actual;
-  });
+/**
+ * Why the persisted limits are not fit to arm under, or an empty list.
+ *
+ * This used to demand that the row equal a fixed 3/5/5/5/7.50/40 envelope.
+ * That check has been replaced rather than weakened, because the thing it was
+ * really protecting is already protected better, twice over:
+ *
+ *  - "nobody changed the policy since the operator reviewed it" is
+ *    `POLICY_VERSION_CHANGED` above, which compares the row's optimistic-lock
+ *    version against the one the caller reviewed. That catches every edit,
+ *    including one that lands back on the same numbers.
+ *  - "the policy cannot exceed what the environment permits" is the min-merge
+ *    admission applies on every single admission. A row wider than the env
+ *    ceiling changes the row and changes nothing that is enforced.
+ *
+ * What an exact pin added on top of those was not safety, it was a copy of one
+ * historical configuration — and it refused every policy the Trading Policy
+ * Editor was built to let an operator choose.
+ *
+ * What remains is the part that IS about arming: a row that could never trade,
+ * or whose limits contradict each other, must not open a live window. The
+ * rules are the shared ones, so this agrees with the policy write path and
+ * with readiness by construction.
+ *
+ * The env ceiling is deliberately not consulted here. This module is given a
+ * transaction client and no environment, and it does not need one: the merge
+ * can only lower these values, so a row that is usable and self-consistent
+ * cannot merge into one that is not.
+ */
+export function reviewedEnvelopeViolations(policy: ExecutionSafetyPolicy): string[] {
+  const violations: string[] = [];
+  const counts = {
+    maxOpenPositions: policy.maxOpenPositions,
+    maxPendingEntries: policy.maxPendingEntries,
+    maxTotalActiveTrades: policy.maxTotalActiveTrades,
+    maxActivePerSymbolSide: policy.maxActivePerSymbolSide,
+    softOpenPositionTarget: policy.softOpenPositionTarget,
+  };
+  for (const [name, value] of Object.entries(counts)) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      violations.push(`${name} is ${String(value)}, which admits nothing.`);
+    }
+  }
+  for (const name of ["maxTotalPlannedRiskUsd", "maxTotalIsolatedMarginUsd"] as const) {
+    const value = policy[name] as Prisma.Decimal;
+    if (!(value instanceof Prisma.Decimal) || !value.greaterThan(0)) {
+      violations.push(`${name} is ${String(value)}, which reserves nothing.`);
+    }
+  }
+  violations.push(...policyReachabilityViolations(counts));
+  return violations;
 }
 
 function sameSymbols(a: readonly string[], b: readonly string[]): boolean {
@@ -203,8 +246,9 @@ export async function armNaturalWindow(
       `the safety policy moved from version ${input.expectedPolicyVersion} to ${policy.version} after it was reviewed.`
     );
   }
-  if (!policyMatchesReviewedEnvelope(policy)) {
-    return refuse("POLICY_ENVELOPE_MISMATCH", "the persisted limits are no longer the reviewed canary envelope.");
+  const envelopeViolations = reviewedEnvelopeViolations(policy);
+  if (envelopeViolations.length > 0) {
+    return refuse("POLICY_ENVELOPE_MISMATCH", `the persisted limits cannot be armed under: ${envelopeViolations.join(" ")}`);
   }
   if (!sameSymbols(policy.allowedSymbols, input.expectedAllowedSymbols)) {
     return refuse(

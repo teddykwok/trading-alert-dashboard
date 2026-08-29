@@ -1,7 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { OptimisticLockError } from "./execution.service";
-import { CANARY_POLICY, effectiveCanaryLimits, type CanaryPolicyLimits } from "./canary-readiness";
+import { effectiveCanaryLimits, type CanaryPolicyLimits } from "./canary-readiness";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 import { SafetyPolicyService, type SafetyPolicyValues } from "./safety-policy.service";
 
@@ -210,10 +210,9 @@ export async function setPolicy(): Promise<void> {
       console.log(`  ${field}`);
       line("    current row", currentLimits[field]);
       line("    proposed row", proposedLimits[field]);
-      line("    global (env)", globals[field]);
+      line("    env ceiling", globals[field]);
       line("    effective now", effectiveNow[field]);
       line("    effective after", effectiveNext[field]);
-      line("    canary requires", CANARY_POLICY[field]);
     }
 
     if (!confirmed) {
