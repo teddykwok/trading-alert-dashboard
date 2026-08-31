@@ -268,8 +268,18 @@ describe("reconciliation routing", () => {
     ]);
   });
 
-  it("protects a filled entry", async () => {
-    expect(await route("ENTRY_FILLED")).toEqual(["protection.ensureProtectionForExposure"]);
+  it("reconciles closure BEFORE protecting a filled entry", async () => {
+    // Same order as PLACING_PROTECTION and PROTECTED, and load-bearing for the
+    // same reason: a position that filled and then closed appears on a real
+    // exchange as a MISSING positionRisk row, and closure is the only path
+    // that reads absence as flat. Protection reads it as
+    // POSITION_NOT_FOUND_AFTER_FILL and parks the execution for a human
+    // instead — a detour, when CLOSED_EXTERNAL is already a legal transition
+    // straight from ENTRY_FILLED.
+    expect(await route("ENTRY_FILLED")).toEqual([
+      "protection.reconcileProtectionAndClosure",
+      "protection.ensureProtectionForExposure",
+    ]);
   });
 
   it("reconciles closure BEFORE resuming a half-finished protection tranche", async () => {
@@ -434,6 +444,13 @@ describe("reconciliation routing", () => {
       admission: {} as never,
       entry: {} as never,
       protection: {
+        // Closure runs first for ENTRY_FILLED and finds the position still
+        // open, so it writes nothing and hands back the unchanged execution —
+        // which is what routes the tick on to protection below.
+        reconcileProtectionAndClosure: async (input: { executionId: string }) => ({
+          mutationsDispatched: 0,
+          execution: { id: input.executionId, status: "ENTRY_FILLED", version: 1 },
+        }),
         ensureProtectionForExposure: async (input: { executionId: string }) => {
           calls.push(input.executionId);
           if (input.executionId === "bad") throw new Error("exchange unavailable");
