@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
 import { connectTestDatabase } from "./helpers/test-database";
@@ -15,6 +17,7 @@ import type { TradeExecutionStatusName } from "../src/modules/execution/executio
 
 const SYNTHETIC_TAG = "phase7-synthetic";
 const SYMBOL = "TESTPUSDT";
+const BACKEND = process.cwd();
 
 // Env must be set BEFORE config/env.ts is evaluated. The two live-entry gates
 // stay CLOSED on purpose: every Phase 7 mutation is risk-reducing and must
@@ -262,7 +265,9 @@ const readOnlyStub = {
       symbol: SYMBOL,
       status: row.status,
       side: row.side ?? "SELL",
-      positionSide: "LONG",
+      // Defaults to LONG so every pre-existing scenario is unchanged; a row
+      // may name its own side, which a HEDGE-identity test needs.
+      positionSide: row.positionSide ?? "LONG",
       type: row.type ?? "MARKET",
       timeInForce: null,
       price: row.price ?? "0",
@@ -2183,6 +2188,366 @@ describe("entry remainder cleanup before terminal closure", () => {
     scenario.positionAmt = "0";
     scenario.mutations = [];
   }
+
+  // =========================================================================
+  // Stale PLACING_PROTECTION: the exchange moved on and the local row did not
+  // =========================================================================
+
+  /**
+   * The MAINNET incident, as a fixture.
+   *
+   * An entry filled, protection began, and the position later closed on the
+   * exchange while the local row stayed in PLACING_PROTECTION with a STOP that
+   * was never observed and a TAKE_PROFIT still SUBMITTING. It then held an
+   * OPEN slot, a TOTAL_ACTIVE slot, its planned risk and its isolated margin
+   * for as long as the row existed — and reconciliation never moved it,
+   * because the PLACING_PROTECTION branch asked "can I finish placing
+   * protection?" and never "is this position still there?".
+   *
+   * Deliberately generic: no incident symbol or count appears in production
+   * code or here. What is reproduced is the STATE, not the trade.
+   */
+  async function stalePlacingProtection(direction: "LONG" | "SHORT" = "LONG") {
+    const execution = await filledExecution({ direction, filled: "0.100" });
+    const entryClientOrderId = buildClientOrderId(execution.id, "ENTRY", 1);
+    await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: execution.id, role: "ENTRY", generation: 1,
+        clientOrderId: entryClientOrderId, side: direction === "LONG" ? "BUY" : "SELL",
+        positionSide: direction, orderType: "LIMIT", timeInForce: "GTC", price: "100",
+        // Fully filled: there is no remainder that could refill.
+        originalQuantity: "0.100", executedQuantity: "0.100", status: "FILLED",
+      },
+    });
+    scenario.standardOrders.set(entryClientOrderId, {
+      status: "FILLED", executedQty: "0.100", avgPrice: "100", orderId: "EN1",
+      side: direction === "LONG" ? "BUY" : "SELL", positionSide: direction,
+      type: "LIMIT", price: "100", origQty: "0.100",
+    });
+    const moved = await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { status: "PLACING_PROTECTION", version: { increment: 1 } },
+    });
+    await prisma!.executionProtectionState.create({
+      // Mirrors the incident exactly: mid-placement, with NO verified
+      // coverage on either leg.
+      data: {
+        tradeExecutionId: execution.id,
+        state: "PLACING_STOP",
+        confirmedOpenQuantity: "0.100",
+        protectedStopQuantity: "0",
+        protectedTakeProfitQuantity: "0",
+        currentGeneration: 1,
+      },
+    });
+    return moved;
+  }
+
+  /** A protection tranche that was reserved locally but never observed. */
+  async function reserveTranche(
+    executionId: string,
+    role: "STOP_LOSS" | "TAKE_PROFIT",
+    direction: "LONG" | "SHORT",
+    status: string
+  ) {
+    const clientAlgoId = buildClientOrderId(executionId, role, 1);
+    await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: executionId, role, generation: 1,
+        // Both ids are the same deterministic value, exactly as the reservation
+        // transaction writes them.
+        clientOrderId: clientAlgoId, clientAlgoId,
+        side: direction === "LONG" ? "SELL" : "BUY", positionSide: direction,
+        orderType: role === "STOP_LOSS" ? "STOP_MARKET" : "TAKE_PROFIT_MARKET",
+        triggerPrice: role === "STOP_LOSS" ? "96" : "108",
+        workingType: "MARK_PRICE", priceProtect: false,
+        originalQuantity: "0.100", status,
+      },
+    });
+    return clientAlgoId;
+  }
+
+  const closeStale = (execution: { id: string; version: number }) =>
+    protectionService.reconcileProtectionAndClosure({
+      executionId: execution.id, expectedVersion: execution.version, evaluatedAt: at(),
+    });
+
+  // TEST A -------------------------------------------------------------------
+  maybe()("A. a stale PLACING_PROTECTION whose TP already filled closes as CLOSED_TP", async () => {
+    const execution = await stalePlacingProtection();
+    const tpId = await reserveTranche(execution.id, "TAKE_PROFIT", "LONG", "SUBMITTING");
+    // The exchange's answer: our own TP filled and the position is gone.
+    scenario.algoOrders.set(tpId, { algoStatus: "FILLED", executedQty: "0.100", avgPrice: "108" } as never);
+    scenario.positionAmt = "0";
+    scenario.mutations = [];
+
+    await closeStale(execution);
+
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_TP");
+    expect(closed.exitReason).toBe("TAKE_PROFIT");
+    // The exit price is the one the exchange reported; nothing is invented.
+    expect(closed.actualExitPrice?.toString()).toBe("108");
+    // TEST H: terminal convergence writes NOTHING to the exchange.
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  // TEST B -------------------------------------------------------------------
+  maybe()("B. a stale PLACING_PROTECTION whose STOP already filled closes as CLOSED_SL", async () => {
+    const execution = await stalePlacingProtection();
+    const stopId = await reserveTranche(execution.id, "STOP_LOSS", "LONG", "UNKNOWN");
+    scenario.algoOrders.set(stopId, { algoStatus: "FILLED", executedQty: "0.100", avgPrice: "96" } as never);
+    scenario.positionAmt = "0";
+    scenario.mutations = [];
+
+    await closeStale(execution);
+
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_SL");
+    expect(closed.exitReason).toBe("STOP_LOSS");
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  // TEST C -------------------------------------------------------------------
+  maybe()("C. proven flat with no owned fill closes as CLOSED_EXTERNAL, inventing nothing", async () => {
+    const execution = await stalePlacingProtection();
+    // Both tranches are gone from the exchange — PROVEN absent, not merely
+    // unseen — and neither of them filled.
+    const stopId = await reserveTranche(execution.id, "STOP_LOSS", "LONG", "UNKNOWN");
+    const tpId = await reserveTranche(execution.id, "TAKE_PROFIT", "LONG", "SUBMITTING");
+    scenario.queryFailures.delete(stopId);
+    scenario.queryFailures.delete(tpId);
+    scenario.positionAmt = "0";
+    scenario.mutations = [];
+
+    await closeStale(execution);
+
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_EXTERNAL");
+    expect(closed.exitReason).toBe("EXTERNAL");
+    // Nothing is fabricated: no exit price, no realized PnL, no fees.
+    expect(closed.actualExitPrice).toBeNull();
+    expect(closed.realizedPnl).toBeNull();
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  // TEST D -------------------------------------------------------------------
+  maybe()("D. an unreadable position never terminalizes anything", async () => {
+    const execution = await stalePlacingProtection();
+    const originalRead = readOnlyStub.getPositionForSide;
+    readOnlyStub.getPositionForSide = async () => {
+      throw timeoutError("positionRisk");
+    };
+    scenario.mutations = [];
+
+    const outcome = await closeStale(execution);
+
+    readOnlyStub.getPositionForSide = originalRead;
+    expect(outcome.reasonCode).toBe("POSITION_STATE_UNAVAILABLE");
+    // Unchanged, and still recoverable on a later tick.
+    expect((await reload(execution.id)).status).toBe("PLACING_PROTECTION");
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  // TEST E -------------------------------------------------------------------
+  maybe()("E. a position that is still open is never closed", async () => {
+    const execution = await stalePlacingProtection();
+    scenario.positionAmt = "0.100";
+    scenario.mutations = [];
+
+    const outcome = await closeStale(execution);
+
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect((await reload(execution.id)).status).toBe("PLACING_PROTECTION");
+    // Closure performs no protection work of its own; the orchestrator's
+    // resume half owns that, and runs precisely because this returned early.
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  // TEST F -------------------------------------------------------------------
+  maybe()("F. HEDGE identity: a flat LONG closes while a live SHORT is untouched", async () => {
+    // Two executions on the SAME symbol, opposite sides. The stub answers per
+    // positionSide, which is the identity the service reads — a net or
+    // aggregate view would have closed both.
+    const longExecution = await stalePlacingProtection("LONG");
+    const shortExecution = await stalePlacingProtection("SHORT");
+
+    const readPerSide = readOnlyStub.getPositionForSide;
+    readOnlyStub.getPositionForSide = async (_symbol: string, positionSide: string) => {
+      if (positionSide === "LONG") return null; // flat: the row is omitted
+      return {
+        symbol: SYMBOL, positionSide, positionAmt: "-0.100", entryPrice: "100",
+        markPrice: "100", liquidationPrice: "110", isolatedMargin: "3.00",
+        isolatedWallet: "3.00", leverage: "10", unrealizedProfit: "0",
+        notional: "10", marginType: "isolated",
+      } as never;
+    };
+
+    await closeStale(longExecution);
+    await closeStale(shortExecution);
+    readOnlyStub.getPositionForSide = readPerSide;
+
+    expect((await reload(longExecution.id)).status).toBe("CLOSED_EXTERNAL");
+    // The SHORT still has exposure and must keep it.
+    expect((await reload(shortExecution.id)).status).toBe("PLACING_PROTECTION");
+  });
+
+  maybe()("F2. and the mirror image: a flat SHORT closes while a live LONG is untouched", async () => {
+    const longExecution = await stalePlacingProtection("LONG");
+    const shortExecution = await stalePlacingProtection("SHORT");
+
+    const readPerSide = readOnlyStub.getPositionForSide;
+    readOnlyStub.getPositionForSide = async (_symbol: string, positionSide: string) => {
+      if (positionSide === "SHORT") return null;
+      return {
+        symbol: SYMBOL, positionSide, positionAmt: "0.100", entryPrice: "100",
+        markPrice: "100", liquidationPrice: "90", isolatedMargin: "3.00",
+        isolatedWallet: "3.00", leverage: "10", unrealizedProfit: "0",
+        notional: "10", marginType: "isolated",
+      } as never;
+    };
+
+    await closeStale(longExecution);
+    await closeStale(shortExecution);
+    readOnlyStub.getPositionForSide = readPerSide;
+
+    expect((await reload(shortExecution.id)).status).toBe("CLOSED_EXTERNAL");
+    expect((await reload(longExecution.id)).status).toBe("PLACING_PROTECTION");
+  });
+
+  // TEST G -------------------------------------------------------------------
+  maybe()("G. stale UNKNOWN/SUBMITTING generations do not strand a proven-flat trade", async () => {
+    const execution = await stalePlacingProtection();
+    await reserveTranche(execution.id, "STOP_LOSS", "LONG", "UNKNOWN");
+    await reserveTranche(execution.id, "TAKE_PROFIT", "LONG", "SUBMITTING");
+    scenario.positionAmt = "0";
+
+    await closeStale(execution);
+
+    const closed = await reload(execution.id);
+    const { isTerminalStatus: terminal } = await import("../src/modules/execution/execution-status");
+    expect(terminal(closed.status as never)).toBe(true);
+    // The local order rows are NOT rewritten to FILLED to tidy the UI. They
+    // keep whatever the exchange actually proved about them; the EXECUTION's
+    // terminal status is what decides that nothing needs protecting.
+    const orders = await ordersOf(execution.id);
+    for (const order of orders.filter((o) => o.role !== "ENTRY")) {
+      expect(`${order.role}:${order.status}`).not.toBe(`${order.role}:FILLED`);
+    }
+    // And the protection row is closed, so it no longer reads as in-flight.
+    const protection = await prisma!.executionProtectionState.findUnique({
+      where: { tradeExecutionId: execution.id },
+    });
+    expect(protection?.state).toBe("CLOSED");
+  });
+
+  // TEST N -------------------------------------------------------------------
+  maybe()("N. a terminalized execution is never reconciled again", async () => {
+    // Idempotence here is STRUCTURAL, and that is worth stating precisely
+    // rather than asserting a version number. Terminal statuses are excluded
+    // from RECONCILABLE_STATUSES, so once closure has committed one the
+    // orchestrator stops selecting the row at all: there is no second tick to
+    // be idempotent about, and no second terminal transition, session
+    // accounting, notification or exchange write can occur.
+    const { RECONCILABLE_STATUSES, RECOVERY_REQUIRED_STATUSES } = await import(
+      "../src/modules/execution/execution-orchestrator"
+    );
+    const { TERMINAL_STATUSES } = await import("../src/modules/execution/execution-status");
+
+    for (const terminal of TERMINAL_STATUSES) {
+      expect(`${terminal}:${[...RECONCILABLE_STATUSES].includes(terminal as never)}`).toBe(
+        `${terminal}:false`
+      );
+      // And it stops counting toward recoveryPending, which is what kept the
+      // incident's stale rows blocking new work indefinitely.
+      expect(`${terminal}:${[...RECOVERY_REQUIRED_STATUSES].includes(terminal as never)}`).toBe(
+        `${terminal}:false`
+      );
+    }
+  });
+
+  maybe()("N2. and a direct repeat never rewrites the terminal fact or writes to the exchange", async () => {
+    // Belt and braces: even called directly — which the orchestrator never
+    // does — closure must not restate the outcome, duplicate the journal, or
+    // touch the exchange.
+    const execution = await stalePlacingProtection();
+    const tpId = await reserveTranche(execution.id, "TAKE_PROFIT", "LONG", "SUBMITTING");
+    scenario.algoOrders.set(tpId, { algoStatus: "FILLED", executedQty: "0.100", avgPrice: "108" } as never);
+    scenario.positionAmt = "0";
+
+    await closeStale(execution);
+    const first = await reload(execution.id);
+    expect(first.status).toBe("CLOSED_TP");
+
+    const eventsAfterFirst = await prisma!.executionEvent.count({
+      where: { tradeExecutionId: execution.id },
+    });
+    const alertsAfterFirst = await prisma!.criticalAlert.count({
+      where: { tradeExecutionId: execution.id },
+    });
+    scenario.mutations = [];
+
+    for (let index = 0; index < 3; index += 1) await closeStale(await reload(execution.id));
+    const after = await reload(execution.id);
+
+    // The terminal fact and its attribution are never rewritten.
+    expect(after.status).toBe("CLOSED_TP");
+    expect(after.exitReason).toBe("TAKE_PROFIT");
+    expect(after.closedAt?.getTime()).toBe(first.closedAt?.getTime());
+    expect(after.actualExitPrice?.toString()).toBe(first.actualExitPrice?.toString());
+    // No duplicate journal entries and no duplicate operator alerts.
+    expect(await prisma!.executionEvent.count({ where: { tradeExecutionId: execution.id } })).toBe(
+      eventsAfterFirst
+    );
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBe(
+      alertsAfterFirst
+    );
+    // And nothing is ever sent to the exchange for a finished trade.
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  // TEST I / P ---------------------------------------------------------------
+  maybe()("I/P. terminalizing releases live exposure and the protection warning", async () => {
+    const { consumesOpenPosition, consumesTotalActive, consumesNoCapacity } = await import(
+      "../src/modules/execution/capacity-status"
+    );
+
+    // The panel counts FILLED_WITHOUT_VERIFIED_PROTECTION over exactly these
+    // statuses. The list is module-private to trading-control.service.ts, so
+    // it is restated here and pinned against that file, rather than imported.
+    const FILLED_UNPROTECTED_STATUSES = ["PARTIALLY_FILLED", "ENTRY_FILLED", "PLACING_PROTECTION"];
+    const controlSource = readFileSync(
+      path.join(BACKEND, "src/modules/operator/trading-control.service.ts"),
+      "utf8"
+    );
+    for (const status of FILLED_UNPROTECTED_STATUSES) {
+      expect(controlSource).toContain(`"${status}",`);
+    }
+
+    const execution = await stalePlacingProtection();
+    // Before: it occupies an OPEN slot, an ACTIVE slot, and its risk and
+    // margin count toward the aggregate ceilings.
+    expect(consumesOpenPosition("PLACING_PROTECTION")).toBe(true);
+    expect(consumesTotalActive("PLACING_PROTECTION")).toBe(true);
+    // And it is exactly what FILLED_WITHOUT_VERIFIED_PROTECTION counts.
+    expect([...FILLED_UNPROTECTED_STATUSES]).toContain("PLACING_PROTECTION");
+
+    const tpId = await reserveTranche(execution.id, "TAKE_PROFIT", "LONG", "SUBMITTING");
+    scenario.algoOrders.set(tpId, { algoStatus: "FILLED", executedQty: "0.100", avgPrice: "108" } as never);
+    scenario.positionAmt = "0";
+
+    await closeStale(execution);
+
+    const closed = await reload(execution.id);
+    // After: it consumes nothing and is not a filled-unprotected position.
+    // Exposure is a LIVE query over these status groups, so fixing the
+    // lifecycle is what fixes the numbers — no counter is adjusted anywhere.
+    expect(consumesOpenPosition(closed.status as never)).toBe(false);
+    expect(consumesTotalActive(closed.status as never)).toBe(false);
+    expect(consumesNoCapacity(closed.status as never)).toBe(true);
+    expect([...FILLED_UNPROTECTED_STATUSES]).not.toContain(closed.status);
+    expect(closed.requiresManualIntervention).toBe(false);
+  });
 
   maybe()("1. cancels the remaining entry BEFORE the protection siblings, then CLOSED_TP", async () => {
     const { execution } = await partiallyFilledEntryProtected();

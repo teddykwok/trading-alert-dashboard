@@ -131,7 +131,32 @@ const TRANSITIONS: Record<TradeExecutionStatusName, readonly TradeExecutionStatu
     "CLOSED_EXTERNAL",
     "MANUAL_INTERVENTION",
   ],
-  PLACING_PROTECTION: ["PROTECTED", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "MANUAL_INTERVENTION"],
+  // CLOSED_TP and CLOSED_SL are reachable from here, not only from PROTECTED.
+  //
+  // PLACING_PROTECTION means the entry FILLED and protection was being built,
+  // so a tranche may already be resting on the exchange — a TAKE_PROFIT in
+  // SUBMITTING is exactly the state this incident found. If such an order is
+  // later proven FILLED by its own deterministic clientAlgoId, that is the
+  // strongest attribution available, and stronger than the CLOSED_EXTERNAL
+  // this list used to force.
+  //
+  // Without these two, closure reconciliation could prove "our own TP filled"
+  // and then fail to record it, because the terminal write is gated on
+  // `canTransition`. The trade would be journalled as an unattributed external
+  // close, or left stuck entirely. Both are worse than the truth.
+  //
+  // This does NOT weaken anything: reaching a terminal status still requires
+  // the full closure proof — position flat for this symbol AND positionSide,
+  // no partial protection exit, the entry remainder neutralized and re-checked
+  // for refill, and every owned sibling observed and resolved.
+  PLACING_PROTECTION: [
+    "PROTECTED",
+    "CLOSED_TP",
+    "CLOSED_SL",
+    "CLOSED_EMERGENCY",
+    "CLOSED_EXTERNAL",
+    "MANUAL_INTERVENTION",
+  ],
   PROTECTED: ["CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "MANUAL_INTERVENTION"],
   // Terminal.
   ENTRY_EXPIRED: [],

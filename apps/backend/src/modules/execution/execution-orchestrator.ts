@@ -462,9 +462,37 @@ export class ExecutionOrchestrator {
         case "ENTRY_FILLED":
           return (await this.deps.protection.ensureProtectionForExposure(input)).mutationsDispatched;
 
-        // A half-finished protection tranche: resume, never re-reserve.
-        case "PLACING_PROTECTION":
-          return (await this.deps.protection.resumeProtectionLifecycle(input)).mutationsDispatched;
+        // A half-finished protection tranche. Closure FIRST, then resume — the
+        // same order PROTECTED and MANUAL_INTERVENTION already use, and it is
+        // load-bearing for the same reason.
+        //
+        // This case used to call `resumeProtectionLifecycle` alone, and that is
+        // what stranded the executions this fix exists for. An entry that
+        // filled and then closed on the exchange — by our own TP or SL, or by
+        // anything else — leaves the position flat. Resume routes to
+        // `ensureProtectionForExposure`, which reads a MISSING position row as
+        // POSITION_NOT_FOUND_AFTER_FILL and parks the execution, and reads a
+        // zero-quantity row by handing off to closure. Neither is the right
+        // first question for an execution whose position may simply be gone,
+        // and the parking path is strictly worse: it turns an ordinary close
+        // into a MANUAL_INTERVENTION a human has to clear.
+        //
+        // Closure asks the right question directly. It owns the flat case, it
+        // is the only path that reads a missing position row as flat, and it
+        // fails closed on an unreadable one. If the position is still open it
+        // returns without terminalizing and the resume below runs exactly as
+        // before, so nothing about the live-exposure path changes.
+        case "PLACING_PROTECTION": {
+          const closure = await this.deps.protection.reconcileProtectionAndClosure(input);
+          // Terminalized, escalated, or otherwise moved on: closure owns it.
+          if (closure.execution.status !== "PLACING_PROTECTION") return closure.mutationsDispatched;
+
+          const resumed = await this.deps.protection.resumeProtectionLifecycle({
+            ...input,
+            expectedVersion: closure.execution.version,
+          });
+          return closure.mutationsDispatched + resumed.mutationsDispatched;
+        }
 
         // Verified protection: watch for closure AND for coverage drift.
         //

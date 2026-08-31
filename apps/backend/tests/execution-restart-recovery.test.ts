@@ -113,7 +113,18 @@ function freshRuntime(db: FakeDatabase, exchange: FakeExchange) {
       for (const id of [`tad-sl-1-${executionId}`, `tad-tp-1-${executionId}`]) {
         exchange.queriedClientOrderIds.push(id);
       }
-      return { mutationsDispatched: 0 };
+      // The EXECUTION is returned, exactly as the real service's `outcome()`
+      // always does. Callers decide what to do next by reading
+      // `closure.execution.status` — PROTECTED, MANUAL_INTERVENTION and now
+      // PLACING_PROTECTION all do — so a fake that omitted it made closure look
+      // like it had terminalized every execution it touched.
+      //
+      // Nothing here models a position, which is correct for this suite: it
+      // asks who gets CALLED after a restart. Whether a position is flat is
+      // closure's own business and is covered against the real service in
+      // `stale-terminal-reconciliation.test.ts`.
+      const row = db.executions.find((e) => e.id === executionId)!;
+      return { mutationsDispatched: 0, execution: row };
     },
   };
 
