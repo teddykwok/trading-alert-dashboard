@@ -134,6 +134,27 @@ export interface ReconcileTickResult {
   progressed: number;
   mutationsDispatched: number;
   recoveryPending: number;
+  /**
+   * How many rows match RECONCILABLE_STATUSES table-wide, at the end of the
+   * tick. Telemetry only — nothing branches on it.
+   *
+   * `inspected` is one bounded window of this pool; this is the pool. Reading
+   * `inspected: 10` every tick cannot distinguish a cursor most of the way
+   * through a short queue from one a fraction of the way through a long one,
+   * and those imply opposite conclusions about an execution that has not
+   * changed: not reached yet, versus reached and did nothing.
+   *
+   * Null means the supplemental count itself failed, never zero.
+   */
+  reconcilableTotal: number | null;
+  /**
+   * Whether the fairness cursor still held continuation state when the tick
+   * ended: true mid-cycle, false back at the oldest row.
+   *
+   * A boolean deliberately. Which row the cursor sits on is of no operational
+   * interest, and execution identifiers do not belong in runtime telemetry.
+   */
+  cursorActive: boolean;
   failed: boolean;
 }
 
@@ -276,6 +297,8 @@ export class ExecutionOrchestrator {
       progressed: 0,
       mutationsDispatched: 0,
       recoveryPending: 0,
+      reconcilableTotal: null,
+      cursorActive: false,
       failed: false,
     };
     const versionsBefore = new Map<string, number>();
@@ -326,6 +349,20 @@ export class ExecutionOrchestrator {
       // tick that throws mid-batch leaves the cursor alone and retries the
       // same window rather than skipping past unserviced rows.
       this.advanceReconciliationCursor(executions, batchSize);
+      result.cursorActive = this.reconcileCursor !== null;
+
+      // The size of the pool the cursor is rotating through, in its OWN try
+      // for the same reason `progressed` above has one: an observability
+      // metric must never be able to abort the reconciliation it reports on.
+      // A failure leaves the field null, which reads as unknown, not as zero.
+      try {
+        result.reconcilableTotal = await this.countReconcilable();
+      } catch (error) {
+        logger.warn(
+          { error: error instanceof Error ? error.message.slice(0, 300) : "unknown" },
+          "Reconciliation backlog count failed — telemetry only, the tick itself is unaffected"
+        );
+      }
 
       result.recoveryPending = await this.countRecoveryRequired();
     } catch (error) {
@@ -830,6 +867,22 @@ export class ExecutionOrchestrator {
         : "Execution startup recovery complete"
     );
     return result;
+  }
+
+  /**
+   * Executions currently eligible for reconciliation, table-wide.
+   *
+   * Reads the SAME RECONCILABLE_STATUSES constant as
+   * `selectReconciliationBatch`, so the reported total can never describe a
+   * different set from the one the cursor actually walks. A COUNT over the
+   * indexed `status` column: no execution rows are loaded, and it is strictly
+   * cheaper than `countRecoveryRequired`, which already runs every tick and
+   * whose OR reaches an unindexed column.
+   */
+  async countReconcilable(): Promise<number> {
+    return this.deps.prisma.tradeExecution.count({
+      where: { status: { in: [...RECONCILABLE_STATUSES] } },
+    });
   }
 
   /** Executions whose exposure is not yet provably resolved. */

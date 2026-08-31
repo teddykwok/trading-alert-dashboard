@@ -39,6 +39,7 @@ const { SafetyAdmissionService } = await import("../src/modules/execution/safety
 const { CriticalAlertService } = await import("../src/modules/execution/critical-alert.service");
 const { ExecutionService } = await import("../src/modules/execution/execution.service");
 const { buildClientOrderId } = await import("../src/modules/execution/execution-safety");
+const { RECONCILABLE_STATUSES } = await import("../src/modules/execution/execution-orchestrator");
 
 const maybe = () => (available ? it : it.skip);
 
@@ -173,6 +174,9 @@ function makeWorker() {
   const visited: string[] = [];
   const orchestrator = workerOrchestrator(visited);
   return {
+    // Exposed for the telemetry cases below, which need the same seam the
+    // scheduler holds: ONE long-lived orchestrator.
+    orchestrator,
     async tick() {
       visited.length = 0;
       const result = await orchestrator.runExecutionReconciliationTick();
@@ -615,5 +619,182 @@ describe("F3-F12. fairness without side effects", () => {
     expect((await reload(placing.id)).status).toBe("CLOSED_EXTERNAL");
     // A live PARTIALLY_FILLED is protected rather than closed.
     expect((await reload(partial.id)).status).not.toBe("CLOSED_EXTERNAL");
+  });
+});
+
+// ===========================================================================
+// B1-B8 - the backlog measurement, and what it must not disturb
+// ===========================================================================
+
+/**
+ * `inspected` alone cannot be interpreted.
+ *
+ * A window of ten is either the whole queue nearly drained or a thirtieth of
+ * one, and those imply opposite things about a row that has not changed. These
+ * pin the denominator: what it counts, that it is whole-table rather than
+ * batch-shaped, that it stays distinct from `recoveryPending`, and above all
+ * that measuring cannot disturb the thing measured.
+ */
+describe("B1-B8. reconciliation backlog telemetry", () => {
+  /** 26 rows admission declines, plus the one parked row that needs recovery. */
+  async function twentySevenRows() {
+    const base = Date.parse("2026-08-31T09:00:00.000Z");
+    // Parked with a NON-recoverable reason: a faithful no-op, and the only
+    // recovery-required row, which is what makes the two counts differ.
+    const parked = await persistExecution({
+      status: "MANUAL_INTERVENTION",
+      parkedReason: "POSITION_IDENTITY_MISMATCH",
+      updatedAt: new Date(base),
+    });
+    const planned = [];
+    for (let index = 1; index < 27; index += 1) {
+      planned.push(
+        await persistExecution({ status: "PLAN_READY", updatedAt: new Date(base + index * 1000) })
+      );
+    }
+    // Real behaviour rather than a contrivance: with recovery outstanding,
+    // `admitAndSubmit` returns RECOVERY_REQUIRED before touching any row.
+    return { parked, planned };
+  }
+
+  maybe()("B1. the count uses the production RECONCILABLE_STATUSES, not its own list", async () => {
+    // One row per lifecycle status. Whatever the constant says is eligible is
+    // exactly what the count returns: no terminal row leaks in, and no
+    // reconcilable status is forgotten.
+    const every = [
+      "PLAN_READY", "PREFLIGHT", "ENTRY_SUBMITTING", "ENTRY_PENDING", "PARTIALLY_FILLED",
+      "ENTRY_FILLED", "PLACING_PROTECTION", "PROTECTED", "MANUAL_INTERVENTION",
+      "ENTRY_EXPIRED", "CLOSED_TP", "CLOSED_SL", "CANCELED", "SKIPPED", "FAILED",
+      "CLOSED_EMERGENCY", "CLOSED_EXTERNAL",
+    ];
+    const base = Date.parse("2026-08-31T09:00:00.000Z");
+    for (let index = 0; index < every.length; index += 1) {
+      await persistExecution({ status: every[index], updatedAt: new Date(base + index * 1000) });
+    }
+
+    const total = await makeWorker().orchestrator.countReconcilable();
+
+    // The expectation is derived from the production constant rather than
+    // restated here, so widening it cannot silently desynchronise the two.
+    expect(total).toBe(RECONCILABLE_STATUSES.length);
+    expect(total).toBeLessThan(every.length);
+  });
+
+  maybe()("B2. the total is whole-table, not the batch length", async () => {
+    await twentySevenRows();
+
+    const { result } = await makeWorker().tick();
+
+    // The distinction the live investigation needed: one bounded window over a
+    // pool nearly three times its size.
+    expect(result.inspected).toBe(10);
+    expect(result.reconcilableTotal).toBe(27);
+    expect(result.reconcilableTotal).not.toBe(result.inspected);
+  });
+
+  maybe()("B3. recoveryPending keeps its own, narrower meaning", async () => {
+    await twentySevenRows();
+
+    const { result } = await makeWorker().tick();
+
+    expect(result.reconcilableTotal).toBe(27);
+    // Unchanged: rows whose exposure is not yet provably resolved.
+    expect(result.recoveryPending).toBe(1);
+  });
+
+  maybe()("B4. the total falls when an execution terminalizes through canonical behaviour", async () => {
+    // The starved row is FLAT, so closure terminalizes it on the tick that
+    // reaches it. Nothing here pushes the count down by hand.
+    const { starved } = await elevenRows();
+    const worker = makeWorker();
+
+    const first = await worker.tick();
+    expect(first.result.reconcilableTotal).toBe(11);
+    expect((await reload(starved.id)).status).toBe("ENTRY_FILLED");
+
+    const second = await worker.tick();
+    expect((await reload(starved.id)).status).toBe("CLOSED_EXTERNAL");
+    // CLOSED_EXTERNAL is not reconcilable, so the pool the cursor rotates
+    // through is genuinely one smaller.
+    expect(second.result.reconcilableTotal).toBe(10);
+  });
+
+  maybe()("B5. a failing telemetry count cannot fail the reconciliation it reports on", async () => {
+    const { starved } = await elevenRows();
+    const worker = makeWorker();
+    (worker.orchestrator as unknown as { countReconcilable: () => Promise<number> })
+      .countReconcilable = async () => {
+        throw new Error("backlog count exploded");
+      };
+
+    const first = await worker.tick();
+    const second = await worker.tick();
+
+    for (const { result } of [first, second]) {
+      expect(result.failed).toBe(false);
+      // Unknown, which is not the same claim as an empty pool.
+      expect(result.reconcilableTotal).toBeNull();
+    }
+    expect(first.result.inspected).toBe(10);
+    // recoveryPending is a separate query and still answers.
+    expect(first.result.recoveryPending).toBe(11);
+    // And the real work still happened: the starved row closed anyway.
+    expect((await reload(starved.id)).status).toBe("CLOSED_EXTERNAL");
+  });
+
+  maybe()("B6. measuring the backlog writes nothing", async () => {
+    const { parked, planned } = await twentySevenRows();
+    const rows = [parked, ...planned];
+    const before = await Promise.all(rows.map((row) => reload(row.id)));
+    scenario.mutations = [];
+
+    const worker = makeWorker();
+    for (let index = 0; index < 3; index += 1) {
+      expect((await worker.tick()).result.reconcilableTotal).toBe(27);
+    }
+
+    const after = await Promise.all(rows.map((row) => reload(row.id)));
+    for (let index = 0; index < before.length; index += 1) {
+      expect(after[index].status).toBe(before[index].status);
+      expect(after[index].version).toBe(before[index].version);
+      expect(after[index].updatedAt.getTime()).toBe(before[index].updatedAt.getTime());
+      expect(after[index].lastReconciledAt?.getTime()).toBe(before[index].lastReconciledAt?.getTime());
+      expect(after[index].filledQuantity?.toString()).toBe(before[index].filledQuantity?.toString());
+    }
+    // Nothing durable landed elsewhere either, and nothing was sent. These
+    // synthetic rows carry no session, so the accounting these executions
+    // could touch is exactly the event, alert and protection state below.
+    const ids = rows.map((row) => row.id);
+    expect(await prisma!.executionEvent.count({ where: { tradeExecutionId: { in: ids } } })).toBe(0);
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: { in: ids } } })).toBe(0);
+    expect(
+      await prisma!.executionProtectionState.count({ where: { tradeExecutionId: { in: ids } } })
+    ).toBe(1);
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  maybe()("B8. cursorActive reports rotation state and carries no row identity", async () => {
+    const { parked, planned } = await twentySevenRows();
+    const worker = makeWorker();
+
+    // 27 rows at batchSize 10: two full windows, then a short one that ends
+    // the cycle and rewinds the cursor. The existing wrap behaviour, observed
+    // rather than altered.
+    const flags: boolean[] = [];
+    const payloads: string[] = [];
+    for (let index = 0; index < 3; index += 1) {
+      const { result } = await worker.tick();
+      flags.push(result.cursorActive);
+      payloads.push(JSON.stringify(result));
+    }
+    expect(flags).toEqual([true, true, false]);
+
+    // Nothing that could identify a row reaches telemetry.
+    for (const payload of payloads) {
+      for (const row of [parked, ...planned]) {
+        expect(payload).not.toContain(row.id);
+        expect(payload).not.toContain(row.symbol);
+      }
+    }
   });
 });

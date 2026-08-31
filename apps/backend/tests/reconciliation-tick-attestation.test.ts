@@ -74,6 +74,8 @@ function orchestratorReturning(
     progressed: number;
     mutationsDispatched: number;
     recoveryPending: number;
+    reconcilableTotal: number | null;
+    cursorActive: boolean;
     failed: boolean;
   }> = {},
   options: { throws?: boolean; hangs?: boolean } = {}
@@ -84,6 +86,8 @@ function orchestratorReturning(
     progressed: 0,
     mutationsDispatched: 0,
     recoveryPending: 0,
+    reconcilableTotal: null,
+    cursorActive: false,
     failed: false,
     ...result,
   };
@@ -269,6 +273,8 @@ describe("T5. heartbeat activity is not reconciliation activity", () => {
       attempted: 2,
       progressed: 1,
       recoveryPending: 3,
+      reconcilableTotal: null,
+      cursorActive: false,
     });
   });
 });
@@ -367,6 +373,7 @@ describe("T8/T10. counters and unchanged health semantics", () => {
     );
     expect(reconciliationAttestation().lastTickResult).toEqual({
       inspected: 10, attempted: 5, progressed: 5, recoveryPending: 0,
+      reconcilableTotal: null, cursorActive: false,
     });
 
     // A failing pass must not overwrite them with its own numbers.
@@ -375,6 +382,7 @@ describe("T8/T10. counters and unchanged health semantics", () => {
     );
     expect(reconciliationAttestation().lastTickResult).toEqual({
       inspected: 10, attempted: 5, progressed: 5, recoveryPending: 0,
+      reconcilableTotal: null, cursorActive: false,
     });
 
     // A later good pass replaces them wholesale.
@@ -383,6 +391,7 @@ describe("T8/T10. counters and unchanged health semantics", () => {
     );
     expect(reconciliationAttestation().lastTickResult).toEqual({
       inspected: 1, attempted: 0, progressed: 0, recoveryPending: 2,
+      reconcilableTotal: null, cursorActive: false,
     });
   });
 
@@ -407,5 +416,128 @@ describe("T8/T10. counters and unchanged health semantics", () => {
     expect(health.label).toBe("reconciliation tick");
     // Still healthy: three minutes is the stall threshold, not five ms.
     expect(health.healthy).toBe(true);
+  });
+});
+
+// ===========================================================================
+// B7 - the backlog fields on the wire
+// ===========================================================================
+
+/**
+ * The published shape, which is what an operator actually reads.
+ *
+ * `inspected` was never interpretable on its own; these prove the denominator
+ * travels with it, that "unknown" survives the JSON round trip as null rather
+ * than collapsing to zero, and that adding the fields changed nothing a reader
+ * already depended on.
+ */
+describe("B7. reconciliation backlog reaches the published payload", () => {
+  function publish(redis: RuntimeAttestationRedis) {
+    return createRuntimeAttestationPublisher({
+      role: "WORKER",
+      redis,
+      identity: IDENTITY,
+      gates: GATES,
+      reconciliation: reconciliationAttestation,
+    });
+  }
+
+  it("B7a. the WORKER payload carries the pool size beside the window", async () => {
+    const { redis, store } = fakeRedis();
+
+    await runReconciliationTickOnce(
+      orchestratorReturning({
+        inspected: 10, advanced: 0, progressed: 0, recoveryPending: 1,
+        reconcilableTotal: 327, cursorActive: true,
+      })
+    );
+    await publish(redis).publishOnce();
+
+    const payload = JSON.parse([...store.values()][0]) as {
+      schemaVersion: number;
+      reconciliation: ReconciliationAttestation;
+    };
+    // The live signature that could not be interpreted, now with its
+    // denominator: ten of three hundred and twenty-seven per tick.
+    expect(payload.reconciliation.lastTickResult).toEqual({
+      inspected: 10,
+      attempted: 0,
+      progressed: 0,
+      recoveryPending: 1,
+      reconcilableTotal: 327,
+      cursorActive: true,
+    });
+    // Additive optional fields inside an optional block. No version bump.
+    expect(payload.schemaVersion).toBe(RUNTIME_ATTESTATION_SCHEMA_VERSION);
+  });
+
+  it("B7b. an unavailable count publishes null, never zero", async () => {
+    const { redis, store } = fakeRedis();
+
+    await runReconciliationTickOnce(
+      orchestratorReturning({ inspected: 10, recoveryPending: 1, reconcilableTotal: null })
+    );
+    await publish(redis).publishOnce();
+
+    const payload = JSON.parse([...store.values()][0]) as {
+      reconciliation: ReconciliationAttestation;
+    };
+    // JSON keeps null distinct from 0, and the two mean opposite things: one
+    // says the pool could not be measured, the other that it is empty.
+    expect(payload.reconciliation.lastTickResult?.reconcilableTotal).toBeNull();
+    expect(payload.reconciliation.lastTickResult?.reconcilableTotal).not.toBe(0);
+  });
+
+  it("B7c. a reader that predates the fields still parses the payload", async () => {
+    const { redis, store } = fakeRedis();
+
+    await runReconciliationTickOnce(
+      orchestratorReturning({ inspected: 10, reconcilableTotal: 327, cursorActive: true })
+    );
+    await publish(redis).publishOnce();
+
+    // The deployment reader validates the required envelope and passes the
+    // rest through, so the added fields cannot make an attestation
+    // unreadable - which is the whole basis for not bumping schemaVersion.
+    const status = await readRuntimeDeploymentAttestationStatus({ redis, identity: IDENTITY });
+    expect(status.worker.freshCount).toBe(1);
+    expect(status.worker.staleCount).toBe(0);
+    expect(status.worker.gates).not.toBeNull();
+  });
+
+  it("B7d. a payload written WITHOUT the new fields is still valid", async () => {
+    // The reverse direction: a worker still running the previous build during
+    // a rolling restart. Its reconciliation block simply lacks the fields.
+    const { redis, store } = fakeRedis();
+    await publish(redis).publishOnce();
+    const [key, raw] = [...store.entries()][0];
+    const legacy = JSON.parse(raw) as Record<string, unknown>;
+    legacy.reconciliation = {
+      lastTickStartedAt: "2026-08-31T09:55:32.416Z",
+      lastTickCompletedAt: "2026-08-31T09:55:32.568Z",
+      lastTickTrigger: "PERIODIC",
+      lastTickResult: { inspected: 10, attempted: 0, progressed: 0, recoveryPending: 1 },
+    };
+    store.set(key, JSON.stringify(legacy));
+
+    const status = await readRuntimeDeploymentAttestationStatus({ redis, identity: IDENTITY });
+    expect(status.worker.freshCount).toBe(1);
+    expect(status.worker.staleCount).toBe(0);
+  });
+
+  it("B7e. a BACKEND payload is unaffected", async () => {
+    const { redis, store } = fakeRedis();
+    await createRuntimeAttestationPublisher({
+      role: "BACKEND",
+      redis,
+      identity: IDENTITY,
+      gates: GATES,
+    }).publishOnce();
+
+    const payload = JSON.parse([...store.values()][0]) as Record<string, unknown>;
+    // The backend runs no scheduler, so it still says nothing at all about
+    // reconciliation rather than saying zero.
+    expect(payload.reconciliation).toBeUndefined();
+    expect(payload.schemaVersion).toBe(RUNTIME_ATTESTATION_SCHEMA_VERSION);
   });
 });

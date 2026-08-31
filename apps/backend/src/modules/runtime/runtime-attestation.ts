@@ -112,6 +112,16 @@ export interface ReconciliationAttestation {
     attempted: number;
     progressed: number;
     recoveryPending: number;
+    /**
+     * Rows matching RECONCILABLE_STATUSES table-wide when the pass ended.
+     *
+     * The denominator for `inspected`: one tick covers at most `batchSize` of
+     * these, so a full rotation takes ceil(total / batchSize) ticks. Null when
+     * the count failed, which is distinct from an empty pool.
+     */
+    reconcilableTotal: number | null;
+    /** Whether the fairness cursor was mid-rotation. Carries no row identity. */
+    cursorActive: boolean;
   } | null;
 }
 
