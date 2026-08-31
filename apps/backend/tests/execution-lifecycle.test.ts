@@ -65,7 +65,16 @@ describe("execution state machine", () => {
       "ENTRY_FILLED",
       ["PLACING_PROTECTION", "CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "MANUAL_INTERVENTION"],
     ],
-    ["PLACING_PROTECTION", ["PROTECTED", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "MANUAL_INTERVENTION"]],
+    // CLOSED_TP / CLOSED_SL are reachable from here as well as from
+    // PROTECTED. PLACING_PROTECTION means the entry FILLED and a protection
+    // tranche may already be resting on the exchange, so one of OUR orders can
+    // fill before coverage was ever verified. When closure proves that
+    // happened, the trade is journalled as what actually closed it rather than
+    // downgraded to an unattributed external close.
+    [
+      "PLACING_PROTECTION",
+      ["PROTECTED", "CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "MANUAL_INTERVENTION"],
+    ],
     ["PROTECTED", ["CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "MANUAL_INTERVENTION"]],
     // The two documented ways out of a parked execution, both requiring
     // exchange proof: a verified emergency close, or a position proven flat

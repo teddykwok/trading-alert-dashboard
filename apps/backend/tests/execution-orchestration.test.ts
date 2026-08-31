@@ -272,8 +272,18 @@ describe("reconciliation routing", () => {
     expect(await route("ENTRY_FILLED")).toEqual(["protection.ensureProtectionForExposure"]);
   });
 
-  it("resumes a half-finished protection tranche rather than reserving a new one", async () => {
-    expect(await route("PLACING_PROTECTION")).toEqual(["protection.resumeProtectionLifecycle"]);
+  it("reconciles closure BEFORE resuming a half-finished protection tranche", async () => {
+    // Same order, and same reason, as PROTECTED below. An entry that filled
+    // and then closed on the exchange leaves the position flat, and closure is
+    // the ONLY path that reads a missing position row as flat. Resuming first
+    // sent that case to ensureProtectionForExposure, which parked it as
+    // POSITION_NOT_FOUND_AFTER_FILL — or, when the row existed with quantity
+    // zero, simply never progressed. Both left the execution holding capacity
+    // forever after the trade was over.
+    expect(await route("PLACING_PROTECTION")).toEqual([
+      "protection.reconcileProtectionAndClosure",
+      "protection.resumeProtectionLifecycle",
+    ]);
   });
 
   it("watches a protected position for closure", async () => {

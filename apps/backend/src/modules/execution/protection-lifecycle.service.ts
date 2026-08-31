@@ -765,6 +765,38 @@ export class ProtectionLifecycleService {
     const positionSide = protectionPositionSide(direction);
     const protection = await this.ensureProtectionRow(execution.id);
 
+    // Already finished: there is nothing left to prove and nothing left to do.
+    //
+    // The same guard `resumeProtectionLifecycle` opens with, and for the same
+    // reason. Without it a repeated call re-commits the SAME terminal status —
+    // appending a duplicate PROTECTION_CLEANUP event and moving `closedAt`
+    // each time — because `commitExecutionChange` permits a terminal
+    // self-transition. The attribution never changed, so nothing was ever
+    // wrong; it simply restated a finished fact once per call.
+    //
+    // The orchestrator does not reach this today: terminal statuses are
+    // excluded from RECONCILABLE_STATUSES, so a closed execution is never
+    // selected for another tick. That makes this cheap insurance rather than a
+    // live bug fix — and it means any future caller, or a direct operator
+    // tool, cannot churn a finished trade's journal.
+    //
+    // The protection row is still settled here, because the branch below that
+    // handles "another reconciliation winner terminalized this" does exactly
+    // that: a terminal execution whose protection row is still open would
+    // otherwise keep reading as in-flight.
+    if (isTerminalStatus(execution.status as TradeExecutionStatusName)) {
+      if (protection.state !== "CLOSED") {
+        await this.setProtectionState(protection.id, "CLOSED", "PROTECTION_VERIFIED", "Execution is already terminal.");
+      }
+      return this.outcome(
+        true,
+        "PROTECTION_VERIFIED",
+        `Execution is already terminal (${execution.status}).`,
+        execution,
+        await this.loadProtection(execution.id)
+      );
+    }
+
     const position = await this.readPosition(execution.symbol, positionSide);
     if (position === "UNAVAILABLE") {
       return this.outcome(false, "POSITION_STATE_UNAVAILABLE", "Position state could not be read.", execution, protection);
