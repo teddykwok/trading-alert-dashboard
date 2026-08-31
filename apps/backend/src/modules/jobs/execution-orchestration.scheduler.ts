@@ -8,6 +8,7 @@ import { ExecutionService } from "../execution/execution.service";
 import { ProtectionLifecycleService } from "../execution/protection-lifecycle.service";
 import { CriticalAlertService } from "../execution/critical-alert.service";
 import { ExecutionOrchestrator } from "../execution/execution-orchestrator";
+import type { ReconcileTickResult } from "../execution/execution-orchestrator";
 
 /**
  * Phase 11A.1 — production registration of the execution orchestrator.
@@ -96,6 +97,70 @@ export function createExecutionOrchestrator(): ExecutionOrchestrator {
     // thing only: recording that reconciling an execution threw.
     executions: new ExecutionService(prisma),
   });
+}
+
+/** Which pass ran. Both count as reconciliation activity. */
+export type ReconciliationTrigger = "STARTUP" | "PERIODIC";
+
+/**
+ * The last pass, for attestation.
+ *
+ * Module state, exactly like the in-flight fields above, and for the same
+ * reason: the scheduler is a singleton per process and this describes that
+ * process. Nothing here is persisted — it is published on the heartbeat the
+ * worker already sends, and a restart correctly resets it to "no pass yet".
+ */
+let lastTickStartedAtMs: number | null = null;
+let lastTickCompletedAtMs: number | null = null;
+let lastTickTrigger: ReconciliationTrigger | null = null;
+let lastTickResult: ReconcileTickResult | null = null;
+
+/**
+ * What this process can honestly say about its reconciliation activity.
+ *
+ * Deliberately SEPARATE from `reconciliationHealth()`. Health decides whether
+ * the runtime may be armed over and is consumed by the attestation interlock;
+ * changing what it means would change launcher readiness, and a first tick
+ * that has not happened yet must not make a SAFE start look unfit. This is
+ * telemetry: it reports, it gates nothing.
+ */
+export function reconciliationAttestation(): {
+  lastTickStartedAt: string | null;
+  lastTickCompletedAt: string | null;
+  lastTickTrigger: ReconciliationTrigger | null;
+  lastTickResult: { inspected: number; attempted: number; progressed: number; recoveryPending: number } | null;
+} {
+  return {
+    lastTickStartedAt: lastTickStartedAtMs === null ? null : new Date(lastTickStartedAtMs).toISOString(),
+    lastTickCompletedAt:
+      lastTickCompletedAtMs === null ? null : new Date(lastTickCompletedAtMs).toISOString(),
+    lastTickTrigger,
+    lastTickResult:
+      lastTickResult === null
+        ? null
+        : {
+            inspected: lastTickResult.inspected,
+            // `attempted` is what the tick log calls `advanced`: dispatches,
+            // not progress. Named here as the operator already reads it.
+            attempted: lastTickResult.advanced,
+            progressed: lastTickResult.progressed,
+            recoveryPending: lastTickResult.recoveryPending,
+          },
+  };
+}
+
+/**
+ * Records that a COMPLETED pass produced this result.
+ *
+ * Only a pass that returned without failing reaches here, so a hung pass never
+ * advances the completed timestamp and a failed one never publishes counters
+ * that describe work it did not finish.
+ */
+function recordCompletedTick(trigger: ReconciliationTrigger, result: ReconcileTickResult): void {
+  if (result.failed) return;
+  lastTickCompletedAtMs = Date.now();
+  lastTickTrigger = trigger;
+  lastTickResult = result;
 }
 
 export interface ReconciliationHealth {
@@ -195,6 +260,9 @@ async function runSingleFlight(label: string, run: () => Promise<void>): Promise
   tickInFlight = true;
   tickStartedAtMs = startedAtMs;
   tickLabel = label;
+  // Stamped only after the busy check above, so a suppressed overlapping pass
+  // is never mistaken for one that ran.
+  lastTickStartedAtMs = startedAtMs;
   try {
     await run();
   } catch (error) {
@@ -225,6 +293,7 @@ export async function runReconciliationTickOnce(
 ): Promise<void> {
   await runSingleFlight("reconciliation tick", async () => {
     const result = await orchestrator.runExecutionReconciliationTick();
+    recordCompletedTick("PERIODIC", result);
     if (result.inspected > 0) {
       logger.info(
         {
@@ -255,7 +324,11 @@ export async function runReconciliationTickOnce(
  */
 export async function runStartupRecoveryOnce(orchestrator: ExecutionOrchestrator): Promise<void> {
   await runSingleFlight("startup recovery", async () => {
-    await orchestrator.runStartupRecovery();
+    // Startup recovery IS a reconciliation pass — it runs the same tick with a
+    // larger batch — so it counts. Distinguishing it from the periodic pass is
+    // what makes "recovery ran but the interval never fired" readable.
+    const result = await orchestrator.runStartupRecovery();
+    recordCompletedTick("STARTUP", result);
   });
 }
 
@@ -291,4 +364,11 @@ export function resetOrchestrationTickGuardForTests(): void {
   tickStartedAtMs = null;
   tickLabel = null;
   lastStallReportAtMs = null;
+  // The telemetry is module state too, so it has to be cleared here or a test
+  // inherits the previous one's passes and "no tick has ever run" becomes
+  // unassertable.
+  lastTickStartedAtMs = null;
+  lastTickCompletedAtMs = null;
+  lastTickTrigger = null;
+  lastTickResult = null;
 }
