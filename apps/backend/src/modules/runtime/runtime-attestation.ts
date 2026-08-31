@@ -80,6 +80,41 @@ export interface RuntimeGateSnapshot {
   emergencyCloseMode: string;
 }
 
+/**
+ * What the last reconciliation pass did, for the role that runs one.
+ *
+ * `lastSeenAt` proves a process is publishing; it says nothing about whether
+ * that process is doing its job. For the WORKER those are different questions
+ * and the difference has already cost an investigation: reconciliation health
+ * reports healthy whenever no pass is IN FLIGHT, which is also true of a
+ * worker that has never run a pass at all. Alive and idle were
+ * indistinguishable from outside the process.
+ *
+ * These three answer it. Absent timestamps mean no pass has begun; a started
+ * timestamp with no completed one means a pass began and did not finish.
+ */
+export interface ReconciliationAttestation {
+  /** When the most recent pass BEGAN. Null until the first one does. */
+  lastTickStartedAt: string | null;
+  /**
+   * When the most recent pass finished SUCCESSFULLY.
+   *
+   * Only a pass that ran to completion without failing sets this, so a hung or
+   * failed pass leaves it behind the started timestamp rather than advancing
+   * it into a claim that work completed.
+   */
+  lastTickCompletedAt: string | null;
+  /** Which pass it was. Startup recovery and the periodic tick both count. */
+  lastTickTrigger: "STARTUP" | "PERIODIC" | null;
+  /** The counters of the last COMPLETED pass. Never a partial one. */
+  lastTickResult: {
+    inspected: number;
+    attempted: number;
+    progressed: number;
+    recoveryPending: number;
+  } | null;
+}
+
 export interface RuntimeAttestation {
   schemaVersion: number;
   role: RuntimeRole;
@@ -89,6 +124,15 @@ export interface RuntimeAttestation {
   accountIdentifier: string;
   environment: string;
   gates: RuntimeGateSnapshot;
+  /**
+   * Present only for a role that reconciles, which today is the WORKER.
+   *
+   * OPTIONAL, and deliberately so: `parseAttestation` validates the fields it
+   * requires and passes everything else through untouched, so an older reader
+   * ignores this and a newer reader simply finds it absent on a BACKEND
+   * payload. No schemaVersion change is needed, and none is made.
+   */
+  reconciliation?: ReconciliationAttestation;
 }
 
 /** Only the two commands used, so tests need no Redis server. */
@@ -184,6 +228,15 @@ export interface RuntimeAttestationPublisherOptions {
   healthy?: () => boolean;
   /** Called once each time the publisher transitions into withdrawal. */
   onWithdraw?: () => void;
+  /**
+   * The reconciliation telemetry to attach to each heartbeat.
+   *
+   * A callback rather than a value because it is read at PUBLISH time — the
+   * payload has to describe the pass that most recently ran, not the state at
+   * construction. Omitted by roles that do not reconcile, which is what keeps
+   * this module free of any knowledge of the scheduler.
+   */
+  reconciliation?: () => ReconciliationAttestation;
 }
 
 export interface RuntimeAttestationPublisher {
@@ -273,6 +326,7 @@ export function createRuntimeAttestationPublisher(
       accountIdentifier: identity.accountIdentifier,
       environment: identity.environment,
       gates,
+      ...(options.reconciliation ? { reconciliation: options.reconciliation() } : {}),
     };
     await withPublishTimeout(
       Promise.resolve(options.redis.set(key, JSON.stringify(payload), "PX", ttlMs)),

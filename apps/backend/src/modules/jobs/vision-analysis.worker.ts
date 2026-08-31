@@ -30,6 +30,7 @@ import { startAlertQueueRecoveryScheduler } from "./alert-queue-recovery.schedul
 import {
   createExecutionOrchestrator,
   isReconciliationHealthy,
+  reconciliationAttestation,
   startExecutionOrchestrationScheduler,
 } from "./execution-orchestration.scheduler";
 import { BinanceMarginPlanService } from "../binance/binance-margin-plan.service";
@@ -321,6 +322,12 @@ const runtimeAttestation = createRuntimeAttestationPublisher({
   // activation only — protection and reconciliation of executions already
   // admitted never consult attestation.
   healthy: isReconciliationHealthy,
+  // What this worker's reconciliation has actually DONE, on every heartbeat.
+  //
+  // `healthy` above answers "is a pass hung?", and answers it identically for
+  // a worker that is idle between passes and one that has never run a pass at
+  // all. This is the field that tells those apart, and it gates nothing.
+  reconciliation: reconciliationAttestation,
   onWithdraw: () =>
     logger.error(
       {},
