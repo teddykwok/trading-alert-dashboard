@@ -1,3 +1,4 @@
+import { logger } from "../../config/logger";
 import { Prisma } from "@prisma/client";
 import type {
   ExecutionEventType,
@@ -160,7 +161,112 @@ export const IMMUTABLE_PLANNED_FIELDS = [
   "exchangeFiltersSnapshot",
 ] as const;
 
+/**
+ * The stable code every unexpected reconciliation throw is recorded under.
+ *
+ * One code rather than a family: the point is to capture an error nobody has
+ * classified yet. The sanitized message carries what actually happened, and a
+ * recognised failure that deserves its own code should be handled where it
+ * arises rather than here.
+ */
+export const RECONCILIATION_FAILURE_REASON_CODE = "RECONCILIATION_FAILED";
+
 export class ExecutionService {
+  /**
+   * Persist evidence that reconciling ONE execution threw.
+   *
+   * ## Why an ExecutionEvent
+   *
+   * It is the repository's existing execution-scoped durable record, it
+   * already renders in the Execution Detail timeline with no frontend change,
+   * and `FAILURE_RECORDED` already exists for exactly this shape of fact. A
+   * CriticalAlert was the alternative and was rejected: alerts are DELIVERED
+   * by the Phase 9 dispatcher, so a repeatedly-throwing execution would page
+   * the operator on a schedule, and the failure is a diagnostic rather than a
+   * new hazard — the hazard it describes is already visible as
+   * FILLED_WITHOUT_VERIFIED_PROTECTION and in recoveryPending.
+   *
+   * ## Deduplication
+   *
+   * The worker ticks every 30 seconds, so a permanent failure must not append
+   * 120 rows an hour. One record is kept per (execution, failure, state):
+   * the latest event is read first, and an identical FAILURE_RECORDED at the
+   * same execution version and status is left alone.
+   *
+   * Version is what makes that safe rather than merely quiet. A throw commits
+   * nothing, so the version cannot move while the same failure repeats — and
+   * the moment anything about the execution DOES move, the next failure is a
+   * genuinely new fact and is recorded again.
+   *
+   * The unique constraint on (tradeExecutionId, sequenceNumber) is the
+   * backstop: two racing writers cannot both land, and the loser is treated as
+   * "already recorded" rather than as an error.
+   *
+   * ## Never fatal
+   *
+   * Wrapped whole. Diagnostics must not be able to break the reconciliation
+   * they describe, so a failure to record is logged and swallowed — the batch
+   * continues and the original error is never masked.
+   */
+  async recordReconciliationFailure(
+    execution: TradeExecution,
+    detail: string,
+    evaluatedAt: Date
+  ): Promise<void> {
+    try {
+      const latest = await this.prisma.executionEvent.findFirst({
+        where: { tradeExecutionId: execution.id },
+        orderBy: { sequenceNumber: "desc" },
+        select: { sequenceNumber: true, eventType: true, reasonCode: true, message: true, metadata: true },
+      });
+
+      // Already recorded for this exact failure, in this exact state.
+      if (
+        latest?.eventType === "FAILURE_RECORDED" &&
+        latest.reasonCode === RECONCILIATION_FAILURE_REASON_CODE &&
+        latest.message === detail &&
+        (latest.metadata as { executionVersion?: number } | null)?.executionVersion === execution.version
+      ) {
+        return;
+      }
+
+      await this.prisma.executionEvent.create({
+        data: {
+          tradeExecutionId: execution.id,
+          // NOT `execution.version`: elsewhere a sequence number IS the version
+          // the committing transaction produced, and nothing commits here, so
+          // that number is already taken by the event of the last real
+          // transition. Appending after the highest keeps the timeline ordered
+          // without colliding with it.
+          sequenceNumber: (latest?.sequenceNumber ?? 0) + 1,
+          eventType: "FAILURE_RECORDED",
+          // Deliberately no toStatus: nothing transitioned. Recording one would
+          // claim a lifecycle change that did not happen.
+          fromStatus: execution.status,
+          reasonCode: RECONCILIATION_FAILURE_REASON_CODE,
+          message: detail,
+          metadata: sanitizeMetadata({
+            executionVersion: execution.version,
+            status: execution.status,
+            evaluatedAt: evaluatedAt.toISOString(),
+          }) as Prisma.InputJsonValue,
+        },
+      });
+    } catch (recordingError) {
+      // Includes the unique-constraint loser of a race, which is a correct
+      // outcome rather than a problem. Never rethrown: the original failure is
+      // what matters and the batch must continue.
+      logger.warn(
+        {
+          executionId: execution.id,
+          error:
+            recordingError instanceof Error ? recordingError.message.slice(0, 200) : "unknown",
+        },
+        "Could not persist reconciliation-failure evidence — the batch continues"
+      );
+    }
+  }
+
   constructor(private readonly prisma: PrismaClient) {}
 
   // -------------------------------------------------------------------------

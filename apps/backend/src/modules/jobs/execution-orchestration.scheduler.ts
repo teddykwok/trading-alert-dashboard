@@ -4,6 +4,7 @@ import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { BinanceUsdMExecutionClient } from "../binance/binance-execution.client";
 import { SafetyAdmissionService } from "../execution/safety-admission.service";
 import { EntryLifecycleService } from "../execution/entry-lifecycle.service";
+import { ExecutionService } from "../execution/execution.service";
 import { ProtectionLifecycleService } from "../execution/protection-lifecycle.service";
 import { CriticalAlertService } from "../execution/critical-alert.service";
 import { ExecutionOrchestrator } from "../execution/execution-orchestrator";
@@ -91,6 +92,9 @@ export function createExecutionOrchestrator(): ExecutionOrchestrator {
     admission: new SafetyAdmissionService(prisma, readOnly),
     entry: new EntryLifecycleService(prisma, readOnly, mutations),
     protection: new ProtectionLifecycleService(prisma, readOnly, mutations, alerts),
+    // Durable execution rows and events. The orchestrator uses it for one
+    // thing only: recording that reconciling an execution threw.
+    executions: new ExecutionService(prisma),
   });
 }
 
