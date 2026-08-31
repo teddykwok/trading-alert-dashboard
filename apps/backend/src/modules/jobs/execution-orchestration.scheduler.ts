@@ -128,7 +128,14 @@ export function reconciliationAttestation(): {
   lastTickStartedAt: string | null;
   lastTickCompletedAt: string | null;
   lastTickTrigger: ReconciliationTrigger | null;
-  lastTickResult: { inspected: number; attempted: number; progressed: number; recoveryPending: number } | null;
+  lastTickResult: {
+    inspected: number;
+    attempted: number;
+    progressed: number;
+    recoveryPending: number;
+    reconcilableTotal: number | null;
+    cursorActive: boolean;
+  } | null;
 } {
   return {
     lastTickStartedAt: lastTickStartedAtMs === null ? null : new Date(lastTickStartedAtMs).toISOString(),
@@ -145,6 +152,10 @@ export function reconciliationAttestation(): {
             attempted: lastTickResult.advanced,
             progressed: lastTickResult.progressed,
             recoveryPending: lastTickResult.recoveryPending,
+            // The whole pool, so `inspected` can be read as the fraction of it
+            // one tick covers rather than as the amount of work outstanding.
+            reconcilableTotal: lastTickResult.reconcilableTotal,
+            cursorActive: lastTickResult.cursorActive,
           },
   };
 }
