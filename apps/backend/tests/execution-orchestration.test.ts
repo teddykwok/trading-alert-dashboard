@@ -443,6 +443,10 @@ describe("reconciliation routing", () => {
       readOnly: {} as never,
       admission: {} as never,
       entry: {} as never,
+      // The recorder the catch delegates to. Supplied so this fake matches
+      // production; the orchestrator also guards the call, so a fake without
+      // it would still not abort the batch.
+      executions: { recordReconciliationFailure: async () => undefined } as never,
       protection: {
         // Closure runs first for ENTRY_FILLED and finds the position still
         // open, so it writes nothing and hands back the unchanged execution —

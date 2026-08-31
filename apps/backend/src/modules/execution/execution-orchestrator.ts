@@ -3,6 +3,7 @@ import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import type { EntryLifecycleService } from "./entry-lifecycle.service";
+import type { ExecutionService } from "./execution.service";
 import type { ProtectionLifecycleService } from "./protection-lifecycle.service";
 import type { SafetyAdmissionService } from "./safety-admission.service";
 // The SAME open-position classification and min-merge admission uses, so the
@@ -77,6 +78,16 @@ const UNRESOLVED_FILLED_EXPOSURE_REASONS: readonly string[] = [
   "EXECUTION_HAS_NO_CONFIRMED_FILL",
 ];
 
+/**
+ * The stable code every unexpected reconciliation throw is recorded under.
+ *
+ * One code rather than a family: the point is to capture an error nobody has
+ * classified yet. The sanitized message carries what actually happened, and a
+ * recognised failure that deserves its own code should be handled where it
+ * arises rather than here.
+ */
+export const RECONCILIATION_FAILURE_REASON_CODE = "RECONCILIATION_FAILED";
+
 /** Statuses that mean unresolved exposure may exist and must be resolved first. */
 export const RECOVERY_REQUIRED_STATUSES = [
   "ENTRY_SUBMITTING",
@@ -92,6 +103,8 @@ export interface OrchestratorDependencies {
   admission: SafetyAdmissionService;
   entry: EntryLifecycleService;
   protection: ProtectionLifecycleService;
+  /** Owns durable execution rows and events; used here only for diagnostics. */
+  executions: ExecutionService;
   /** Defaults to the configured identity; injected in tests. */
   profileIdentity?: ProfileIdentity;
 }
@@ -667,14 +680,38 @@ export class ExecutionOrchestrator {
       }
     } catch (error) {
       // One bad execution must not abort the whole batch.
+      const detail = error instanceof Error ? error.message.slice(0, 200) : "unknown";
       logger.warn(
-        {
-          executionId: execution.id,
-          status: execution.status,
-          error: error instanceof Error ? error.message.slice(0, 200) : "unknown",
-        },
+        { executionId: execution.id, status: execution.status, error: detail },
         "Execution reconciliation failed for one execution — continuing with the rest"
       );
+
+      // The log line above is the ONLY record this used to leave, and the
+      // launcher spawns the worker with `stdio: "ignore"` — so on a real
+      // runtime it goes to NUL and the error is gone. An execution can
+      // therefore fail to reconcile on every tick for hours while looking, to
+      // an operator, exactly like an execution nothing has tried to touch.
+      //
+      // That is what happened: a filled MAINNET position sat unprotected with
+      // a timeline whose last entry predated the failures entirely.
+      //
+      // Recording it durably costs one row and makes the next occurrence
+      // diagnosable from the execution's own timeline.
+      // Delegated, never written here. The orchestrator routes and counts;
+      // every durable write in this system belongs to a service, and a
+      // structural test keeps that boundary honest.
+      // Guarded at the CALL SITE as well as inside the recorder.
+      //
+      // The recorder catches its own persistence failures, but that only
+      // helps once it has been entered — a missing or malformed dependency
+      // throws on the property access itself, inside this catch, and would
+      // escape `reconcileOne` and abort the rest of the batch. Diagnostics
+      // must never be able to do that, so the delegation is wrapped too.
+      try {
+        await this.deps.executions.recordReconciliationFailure(execution, detail, evaluatedAt);
+      } catch {
+        // Already logged above; the batch continues regardless.
+      }
       return 0;
     }
   }
