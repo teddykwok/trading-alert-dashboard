@@ -228,6 +228,22 @@ const RECOVERABLE_INTERVENTION_REASON_CODES: readonly ProtectionReasonCode[] = [
   "STOP_NOT_VERIFIED",
   "STOP_IDENTITY_MISMATCH",
   "STOP_SUBMISSION_RESULT_UNKNOWN",
+  // A filled position whose exchange state could not be READ.
+  //
+  // Every other entry in this list describes something we observed and could
+  // not resolve. This one describes the opposite: we observed NOTHING. It
+  // asserts no contradiction about the position and no failed submission — it
+  // says only that the read did not answer, which is by nature transient.
+  //
+  // That makes it the most recoverable park in the file rather than the least.
+  // Un-parking is still gated on fresh proof: Gate 4 re-reads the position and
+  // stays parked while the read is still failing, and refuses to un-park a
+  // flat one because closure owns that. So the worst case of listing it here
+  // is that recovery declines again, exactly as it does today.
+  //
+  // Not listing it was what would have stranded a live, unprotected position
+  // for a human after nothing worse than a timeout.
+  "POSITION_STATE_UNAVAILABLE",
 ];
 
 function isRecoverableInterventionReason(reasonCode: string | null): boolean {
@@ -533,6 +549,43 @@ export class ProtectionLifecycleService {
     // Everything else is driven by the current exposure, which also resolves
     // any half-submitted protection tranche via its own clientAlgoId.
     return this.ensureProtectionForExposure(input);
+  }
+
+  /**
+   * Park a FILLED execution whose exposure could not be resolved this tick.
+   *
+   * The narrow public door onto `escalate`, for one specific and dangerous
+   * shape: a confirmed fill, no verified protection, and a reconciliation pass
+   * that could neither protect it nor prove it closed. Left alone that state
+   * is inert forever — the MAINNET incident sat in it, filled and unprotected,
+   * while every tick reported nothing to do.
+   *
+   * Parking does NOT invent exposure and does not submit anything. It records
+   * the durable safety state the repository already uses for "this needs
+   * attention", raises the existing critical alert, and — because
+   * POSITION_STATE_UNAVAILABLE is a recoverable intervention reason — lets the
+   * ordinary MANUAL_INTERVENTION route un-park it automatically once the
+   * exchange answers again.
+   *
+   * Deliberately NOT called for a healthy PROTECTED execution: a transient
+   * read failure over verified coverage is not an emergency, and parking it
+   * would churn a position that is already protected.
+   */
+  async parkUnresolvedFilledExposure(
+    input: ProtectionLifecycleInput,
+    reasonCode: ProtectionReasonCode,
+    message: string
+  ): Promise<ProtectionOutcome> {
+    const execution = await this.loadExecution(input.executionId);
+    if (isTerminalStatus(execution.status as TradeExecutionStatusName)) {
+      return this.outcome(false, "MANUAL_REVIEW_REQUIRED", `Execution is terminal (${execution.status}).`, execution);
+    }
+    if (execution.requiresManualIntervention) {
+      // Already parked. Re-stamping would churn the version and the journal
+      // for a fact that is already recorded.
+      return this.outcome(false, reasonCode, "Execution is already parked.", execution);
+    }
+    return this.escalate(execution, reasonCode, message, input);
   }
 
   // ==========================================================================

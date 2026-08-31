@@ -61,7 +61,11 @@ class FakeDatabase {
  * Builds an ENTIRELY FRESH runtime over surviving durable state. Every call
  * returns new service objects — this is the restart.
  */
-function freshRuntime(db: FakeDatabase, exchange: FakeExchange) {
+function freshRuntime(
+  db: FakeDatabase,
+  exchange: FakeExchange,
+  options: { positionFlat?: boolean } = {}
+) {
   const entry = {
     resumeEntrySubmission: async ({ executionId }: { executionId: string }) => {
       // Resume asks about the SAME deterministic id rather than submitting.
@@ -76,8 +80,17 @@ function freshRuntime(db: FakeDatabase, exchange: FakeExchange) {
       return { mutationsDispatched: 0, execution: { version: 1 } };
     },
     reconcileEntryOrder: async ({ executionId }: { executionId: string }) => {
-      exchange.queriedClientOrderIds.push(`tad-en-1-${executionId}`);
-      return { mutationsDispatched: 0, execution: { version: 1 } };
+      const clientOrderId = `tad-en-1-${executionId}`;
+      exchange.queriedClientOrderIds.push(clientOrderId);
+      // Discovering a fill is what entry reconciliation DOES. Modelling it is
+      // what makes the lost-fill path testable end to end.
+      const existing = exchange.orders.get(clientOrderId);
+      const row = db.executions.find((e) => e.id === executionId)!;
+      if (existing?.status === "FILLED" && row.status === "ENTRY_PENDING") {
+        row.status = "ENTRY_FILLED";
+        row.version += 1;
+      }
+      return { mutationsDispatched: 0, execution: { version: row.version } };
     },
     expireEntryOrderIfDue: async () => ({ mutationsDispatched: 0, execution: { version: 1 } }),
     prepareEntrySubmission: async ({ executionId }: { executionId: string }) => {
@@ -124,6 +137,13 @@ function freshRuntime(db: FakeDatabase, exchange: FakeExchange) {
       // closure's own business and is covered against the real service in
       // `stale-terminal-reconciliation.test.ts`.
       const row = db.executions.find((e) => e.id === executionId)!;
+      // A flat position terminalizes here, which is exactly what closure does
+      // on the real service when positionRisk omits the row. Nothing is sent
+      // to the exchange for a position that is already gone.
+      if (options.positionFlat && row.status !== "CLOSED_EXTERNAL") {
+        row.status = "CLOSED_EXTERNAL";
+        row.version += 1;
+      }
       return { mutationsDispatched: 0, execution: row };
     },
   };
@@ -210,6 +230,53 @@ describe("restart after fill before protection", () => {
 
     expect(db.executions[0].status).toBe("PROTECTED");
     expect(exchange.submittedAlgoIds.sort()).toEqual(["tad-sl-1-exec-1", "tad-tp-1-exec-1"]);
+  });
+
+  // TEST L -------------------------------------------------------------------
+  it("L. a fill that landed while the worker was away is routed into protection", async () => {
+    // The dangerous shape, and the one this repository has actually seen: a
+    // resting LIMIT fills while nothing is watching. On return, entry
+    // reconciliation discovers the fill and the execution becomes
+    // ENTRY_FILLED — and it must not STOP there. Real exposure with no stop
+    // and no target is the whole reason this test exists.
+    const db = new FakeDatabase([stored("ENTRY_PENDING")]);
+    const exchange = new FakeExchange();
+    // The exchange filled it while the worker was down.
+    exchange.orders.set("tad-en-1-exec-1", { status: "FILLED", executedQty: "294" });
+
+    // Pass 1: the worker comes back and discovers the fill.
+    const first = freshRuntime(db, exchange);
+    await first.orchestrator.runStartupRecovery();
+    expect(db.executions[0].status).toBe("ENTRY_FILLED");
+    // Nothing was protected yet — the tick routed on the status it read at the
+    // start of the pass, which was ENTRY_PENDING.
+    expect(exchange.submittedAlgoIds).toEqual([]);
+
+    // Pass 2: the very next reconciliation must protect the exposure.
+    const second = freshRuntime(db, exchange);
+    await second.orchestrator.runStartupRecovery();
+
+    expect(db.executions[0].status).toBe("PROTECTED");
+    expect(exchange.submittedAlgoIds.sort()).toEqual(["tad-sl-1-exec-1", "tad-tp-1-exec-1"]);
+    // And the entry was never resubmitted while all this happened.
+    expect(exchange.submittedClientOrderIds).toEqual([]);
+  });
+
+  it("L2. and a recovered fill whose position is already gone converges instead", async () => {
+    // Same discovery, opposite exchange reality: the position closed before
+    // the worker returned. Closure runs first for ENTRY_FILLED, so the row
+    // terminalizes rather than being protected — and rather than being parked
+    // for a human, which is what happened before closure ran first here.
+    const db = new FakeDatabase([stored("ENTRY_FILLED")]);
+    const exchange = new FakeExchange();
+    exchange.orders.set("tad-en-1-exec-1", { status: "FILLED", executedQty: "294" });
+
+    const runtime = freshRuntime(db, exchange, { positionFlat: true });
+    await runtime.orchestrator.runStartupRecovery();
+
+    expect(db.executions[0].status).toBe("CLOSED_EXTERNAL");
+    // Nothing was sent to the exchange for a position that no longer exists.
+    expect(exchange.submittedAlgoIds).toEqual([]);
   });
 
   it("does not duplicate a STOP that is already verified", async () => {

@@ -64,6 +64,19 @@ export const RECONCILABLE_STATUSES = [
   "MANUAL_INTERVENTION",
 ] as const;
 
+/**
+ * Protection refusals that leave a FILLED execution completely unresolved.
+ *
+ * Both write nothing, escalate nothing and dispatch nothing, so an execution
+ * that keeps hitting one of them never moves and never raises anything. Named
+ * here so the ENTRY_FILLED route can turn that silence into the repository's
+ * ordinary parked-and-alerted state.
+ */
+const UNRESOLVED_FILLED_EXPOSURE_REASONS: readonly string[] = [
+  "POSITION_STATE_UNAVAILABLE",
+  "EXECUTION_HAS_NO_CONFIRMED_FILL",
+];
+
 /** Statuses that mean unresolved exposure may exist and must be resolved first. */
 export const RECOVERY_REQUIRED_STATUSES = [
   "ENTRY_SUBMITTING",
@@ -459,8 +472,108 @@ export class ExecutionOrchestrator {
           return reconciled.mutationsDispatched + protection.mutationsDispatched + withdrawn.mutationsDispatched;
         }
 
-        case "ENTRY_FILLED":
-          return (await this.deps.protection.ensureProtectionForExposure(input)).mutationsDispatched;
+        // Exposure exists and nothing has been built on it yet. Closure FIRST,
+        // then protection — the same order PLACING_PROTECTION, PROTECTED and
+        // MANUAL_INTERVENTION already use, and load-bearing for the same
+        // reason plus one more that only applies here.
+        //
+        // The shared reason: on a real exchange a closed position is a MISSING
+        // positionRisk row, and closure is the only path that reads absence as
+        // flat. `ensureProtectionForExposure` reads the same absence as
+        // POSITION_NOT_FOUND_AFTER_FILL and parks the execution at
+        // MANUAL_INTERVENTION — so an entry that filled and then closed, by a
+        // stop, a target or an operator, took a detour through a human queue
+        // before another tick could terminalize it. Closure reaches
+        // CLOSED_EXTERNAL (or CLOSED_TP / CLOSED_SL on owned evidence)
+        // directly, and every one of those is already a legal transition from
+        // ENTRY_FILLED.
+        //
+        // The reason specific to ENTRY_FILLED: this is the FIRST state in
+        // which real exposure exists with no protection row and no protection
+        // orders yet. `ensureProtectionForExposure` has two early returns that
+        // write nothing at all and escalate nothing —
+        // EXECUTION_HAS_NO_CONFIRMED_FILL and POSITION_STATE_UNAVAILABLE — so
+        // an execution that hits either one stays ENTRY_FILLED, with no
+        // protection row, indefinitely. That is precisely the shape the
+        // MAINNET incident left behind: filled, holding an OPEN slot and its
+        // risk and margin, with reconciliation reporting attempted 0 forever.
+        // Asking closure first gives the row a second, independent chance to
+        // resolve on authoritative exchange state.
+        //
+        // Live exposure is unaffected: closure returns early, writing nothing,
+        // while the position is still open, and protection then runs exactly
+        // as it does today.
+        case "ENTRY_FILLED": {
+          const closure = await this.deps.protection.reconcileProtectionAndClosure(input);
+          // Terminalized, escalated, or otherwise moved on: closure owns it.
+          if (closure.execution.status !== "ENTRY_FILLED") return closure.mutationsDispatched;
+
+          let dispatched = closure.mutationsDispatched;
+          let protection = await this.deps.protection.ensureProtectionForExposure({
+            ...input,
+            expectedVersion: closure.execution.version,
+          });
+          dispatched += protection.mutationsDispatched;
+
+          // --- Repair a missing confirmed fill, never invent one -----------
+          //
+          // `ensureProtectionForExposure` refuses outright when
+          // `TradeExecution.filledQuantity` is not positive, and that refusal
+          // writes nothing and escalates nothing — so an execution that
+          // reached ENTRY_FILLED without that field populated would sit inert
+          // while its position was live and unprotected.
+          //
+          // Detected by REASON CODE rather than by inspecting the field here.
+          // The orchestrator routes; it does not do arithmetic, and protection
+          // is the authority on what counts as a confirmed fill.
+          //
+          // `reconcileEntryOrder` is the canonical repair and the only one
+          // used: it re-queries the entry by its own deterministic
+          // clientOrderId and writes the quantity the EXCHANGE reports.
+          // Nothing is guessed. If the query cannot answer, the fill stays
+          // unset and the park below catches it.
+          if (protection.reasonCode === "EXECUTION_HAS_NO_CONFIRMED_FILL") {
+            const reconciled = await this.deps.entry.reconcileEntryOrder({
+              ...input,
+              expectedVersion: closure.execution.version,
+            });
+            dispatched += reconciled.mutationsDispatched;
+            // Reconciling the entry can legitimately move the execution on:
+            // a cancelled remainder, a lost fill, or an escalation of its own.
+            if (reconciled.execution.status !== "ENTRY_FILLED") return dispatched;
+
+            protection = await this.deps.protection.ensureProtectionForExposure({
+              ...input,
+              expectedVersion: reconciled.execution.version,
+            });
+            dispatched += protection.mutationsDispatched;
+          }
+
+          // --- Never leave filled exposure inert ---------------------------
+          //
+          // Two of protection's refusals write nothing and change nothing:
+          // POSITION_STATE_UNAVAILABLE (the exchange did not answer) and
+          // EXECUTION_HAS_NO_CONFIRMED_FILL (the repair above could not prove
+          // the fill). Both leave a possibly-live, definitely-unprotected
+          // position with no owner and no alarm — the exact state the MAINNET
+          // incident was found in, where every tick reported nothing to do.
+          //
+          // UNKNOWN is still not FLAT: nothing is terminalized, and nothing is
+          // submitted on a position we cannot see. The execution is parked
+          // instead — the durable safety state this repository already uses —
+          // and because POSITION_STATE_UNAVAILABLE is a recoverable
+          // intervention reason, the MANUAL_INTERVENTION route un-parks it by
+          // itself once the exchange answers again.
+          if (UNRESOLVED_FILLED_EXPOSURE_REASONS.includes(protection.reasonCode)) {
+            const parked = await this.deps.protection.parkUnresolvedFilledExposure(
+              input,
+              protection.reasonCode,
+              protection.message
+            );
+            dispatched += parked.mutationsDispatched;
+          }
+          return dispatched;
+        }
 
         // A half-finished protection tranche. Closure FIRST, then resume — the
         // same order PROTECTED and MANUAL_INTERVENTION already use, and it is
