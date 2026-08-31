@@ -137,7 +137,21 @@ export interface ReconcileTickResult {
   failed: boolean;
 }
 
+/** Where the last reconciliation window stopped, in the selector's ordering. */
+interface ReconciliationCursor {
+  updatedAt: Date;
+  id: string;
+}
+
 export class ExecutionOrchestrator {
+  /**
+   * Round-robin position, held for the life of this orchestrator.
+   *
+   * The scheduler builds ONE orchestrator and reuses it for startup recovery
+   * and every periodic tick, which is what lets successive windows advance.
+   */
+  private reconcileCursor: ReconciliationCursor | null = null;
+
   constructor(private readonly deps: OrchestratorDependencies) {}
 
   // -------------------------------------------------------------------------
@@ -267,13 +281,7 @@ export class ExecutionOrchestrator {
     const versionsBefore = new Map<string, number>();
 
     try {
-      const executions = await this.deps.prisma.tradeExecution.findMany({
-        where: { status: { in: [...RECONCILABLE_STATUSES] } },
-        // Oldest first, stable by id: a backlog drains in a deterministic
-        // order and no execution can be starved by a newer one.
-        orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
-        take: batchSize,
-      });
+      const executions = await this.selectReconciliationBatch(batchSize);
 
       // Which profiles have already reached their SOFT open-position target.
       // Derived from persisted state every tick — no in-memory counter — so it
@@ -313,6 +321,11 @@ export class ExecutionOrchestrator {
       } catch {
         // Leaves progressed at 0 rather than failing the tick.
       }
+
+      // Where the next tick resumes. Set AFTER the batch is processed so a
+      // tick that throws mid-batch leaves the cursor alone and retries the
+      // same window rather than skipping past unserviced rows.
+      this.advanceReconciliationCursor(executions, batchSize);
 
       result.recoveryPending = await this.countRecoveryRequired();
     } catch (error) {
@@ -402,6 +415,78 @@ export class ExecutionOrchestrator {
       );
 
     return openCount >= effective.softOpenPositionTarget ? profileId : "";
+  }
+
+  /**
+   * One bounded window of reconcilable work, resuming where the last tick
+   * stopped.
+   *
+   * ## Why a cursor at all
+   *
+   * The batch is the `batchSize` oldest rows by `updatedAt`, and a row that is
+   * inspected but needs no durable write keeps its `updatedAt`. A full batch of
+   * such rows therefore sorts identically on the next tick, and the next, for
+   * as long as they stay that way — so row `batchSize + 1` is never reached.
+   * Not delayed: never reached. That is what a live MAINNET filled position sat
+   * behind, while every tick honestly reported `inspected 10, progressed 0` and
+   * `recoveryPending 1` for work the batch could not see.
+   *
+   * The ordering comment this replaced said "no execution can be starved by a
+   * newer one", which was true and beside the point: the starvation came from
+   * OLDER rows that never moved.
+   *
+   * ## Why a keyset, and why process-local
+   *
+   * Keyset rather than OFFSET so the window stays bounded and stable under
+   * concurrent writes. Process-local rather than persisted because it is a
+   * scheduling hint, not a fact about an execution — a restart simply resumes
+   * from the oldest row, which delays a cycle at worst and cannot strand
+   * anything. Persisting it would mean a schema change to make a fairness
+   * heuristic durable, which is the wrong trade.
+   *
+   * ## Why it cannot skip anything
+   *
+   * The cursor only ever moves forward through the ordering and resets to the
+   * start as soon as a window comes back short — the end of the set. Every
+   * eligible row is therefore reached within one full cycle,
+   * `ceil(total / batchSize)` ticks, whatever the rows ahead of it do.
+   */
+  private async selectReconciliationBatch(batchSize: number): Promise<TradeExecution[]> {
+    const query = (after: ReconciliationCursor | null) =>
+      this.deps.prisma.tradeExecution.findMany({
+        where: {
+          status: { in: [...RECONCILABLE_STATUSES] },
+          ...(after
+            ? {
+                OR: [
+                  { updatedAt: { gt: after.updatedAt } },
+                  { updatedAt: after.updatedAt, id: { gt: after.id } },
+                ],
+              }
+            : {}),
+        },
+        // Oldest first, stable by id: the same total order the cursor walks.
+        orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+        take: batchSize,
+      });
+
+    const batch = await query(this.reconcileCursor);
+    if (batch.length > 0 || this.reconcileCursor === null) return batch;
+
+    // The cursor ran off the end. Wrap once, in the SAME tick, so reaching the
+    // tail never costs an idle pass. Bounded: at most two queries, each of at
+    // most `batchSize` rows.
+    this.reconcileCursor = null;
+    return query(null);
+  }
+
+  /** Park the cursor on the last row served, or rewind when the set ends. */
+  private advanceReconciliationCursor(batch: TradeExecution[], batchSize: number): void {
+    const last = batch[batch.length - 1];
+    // A short window means the end of the ordering was reached, so the next
+    // tick starts over. A full one continues after the row just served.
+    this.reconcileCursor =
+      last && batch.length >= batchSize ? { updatedAt: last.updatedAt, id: last.id } : null;
   }
 
   private async reconcileOne(
