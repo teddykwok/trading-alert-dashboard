@@ -1273,3 +1273,154 @@ describe("real-service harness boundary", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Same-tick protection, with real services
+// ---------------------------------------------------------------------------
+
+/**
+ * The latency fix, proven against the real orchestrator, the real entry and
+ * protection services, the real Binance clients and a real database.
+ *
+ * `runFullLifecycle` above needs TWO ticks after a full fill: one to discover
+ * it, one to protect it. That second tick is what this removes, so every case
+ * here runs exactly ONE reconciliation pass and then asserts on durable state.
+ */
+describeDb("real services: same-tick protection", () => {
+  /** A submitted, resting entry that has just filled on the exchange. */
+  async function restingEntryThatFilled(
+    quantity: string,
+    complete: boolean
+  ): Promise<{ executionId: string; scenario: Awaited<ReturnType<typeof newScenario>> }> {
+    const scenario = await newScenario();
+    await assertTestProfileIsQuiescent(scenario.profileId);
+    const executionId = await createExecution("LONG", scenario);
+    await freshRuntime(scenario.identity).orchestrator.admitAndSubmit({ executionId });
+
+    const resting = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
+    expect(resting.status).toBe("ENTRY_PENDING");
+
+    exchange.fillEntry(quantity, complete);
+    return { executionId, scenario };
+  }
+
+  it("E1. a resting entry that filled is PROTECTED after ONE reconciliation pass", async () => {
+    const { executionId, scenario } = await restingEntryThatFilled("0.037", true);
+
+    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+
+    const execution = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
+    // Before this change the single pass left ENTRY_FILLED with no protection
+    // and the position waited for another cursor cycle.
+    expect(execution.status).toBe("PROTECTED");
+
+    const roles = (await prisma!.binanceOrder.findMany({ where: { tradeExecutionId: executionId } }))
+      .filter((order) => order.role !== "ENTRY")
+      .map((order) => order.role)
+      .sort();
+    expect(roles).toEqual(["STOP_LOSS", "TAKE_PROFIT"]);
+    expect(exchange.acceptedAlgoIds.size).toBe(2);
+  });
+
+  it("E2. the STOP reaches the exchange before the take profit", async () => {
+    const { scenario } = await restingEntryThatFilled("0.037", true);
+
+    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+
+    // Read from the transport log, not from our own ordering assumptions.
+    const submitted = exchange.requests
+      .filter((request) => request.method === "POST" && (request.clientIdentity ?? "").includes("tad-"))
+      .map((request) => request.clientIdentity ?? "");
+    const stopAt = submitted.findIndex((id) => id.includes("tad-sl-"));
+    const takeProfitAt = submitted.findIndex((id) => id.includes("tad-tp-"));
+    expect(stopAt).toBeGreaterThanOrEqual(0);
+    expect(takeProfitAt).toBeGreaterThan(stopAt);
+  });
+
+  it("E3. a partial fill is protected for the CONFIRMED quantity, not the planned one", async () => {
+    // Planned 0.037; the exchange confirms 0.020.
+    const { executionId, scenario } = await restingEntryThatFilled("0.020", false);
+
+    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+
+    const execution = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
+    expect(execution.plannedQuantity.toFixed()).toBe("0.037");
+    expect(execution.filledQuantity?.toFixed()).toBe("0.02");
+
+    const protectionState = await prisma!.executionProtectionState.findUniqueOrThrow({
+      where: { tradeExecutionId: executionId },
+    });
+    expect(protectionState.confirmedOpenQuantity.toFixed()).toBe("0.02");
+
+    // No leg may cover more than the exposure that actually exists.
+    const legs = (await prisma!.binanceOrder.findMany({ where: { tradeExecutionId: executionId } }))
+      .filter((order) => order.role !== "ENTRY");
+    expect(legs.length).toBeGreaterThan(0);
+    for (const leg of legs) expect(leg.originalQuantity.toFixed()).toBe("0.02");
+  });
+
+  it("E4. a fill discovered inside the expiry window is protected, never cancelled", async () => {
+    const { executionId, scenario } = await restingEntryThatFilled("0.037", true);
+    // The TTL is already past, so the same pass that finds the fill would also
+    // have reached the expiry decision.
+    await prisma!.binanceOrder.updateMany({
+      where: { tradeExecutionId: executionId, role: "ENTRY" },
+      data: { entryOrderExpiresAt: new Date(Date.now() - 60_000) },
+    });
+
+    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+
+    const execution = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
+    expect(execution.status).toBe("PROTECTED");
+    const entry = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: executionId, role: "ENTRY" },
+    });
+    expect(entry.status).toBe("FILLED");
+    expect(entry.cancelRequestedAt).toBeNull();
+    // Nothing was sent to cancel it.
+    expect(exchange.requests.filter((request) => request.method === "DELETE")).toEqual([]);
+  });
+
+  it("E5. a further pass adds no second generation and no duplicate submission", async () => {
+    const { executionId, scenario } = await restingEntryThatFilled("0.037", true);
+
+    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    const afterFirst = await prisma!.binanceOrder.count({ where: { tradeExecutionId: executionId } });
+
+    // A second tick, and a THIRD from a completely fresh runtime — the restart
+    // case. Neither may mint a new identity.
+    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+
+    expect(await prisma!.binanceOrder.count({ where: { tradeExecutionId: executionId } })).toBe(afterFirst);
+    const generations = (await prisma!.binanceOrder.findMany({ where: { tradeExecutionId: executionId } }))
+      .filter((order) => order.role !== "ENTRY")
+      .map((order) => order.generation);
+    expect([...new Set(generations)]).toEqual([1]);
+    // Every protection identity was asked for exactly once by the application.
+    for (const [id, attempts] of exchange.algoAttempts) expect(`${id}:${attempts}`).toBe(`${id}:1`);
+    expect(exchange.entryAttempts).toBe(1);
+  });
+
+  it("E6. an unreadable position defers instead of inventing a flat or a duplicate", async () => {
+    const { executionId, scenario } = await restingEntryThatFilled("0.037", true);
+    // The position read fails on the pass that discovers the fill. A 4xx, not
+    // a 5xx: the read-only client retries retryable kinds, so a single scripted
+    // 503 would be absorbed by its own backoff and prove nothing.
+    exchange.failNext = { path: "/fapi/v3/positionRisk", method: "GET", kind: "REJECT" };
+
+    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+
+    const deferred = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
+    // UNKNOWN is not ABSENT: nothing terminalized, nothing was parked for a
+    // human, and no protection was submitted on unread state.
+    expect(deferred.status).toBe("ENTRY_FILLED");
+    expect(deferred.requiresManualIntervention).toBe(false);
+    expect(exchange.acceptedAlgoIds.size).toBe(0);
+
+    // The scheduler fallback still repairs it on the next pass.
+    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    const repaired = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
+    expect(repaired.status).toBe("PROTECTED");
+  });
+});
