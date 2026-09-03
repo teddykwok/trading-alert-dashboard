@@ -152,6 +152,31 @@ export interface CriticalAlertView {
   updatedAt: string;
 }
 
+/**
+ * How an owned take profit actually executed, as measured by the backend.
+ *
+ * Every field is an exact decimal STRING, and `adverseSlippageRatio` is a
+ * FRACTION of the planned reward distance (0.25 means 25%), not a percentage.
+ * Positive means the fill was worse than the trigger, in both directions.
+ *
+ * Present only when the measurement is authoritative; see `ExecutionDetail`.
+ */
+export interface TakeProfitExecution {
+  triggerPrice: string;
+  actualExitPrice: string;
+  closedQuantity: string;
+  plannedRewardDistance: string;
+  actualRewardDistance: string;
+  plannedGrossProfitUsd: string;
+  actualGrossProfitUsd: string;
+  /** planned - actual gross profit: carries entry AND exit effects. */
+  grossProfitShortfallUsd: string;
+  adverseSlippagePrice: string;
+  /** Trigger versus fill only. Deliberately NOT the same as the shortfall. */
+  adverseSlippageUsd: string;
+  adverseSlippageRatio: string;
+}
+
 export interface ExecutionDetail {
   id: string;
   alertId: string | null;
@@ -213,6 +238,12 @@ export interface ExecutionDetail {
   entryOrder: ExecutionOrder | null;
   protection: ProtectionStateView | null;
   protectionOrders: ExecutionOrder[];
+  /**
+   * Null whenever the measurement would not be authoritative — a stop or
+   * external closure, a missing price or quantity, a split closure. Null is
+   * "not measurable", never "no slippage".
+   */
+  takeProfitExecution: TakeProfitExecution | null;
   emergencyCloseOrder: ExecutionOrder | null;
   marginAdjustments: MarginAdjustment[];
   safetyAdmissions: SafetyAdmissionView[];
