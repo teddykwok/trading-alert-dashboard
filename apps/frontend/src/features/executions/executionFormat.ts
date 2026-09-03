@@ -42,6 +42,35 @@ export function displayDecimal(value: string | null | undefined, maxFractionDigi
   return { text: `${whole}.${fraction.slice(0, maxFractionDigits)}…`, exact, known: true };
 }
 
+/**
+ * A ratio rendered as a percentage.
+ *
+ * The backend reports slippage as a FRACTION of the planned reward distance,
+ * so 0.432 is 43.2%. Multiplying here is presentation, not arithmetic the
+ * backend owns — and the untouched fraction stays in `exact`, so the exact
+ * value is always one hover away and a rounding artefact can never be mistaken
+ * for the real number.
+ *
+ * A value that will not parse is unknown, never zero.
+ */
+export function displayPercentFromRatio(
+  value: string | null | undefined,
+  fractionDigits = 1
+): DisplayValue {
+  if (value === null || value === undefined || value === "") {
+    return { text: UNKNOWN_DISPLAY, exact: null, known: false };
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return { text: UNKNOWN_DISPLAY, exact: null, known: false };
+  }
+  return {
+    text: `${(numeric * 100).toFixed(fractionDigits)}%`,
+    exact: String(value),
+    known: true,
+  };
+}
+
 export function displayInteger(value: number | null | undefined): DisplayValue {
   if (value === null || value === undefined) return { text: UNKNOWN_DISPLAY, exact: null, known: false };
   return { text: String(value), exact: String(value), known: true };

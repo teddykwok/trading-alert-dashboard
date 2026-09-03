@@ -19,7 +19,9 @@ import {
   MoneyValue,
   StatusBadge,
   TimestampValue,
+  ValueCell,
 } from "../features/executions/ExecutionValue";
+import { presentTakeProfitExecution } from "../features/executions/takeProfitExecution";
 import { UNKNOWN_DISPLAY, decimalDifference, displayNetPnl } from "../features/executions/executionFormat";
 import {
   presentAlertDelivery,
@@ -200,6 +202,8 @@ export function ExecutionDetailPage() {
         <Differences detail={detail} />
       </Section>
 
+      <TakeProfitExecutionSection detail={detail} />
+
       {/* 3. Entry order */}
       <Section title="Entry order">
         {detail.entryOrder ? (
@@ -371,6 +375,56 @@ export function ExecutionDetailPage() {
         )}
       </Section>
     </div>
+  );
+}
+
+/**
+ * How the take profit actually executed, when it is the thing that closed the
+ * trade and every input is authoritative.
+ *
+ * Rendered only for an owned take-profit closure. For a stop or an external
+ * close the backend reports null and the whole section disappears, because
+ * showing $0 and 0% there would claim a perfect exit that was never measured.
+ */
+function TakeProfitExecutionSection({ detail }: { detail: ExecutionDetail }) {
+  const view = presentTakeProfitExecution(detail.takeProfitExecution);
+  if (!view) return null;
+
+  return (
+    <Section title="Take profit execution">
+      <div className="mb-3 flex items-center gap-2">
+        <Badge tone={view.tone}>{view.verdictLabel}</Badge>
+        <span className="text-xs text-slate-400">
+          The trigger is the only price a TAKE_PROFIT_MARKET order controls; the fill is wherever
+          the market was when it triggered.
+        </span>
+      </div>
+
+      <div className="grid gap-6 md:grid-cols-2">
+        <dl>
+          <FieldRow label="TP trigger"><ValueCell value={view.triggerPrice} /></FieldRow>
+          <FieldRow label="Actual exit"><ValueCell value={view.actualExitPrice} /></FieldRow>
+          <FieldRow label="Closed quantity"><ValueCell value={view.closedQuantity} /></FieldRow>
+        </dl>
+
+        <dl>
+          <FieldRow label="Planned gross profit"><ValueCell value={view.plannedGrossProfit} /></FieldRow>
+          <FieldRow label="Actual gross profit"><ValueCell value={view.actualGrossProfit} /></FieldRow>
+          <FieldRow label="Gross profit shortfall"><ValueCell value={view.grossProfitShortfall} /></FieldRow>
+          <FieldRow label="Exit slippage"><ValueCell value={view.slippagePrice} /></FieldRow>
+          <FieldRow label="Exit slippage (USD)" emphasis>
+            <ValueCell value={view.slippageUsd} />
+          </FieldRow>
+          <FieldRow label="Slippage ratio"><ValueCell value={view.slippageRatio} /></FieldRow>
+        </dl>
+      </div>
+
+      <p className="mt-2 text-[11px] text-slate-400">
+        Gross profit shortfall compares the whole plan; exit slippage isolates the trigger-to-fill
+        gap alone. They differ when the entry filled away from its planned price. Positive is worse
+        than the trigger, negative means the fill beat it.
+      </p>
+    </Section>
   );
 }
 
