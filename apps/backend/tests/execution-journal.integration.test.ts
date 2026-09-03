@@ -20,7 +20,7 @@ const SYMBOL = "TESTJUSDT";
 const { prisma: testDatabase, available } = await connectTestDatabase();
 const prisma: PrismaClient | null = testDatabase;
 
-const { ExecutionJournalService, deriveNetPnl, MAX_PAGE_SIZE } = await import(
+const { ExecutionJournalService, deriveNetPnl, deriveTakeProfitExecution, MAX_PAGE_SIZE } = await import(
   "../src/modules/execution/execution-journal.service"
 );
 const { NotFoundError } = await import("../src/utils/errors");
@@ -598,5 +598,254 @@ describe("timeline", () => {
 
   maybe()("throws NotFound for an unknown execution", async () => {
     await expect(journal.getExecutionTimeline("no-such-execution")).rejects.toBeInstanceOf(NotFoundError);
+  });
+});
+
+// ===========================================================================
+// Take-profit execution telemetry
+// ===========================================================================
+
+/**
+ * What an owned take profit actually delivered against its trigger.
+ *
+ * The measurement exists because a TAKE_PROFIT_MARKET order controls only the
+ * trigger: once touched, Binance fills at market, and across real closures the
+ * fill was adverse 15 times out of 16 — once by 43% of the reward distance,
+ * turning a $2.25 plan into $1.28. These pin what the number means and, more
+ * importantly, everything it must REFUSE to claim.
+ */
+describe("take-profit execution telemetry", () => {
+  const filledLeg = (over: Record<string, unknown> = {}) => ({
+    role: "TAKE_PROFIT",
+    status: "FILLED",
+    executedQuantity: "0.375",
+    averageFillPrice: "108",
+    ...over,
+  });
+
+  /** LONG: entry 100, trigger 108, so the planned reward distance is 8. */
+  const long = (over: Record<string, unknown> = {}) => ({
+    status: "CLOSED_TP",
+    direction: "LONG",
+    exitReason: "TAKE_PROFIT",
+    takeProfit: "108",
+    plannedEntryPrice: "100",
+    averageFillPrice: "100",
+    actualExitPrice: "108",
+    protectionOrders: [{ role: "STOP_LOSS", status: "CANCELED", executedQuantity: "0", averageFillPrice: null }, filledLeg()],
+    ...over,
+  });
+
+  /** SHORT: entry 100, trigger 92, same distance of 8 in the other direction. */
+  const short = (over: Record<string, unknown> = {}) => ({
+    status: "CLOSED_TP",
+    direction: "SHORT",
+    exitReason: "TAKE_PROFIT",
+    takeProfit: "92",
+    plannedEntryPrice: "100",
+    averageFillPrice: "100",
+    actualExitPrice: "92",
+    protectionOrders: [filledLeg({ averageFillPrice: "92" })],
+    ...over,
+  });
+
+  it("A. a LONG filled exactly at the trigger shows no slippage", () => {
+    const tp = deriveTakeProfitExecution(long())!;
+    expect(tp).not.toBeNull();
+    expect(tp.plannedRewardDistance).toBe("8");
+    expect(tp.actualRewardDistance).toBe("8");
+    expect(tp.plannedGrossProfitUsd).toBe("3");
+    expect(tp.actualGrossProfitUsd).toBe("3");
+    expect(tp.grossProfitShortfallUsd).toBe("0");
+    expect(tp.adverseSlippagePrice).toBe("0");
+    expect(tp.adverseSlippageUsd).toBe("0");
+    expect(tp.adverseSlippageRatio).toBe("0");
+  });
+
+  it("B. a LONG filled BELOW the trigger reports positive adverse slippage", () => {
+    // Sold at 106 instead of 108: two dollars of the eight-dollar move lost.
+    const tp = deriveTakeProfitExecution(
+      long({ actualExitPrice: "106", protectionOrders: [filledLeg({ averageFillPrice: "106" })] })
+    )!;
+    expect(tp.actualRewardDistance).toBe("6");
+    expect(tp.actualGrossProfitUsd).toBe("2.25");
+    expect(tp.adverseSlippagePrice).toBe("2");
+    expect(tp.adverseSlippageUsd).toBe("0.75");
+    expect(tp.adverseSlippageRatio).toBe("0.25");
+    expect(tp.grossProfitShortfallUsd).toBe("0.75");
+  });
+
+  it("C. a LONG filled ABOVE the trigger reports NEGATIVE adverse slippage", () => {
+    // Favourable fills are reported as they happened rather than clamped to
+    // zero: clamping would bias every median computed from these upward.
+    const tp = deriveTakeProfitExecution(
+      long({ actualExitPrice: "109", protectionOrders: [filledLeg({ averageFillPrice: "109" })] })
+    )!;
+    expect(tp.adverseSlippagePrice).toBe("-1");
+    expect(tp.adverseSlippageUsd).toBe("-0.375");
+    expect(tp.adverseSlippageRatio).toBe("-0.125");
+    expect(tp.actualGrossProfitUsd).toBe("3.375");
+  });
+
+  it("D. a SHORT filled ABOVE the trigger is adverse, with the sign handled", () => {
+    // Bought back at 94 instead of 92 — worse for a short, same positive sign.
+    const tp = deriveTakeProfitExecution(
+      short({ actualExitPrice: "94", protectionOrders: [filledLeg({ averageFillPrice: "94" })] })
+    )!;
+    expect(tp.plannedRewardDistance).toBe("8");
+    expect(tp.actualRewardDistance).toBe("6");
+    expect(tp.adverseSlippagePrice).toBe("2");
+    expect(tp.adverseSlippageRatio).toBe("0.25");
+  });
+
+  it("E. a SHORT filled BELOW the trigger is favourable", () => {
+    const tp = deriveTakeProfitExecution(
+      short({ actualExitPrice: "91", protectionOrders: [filledLeg({ averageFillPrice: "91" })] })
+    )!;
+    expect(tp.adverseSlippagePrice).toBe("-1");
+    expect(tp.actualRewardDistance).toBe("9");
+  });
+
+  it("F. an externally closed execution reports nothing", () => {
+    // CLOSED_EXTERNAL records no exit price at all; inventing one would be
+    // fabrication, and the closure was not ours to measure.
+    expect(deriveTakeProfitExecution(long({ status: "CLOSED_EXTERNAL", exitReason: "EXTERNAL" }))).toBeNull();
+    expect(deriveTakeProfitExecution(long({ status: "CLOSED_EXTERNAL", exitReason: "EXTERNAL", actualExitPrice: null }))).toBeNull();
+  });
+
+  it("G. a stop closure has no take-profit execution to measure", () => {
+    expect(deriveTakeProfitExecution(long({ status: "CLOSED_SL", exitReason: "STOP_LOSS" }))).toBeNull();
+    // Status and attribution must BOTH agree; neither alone is enough.
+    expect(deriveTakeProfitExecution(long({ exitReason: "STOP_LOSS" }))).toBeNull();
+    expect(deriveTakeProfitExecution(long({ status: "CLOSED_SL" }))).toBeNull();
+  });
+
+  it("H. a missing exit price yields null, never zero", () => {
+    // If an unknown exit were treated as zero this would report the entire
+    // planned profit as lost — a fabricated catastrophe.
+    expect(deriveTakeProfitExecution(long({ actualExitPrice: null }))).toBeNull();
+    expect(deriveTakeProfitExecution(long({ averageFillPrice: null }))).toBeNull();
+    expect(deriveTakeProfitExecution(long({ takeProfit: null }))).toBeNull();
+    expect(deriveTakeProfitExecution(long({ plannedEntryPrice: null }))).toBeNull();
+  });
+
+  it("I. an unusable quantity yields null, never a guess", () => {
+    // No filled leg, an unknown quantity, a zero quantity, and a leg with no
+    // price of its own: none of them may fall back to plannedQuantity.
+    expect(deriveTakeProfitExecution(long({ protectionOrders: [] }))).toBeNull();
+    expect(deriveTakeProfitExecution(long({ protectionOrders: [filledLeg({ status: "NEW" })] }))).toBeNull();
+    expect(deriveTakeProfitExecution(long({ protectionOrders: [filledLeg({ executedQuantity: null })] }))).toBeNull();
+    expect(deriveTakeProfitExecution(long({ protectionOrders: [filledLeg({ executedQuantity: "0" })] }))).toBeNull();
+    expect(deriveTakeProfitExecution(long({ protectionOrders: [filledLeg({ averageFillPrice: null })] }))).toBeNull();
+  });
+
+  it("I2. a closure split across two filled legs is not described by one price", () => {
+    // Two generations both filled: a single price/quantity pair cannot honestly
+    // represent the exit, so it declines rather than reporting the first.
+    const split = long({
+      protectionOrders: [
+        filledLeg({ executedQuantity: "0.200" }),
+        filledLeg({ executedQuantity: "0.175", averageFillPrice: "107" }),
+      ],
+    });
+    expect(deriveTakeProfitExecution(split)).toBeNull();
+  });
+
+  it("I3. a leg whose own fill price contradicts the exit price is refused", () => {
+    // Two sources describing the same fill disagree, so neither is trusted.
+    expect(
+      deriveTakeProfitExecution(long({ actualExitPrice: "106", protectionOrders: [filledLeg({ averageFillPrice: "108" })] }))
+    ).toBeNull();
+  });
+
+  it("I4. a non-positive planned reward distance is refused", () => {
+    // A trigger on the wrong side of entry makes the ratio meaningless.
+    expect(deriveTakeProfitExecution(long({ takeProfit: "100" }))).toBeNull();
+    expect(deriveTakeProfitExecution(long({ takeProfit: "95" }))).toBeNull();
+  });
+
+  it("K. the calculation is price movement only — no fee or funding input exists", () => {
+    // The measured shortfall for a LONG sold two dollars early is exactly
+    // quantity x price, with nothing else able to enter the arithmetic: the
+    // input carries no fee or funding field at all.
+    const input = long({ actualExitPrice: "106", protectionOrders: [filledLeg({ averageFillPrice: "106" })] });
+    expect(Object.keys(input)).not.toContain("tradingFeesUsd");
+    expect(Object.keys(input)).not.toContain("fundingPnlUsd");
+    expect(Object.keys(input)).not.toContain("realizedPnl");
+    const tp = deriveTakeProfitExecution(input)!;
+    expect(tp.adverseSlippageUsd).toBe("0.75");
+  });
+});
+
+describe("take-profit telemetry on persisted executions", () => {
+  maybe()("J. derives telemetry from a historical row, with no exchange call", async () => {
+    // Persisted exactly as production writes it: the execution's exit price
+    // and the filled leg's own price and quantity. Nothing is back-filled.
+    const execution = await synthetic({
+      key: "tp-telemetry-historical",
+      status: "CLOSED_TP",
+      actual: {
+        averageFillPrice: "100",
+        filledQuantity: "0.375",
+        actualExitPrice: "106",
+        exitReason: "TAKE_PROFIT",
+        closedAt: new Date(),
+        // Present, large, and deliberately irrelevant: none of these may reach
+        // the gross price-movement figures below.
+        realizedPnl: "-99",
+        tradingFeesUsd: "50",
+        fundingPnlUsd: "-25",
+      },
+    });
+    for (const [role, type, status, executed, avg] of [
+      ["STOP_LOSS", "STOP_MARKET", "CANCELED", "0", null],
+      ["TAKE_PROFIT", "TAKE_PROFIT_MARKET", "FILLED", "0.375", "106"],
+    ] as const) {
+      await prisma!.binanceOrder.create({
+        data: {
+          tradeExecutionId: execution.id,
+          role,
+          generation: 1,
+          clientOrderId: `${TAG}-tptel-${execution.id}-${role}`,
+          clientAlgoId: `${TAG}-tptel-${execution.id}-${role}`,
+          side: "SELL",
+          positionSide: "LONG",
+          orderType: type,
+          originalQuantity: "0.375",
+          executedQuantity: executed,
+          averageFillPrice: avg,
+          triggerPrice: role === "STOP_LOSS" ? "96" : "108",
+          workingType: "CONTRACT_PRICE",
+          priceProtect: false,
+          status,
+          algoStatus: status,
+        },
+      });
+    }
+
+    const detail = await journal.getExecutionDetail(execution.id);
+    const tp = detail.takeProfitExecution!;
+
+    expect(tp).not.toBeNull();
+    expect(tp.triggerPrice).toBe("108");
+    expect(tp.actualExitPrice).toBe("106");
+    expect(tp.closedQuantity).toBe("0.375");
+    // Planned $3.00 at the trigger, $2.25 delivered: 25% of the move lost.
+    expect(tp.plannedGrossProfitUsd).toBe("3");
+    expect(tp.actualGrossProfitUsd).toBe("2.25");
+    expect(tp.adverseSlippageUsd).toBe("0.75");
+    expect(tp.adverseSlippageRatio).toBe("0.25");
+    // The fees and funding persisted above changed none of it.
+    expect(detail.actual.tradingFeesUsd).toBe("50");
+  });
+
+  maybe()("J2. a non-take-profit closure exposes the field as null", async () => {
+    const execution = await synthetic({
+      key: "tp-telemetry-external",
+      status: "CLOSED_EXTERNAL",
+      actual: { averageFillPrice: "100", filledQuantity: "0.375", exitReason: "EXTERNAL", closedAt: new Date() },
+    });
+    const detail = await journal.getExecutionDetail(execution.id);
+    expect(detail.takeProfitExecution).toBeNull();
   });
 });
