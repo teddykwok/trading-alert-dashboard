@@ -82,6 +82,163 @@ export function deriveNetPnl(
   }
 }
 
+/**
+ * What an owned take-profit exit actually delivered, against what its trigger
+ * promised.
+ *
+ * Every figure is GROSS price movement. Commission and funding are excluded on
+ * purpose: they are a separate, known cost, and folding them in here would
+ * hide the thing this measures.
+ */
+export interface TakeProfitExecutionDto {
+  /** The frozen trigger the plan committed to. */
+  triggerPrice: string;
+  /** Where the triggered MARKET order actually filled. */
+  actualExitPrice: string;
+  /** Quantity the filled take-profit leg actually closed. */
+  closedQuantity: string;
+  /** |takeProfit - plannedEntryPrice|, always positive. */
+  plannedRewardDistance: string;
+  /** Entry-to-exit distance in the profitable direction; negative if it lost. */
+  actualRewardDistance: string;
+  plannedGrossProfitUsd: string;
+  actualGrossProfitUsd: string;
+  /** planned - actual. Carries BOTH entry-price and exit-slippage effects. */
+  grossProfitShortfallUsd: string;
+  /** Trigger-to-fill only, per unit. POSITIVE means adverse. */
+  adverseSlippagePrice: string;
+  /** closedQuantity x adverseSlippagePrice. Exit slippage in isolation. */
+  adverseSlippageUsd: string;
+  /** adverseSlippagePrice / plannedRewardDistance. POSITIVE means adverse. */
+  adverseSlippageRatio: string;
+}
+
+/** The facts a take-profit measurement needs. Any missing one yields null. */
+export interface TakeProfitExecutionInput {
+  status: string;
+  direction: string;
+  exitReason: string | null;
+  takeProfit: string | null;
+  plannedEntryPrice: string | null;
+  /** Actual ENTRY fill, not the planned price. */
+  averageFillPrice: string | null;
+  actualExitPrice: string | null;
+  /** Every persisted protection order, at any generation. */
+  protectionOrders: ReadonlyArray<{
+    role: string;
+    status: string;
+    executedQuantity: string | null;
+    averageFillPrice: string | null;
+  }>;
+}
+
+/**
+ * Measures one owned take-profit exit, or returns null.
+ *
+ * ## Why so many refusals
+ *
+ * The same doctrine as `deriveNetPnl` above, for the same reason: a number
+ * that silently treats an unknown as zero reads exactly like a real result.
+ * Here that would be worse than useless — it would understate slippage on
+ * precisely the executions whose exits are least well understood. So this
+ * returns null unless every input is authoritative, and never substitutes a
+ * default for a missing fact.
+ *
+ * Refused, deliberately:
+ *
+ *   - anything that is not CLOSED_TP attributed to TAKE_PROFIT. A stop closure
+ *     has no take-profit execution to measure, and CLOSED_EXTERNAL records no
+ *     exit price at all — inferring one would be fabrication;
+ *   - more than one FILLED take-profit leg. The exit price belongs to ONE
+ *     order, so a closure split across generations cannot be described by a
+ *     single price/quantity pair. Rather than pick the first and misreport the
+ *     rest, it declines;
+ *   - a filled leg whose own average price contradicts `actualExitPrice`. Two
+ *     sources disagreeing about the same fill means neither is trustworthy;
+ *   - a non-positive planned reward distance, which would make the ratio
+ *     meaningless rather than merely unknown.
+ *
+ * ## Sign convention
+ *
+ * `adverseSlippagePrice` is POSITIVE when the fill was worse than the trigger,
+ * in both directions — LONG sells below the trigger, SHORT buys above it. A
+ * favourable fill yields a NEGATIVE value rather than a clamped zero, because
+ * "better than promised" is real information and hiding it would bias any
+ * median computed from these.
+ *
+ * ## Quantity
+ *
+ * Both gross figures use the quantity the take-profit leg actually closed, so
+ * `adverseSlippageUsd` isolates price. `grossProfitShortfallUsd` is the wider
+ * number the operator sees — it also carries any difference between the
+ * planned entry and the real fill, which is why the two are reported
+ * separately rather than as one figure that could be read either way.
+ */
+export function deriveTakeProfitExecution(
+  input: TakeProfitExecutionInput
+): TakeProfitExecutionDto | null {
+  if (input.status !== "CLOSED_TP" || input.exitReason !== "TAKE_PROFIT") return null;
+  if (input.direction !== "LONG" && input.direction !== "SHORT") return null;
+  if (
+    input.takeProfit === null ||
+    input.plannedEntryPrice === null ||
+    input.averageFillPrice === null ||
+    input.actualExitPrice === null
+  ) {
+    return null;
+  }
+
+  const filled = input.protectionOrders.filter(
+    (order) => order.role === "TAKE_PROFIT" && order.status === "FILLED"
+  );
+  // Exactly one, or the single price/quantity pair below cannot describe it.
+  if (filled.length !== 1) return null;
+  const leg = filled[0];
+  if (leg.executedQuantity === null || leg.averageFillPrice === null) return null;
+
+  try {
+    const trigger = new Prisma.Decimal(input.takeProfit);
+    const plannedEntry = new Prisma.Decimal(input.plannedEntryPrice);
+    const entry = new Prisma.Decimal(input.averageFillPrice);
+    const exit = new Prisma.Decimal(input.actualExitPrice);
+    const quantity = new Prisma.Decimal(leg.executedQuantity);
+
+    if (quantity.lessThanOrEqualTo(0)) return null;
+    // The leg's own fill price and the execution's exit price describe the
+    // same event; if they disagree, neither is authoritative.
+    if (!new Prisma.Decimal(leg.averageFillPrice).equals(exit)) return null;
+
+    const long = input.direction === "LONG";
+    const plannedRewardDistance = long ? trigger.minus(plannedEntry) : plannedEntry.minus(trigger);
+    if (plannedRewardDistance.lessThanOrEqualTo(0)) return null;
+
+    const actualRewardDistance = long ? exit.minus(entry) : entry.minus(exit);
+    // Identical statement in both directions: how far short of the trigger the
+    // fill landed, measured along the profitable axis.
+    const adverseSlippagePrice = long ? trigger.minus(exit) : exit.minus(trigger);
+
+    const plannedGrossProfitUsd = quantity.times(plannedRewardDistance);
+    const actualGrossProfitUsd = quantity.times(actualRewardDistance);
+
+    return {
+      triggerPrice: trigger.toString(),
+      actualExitPrice: exit.toString(),
+      closedQuantity: quantity.toString(),
+      plannedRewardDistance: plannedRewardDistance.toString(),
+      actualRewardDistance: actualRewardDistance.toString(),
+      plannedGrossProfitUsd: plannedGrossProfitUsd.toString(),
+      actualGrossProfitUsd: actualGrossProfitUsd.toString(),
+      grossProfitShortfallUsd: plannedGrossProfitUsd.minus(actualGrossProfitUsd).toString(),
+      adverseSlippagePrice: adverseSlippagePrice.toString(),
+      adverseSlippageUsd: quantity.times(adverseSlippagePrice).toString(),
+      adverseSlippageRatio: adverseSlippagePrice.div(plannedRewardDistance).toString(),
+    };
+  } catch {
+    // An unparseable decimal is an unknown, never a zero.
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // DTOs
 // ---------------------------------------------------------------------------
@@ -310,6 +467,11 @@ export interface ExecutionDetailDto {
   entryOrder: ExecutionOrderDto | null;
   protection: ProtectionStateDto | null;
   protectionOrders: ExecutionOrderDto[];
+  /**
+   * Null unless this execution closed on its OWN verified take profit and
+   * every input is authoritative. Never a zero-filled placeholder.
+   */
+  takeProfitExecution: TakeProfitExecutionDto | null;
   emergencyCloseOrder: ExecutionOrderDto | null;
   marginAdjustments: MarginAdjustmentDto[];
   safetyAdmissions: SafetyAdmissionDto[];
@@ -567,6 +729,24 @@ export class ExecutionJournalService {
       entryOrder: entryOrder ? this.toOrder(entryOrder) : null,
       protection: row.protectionState ? this.toProtection(row.protectionState) : null,
       protectionOrders: protectionOrders.map((order) => this.toOrder(order)),
+      // Derived from rows already loaded above: no extra query, no exchange
+      // call, and nothing persisted. Historical executions measure exactly as
+      // new ones do.
+      takeProfitExecution: deriveTakeProfitExecution({
+        status: row.status,
+        direction: row.direction,
+        exitReason: row.exitReason,
+        takeProfit: decimal(row.takeProfit),
+        plannedEntryPrice: decimal(row.plannedEntryPrice),
+        averageFillPrice: decimal(row.averageFillPrice),
+        actualExitPrice: decimal(row.actualExitPrice),
+        protectionOrders: protectionOrders.map((order) => ({
+          role: order.role,
+          status: order.status,
+          executedQuantity: decimal(order.executedQuantity),
+          averageFillPrice: decimal(order.averageFillPrice),
+        })),
+      }),
       emergencyCloseOrder: emergencyCloseOrder ? this.toOrder(emergencyCloseOrder) : null,
       marginAdjustments: row.marginAdjustments.map((intent) => ({
         id: intent.id,
