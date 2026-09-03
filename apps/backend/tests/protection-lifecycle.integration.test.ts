@@ -1089,6 +1089,200 @@ describe("execution status reflects verified protection", () => {
     expect((await reload(execution.id)).status).toBe("PROTECTED");
   });
 
+  // =========================================================================
+  // PARTIAL EXIT — over-coverage we caused ourselves.
+  //
+  // A leg that is TRIGGERED or PARTIALLY_FILLED is closing the position right
+  // now. Exposure has already fallen by whatever it filled while its sibling
+  // still guards the pre-fill quantity, so coverage legitimately exceeds
+  // exposure until the fill resolves.
+  //
+  // That used to escalate: ORPHAN_PROTECTION_ORDER plus MANUAL_INTERVENTION,
+  // on a transient snapshot, naming an orphan that does not exist. It now
+  // defers, exactly as an unreadable leg does. Unexplained over-coverage is
+  // untouched and still fails closed.
+  // =========================================================================
+
+  /** The TP fires and half-fills, so the STOP now guards more than is left. */
+  async function partiallyExitedByTakeProfit() {
+    const execution = await protectedExecution();
+    const takeProfitId = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+    const leg = scenario.algoOrders.get(takeProfitId)!;
+    leg.algoStatus = "PARTIALLY_FILLED";
+    leg.executedQty = "0.060";
+    // The exchange agrees: 0.100 became 0.040.
+    scenario.positionAmt = "0.040";
+    return execution;
+  }
+
+  maybe()("A. an owned TP partial fill defers instead of escalating", async () => {
+    const execution = await partiallyExitedByTakeProfit();
+
+    const outcome = await protect(await reload(execution.id));
+
+    // Deferred and retryable — not a false success, not an escalation.
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("TAKE_PROFIT_EXECUTION_IN_PROGRESS");
+    const after = await reload(execution.id);
+    expect(after.requiresManualIntervention).toBe(false);
+    expect(after.status).toBe("PROTECTED");
+    // Nothing cancelled, nothing submitted, no new identity minted.
+    expect(scenario.submitted).toEqual([]);
+    expect(scenario.mutations).toEqual([]);
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1]);
+  });
+
+  maybe()("A2. no ORPHAN_PROTECTION_ORDER alert is raised for our own fill", async () => {
+    const execution = await partiallyExitedByTakeProfit();
+
+    await protect(await reload(execution.id));
+
+    const alerts = await prisma!.criticalAlert.findMany({ where: { tradeExecutionId: execution.id } });
+    expect(alerts.map((alert) => alert.alertType)).not.toContain("ORPHAN_PROTECTION_ORDER");
+  });
+
+  maybe()("B. an owned STOP partial fill defers on the same evidence", async () => {
+    const execution = await protectedExecution();
+    const stopId = buildClientOrderId(execution.id, "STOP_LOSS", 1);
+    const leg = scenario.algoOrders.get(stopId)!;
+    leg.algoStatus = "PARTIALLY_FILLED";
+    leg.executedQty = "0.060";
+    scenario.positionAmt = "0.040";
+
+    const outcome = await protect(await reload(execution.id));
+
+    // The STOP is the executing leg, so its code is reported.
+    expect(outcome.reasonCode).toBe("STOP_EXECUTION_IN_PROGRESS");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(false);
+    expect(scenario.submitted).toEqual([]);
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  maybe()("B2. a TRIGGERED leg that has filled nothing yet defers too", async () => {
+    // TRIGGERED is the same situation one moment earlier: the guard is gone
+    // from the book and the close is on its way.
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(buildClientOrderId(execution.id, "TAKE_PROFIT", 1))!.algoStatus = "TRIGGERED";
+    scenario.positionAmt = "0.040";
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).toBe("TAKE_PROFIT_EXECUTION_IN_PROGRESS");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(false);
+  });
+
+  maybe()("C. an executing leg contributes no coverage and is not a repairable gap", async () => {
+    // The arithmetic question: a PARTIALLY_FILLED conditional is not a resting
+    // guard, so it counts as zero. That must not be read as an absent leg and
+    // repaired with a duplicate — the deferral above is what prevents it.
+    const execution = await partiallyExitedByTakeProfit();
+
+    await protect(await reload(execution.id));
+    await protect(await reload(execution.id));
+
+    // Two ticks, still exactly one generation and nothing sent.
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1]);
+    expect(scenario.submitted).toEqual([]);
+  });
+
+  maybe()("D. unexplained shrinkage still fails closed", async () => {
+    // Same shrunken position, but every owned leg is a healthy resting guard:
+    // nothing of ours explains it, so this is the orphan case and is escalated.
+    const execution = await protectedExecution();
+    scenario.positionAmt = "0.040";
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    const after = await reload(execution.id);
+    expect(after.requiresManualIntervention).toBe(true);
+    expect(after.status).toBe("MANUAL_INTERVENTION");
+    // flushPending() is global and batched, so a queued alert left behind here
+    // would starve an unrelated outbox test later in the file.
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("N. the ORPHAN_PROTECTION_ORDER alert is preserved for unexplained cases", async () => {
+    const execution = await protectedExecution();
+    scenario.positionAmt = "0.040";
+
+    await protect(await reload(execution.id));
+
+    const alerts = await prisma!.criticalAlert.findMany({ where: { tradeExecutionId: execution.id } });
+    expect(alerts.map((alert) => alert.alertType)).toContain("ORPHAN_PROTECTION_ORDER");
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("E. an UNREADABLE leg is never treated as an executing one", async () => {
+    // The two deferrals must not be conflated. "The exchange said nothing" is
+    // not evidence that our protection caused the shrinkage, so this keeps the
+    // pre-existing fail-closed escalation rather than borrowing the new
+    // deferral. Unreadable is not owned evidence.
+    const execution = await protectedExecution();
+    scenario.queryFailures.add(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+    scenario.positionAmt = "0.040";
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect(outcome.reasonCode).not.toBe("TAKE_PROFIT_EXECUTION_IN_PROGRESS");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(true);
+    expect(scenario.submitted).toEqual([]);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("I. a position that goes flat during the fill is terminalized, not repaired", async () => {
+    // The next tick's authoritative result. Closure reconciliation owns it and
+    // attributes the exit; no replacement exit order is ever posted.
+    const execution = await protectedExecution();
+    const takeProfitId = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+    scenario.algoOrders.get(takeProfitId)!.algoStatus = "FILLED";
+    scenario.algoOrders.get(takeProfitId)!.executedQty = "0.100";
+    scenario.positionAmt = "0";
+
+    await protectionService.reconcileProtectionAndClosure({
+      executionId: execution.id,
+      expectedVersion: (await reload(execution.id)).version,
+      evaluatedAt: at(),
+    });
+
+    const after = await reload(execution.id);
+    expect(after.status).toBe("CLOSED_TP");
+    expect(after.requiresManualIntervention).toBe(false);
+    expect(scenario.submitted).toEqual([]);
+  });
+
+  maybe()("M. a fully covered execution is completely unaffected", async () => {
+    const execution = await protectedExecution();
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reasonCode).toBe("PROTECTION_VERIFIED");
+    expect(scenario.submitted).toEqual([]);
+    expect((await reload(execution.id)).status).toBe("PROTECTED");
+  });
+
+  maybe()("O. the deferral is read-only: no cancel, no submit, no state rewrite", async () => {
+    const execution = await partiallyExitedByTakeProfit();
+    const before = await ordersOf(execution.id);
+    const versionBefore = (await reload(execution.id)).version;
+
+    await protect(await reload(execution.id));
+    await protect(await reload(execution.id));
+
+    const after = await ordersOf(execution.id);
+    expect(after.length).toBe(before.length);
+    for (let index = 0; index < before.length; index += 1) {
+      expect(after[index].clientAlgoId).toBe(before[index].clientAlgoId);
+      expect(after[index].originalQuantity.toString()).toBe(before[index].originalQuantity.toString());
+    }
+    // Repeated deferrals cause no version churn on the execution row.
+    expect((await reload(execution.id)).version).toBe(versionBefore);
+    expect(scenario.mutations).toEqual([]);
+  });
+
   maybe()("a locally terminal generation never blocks the health path", async () => {
     // A dead generation 1 whose query later becomes unreadable must not stall
     // repair forever: we already know it is finished.
