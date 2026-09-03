@@ -115,6 +115,15 @@ interface VerifiedCoverage {
   stop: string;
   takeProfit: string;
   unresolved: ReadonlyArray<"STOP_LOSS" | "TAKE_PROFIT">;
+  /**
+   * Legs the exchange reported as TRIGGERED or PARTIALLY_FILLED.
+   *
+   * Neither contributes ACTIVE coverage, and both explain why exposure may
+   * now be smaller than the sibling leg still guards. Kept separate from
+   * `unresolved`, which means the opposite: there the exchange said nothing,
+   * here it said the protection is working.
+   */
+  executing: ReadonlyArray<"STOP_LOSS" | "TAKE_PROFIT">;
 }
 
 /**
@@ -1171,9 +1180,60 @@ export class ProtectionLifecycleService {
     });
 
     if (coverage.overProtected) {
-      // More protection than exposure means the exchange is reporting
-      // something we did not intend â€” an identity contradiction or an order we
-      // do not own. It is never silently accepted as "protected".
+      /**
+       * FIRST ASK WHETHER WE CAUSED IT.
+       *
+       * A protection leg that is TRIGGERED or PARTIALLY_FILLED is closing the
+       * position right now. Exposure has already fallen by whatever it filled,
+       * while its sibling still guards the pre-fill quantity — so coverage
+       * legitimately exceeds exposure for as long as the fill is in flight.
+       *
+       * That is our own protection doing its job, not an orphan. Escalating on
+       * it parked a healthy execution at MANUAL_INTERVENTION on a transient
+       * mid-execution snapshot, under an ORPHAN_PROTECTION_ORDER alert that
+       * sent an operator hunting for an order that does not exist.
+       *
+       * So this DEFERS, exactly as an unreadable leg does and for a symmetric
+       * reason: nothing is known to be wrong, and the next tick sees the
+       * authoritative result — flat, which closure reconciliation attributes
+       * and terminalizes, or a stable remainder, which is measured then.
+       * Nothing is written, nothing is cancelled and nothing is submitted, so
+       * repeated ticks cause no churn and the position keeps every guard it
+       * currently has.
+       *
+       * Requires OWNED evidence: `executing` is only ever populated from a
+       * CONFIRMED_ACCEPTED query for one of our own deterministic ids. A
+       * position shrunk by a manual close, an external fill or an unreadable
+       * leg populates nothing here and still takes the escalation below.
+       */
+      if (coverageNow.executing.length > 0) {
+        const reasonCode: ProtectionReasonCode = coverageNow.executing.includes("STOP_LOSS")
+          ? "STOP_EXECUTION_IN_PROGRESS"
+          : "TAKE_PROFIT_EXECUTION_IN_PROGRESS";
+        logger.info(
+          {
+            executionId: execution.id,
+            executing: coverageNow.executing,
+            measuredStop: coverageNow.stop,
+            measuredTakeProfit: coverageNow.takeProfit,
+            confirmedOpenQuantity: openQuantity,
+          },
+          "Protection exceeds exposure while an owned leg is executing; deferring to the next tick"
+        );
+        return this.outcome(
+          false,
+          reasonCode,
+          `${coverageNow.executing.join(" and ")} is executing, so coverage still reflects the ` +
+            `pre-fill quantity (stop ${coverageNow.stop}, take profit ${coverageNow.takeProfit}, ` +
+            `exposure ${openQuantity}); waiting for the authoritative result.`,
+          execution,
+          protection
+        );
+      }
+
+      // Nothing of ours explains it: the exchange is reporting something we
+      // did not intend â€” an identity contradiction or an order we do not own.
+      // It is never silently accepted as "protected".
       await this.alerts.raise({
         tradeExecutionId: execution.id,
         alertType: "ORPHAN_PROTECTION_ORDER",
@@ -2127,6 +2187,7 @@ export class ProtectionLifecycleService {
     let stop = new D(0);
     let takeProfit = new D(0);
     const unresolved = new Set<"STOP_LOSS" | "TAKE_PROFIT">();
+    const executing = new Set<"STOP_LOSS" | "TAKE_PROFIT">();
 
     for (const order of orders) {
       const role = order.role as "STOP_LOSS" | "TAKE_PROFIT";
@@ -2153,6 +2214,10 @@ export class ProtectionLifecycleService {
       // originals may well have still been live on Binance.
       if (query.outcome === "CONFIRMED_ACCEPTED" && query.order) {
         const status = normalizeAlgoStatus(query.order.algoStatus);
+        // Fired and working through the book. It guards nothing any more, but
+        // it is also the reason the position is shrinking, so the caller needs
+        // to know rather than seeing an unexplained coverage gap.
+        if (isExecutingProtection(status)) executing.add(role);
         if (!countsAsActiveCoverage(status)) continue; // proven inactive
         const quantity = new D(query.order.quantity ?? order.originalQuantity.toString());
         if (role === "STOP_LOSS") stop = stop.plus(quantity);
@@ -2165,7 +2230,12 @@ export class ProtectionLifecycleService {
       unresolved.add(role);
     }
 
-    return { stop: stop.toString(), takeProfit: takeProfit.toString(), unresolved: [...unresolved] };
+    return {
+      stop: stop.toString(),
+      takeProfit: takeProfit.toString(),
+      unresolved: [...unresolved],
+      executing: [...executing],
+    };
   }
 
   // ==========================================================================
