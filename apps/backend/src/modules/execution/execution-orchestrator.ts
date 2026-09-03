@@ -97,6 +97,36 @@ export const RECOVERY_REQUIRED_STATUSES = [
   "MANUAL_INTERVENTION",
 ] as const;
 
+/**
+ * The statuses a JUST-RECONCILED entry can hold that prove confirmed exposure.
+ *
+ * Deliberately NOT `OPEN_POSITION_STATUSES`: that is a capacity
+ * classification, and it includes states meaning something has already been
+ * built on the exposure (PLACING_PROTECTION, PROTECTED) or that a human owns
+ * it (MANUAL_INTERVENTION). This answers a narrower question — did the entry
+ * call that just returned leave real exposure with nothing protecting it yet?
+ *
+ * The status is the authoritative evidence, and the only evidence read here.
+ * Phase 6 derives it from the executed quantity it observed and committed in
+ * the same transaction, so it cannot disagree with the fill it accounted for.
+ * The orchestrator deliberately reads no quantity of its own: how much to
+ * protect is decided by `ensureProtectionForExposure` from the live exchange
+ * position, which is the only place that judgement belongs.
+ */
+const CONFIRMED_ENTRY_EXPOSURE_STATUSES = ["PARTIALLY_FILLED", "ENTRY_FILLED"] as const;
+
+/**
+ * Whether an entry call just left real exposure that nothing is protecting.
+ *
+ * Reads the COMMITTED row the entry service returned, never the status the
+ * tick started with. An order that is still resting, one that expired, a
+ * reconciliation that lost its CAS and changed nothing, and one that parked
+ * the execution for a human all fail this — none of them is a fill.
+ */
+function hasConfirmedEntryExposure(execution: TradeExecution): boolean {
+  return (CONFIRMED_ENTRY_EXPOSURE_STATUSES as readonly string[]).includes(execution.status);
+}
+
 export interface OrchestratorDependencies {
   prisma: PrismaClient;
   readOnly: BinanceReadOnlyService;
@@ -526,6 +556,47 @@ export class ExecutionOrchestrator {
       last && batch.length >= batchSize ? { updatedAt: last.updatedAt, id: last.id } : null;
   }
 
+  /**
+   * Protect exposure an entry call just confirmed, within the same pass.
+   *
+   * PROTECT FIRST, then withdraw any unfilled remainder. The filled quantity
+   * is real exposure and its protection must never wait on a cancellation that
+   * can fail, time out or come back UNKNOWN. Only after protection has been
+   * attempted is the remainder withdrawn — and the SOFT_OPEN_TARGET cause is
+   * what keeps that withdrawal from being mistaken for an unprotected partial
+   * fill.
+   *
+   * Nothing here decides anything. `ensureProtectionForExposure` re-loads the
+   * execution, re-checks that a confirmed fill exists, reads the live position
+   * and sizes protection from it, reserves a tranche under the existing
+   * advisory lock and deterministic client ids, and submits the stop before
+   * the take profit. Passing the version the entry call committed means a
+   * concurrent writer loses the CAS and this writes nothing, rather than
+   * acting on state it no longer owns.
+   *
+   * A full fill takes no withdrawal branch worth the name: `expireEntryOrderIfDue`
+   * refuses outright once the execution is ENTRY_FILLED, which is not one of
+   * the statuses in which an entry order can exist.
+   */
+  private async protectConfirmedFill(
+    reconciledExecution: TradeExecution,
+    input: { executionId: string; expectedVersion: number; evaluatedAt: Date },
+    softOpenTargetReached: boolean
+  ): Promise<number> {
+    const protection = await this.deps.protection.ensureProtectionForExposure({
+      ...input,
+      expectedVersion: reconciledExecution.version,
+    });
+    if (!softOpenTargetReached) return protection.mutationsDispatched;
+
+    const withdrawn = await this.deps.entry.expireEntryOrderIfDue({
+      ...input,
+      expectedVersion: protection.execution.version,
+      recoveryReason: "SOFT_OPEN_TARGET",
+    });
+    return protection.mutationsDispatched + withdrawn.mutationsDispatched;
+  }
+
   private async reconcileOne(
     execution: TradeExecution,
     evaluatedAt: Date,
@@ -561,14 +632,45 @@ export class ExecutionOrchestrator {
         }
 
         // An ambiguous submission: resume queries the SAME deterministic client
-        // order id rather than submitting anything new.
-        case "ENTRY_SUBMITTING":
-          return (await this.deps.entry.resumeEntrySubmission(input)).mutationsDispatched;
+        // order id rather than submitting anything new. Resolving it can land a
+        // fill, so the same-pass protection below applies here too.
+        case "ENTRY_SUBMITTING": {
+          const resumed = await this.deps.entry.resumeEntrySubmission(input);
+          if (!hasConfirmedEntryExposure(resumed.execution)) return resumed.mutationsDispatched;
+          return (
+            resumed.mutationsDispatched +
+            (await this.protectConfirmedFill(resumed.execution, input, softOpenTargetReached))
+          );
+        }
 
         // A resting order: reconcile its exchange state, then let Phase 6 decide
         // whether the TTL is due. Expiry never bypasses the fill check.
         case "ENTRY_PENDING": {
           const reconciled = await this.deps.entry.reconcileEntryOrder(input);
+
+          /**
+           * THE FILL LANDED IN THIS PASS. Protect it now.
+           *
+           * This branch used to reconcile, discover the fill, commit
+           * ENTRY_FILLED and return — leaving protection to whichever later
+           * tick next routed the row. Two full cursor cycles therefore stood
+           * between a filled entry and its stop: one to find the fill, another
+           * to act on it. `PARTIALLY_FILLED` four lines below already
+           * reconciled and then protected in one pass; this is the same call,
+           * behind a gate on what the reconcile actually committed.
+           *
+           * It is a latency fix, not an event-driven fill source. Discovery is
+           * still bounded by the scheduler interval — there is no user-data
+           * stream — and the periodic tick remains the fallback that repairs
+           * anything this path does not finish.
+           */
+          if (hasConfirmedEntryExposure(reconciled.execution)) {
+            return (
+              reconciled.mutationsDispatched +
+              (await this.protectConfirmedFill(reconciled.execution, input, softOpenTargetReached))
+            );
+          }
+
           // A resting order is the ONE state that is unambiguously cancellable:
           // the order is known to exist and no fill is recorded. When the soft
           // target is reached we withdraw it; otherwise the TTL decides.
@@ -586,25 +688,14 @@ export class ExecutionOrchestrator {
         // is measured against the latest confirmed fill, then protect it.
         case "PARTIALLY_FILLED": {
           const reconciled = await this.deps.entry.reconcileEntryOrder(input);
-          // PROTECT FIRST, then withdraw the remainder. The filled quantity is
-          // real exposure and its protection must never wait on a cancellation
-          // that can fail, time out or come back UNKNOWN. Only after protection
-          // has been attempted is the unfilled remainder cancelled — and the
-          // SOFT_OPEN_TARGET cause is what keeps that from being mistaken for
-          // an unprotected partial fill.
-          const protection = await this.deps.protection.ensureProtectionForExposure({
-            ...input,
-            expectedVersion: reconciled.execution.version,
-          });
-          if (!softOpenTargetReached) {
-            return reconciled.mutationsDispatched + protection.mutationsDispatched;
-          }
-          const withdrawn = await this.deps.entry.expireEntryOrderIfDue({
-            ...input,
-            expectedVersion: protection.execution.version,
-            recoveryReason: "SOFT_OPEN_TARGET",
-          });
-          return reconciled.mutationsDispatched + protection.mutationsDispatched + withdrawn.mutationsDispatched;
+          // Exposure is already established for this status, so protection is
+          // attempted unconditionally exactly as it always was. The sequence
+          // itself now lives in one place so the three entry states that can
+          // hold exposure cannot drift apart.
+          return (
+            reconciled.mutationsDispatched +
+            (await this.protectConfirmedFill(reconciled.execution, input, softOpenTargetReached))
+          );
         }
 
         // Exposure exists and nothing has been built on it yet. Closure FIRST,

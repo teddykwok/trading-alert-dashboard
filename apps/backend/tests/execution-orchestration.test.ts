@@ -45,6 +45,16 @@ function harness(options: {
   mutationsPerCall?: number;
   /** Status the closure reconciliation leaves the execution in. */
   closureResultStatus?: string;
+  /**
+   * Status an ENTRY call leaves the execution in.
+   *
+   * The real `reconcileEntryOrder` / `resumeEntrySubmission` return the row
+   * they just committed, so a fill discovered during the call comes back as a
+   * changed status. Without this the fake could only ever echo the status the
+   * tick started with, which is exactly the case the same-tick protection path
+   * must NOT fire on.
+   */
+  entryResultStatus?: string;
   /** Authoritative open-position count the soft-target check reads. */
   openPositionCount?: number;
   /** Effective soft target on the profile's policy row. */
@@ -71,10 +81,13 @@ function harness(options: {
     // execution in, so the stub has to model it. `closureResultStatus` lets a
     // test say "this reconciliation terminalized or escalated".
     const source = executions.find((row: { id: string }) => row.id === input.executionId);
+    const entryCall = method === "reconcileEntryOrder" || method === "resumeEntrySubmission";
     const status =
       method === "reconcileProtectionAndClosure" && options.closureResultStatus !== undefined
         ? options.closureResultStatus
-        : (source?.status as string | undefined);
+        : entryCall && options.entryResultStatus !== undefined
+          ? options.entryResultStatus
+          : (source?.status as string | undefined);
     return {
       mutationsDispatched: mutations,
       execution: { id: input.executionId, version: input.expectedVersion + 1, status },
@@ -898,5 +911,123 @@ describe("soft open-position target", () => {
       // One open position is already at the EFFECTIVE target of 1.
       expect(cancelCall(atCalls)?.recoveryReason).toBe("SOFT_OPEN_TARGET");
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S. Same-tick protection of a confirmed fill
+// ---------------------------------------------------------------------------
+
+/**
+ * A fill discovered during a pass is protected during that pass.
+ *
+ * `ENTRY_PENDING` used to reconcile, commit the fill and return, so protection
+ * waited for whichever later tick next routed the row: one cursor cycle to find
+ * the fill, another to act on it. These pin the continuation and, just as
+ * importantly, pin what must NOT trigger it — the gate reads the status the
+ * entry call COMMITTED, never the one the tick started with.
+ */
+describe("S. same-tick protection", () => {
+  const pass = async (options: {
+    status: string;
+    entryResultStatus?: string;
+    openPositionCount?: number;
+    softOpenPositionTarget?: number;
+  }) => {
+    const { orchestrator, calls } = harness({
+      executions: [execution({ status: options.status, version: 5 })],
+      entryResultStatus: options.entryResultStatus,
+      openPositionCount: options.openPositionCount,
+      softOpenPositionTarget: options.softOpenPositionTarget,
+    });
+    await orchestrator.runExecutionReconciliationTick();
+    return { calls, names: calls.map((c) => `${c.service}.${c.method}`) };
+  };
+
+  it("S1. protects a resting order that filled during this pass", async () => {
+    const { names } = await pass({ status: "ENTRY_PENDING", entryResultStatus: "ENTRY_FILLED" });
+
+    // One pass, not two: the protection call happens here rather than on the
+    // next visit. And nothing tries to expire an order that just filled.
+    expect(names).toEqual(["entry.reconcileEntryOrder", "protection.ensureProtectionForExposure"]);
+  });
+
+  it("S2. protects a resting order that partially filled during this pass", async () => {
+    const { names } = await pass({ status: "ENTRY_PENDING", entryResultStatus: "PARTIALLY_FILLED" });
+
+    // Same continuation. How MUCH to protect is not decided here — the
+    // protection service sizes it from the live exchange position.
+    expect(names).toEqual(["entry.reconcileEntryOrder", "protection.ensureProtectionForExposure"]);
+  });
+
+  it("S3. protects a fill discovered while resolving an ambiguous submission", async () => {
+    const { names } = await pass({ status: "ENTRY_SUBMITTING", entryResultStatus: "ENTRY_FILLED" });
+
+    expect(names).toEqual(["entry.resumeEntrySubmission", "protection.ensureProtectionForExposure"]);
+  });
+
+  it("S4. hands protection the version the ENTRY call committed, not the tick's", async () => {
+    const { calls } = await pass({ status: "ENTRY_PENDING", entryResultStatus: "ENTRY_FILLED" });
+
+    // The tick read version 5; the entry call committed 6. Protecting on 5
+    // would CAS against state the entry call already superseded.
+    expect(calls[0].expectedVersion).toBe(5);
+    expect(calls[1].expectedVersion).toBe(6);
+  });
+
+  it("S5. never protects on the status the tick STARTED with", async () => {
+    // The whole point of the gate. A resting order, an expired one, a
+    // cancelled one and one parked for a human all reach the same conclusion:
+    // no confirmed exposure, so no protection call. Eligibility comes from
+    // what reconciliation committed, never from "it was ENTRY_PENDING and an
+    // order existed".
+    for (const status of ["ENTRY_PENDING", "ENTRY_SUBMITTING"]) {
+      for (const committed of ["ENTRY_PENDING", "ENTRY_EXPIRED", "CANCELED", "MANUAL_INTERVENTION"]) {
+        const { names } = await pass({ status, entryResultStatus: committed });
+        expect(names.join(","), `${status}->${committed}`).not.toContain(
+          "protection.ensureProtectionForExposure"
+        );
+      }
+    }
+  });
+
+  it("S6. an unfilled resting order still reaches the Phase 6 TTL decision", async () => {
+    const { names } = await pass({ status: "ENTRY_PENDING", entryResultStatus: "ENTRY_PENDING" });
+
+    // Unchanged behaviour for the common case.
+    expect(names).toEqual(["entry.reconcileEntryOrder", "entry.expireEntryOrderIfDue"]);
+  });
+
+  it("S7. withdraws the remainder only after protection, and only at the soft target", async () => {
+    const { calls, names } = await pass({
+      status: "ENTRY_PENDING",
+      entryResultStatus: "PARTIALLY_FILLED",
+      openPositionCount: 5,
+      softOpenPositionTarget: 1,
+    });
+
+    // PROTECT FIRST. The withdrawal is cause-tagged so it can never be read
+    // back as an unprotected partial fill, and it runs on the version
+    // PROTECTION committed rather than the entry call's.
+    expect(names).toEqual([
+      "entry.reconcileEntryOrder",
+      "protection.ensureProtectionForExposure",
+      "entry.expireEntryOrderIfDue",
+    ]);
+    expect(calls[2].recoveryReason).toBe("SOFT_OPEN_TARGET");
+    expect(calls[2].expectedVersion).toBe(calls[1].expectedVersion + 1);
+  });
+
+  it("S8. routes the three exposure-bearing entry states through ONE sequence", async () => {
+    // PARTIALLY_FILLED already reconciled then protected; the other two now do
+    // the same. Sharing one helper is what stops them drifting apart again.
+    const source = stripComments(
+      readFileSync(path.join(BACKEND, "src", "modules", "execution", "execution-orchestrator.ts"), "utf8")
+    );
+    expect(source.match(/this\.protectConfirmedFill\(/g) ?? []).toHaveLength(3);
+    // And exactly one place actually calls the protection entry point for it.
+    expect(
+      source.match(/protection\.ensureProtectionForExposure\(\{\s*\.\.\.input,\s*expectedVersion: reconciledExecution\.version/g) ?? []
+    ).toHaveLength(1);
   });
 });
