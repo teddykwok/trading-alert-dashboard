@@ -1243,7 +1243,10 @@ export class ProtectionLifecycleService {
 
     // Current verified aggregate coverage, refreshed from the exchange.
     const coverageNow = await this.measureVerifiedCoverage(execution);
-    const coverage = calculateCoverage({
+    // RAW arithmetic, and it stays raw for every safety decision below. Only
+    // the proven-safe over-guarded case re-points this at a repair-only view,
+    // and only once that case has already been established.
+    let coverage = calculateCoverage({
       confirmedOpenQuantity: openQuantity,
       activeStopQuantity: coverageNow.stop,
       activeTakeProfitQuantity: coverageNow.takeProfit,
@@ -1345,25 +1348,70 @@ export class ProtectionLifecycleService {
       const excessIsOwnedStopOnly = this.safeOversizedStopOnly(coverageNow, openQuantity);
 
       if (excessIsOwnedStopOnly) {
+        /**
+         * THE STOP IS SAFE. THE TARGET MAY STILL BE MISSING.
+         *
+         * Returning here unconditionally meant a take-profit gap could never be
+         * repaired while such a stop existed — and nothing resizes that stop,
+         * by design — so the execution ran to close with a verified stop and no
+         * target at all, silently.
+         *
+         * What the stop is WORTH is what decides whether anything is missing. A
+         * conditional close clamps to the actual position when it triggers, so
+         * a stop armed for 10 against a position of 4 protects 4: no more, and
+         * no less. Scoring it as 4 for this arithmetic is faithful rather than
+         * generous, and it is the difference between a gap that can be repaired
+         * and one that can never be reached.
+         *
+         * Deliberately local. It is not persisted, not a new observation, and
+         * it decides NOTHING about safety: the escalation above, identity
+         * verification, the multiple-stop rule, unreadable and executing
+         * handling, cleanup and closure attribution all read `coverageNow`,
+         * which is untouched. It is reached only after the shared predicate has
+         * already proved the narrow state, so no other shape can see it.
+         */
+        const repairCoverage = calculateCoverage({
+          confirmedOpenQuantity: openQuantity,
+          activeStopQuantity: openQuantity,
+          activeTakeProfitQuantity: coverageNow.takeProfit,
+        });
+
+        if (repairCoverage.missingTakeProfitQuantity === "0") {
+          logger.info(
+            {
+              executionId: execution.id,
+              measuredStop: coverageNow.stop,
+              measuredTakeProfit: coverageNow.takeProfit,
+              confirmedOpenQuantity: openQuantity,
+            },
+            "Owned verified stop guards more than the position holds; safe and left alone"
+          );
+          return this.outcome(
+            false,
+            "STOP_COVERAGE_EXCEEDS_EXPOSURE",
+            `The owned stop still guards ${coverageNow.stop} against ${openQuantity} of exposure. ` +
+              "The exchange clamps a conditional close to the actual position, so this is " +
+              "over-guarded rather than unprotected; the stop is left exactly as it is.",
+            execution,
+            protection
+          );
+        }
+
         logger.info(
           {
             executionId: execution.id,
             measuredStop: coverageNow.stop,
             measuredTakeProfit: coverageNow.takeProfit,
             confirmedOpenQuantity: openQuantity,
+            missingTakeProfit: repairCoverage.missingTakeProfitQuantity,
           },
-          "Owned verified stop guards more than the position holds; safe and left alone"
+          "Owned verified stop over-guards but the take profit is short; repairing the target only"
         );
-        return this.outcome(
-          false,
-          "STOP_COVERAGE_EXCEEDS_EXPOSURE",
-          `The owned stop still guards ${coverageNow.stop} against ${openQuantity} of exposure. ` +
-            "The exchange clamps a conditional close to the actual position, so this is " +
-            "over-guarded rather than unprotected; the stop is left exactly as it is.",
-          execution,
-          protection
-        );
-      }
+        // Fall through to the ORDINARY role-aware repair below on this view.
+        // With no stop gap it reserves a take-profit-only generation for
+        // exactly the missing delta, and no second stop.
+        coverage = repairCoverage;
+      } else {
 
       // Nothing of ours explains it: the exchange is reporting something we
       // did not intend â€” an identity contradiction or an order we do not own.
@@ -1386,6 +1434,7 @@ export class ProtectionLifecycleService {
         `Protection exceeds exposure (stop ${coverageNow.stop}, take profit ${coverageNow.takeProfit}, exposure ${openQuantity}).`,
         input
       );
+      }
     }
 
     if (coverage.fullyCovered) {
@@ -2016,13 +2065,26 @@ export class ProtectionLifecycleService {
       activeTakeProfitQuantity: coverageNow.takeProfit,
     });
 
-    // The single check that carries the over-coverage invariants wholesale.
-    if (coverage.overProtected) {
+    /**
+     * OVER-COVERAGE IS NOT WAVED THROUGH — ONLY ONE PROVEN SHAPE IS.
+     *
+     * Refusing on raw over-coverage alone would block the very target this
+     * tranche was reserved to place: the stop it sits behind is over-guarding,
+     * which is exactly why the repair was allowed to start. The exception is
+     * the SAME narrow one the pair path already applies, through the SAME
+     * shared predicate — one owned, identity-verified, readable, non-executing
+     * active stop, with take-profit coverage still within exposure.
+     *
+     * Everything else keeps the existing refusal. Two active stop generations
+     * above all: that is duplicate protection, and this must not become a side
+     * door around it. Raw coverage is never normalised here.
+     */
+    if (coverage.overProtected && !this.safeOversizedStopOnly(coverageNow, normalized.quantity)) {
       return { kind: "REFUSE", outcome: this.outcome(
         false,
         "PROTECTION_COVERAGE_INCOMPLETE",
-        `Protection exceeds exposure (stop ${coverageNow.stop}, take profit ${coverageNow.takeProfit}, ` +
-          `exposure ${normalized.quantity}); no take profit is placed.`,
+        `Protection exceeds exposure (stop ${coverageNow.stop} across ${coverageNow.activeStopLegs} leg(s), ` +
+          `take profit ${coverageNow.takeProfit}, exposure ${normalized.quantity}); no take profit is placed.`,
         execution,
         protection
       ) };

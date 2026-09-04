@@ -1317,8 +1317,27 @@ describe("execution status reflects verified protection", () => {
     return execution;
   }
 
+  /**
+   * The same safe oversized stop, but with the target still covering the
+   * exposure exactly, so there is NOTHING to repair.
+   *
+   * This is the state whose behaviour must stay byte-for-byte what it was. The
+   * three read-only guarantees below were originally written against the gap
+   * fixture, back when a take-profit gap behind such a stop could not be
+   * repaired at all; that limitation is gone, so they are pinned here, where
+   * "the exemption writes nothing" is still exactly the right claim. The gap
+   * case is covered by its own tests further down.
+   */
+  async function stopOverCoversWithTargetIntact() {
+    const execution = await protectedExecution();
+    // The target shrinks with the position; only the stop is left oversized.
+    scenario.algoOrders.get(buildClientOrderId(execution.id, "TAKE_PROFIT", 1))!.quantity = "0.040";
+    scenario.positionAmt = "0.040";
+    return execution;
+  }
+
   maybe()("P1-A. an owned verified stop guarding more than the position is left alone", async () => {
-    const execution = await stopOverCovers();
+    const execution = await stopOverCoversWithTargetIntact();
 
     const outcome = await protect(await reload(execution.id));
 
@@ -1341,11 +1360,10 @@ describe("execution status reflects verified protection", () => {
     expect(alerts.map((alert) => alert.alertType)).not.toContain("ORPHAN_PROTECTION_ORDER");
   });
 
-  maybe()("P1-B. NO replacement tranche is reserved by this path", async () => {
-    // The take profit is a real gap here, and repairing it needs a
-    // take-profit-only reservation this lifecycle cannot yet express without
-    // also minting a redundant second stop. So this path must reserve nothing.
-    const execution = await stopOverCovers();
+  maybe()("P1-B. with nothing missing, NO tranche is reserved by this path", async () => {
+    // The target already covers the exposure, so there is nothing to repair and
+    // the exemption must reserve nothing at all.
+    const execution = await stopOverCoversWithTargetIntact();
 
     const outcome = await protect(await reload(execution.id));
 
@@ -1509,7 +1527,7 @@ describe("execution status reflects verified protection", () => {
   });
 
   maybe()("P1-N. repeated safe ticks cause no mutation and no state churn", async () => {
-    const execution = await stopOverCovers();
+    const execution = await stopOverCoversWithTargetIntact();
     const before = await ordersOf(execution.id);
     const versionBefore = (await reload(execution.id)).version;
 
@@ -7819,6 +7837,279 @@ describe("pair take-profit submission freshness", () => {
     expect(orders.filter((order) => order.role === "STOP_LOSS")).toHaveLength(1);
     expect(orders.filter((order) => order.role === "TAKE_PROFIT")).toHaveLength(1);
     expect((await rowOf(execution.id, "STOP_LOSS", 1)).originalQuantity.toString()).toBe("0.1");
+    await clearAlerts(execution.id);
+  });
+});
+
+describe("take-profit repair behind a safe oversized stop", () => {
+  const tpIdOf = (id: string, generation: number) => buildClientOrderId(id, "TAKE_PROFIT", generation);
+  const stopIdOf = (id: string, generation: number) => buildClientOrderId(id, "STOP_LOSS", generation);
+
+  const tick = async (id: string) =>
+    protectionService.ensureProtectionForExposure({
+      executionId: id,
+      expectedVersion: (await reload(id)).version,
+      evaluatedAt: at(),
+    });
+
+  const postsOf = (role: string) =>
+    scenario.submitted.filter((entry) => entry.role === role).map((entry) => entry.quantity);
+
+  const generationsOfRole = async (id: string, role: string) =>
+    (await ordersOf(id))
+      .filter((order) => order.role === role)
+      .map((order) => order.generation)
+      .sort((a, b) => a - b);
+
+  const clearAlerts = async (id: string) =>
+    prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: id } });
+
+  /**
+   * The proven-safe shape: ONE owned identity-verified stop still armed for the
+   * pre-shrink quantity, and a target that is conclusively gone.
+   */
+  async function safeOversizedStopWithGap() {
+    const execution = await filledExecution();
+    await protect(execution);
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    scenario.positionAmt = "0.040";
+    scenario.submitted = [];
+    scenario.mutations = [];
+    return execution;
+  }
+
+  maybe()("V1. a real take-profit gap behind one safe oversized stop is repaired", async () => {
+    const execution = await safeOversizedStopWithGap();
+
+    await tick(execution.id);
+
+    // Take-profit-only repair, sized to CURRENT exposure, with no second stop.
+    expect(postsOf("TAKE_PROFIT")).toEqual(["0.04"]);
+    expect(postsOf("STOP_LOSS")).toEqual([]);
+    expect(await generationsOfRole(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
+    expect(await generationsOfRole(execution.id, "STOP_LOSS")).toEqual([1]);
+    // The stop itself is untouched: never resized, cancelled or replaced.
+    expect(scenario.mutations.filter((entry) => entry.startsWith("DELETE"))).toEqual([]);
+    const stop = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id, role: "STOP_LOSS", generation: 1 },
+    });
+    expect(stop.originalQuantity.toString()).toBe("0.1");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("V2. the repair tick does not park, alert or demote the execution", async () => {
+    const execution = await safeOversizedStopWithGap();
+    const before = await reload(execution.id);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+    const eventsBefore = await prisma!.executionEvent.count({ where: { tradeExecutionId: execution.id } });
+
+    await tick(execution.id);
+
+    const after = await reload(execution.id);
+    expect(after.status).toBe(before.status);
+    expect(after.requiresManualIntervention).toBe(false);
+    expect(await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+    // Ordinary reservation accounting only: one version, one reservation event.
+    expect(after.version).toBe(before.version + 1);
+    const events = await prisma!.executionEvent.findMany({
+      where: { tradeExecutionId: execution.id },
+      orderBy: { sequenceNumber: "asc" },
+    });
+    expect(events.length).toBe(eventsBefore + 1);
+    expect(events[events.length - 1]!.eventType).toBe("PROTECTION_RESERVED");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("V3. a PARTIAL take-profit gap is repaired for the exact delta", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.quantity = "0.015";
+    scenario.positionAmt = "0.040";
+    scenario.submitted = [];
+
+    await tick(execution.id);
+
+    expect(postsOf("TAKE_PROFIT")).toEqual(["0.025"]);
+    expect(await generationsOfRole(execution.id, "STOP_LOSS")).toEqual([1]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("V4. once repaired, the next tick returns the ordinary safe deferral", async () => {
+    const execution = await safeOversizedStopWithGap();
+    await tick(execution.id);
+    expect(postsOf("TAKE_PROFIT")).toEqual(["0.04"]);
+    scenario.submitted = [];
+
+    const outcome = await tick(execution.id);
+
+    expect(outcome.reasonCode).toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    expect(scenario.submitted).toEqual([]);
+    expect(await generationsOfRole(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
+    expect(await generationsOfRole(execution.id, "STOP_LOSS")).toEqual([1]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("V5. TWO active stop legs over exposure are never repaired behind", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    // Grow the position so a second pair is legitimately reserved and placed.
+    scenario.positionAmt = "0.200";
+    await tick(execution.id);
+    expect(await generationsOfRole(execution.id, "STOP_LOSS")).toEqual([1, 2]);
+    // Now both targets are gone and the position shrinks: 0.200 of stop across
+    // TWO legs against 0.040 of exposure.
+    for (const generation of [1, 2]) {
+      scenario.algoOrders.get(tpIdOf(execution.id, generation))!.algoStatus = "CANCELED";
+    }
+    scenario.positionAmt = "0.040";
+    scenario.submitted = [];
+
+    const outcome = await tick(execution.id);
+
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect(outcome.reasonCode).not.toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    expect(scenario.submitted).toEqual([]);
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(true);
+    expect(await generationsOfRole(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("V6. an unplaceable target reserves nothing and churns nothing", async () => {
+    const execution = await safeOversizedStopWithGap();
+    scenario.markPrice = "120"; // a LONG target at 108 can no longer be placed
+    const versionBefore = (await reload(execution.id)).version;
+    const ordersBefore = (await ordersOf(execution.id)).length;
+
+    for (let index = 0; index < 3; index += 1) {
+      const outcome = await tick(execution.id);
+      expect(outcome.reasonCode).toBe("TAKE_PROFIT_TRIGGER_INVALID");
+    }
+
+    expect((await ordersOf(execution.id)).length).toBe(ordersBefore);
+    expect((await reload(execution.id)).version).toBe(versionBefore);
+    expect(scenario.submitted).toEqual([]);
+    expect(scenario.mutations).toEqual([]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("V7. a flat position closes out instead of repairing a target", async () => {
+    const execution = await safeOversizedStopWithGap();
+    scenario.positionAmt = "0";
+
+    await tick(execution.id);
+
+    expect(postsOf("TAKE_PROFIT")).toEqual([]);
+    expect(await generationsOfRole(execution.id, "TAKE_PROFIT")).toEqual([1]);
+    expect((await reload(execution.id)).status).toBe("CLOSED_EXTERNAL");
+    await clearAlerts(execution.id);
+  });
+
+  // ---------------------------------------------------------------------
+  // COMPOSITION with the freshness machinery already in main. These do not
+  // re-implement anything: they prove the repaired intent is protected by it.
+  // ---------------------------------------------------------------------
+
+  const plantRepairIntent = async (executionId: string, quantity: string) => {
+    const first = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: executionId, role: "TAKE_PROFIT", generation: 1 },
+    });
+    return prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: executionId,
+        role: "TAKE_PROFIT",
+        generation: 2,
+        clientOrderId: tpIdOf(executionId, 2),
+        clientAlgoId: tpIdOf(executionId, 2),
+        side: first.side,
+        positionSide: first.positionSide,
+        orderType: "TAKE_PROFIT_MARKET",
+        originalQuantity: quantity,
+        triggerPrice: first.triggerPrice,
+        workingType: first.workingType,
+        priceProtect: first.priceProtect,
+        status: "SUBMITTING",
+      },
+    });
+  };
+
+  maybe()("V8. a repair intent that goes stale before its POST is refreshed, not sent", async () => {
+    const execution = await safeOversizedStopWithGap();
+    await plantRepairIntent(execution.id, "0.040");
+    // Exposure shrinks again before the reserved repair is ever submitted.
+    scenario.positionAmt = "0.020";
+    scenario.submitted = [];
+
+    await tick(execution.id);
+
+    expect(postsOf("TAKE_PROFIT")).toEqual(["0.02"]);
+    expect(await generationsOfRole(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("V9. take-profit coverage appearing before the POST shrinks it to the delta", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.quantity = "0.015";
+    scenario.positionAmt = "0.040";
+    await plantRepairIntent(execution.id, "0.040");
+    scenario.submitted = [];
+
+    await tick(execution.id);
+
+    expect(postsOf("TAKE_PROFIT")).toEqual(["0.025"]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("V10. a repair intent whose gap closed is dormant, not posted", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.quantity = "0.040";
+    scenario.positionAmt = "0.040";
+    await plantRepairIntent(execution.id, "0.040");
+    scenario.submitted = [];
+
+    for (let index = 0; index < 3; index += 1) {
+      const outcome = await tick(execution.id);
+      expect(outcome.reasonCode).toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    }
+
+    expect(scenario.submitted).toEqual([]);
+    // Still durable and reusable: no fabricated terminal status.
+    const dormant = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id, role: "TAKE_PROFIT", generation: 2 },
+    });
+    expect(dormant.status).toBe("SUBMITTING");
+    expect(dormant.originalQuantity.toString()).toBe("0.04");
+
+    // When the gap returns the SAME row is reused.
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    await tick(execution.id);
+    expect(postsOf("TAKE_PROFIT")).toEqual(["0.04"]);
+    expect((await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id, role: "TAKE_PROFIT", generation: 2 },
+    })).clientAlgoId).toBe(tpIdOf(execution.id, 2));
+    expect(await generationsOfRole(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("V11. a claimed repair intent is never rewritten or duplicated", async () => {
+    const execution = await safeOversizedStopWithGap();
+    const planted = await plantRepairIntent(execution.id, "0.040");
+    await prisma!.binanceOrder.update({
+      where: { id: planted.id },
+      data: { submissionUnknownAt: at() },
+    });
+    scenario.positionAmt = "0.020";
+    scenario.submitted = [];
+
+    await tick(execution.id);
+
+    expect(scenario.submitted).toEqual([]);
+    const untouched = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id, role: "TAKE_PROFIT", generation: 2 },
+    });
+    expect(untouched.originalQuantity.toString()).toBe("0.04");
+    expect(await generationsOfRole(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
     await clearAlerts(execution.id);
   });
 });
