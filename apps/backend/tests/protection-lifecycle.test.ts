@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { ExecutionOrderType } from "@prisma/client";
 import {
   CRITICAL_REASON_CODES,
   PROTECTION_REASON_CODES,
@@ -9,6 +10,9 @@ import {
   closingSide,
   decideEntryRemainderCleanup,
   countsAsActiveCoverage,
+  isExecutingProtection,
+  protectionModality,
+  readStandardOrderCoverage,
   evaluateEmergencyCloseEligibility,
   evaluateLiquidationSafety,
   findProtectionIdentityMismatches,
@@ -804,5 +808,100 @@ describe("post-cleanup position classification", () => {
       expect(PROTECTION_REASON_CODES).toContain(code);
       expect(isCriticalReason(code)).toBe(true);
     }
+  });
+});
+
+describe("protection modality", () => {
+  it("classifies by durable order type, never by status or which id is set", () => {
+    expect(protectionModality("STOP_MARKET")).toBe("ALGO");
+    expect(protectionModality("TAKE_PROFIT_MARKET")).toBe("ALGO");
+    expect(protectionModality("LIMIT")).toBe("STANDARD");
+  });
+
+  it("fails closed rather than assuming anything that is not LIMIT is conditional", () => {
+    // "Not LIMIT therefore ALGO" would hand this to the conditional reader,
+    // which addresses orders by a clientAlgoId a MARKET row does not have.
+    expect(protectionModality("MARKET")).toBe("UNSUPPORTED");
+    // Whatever a future schema adds is unsupported until it is handled here;
+    // the switch is exhaustive so adding an enum member breaks the build first.
+    expect(protectionModality("SOMETHING_NEW" as ExecutionOrderType)).toBe("UNSUPPORTED");
+  });
+
+  it("A/B. the ALGO status mapping is untouched", () => {
+    // Pinned here so this change cannot quietly reinterpret production
+    // conditional protection while adding the standard reading.
+    expect(normalizeAlgoStatus("NEW")).toBe("ACTIVE");
+    expect(normalizeAlgoStatus("WORKING")).toBe("ACTIVE");
+    expect(normalizeAlgoStatus("TRIGGERED")).toBe("TRIGGERED");
+    expect(normalizeAlgoStatus("PARTIALLY_FILLED")).toBe("PARTIALLY_FILLED");
+    expect(normalizeAlgoStatus("FINISHED")).toBe("FILLED");
+    expect(normalizeAlgoStatus("FILLED")).toBe("FILLED");
+    expect(normalizeAlgoStatus("EXPIRED")).toBe("EXPIRED");
+    expect(normalizeAlgoStatus("CANCELED")).toBe("CANCELED");
+    expect(normalizeAlgoStatus("REJECTED")).toBe("REJECTED");
+    expect(normalizeAlgoStatus("something-else")).toBe("UNKNOWN");
+    // Only ACTIVE covers; TRIGGERED and PARTIALLY_FILLED are executing.
+    expect(countsAsActiveCoverage("ACTIVE")).toBe(true);
+    expect(countsAsActiveCoverage("PARTIALLY_FILLED")).toBe(false);
+    expect(isExecutingProtection("TRIGGERED")).toBe(true);
+    expect(isExecutingProtection("PARTIALLY_FILLED")).toBe(true);
+    expect(isExecutingProtection("ACTIVE")).toBe(false);
+  });
+});
+
+describe("standard protection coverage reading", () => {
+  const read = (status: string, orig: string, exec: string) =>
+    readStandardOrderCoverage({ status, originalQuantity: orig, executedQuantity: exec });
+
+  it("C. NEW rests for its whole quantity", () => {
+    expect(read("NEW", "10", "0")).toEqual({ kind: "RESTING", remaining: "10" });
+  });
+
+  it("D/N. PARTIALLY_FILLED rests for the remnant, from exchange quantities", () => {
+    expect(read("PARTIALLY_FILLED", "10", "4")).toEqual({ kind: "RESTING", remaining: "6" });
+    // Testnet #4 shape: the remnant is what is still working on the book.
+    expect(read("PARTIALLY_FILLED", "2000", "463.8")).toEqual({ kind: "RESTING", remaining: "1536.2" });
+  });
+
+  it("E. a standard PARTIALLY_FILLED remnant is RESTING, not executing", () => {
+    // The whole point of the modality split. The conditional reading of this
+    // same word is "firing, covering nothing"; the standard one is the
+    // opposite, and the two must never be resolved by the same helper.
+    const standard = read("PARTIALLY_FILLED", "10", "4");
+    expect(standard.kind).toBe("RESTING");
+    expect(isExecutingProtection(normalizeAlgoStatus("PARTIALLY_FILLED"))).toBe(true);
+  });
+
+  it("F/O. EXPIRED is terminal even though its history implies a remainder", () => {
+    // Exactly the state Testnet #4 produced when the sibling STOP fired: the
+    // numbers stay coherent, the coverage is gone.
+    expect(read("EXPIRED", "10", "4")).toEqual({ kind: "TERMINAL", status: "EXPIRED" });
+    expect(read("EXPIRED", "2000", "463.8")).toEqual({ kind: "TERMINAL", status: "EXPIRED" });
+  });
+
+  it("G/H/I. every other terminal status covers nothing", () => {
+    expect(read("FILLED", "10", "10")).toEqual({ kind: "TERMINAL", status: "FILLED" });
+    expect(read("CANCELED", "10", "0")).toEqual({ kind: "TERMINAL", status: "CANCELED" });
+    expect(read("CANCELLED", "10", "0")).toEqual({ kind: "TERMINAL", status: "CANCELLED" });
+    expect(read("REJECTED", "10", "0")).toEqual({ kind: "TERMINAL", status: "REJECTED" });
+  });
+
+  it("J. unreadable is UNRESOLVED and never zero", () => {
+    expect(read("UNKNOWN", "10", "0")).toEqual({ kind: "UNRESOLVED" });
+    expect(readStandardOrderCoverage({ status: null, originalQuantity: "10", executedQuantity: "0" })).toEqual({
+      kind: "UNRESOLVED",
+    });
+    // Resting, but the quantities cannot be read: still not zero coverage.
+    expect(readStandardOrderCoverage({ status: "NEW", originalQuantity: null, executedQuantity: "0" })).toEqual({
+      kind: "UNRESOLVED",
+    });
+  });
+
+  it("clamps a nonsensical over-fill to zero rather than going negative", () => {
+    expect(read("PARTIALLY_FILLED", "10", "12")).toEqual({ kind: "RESTING", remaining: "0" });
+  });
+
+  it("tolerates casing and surrounding whitespace", () => {
+    expect(read(" partially_filled ", "10", "4")).toEqual({ kind: "RESTING", remaining: "6" });
   });
 });

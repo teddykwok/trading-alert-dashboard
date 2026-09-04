@@ -32,6 +32,9 @@ import { buildClientOrderId } from "./execution-safety";
 import { protectionWorkingType, type ProtectionPolicy } from "./protection-policy";
 import {
   calculateCoverage,
+  protectionModality,
+  readStandardOrderCoverage,
+  type StandardCoverageReading,
   type CoverageResult,
   classifyPostCleanupPosition,
   decideEntryRemainderCleanup,
@@ -3125,6 +3128,59 @@ export class ProtectionLifecycleService {
       // path forever once a generation 2 has replaced it.
       if (LOCALLY_RESOLVED_ORDER_STATUSES.includes(order.status)) continue;
 
+      /**
+       * A STANDARD protection row is a different exchange primitive and must be
+       * read as one: a different endpoint, a different id, and status words that
+       * do not mean what the conditional ones mean. Above all a
+       * `PARTIALLY_FILLED` LIMIT is NOT executing — its remnant is still resting
+       * and still covering, which is the opposite of the conditional reading.
+       *
+       * No such row is created today, so this branch is unreachable in the
+       * current runtime and the conditional path below is untouched.
+       */
+      const modality = protectionModality(order.orderType);
+
+      /**
+       * A protection row whose order type this lifecycle never places cannot be
+       * read as either modality, so it is neither queried nor counted. It joins
+       * `unresolved`, which is the existing fail-closed answer for "we do not
+       * know what this is": coverage becomes unresolved and the lifecycle
+       * defers instead of repairing against a number it cannot justify.
+       */
+      if (modality === "UNSUPPORTED") {
+        logger.warn(
+          {
+            executionId: execution.id,
+            role,
+            generation: order.generation,
+            orderType: order.orderType,
+          },
+          "Protection row carries an order type this lifecycle does not place; treating coverage as unresolved"
+        );
+        unresolved.add(role);
+        continue;
+      }
+
+      if (modality === "STANDARD") {
+        const reading = await this.readStandardProtection(execution.symbol, order);
+        if (reading.kind === "UNRESOLVED") {
+          unresolved.add(role);
+        } else if (reading.kind === "RESTING") {
+          const resting = new D(reading.remaining);
+          if (resting.greaterThan(0)) {
+            if (role === "STOP_LOSS") {
+              activeStopLegs += 1;
+              stop = stop.plus(resting);
+            } else {
+              takeProfit = takeProfit.plus(resting);
+            }
+          }
+        }
+        // TERMINAL contributes nothing and is not an anomaly: an EXPIRED
+        // close-side remnant is exactly what a fired sibling leaves behind.
+        continue;
+      }
+
       const query = await this.queryProtection(execution.symbol, order.clientAlgoId!);
 
       // THE ABSENT-VS-UNKNOWN BOUNDARY.
@@ -4263,9 +4319,54 @@ export class ProtectionLifecycleService {
     });
   }
 
+  /**
+   * OWNERSHIP IS THE ROLE, NOT THE ID THAT HAPPENS TO BE POPULATED.
+   *
+   * This filtered on `clientAlgoId: { not: null }`, which is the same thing
+   * only for as long as every protection order is a conditional one. A standard
+   * protection row carries a `clientOrderId` and no `clientAlgoId`, so it would
+   * have been invisible here — measured as absent coverage rather than as
+   * protection the lifecycle owns.
+   *
+   * `role` is the durable proof of ownership: it is written once when the row
+   * is reserved and no exchange readback rewrites it. ENTRY and EMERGENCY_CLOSE
+   * carry their own roles and are still excluded by this same predicate, so
+   * widening it cannot pull an entry order into protection coverage.
+   *
+   * Every current protection row does have a `clientAlgoId`, so this changes
+   * nothing that exists today.
+   */
+  /**
+   * Authoritative state of ONE standard protection order, read by its own
+   * deterministic `clientOrderId` through the existing standard query path.
+   *
+   * Read-only by construction: this task adds no standard submission and no
+   * standard cancellation. A row without a `clientOrderId`, or a query that
+   * cannot be resolved, is UNRESOLVED rather than absent — an unreadable
+   * order is never assumed to be covering nothing.
+   */
+  private async readStandardProtection(
+    symbol: string,
+    order: BinanceOrder
+  ): Promise<StandardCoverageReading> {
+    if (!order.clientOrderId) return { kind: "UNRESOLVED" };
+    try {
+      const dto = await this.readOnly.queryOrderByClientOrderId(symbol, order.clientOrderId);
+      if (!dto) return { kind: "UNRESOLVED" };
+      return readStandardOrderCoverage({
+        status: dto.status,
+        originalQuantity: dto.origQty,
+        executedQuantity: dto.executedQty,
+      });
+    } catch {
+      // Unreadable is not absent.
+      return { kind: "UNRESOLVED" };
+    }
+  }
+
   private async loadProtectionOrders(executionId: string): Promise<BinanceOrder[]> {
     return this.prisma.binanceOrder.findMany({
-      where: { tradeExecutionId: executionId, role: { in: ["STOP_LOSS", "TAKE_PROFIT"] }, clientAlgoId: { not: null } },
+      where: { tradeExecutionId: executionId, role: { in: ["STOP_LOSS", "TAKE_PROFIT"] } },
       orderBy: [{ generation: "asc" }, { role: "asc" }],
     });
   }

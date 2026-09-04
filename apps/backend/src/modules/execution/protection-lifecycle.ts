@@ -1,4 +1,7 @@
-import { Prisma } from "@prisma/client";
+import { Prisma, type ExecutionOrderType } from "@prisma/client";
+
+/** The durable order-type vocabulary, straight from the schema enum. */
+type ExecutionOrderTypeName = ExecutionOrderType;
 
 /**
  * Phase 7 — pure SL/TP protection, liquidation-safety and closure logic.
@@ -524,6 +527,116 @@ export function isCancellableProtection(status: NormalizedProtectionStatus): boo
  */
 export function isExecutingProtection(status: NormalizedProtectionStatus): boolean {
   return status === "TRIGGERED" || status === "PARTIALLY_FILLED";
+}
+
+// ---------------------------------------------------------------------------
+// Protection modality
+// ---------------------------------------------------------------------------
+
+/**
+ * WHICH EXCHANGE PRIMITIVE A PROTECTION ROW IS.
+ *
+ * ALGO rows are conditional orders on /fapi/v1/algoOrder, addressed by
+ * `clientAlgoId` and reported through `algoStatus`. STANDARD rows are ordinary
+ * orders on /fapi/v1/order, addressed by `clientOrderId` and reported through
+ * the normal order status.
+ *
+ * The two report the SAME words with different meanings, so nothing may read a
+ * status without first knowing which of them produced it. `PARTIALLY_FILLED`
+ * is the case that matters: on a conditional order it means the protection is
+ * firing and its resting coverage is gone, while on a resting LIMIT it means
+ * part of the order traded and the remnant is STILL covering.
+ *
+ * Derived from `orderType`, which is durable, written once at reservation and
+ * never rewritten by an exchange readback. Deliberately NOT derived from the
+ * status, from which id happens to be populated, or from anything the exchange
+ * can change under us.
+ *
+ * UNSUPPORTED is the third answer and it is the important one. "Not LIMIT
+ * therefore conditional" would quietly hand a MARKET row — or any order type a
+ * later schema adds — to the algo reader, which would address it by a
+ * `clientAlgoId` such a row does not have. A protection row whose type this
+ * lifecycle does not place is not a conditional order; it is an anomaly, and it
+ * fails closed instead of being interpreted.
+ *
+ * Both known types are listed explicitly and the switch is exhaustive over the
+ * enum, so adding a member to `ExecutionOrderType` is a compile error here
+ * rather than a silent reclassification. The `default` still answers
+ * UNSUPPORTED because the value comes from the database, which the compiler
+ * cannot vouch for.
+ */
+export type ProtectionModality = "ALGO" | "STANDARD" | "UNSUPPORTED";
+
+export function protectionModality(orderType: ExecutionOrderTypeName): ProtectionModality {
+  switch (orderType) {
+    case "STOP_MARKET":
+    case "TAKE_PROFIT_MARKET":
+      return "ALGO";
+    case "LIMIT":
+      return "STANDARD";
+    case "MARKET":
+      // A market order is never resting protection.
+      return "UNSUPPORTED";
+    default: {
+      const unhandled: never = orderType;
+      void unhandled;
+      return "UNSUPPORTED";
+    }
+  }
+}
+
+/**
+ * What a STANDARD protection order is worth right now.
+ *
+ * Direct USD-M testnet evidence (hedge mode, both directions): a close-side GTC
+ * LIMIT that is `PARTIALLY_FILLED` still has a resting remnant of
+ * `origQty - executedQty` working on the book, and that remnant really does
+ * close exposure. When a sibling algo STOP fired and took the rest of the
+ * position, the remnant went straight to `EXPIRED` — keeping a historically
+ * coherent `origQty`/`executedQty` whose difference was still positive, while
+ * covering nothing at all.
+ *
+ * So STATUS GATES THE ARITHMETIC. A terminal order covers zero however much
+ * quantity its history implies, and an unreadable one is never assumed to be
+ * either.
+ */
+export type StandardCoverageReading =
+  | { readonly kind: "RESTING"; readonly remaining: string }
+  | { readonly kind: "TERMINAL"; readonly status: string }
+  | { readonly kind: "UNRESOLVED" };
+
+/**
+ * Terminal for a STANDARD order: conclusively settled, nothing resting.
+ *
+ * `EXPIRED` is ordinary here, not an anomaly — it is what Binance does to a
+ * close-side remnant once the position it was closing is gone. Whether a
+ * replacement is needed is a question about current exposure, never about this
+ * word.
+ */
+const STANDARD_TERMINAL_STATUSES: readonly string[] = ["FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"];
+
+/** Still on the book with a remnant that is genuinely covering exposure. */
+const STANDARD_RESTING_STATUSES: readonly string[] = ["NEW", "PARTIALLY_FILLED"];
+
+export function readStandardOrderCoverage(input: {
+  status: string | null | undefined;
+  originalQuantity: string | null | undefined;
+  executedQuantity: string | null | undefined;
+}): StandardCoverageReading {
+  if (typeof input.status !== "string") return { kind: "UNRESOLVED" };
+  const status = input.status.trim().toUpperCase();
+
+  if (STANDARD_TERMINAL_STATUSES.includes(status)) return { kind: "TERMINAL", status };
+  if (!STANDARD_RESTING_STATUSES.includes(status)) return { kind: "UNRESOLVED" };
+
+  const original = toDecimal(input.originalQuantity);
+  const executed = toDecimal(input.executedQuantity);
+  // A resting order whose quantities cannot be read is NOT zero coverage: we
+  // simply do not know what it is holding.
+  if (original === null || executed === null) return { kind: "UNRESOLVED" };
+
+  const remaining = original.minus(executed);
+  return { kind: "RESTING", remaining: (remaining.isNegative() ? new D(0) : remaining).toString() };
 }
 
 // ---------------------------------------------------------------------------
