@@ -76,6 +76,21 @@ const D = Prisma.Decimal;
 /** Namespace for the per-(profile, symbol, positionSide) advisory lock. */
 const PROTECTION_LOCK_NAMESPACE = 0x7afe;
 
+/**
+ * Thrown INSIDE the refresh transaction so the version bump rolls back with the
+ * row update. Never escapes: it is caught and turned into "CONFLICT".
+ */
+class StaleIntentConflict extends Error {}
+
+/**
+ * What the take-profit-only gate decided. PROCEED carries the row that must
+ * actually be submitted — which is not necessarily the one the caller loaded,
+ * because the gate may have re-sized it — and the version to thread onward.
+ */
+type TakeProfitGate =
+  | { kind: "REFUSE"; outcome: ProtectionOutcome }
+  | { kind: "PROCEED"; takeProfit: BinanceOrder; expectedVersion: number };
+
 export interface ProtectionLifecycleInput {
   executionId: string;
   expectedVersion: number;
@@ -193,6 +208,22 @@ const EXECUTING_PROTECTION_REASON_CODES: readonly ProtectionReasonCode[] = [
 ];
 
 /**
+ * The durable intent moved under this call and NOTHING was sent.
+ *
+ * Produced only when the submission claim loses on the quantity it was about to
+ * POST: another writer re-sized the never-submitted row first. No mutation
+ * escaped and no leg is missing, so escalating would raise an operator alert
+ * for a race the next tick resolves by reading the revised intent.
+ *
+ * No pre-existing submission path returns either code, so adding them here
+ * changes nothing that already happens — including for STOP.
+ */
+const INTENT_CHANGED_REASON_CODES: readonly ProtectionReasonCode[] = [
+  "STOP_INTENT_CONFLICT",
+  "TAKE_PROFIT_INTENT_CONFLICT",
+];
+
+/**
  * Outcomes submitTranche must DEFER rather than escalate: nothing is known to
  * be wrong, so the reserved tranche is left incomplete and the next tick asks
  * again.
@@ -201,7 +232,8 @@ function isDeferredProtectionState(reasonCode: ProtectionReasonCode): boolean {
   return (
     isUnreadableProtectionState(reasonCode) ||
     PROPAGATION_PENDING_REASON_CODES.includes(reasonCode) ||
-    EXECUTING_PROTECTION_REASON_CODES.includes(reasonCode)
+    EXECUTING_PROTECTION_REASON_CODES.includes(reasonCode) ||
+    INTENT_CHANGED_REASON_CODES.includes(reasonCode)
   );
 }
 
@@ -1367,7 +1399,10 @@ export class ProtectionLifecycleService {
     }
 
     // Resolve any half-finished tranche before creating a new one.
-    const pending = await this.findIncompleteTranche(execution);
+    const pending = await this.findIncompleteTranche(execution, {
+      stopQuantity: coverage.missingStopQuantity,
+      takeProfitQuantity: coverage.missingTakeProfitQuantity,
+    });
 
     // FAIL CLOSED ON AN UNRESOLVED OBSERVATION.
     //
@@ -1429,7 +1464,14 @@ export class ProtectionLifecycleService {
   }
 
   /** The lowest generation whose STOP or TP is not yet verified active. */
-  private async findIncompleteTranche(execution: TradeExecution): Promise<number | null> {
+  private async findIncompleteTranche(
+    execution: TradeExecution,
+    /**
+     * Current authoritative gaps. Omitted by the reservation-conflict caller,
+     * which only needs to find the generation another worker just created.
+     */
+    missing?: { stopQuantity: string; takeProfitQuantity: string }
+  ): Promise<number | null> {
     const orders = await this.loadProtectionOrders(execution.id);
     const generations = [...new Set(orders.map((order) => order.generation))].sort((a, b) => a - b);
     for (const generation of generations) {
@@ -1454,10 +1496,44 @@ export class ProtectionLifecycleService {
        */
       const rows = orders.filter((order) => order.generation === generation);
       if (rows.length === 0) return generation;
-      const incomplete = rows.some((order) =>
+      const incompleteRows = rows.filter((order) =>
         ["PLANNED", "SUBMITTING", "UNKNOWN"].includes(order.status)
       );
-      if (incomplete) return generation;
+      if (incompleteRows.length === 0) continue;
+
+      /**
+       * A GENERATION WITH NOTHING LEFT TO DO MUST NOT BLOCK THE ONE THAT HAS.
+       *
+       * Resuming is unconditional and takes the LOWEST incomplete generation,
+       * so a take-profit-only tranche whose target has since been covered kept
+       * being chosen for ever — and because a pending generation is resumed
+       * INSTEAD of reserving, no stop-only generation could be created behind
+       * it. A missing STOP is safety-critical, and it was waiting on a take
+       * profit that nobody needed.
+       *
+       * So a generation is skipped only when EVERY one of its incomplete rows
+       * is both:
+       *
+       *  - provably never submitted, so skipping it cannot strand an identity
+       *    that may be live on the exchange and still needs reconciling; and
+       *  - for a role whose CURRENT authoritative gap is zero, so there is
+       *    genuinely no work in it right now.
+       *
+       * It is skipped, not retired: the row stays exactly as it is, keeps its
+       * deterministic identity, and is chosen again the moment its role has a
+       * positive gap — where the pre-submission refresh re-sizes it. Nothing is
+       * written, so a restart reconstructs the same decision from the same
+       * rows. Without the missing quantities this is the old behaviour.
+       */
+      const dormant =
+        missing !== undefined &&
+        incompleteRows.every(
+          (order) =>
+            order.submittedAt === null &&
+            order.submissionUnknownAt === null &&
+            new D(order.role === "STOP_LOSS" ? missing.stopQuantity : missing.takeProfitQuantity).isZero()
+        );
+      if (!dormant) return generation;
     }
     return null;
   }
@@ -1735,11 +1811,145 @@ export class ProtectionLifecycleService {
    * Nothing is written on any path through this, so a tick that defers leaves
    * no trace.
    */
+  /**
+   * THE ONLY FIELDS THAT PROVE AN IDENTITY HAS NEVER ESCAPED.
+   *
+   * `submissionUnknownAt` is written BEFORE the request can be sent and
+   * `submittedAt` once the exchange accepted it, so either one means a POST for
+   * this deterministic id may be live. The three exchange-assigned ids and the
+   * trigger stamp are included because any of them being set means the exchange
+   * has told us about this order, and `algoStatus` because it is only ever
+   * written from a readback. A status outside the two pre-submission values is
+   * likewise proof that something happened to it.
+   *
+   * Used as the WHERE of a conditional UPDATE rather than as an if: read-then-
+   * write cannot be safe across processes, and the claim that authorises a POST
+   * does not take any lock this could share.
+   */
+  private static readonly NEVER_SUBMITTED_WHERE = {
+    submittedAt: null,
+    submissionUnknownAt: null,
+    exchangeOrderId: null,
+    exchangeAlgoId: null,
+    actualOrderId: null,
+    triggeredAt: null,
+    algoStatus: null,
+    status: { in: ["PLANNED", "SUBMITTING"] as BinanceOrder["status"][] },
+  };
+
+  /**
+   * Re-sizes a reserved protection intent that has never been submitted, so the
+   * quantity that reaches the exchange is the one the CURRENT authoritative gap
+   * asks for rather than the one frozen at reservation.
+   *
+   * ## Why the row is revised rather than superseded
+   *
+   * Superseding would need the stale row marked as no longer awaited, and the
+   * only statuses available for that — CANCELED, EXPIRED, REJECTED — are
+   * exchange facts. Writing one for a row the exchange has never seen would put
+   * a lie in the audit trail and make a local decision indistinguishable from
+   * something Binance did. `ExecutionOrderStatus` has no local-supersession
+   * value and this change is not authorised to add one, so the row that was
+   * never submitted is revised in place and the change is journalled.
+   *
+   * ## Why this is atomic against the submission claim
+   *
+   * Both this and the claim are single conditional UPDATEs against the same
+   * row, so Postgres serialises them and exactly one can win:
+   *
+   *  - refresh first: the row's quantity is no longer the one a stale worker
+   *    loaded, so its claim — which now matches on that quantity — finds no row
+   *    and it can never POST the stale number;
+   *  - claim first: `submissionUnknownAt` is set, so this WHERE finds no row
+   *    and the quantity of a possibly-live identity is never rewritten;
+   *  - two refreshes: the second finds the pre-refresh quantity gone.
+   *
+   * The version CAS gives the journal entry its sequence number and a second
+   * layer of exclusion. Row update and event are one transaction, so a restart
+   * can never see one without the other.
+   */
+  private async refreshUnsubmittedIntent(
+    execution: TradeExecution,
+    order: BinanceOrder,
+    desiredQuantity: string,
+    input: ProtectionLifecycleInput
+  ): Promise<{ order: BinanceOrder; expectedVersion: number } | "CONFLICT"> {
+    const previousQuantity = order.originalQuantity.toString();
+
+    const committed = await this.prisma.$transaction(async (tx) => {
+      const advanced = await tx.tradeExecution.updateMany({
+        where: { id: execution.id, version: input.expectedVersion },
+        data: { version: { increment: 1 } },
+      });
+      if (advanced.count === 0) return null;
+
+      const revised = await tx.binanceOrder.updateMany({
+        where: {
+          id: order.id,
+          ...ProtectionLifecycleService.NEVER_SUBMITTED_WHERE,
+          // The quantity THIS call proved stale. Anything else means another
+          // writer moved it, and this decision is no longer about that row.
+          originalQuantity: order.originalQuantity,
+        },
+        data: { originalQuantity: new D(desiredQuantity) },
+      });
+      // Rolls the version bump back with it: the two must not diverge.
+      if (revised.count === 0) throw new StaleIntentConflict();
+
+      const next = await tx.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+      await tx.executionEvent.create({
+        data: {
+          tradeExecutionId: execution.id,
+          sequenceNumber: next.version,
+          // The order row's intent changed. Deliberately NOT a second
+          // PROTECTION_RESERVED: no generation was reserved here and no row was
+          // created, and that event's metadata describes a reservation.
+          eventType: "ORDER_UPDATED",
+          fromStatus: execution.status,
+          toStatus: next.status,
+          reasonCode: "PROTECTION_COVERAGE_INCOMPLETE",
+          message:
+            `Re-sized the unsubmitted ${order.role} intent of generation ${order.generation} ` +
+            `from ${previousQuantity} to ${desiredQuantity} before its first submission.`,
+          metadata: {
+            generation: order.generation,
+            role: order.role,
+            previousQuantity,
+            revisedQuantity: desiredQuantity,
+            clientAlgoId: order.clientAlgoId,
+            reason: "STALE_UNSUBMITTED_INTENT",
+          } as Prisma.InputJsonValue,
+        },
+      });
+
+      return next;
+    }).catch((error: unknown) => {
+      if (error instanceof StaleIntentConflict) return "CONFLICT" as const;
+      throw error;
+    });
+
+    if (committed === "CONFLICT" || committed === null) return "CONFLICT";
+
+    const refreshed = await this.prisma.binanceOrder.findUniqueOrThrow({ where: { id: order.id } });
+    logger.info(
+      {
+        executionId: execution.id,
+        generation: order.generation,
+        role: order.role,
+        previousQuantity,
+        revisedQuantity: desiredQuantity,
+      },
+      "Re-sized a never-submitted protection intent to the current authoritative gap"
+    );
+    return { order: refreshed, expectedVersion: committed.version };
+  }
+
   private async takeProfitOnlyBarrier(
     execution: TradeExecution,
+    reserved: BinanceOrder,
     position: PositionSnapshot,
     input: ProtectionLifecycleInput
-  ): Promise<ProtectionOutcome | null> {
+  ): Promise<TakeProfitGate> {
     const direction = execution.direction as DirectionName;
     const protection = await this.loadProtection(execution.id);
 
@@ -1747,38 +1957,38 @@ export class ProtectionLifecycleService {
     // an exit order must never be added to a position that is not there.
     const normalized = normalizeOpenQuantity(position.quantity, direction);
     if (!normalized.valid || new D(normalized.quantity).lessThanOrEqualTo(0)) {
-      return this.outcome(
+      return { kind: "REFUSE", outcome: this.outcome(
         false,
         "PROTECTION_COVERAGE_INCOMPLETE",
         "No open exposure remains; closure owns this execution and no take profit is placed.",
         execution,
         protection
-      );
+      ) };
     }
 
     const coverageNow = await this.measureVerifiedCoverage(execution);
 
     // Unreadable is not absent, and it is certainly not proof the stop holds.
     if (coverageNow.unresolved.length > 0) {
-      return this.outcome(
+      return { kind: "REFUSE", outcome: this.outcome(
         false,
         coverageNow.unresolved.includes("STOP_LOSS") ? "STOP_QUERY_UNAVAILABLE" : "TAKE_PROFIT_QUERY_UNAVAILABLE",
         `Protection state is unreadable for ${coverageNow.unresolved.join(" and ")}; no take profit is placed.`,
         execution,
         protection
-      );
+      ) };
     }
 
     // A leg that is firing is closing the position; adding an exit order into
     // that race is exactly what the emergency-close path already refuses.
     if (coverageNow.executing.length > 0) {
-      return this.outcome(
+      return { kind: "REFUSE", outcome: this.outcome(
         false,
         coverageNow.executing.includes("STOP_LOSS") ? "STOP_EXECUTION_IN_PROGRESS" : "TAKE_PROFIT_EXECUTION_IN_PROGRESS",
         `${coverageNow.executing.join(" and ")} is executing; no take profit is placed.`,
         execution,
         protection
-      );
+      ) };
     }
 
     const coverage = calculateCoverage({
@@ -1789,28 +1999,130 @@ export class ProtectionLifecycleService {
 
     // The single check that carries the over-coverage invariants wholesale.
     if (coverage.overProtected) {
-      return this.outcome(
+      return { kind: "REFUSE", outcome: this.outcome(
         false,
         "PROTECTION_COVERAGE_INCOMPLETE",
         `Protection exceeds exposure (stop ${coverageNow.stop}, take profit ${coverageNow.takeProfit}, ` +
           `exposure ${normalized.quantity}); no take profit is placed.`,
         execution,
         protection
-      );
+      ) };
     }
 
     if (coverage.missingStopQuantity !== "0") {
-      return this.outcome(
+      return { kind: "REFUSE", outcome: this.outcome(
         false,
         "PROTECTION_COVERAGE_INCOMPLETE",
         `The stop no longer covers the exposure (stop ${coverageNow.stop} of ${normalized.quantity}); ` +
           "the stop is repaired before any take profit is placed.",
         execution,
         protection
-      );
+      ) };
     }
 
-    return null;
+    /**
+     * THE RESERVED QUANTITY IS AN OPINION FROM THE PAST.
+     *
+     * Everything above re-proves the SHAPE of protection from the exchange, but
+     * the number that actually reaches Binance is `originalQuantity`, frozen
+     * when the tranche was reserved. Take-profit coverage that was invisible at
+     * reservation can become visible before the POST, and then the frozen
+     * number is larger than the gap it is meant to fill.
+     *
+     * Nothing here assumes Binance would clamp an oversized TAKE_PROFIT_MARKET.
+     * We have no evidence for that, and it is exactly the assumption not to
+     * make, so the number is proved against the current gap instead.
+     */
+    const gap = coverage.missingTakeProfitQuantity;
+    if (!new D(reserved.originalQuantity.toString()).greaterThan(gap)) {
+      /**
+       * Under-covering is left exactly as it is. A tranche smaller than the gap
+       * is the ordinary tranche model: it places what it can and the next
+       * generation repairs the remainder. Growing an intent to "freshen" it
+       * would place more than was ever reserved, which is the dangerous
+       * direction and is deliberately not implemented.
+       */
+      return { kind: "PROCEED", takeProfit: reserved, expectedVersion: input.expectedVersion };
+    }
+
+    /**
+     * NOTHING LEFT TO PLACE.
+     *
+     * Re-sizing to zero is not a repair and a zero-quantity order is not legal,
+     * so this refuses. It does not starve: with the gap closed, aggregate
+     * coverage is complete, so later ticks return from `advanceProtection`
+     * before the incomplete-tranche path is reached and this row stays dormant.
+     * When a real gap reappears the same path runs again and re-sizes it then.
+     */
+    if (gap === "0") {
+      return { kind: "REFUSE", outcome: this.outcome(
+        false,
+        "TAKE_PROFIT_INTENT_CONFLICT",
+        `The reserved take profit of ${reserved.originalQuantity.toString()} exceeds a gap of zero ` +
+          `(take profit ${coverageNow.takeProfit} of ${normalized.quantity}); nothing is placed.`,
+        execution,
+        protection
+      ) };
+    }
+
+    /**
+     * A SMALLER QUANTITY IS NOT AUTOMATICALLY A PLACEABLE ONE.
+     *
+     * Step size, minimum quantity and the trigger rules are all quantity
+     * dependent, so the revised number is put through exactly the validation a
+     * fresh reservation of that number would face. An unplaceable gap is
+     * refused without writing anything, which is what the reservation path
+     * already does when a take profit cannot be placed.
+     */
+    let inspection;
+    try {
+      inspection = await this.readOnly.inspectSymbol(execution.symbol);
+    } catch {
+      return { kind: "REFUSE", outcome: this.outcome(
+        false,
+        "POSITION_STATE_UNAVAILABLE",
+        "Symbol state could not be read; no take profit is placed.",
+        execution,
+        protection
+      ) };
+    }
+    const verdict = validateProtectionTriggers({
+      direction,
+      stopTriggerPrice: execution.executableStopLoss.toString(),
+      takeProfitTriggerPrice: reserved.triggerPrice?.toString() ?? null,
+      workingPrice: position.markPrice,
+      tickSize: inspection.filters.tickSize,
+      stepSize: inspection.filters.stepSize,
+      minQty: inspection.filters.minQty,
+      quantity: gap,
+    }).takeProfit;
+    if (!verdict.valid) {
+      return { kind: "REFUSE", outcome: this.outcome(
+        false,
+        verdict.reasonCode ?? "TAKE_PROFIT_TRIGGER_INVALID",
+        `The current take-profit gap of ${gap} is not placeable; the reserved intent is left unchanged.`,
+        execution,
+        protection
+      ) };
+    }
+
+    const refreshed = await this.refreshUnsubmittedIntent(execution, reserved, gap, input);
+    if (refreshed === "CONFLICT") {
+      /**
+       * Another writer moved this row between the measurement and the update:
+       * it was claimed for submission, already re-sized, or the version moved.
+       * Nothing is forced — the next tick re-reads whatever is now true.
+       */
+      return { kind: "REFUSE", outcome: this.outcome(
+        false,
+        "TAKE_PROFIT_INTENT_CONFLICT",
+        "The reserved take-profit intent changed while it was being re-sized; nothing is placed.",
+        execution,
+        protection
+      ) };
+    }
+
+    return { kind: "PROCEED", takeProfit: refreshed.order, expectedVersion: refreshed.expectedVersion };
   }
 
   private async submitTranche(
@@ -1822,7 +2134,8 @@ export class ProtectionLifecycleService {
     const protection = await this.ensureProtectionRow(execution.id);
 
     const stop = await this.loadOrder(execution.id, "STOP_LOSS", generation);
-    const reservedTakeProfit = await this.loadOrder(execution.id, "TAKE_PROFIT", generation);
+    let reservedTakeProfit = await this.loadOrder(execution.id, "TAKE_PROFIT", generation);
+    let owned: ProtectionLifecycleInput = input;
 
     /**
      * A generation with NO rows cannot come from the reservation path, which
@@ -1840,8 +2153,13 @@ export class ProtectionLifecycleService {
      * BEFORE anything is written or claimed.
      */
     if (!stop) {
-      const barrier = await this.takeProfitOnlyBarrier(execution, position, input);
-      if (barrier) return barrier;
+      const gate = await this.takeProfitOnlyBarrier(execution, reservedTakeProfit!, position, owned);
+      if (gate.kind === "REFUSE") return gate.outcome;
+      // The gate may have re-sized the intent and bumped the version doing it.
+      // Both must be carried forward: the row because it is what gets POSTed,
+      // the version because anything later in this call CASes against it.
+      reservedTakeProfit = gate.takeProfit;
+      owned = { ...owned, expectedVersion: gate.expectedVersion };
     }
 
     // Protection placement is starting. This is the single funnel for BOTH a
@@ -1857,8 +2175,9 @@ export class ProtectionLifecycleService {
       "PLACING_PROTECTION",
       "Placing protection for the confirmed fill."
     );
-    const owned: ProtectionLifecycleInput =
-      placing.committedVersion === null ? input : { ...input, expectedVersion: placing.committedVersion };
+    // Threaded, not re-derived from `input`: the take-profit gate above may
+    // already have advanced the version, and a promotion here supersedes it.
+    if (placing.committedVersion !== null) owned = { ...owned, expectedVersion: placing.committedVersion };
 
     if (stop) {
     const stopResult = await this.submitAndVerifyProtection(execution, stop, input.evaluatedAt);
@@ -2145,12 +2464,39 @@ export class ProtectionLifecycleService {
       // live — could never be retried at all.
       if (identityMayBeLive) {
         const claim = await this.prisma.binanceOrder.updateMany({
-          where: { id: order.id, submissionUnknownAt: null },
+          where: {
+            id: order.id,
+            submissionUnknownAt: null,
+            /**
+             * THE CLAIM ASSERTS WHAT IT IS ABOUT TO SEND.
+             *
+             * The POST body is built from the row loaded at the top of this
+             * call, so testing only the marker would let a worker holding a
+             * pre-refresh quantity win the claim and send a number the row no
+             * longer holds. Naming the quantity here makes "re-size an
+             * unsubmitted intent" and "authorise this exact intent for POST"
+             * two conditional writes to one row, which Postgres serialises:
+             * whichever lands second finds its precondition gone.
+             */
+            originalQuantity: order.originalQuantity,
+          },
           data: { submissionUnknownAt: evaluatedAt },
         });
         if (claim.count === 0) {
-          // Another worker claimed it between our read and this write.
           const current = await this.prisma.binanceOrder.findUniqueOrThrow({ where: { id: order.id } });
+          // Still unattempted means the claim lost on the QUANTITY, not to
+          // another submitter: the intent was revised under us and nothing was
+          // sent. Reporting that as an unresolved submission would invent an
+          // ambiguity that does not exist, and would bound a deadline against
+          // an attempt that never happened.
+          if (current.submittedAt === null && current.submissionUnknownAt === null) {
+            return {
+              verified: false,
+              reasonCode: role === "STOP_LOSS" ? "STOP_INTENT_CONFLICT" : "TAKE_PROFIT_INTENT_CONFLICT",
+              message: "The reserved quantity was revised before submission; nothing was sent.",
+            };
+          }
+          // Another worker claimed it between our read and this write.
           return this.unresolvedAcceptedSubmission(current, role, evaluatedAt);
         }
         order = { ...order, submissionUnknownAt: evaluatedAt };

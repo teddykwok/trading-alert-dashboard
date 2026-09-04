@@ -258,10 +258,19 @@ describe("structural: only the stop can withhold protection", () => {
 
     const condition = SERVICE.slice(
       SERVICE.indexOf("const rows = orders.filter"),
-      SERVICE.indexOf("if (incomplete) return generation;")
+      SERVICE.indexOf("if (!dormant) return generation;")
     );
-    expect(condition).toContain("rows.some");
+    // Incompleteness is still read from the rows that EXIST -- never from a
+    // role being absent, which is what made every single-role generation
+    // permanently incomplete.
+    expect(condition).toContain("const incompleteRows = rows.filter(");
     expect(condition).not.toContain("!takeProfit");
+    // A generation may now be SKIPPED as dormant, but only on both proofs at
+    // once: nothing of it can be live on the exchange, and its remaining roles
+    // have no current gap. Neither half alone may stand in for the pair.
+    expect(condition).toContain("order.submittedAt === null");
+    expect(condition).toContain("order.submissionUnknownAt === null");
+    expect(condition).toContain(").isZero()");
   });
 
   it("K/L. this change touches no admission, capacity or authorization logic", () => {
