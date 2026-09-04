@@ -32,6 +32,7 @@ import { buildClientOrderId } from "./execution-safety";
 import { protectionWorkingType, type ProtectionPolicy } from "./protection-policy";
 import {
   calculateCoverage,
+  type CoverageResult,
   classifyPostCleanupPosition,
   decideEntryRemainderCleanup,
   calculateMarginTopUp,
@@ -1203,6 +1204,34 @@ export class ProtectionLifecycleService {
   // Protection advancement: reserve tranche -> STOP -> TP -> verify
   // ==========================================================================
 
+  /**
+   * The ONE over-coverage shape direct USD-M testnet evidence proved harmless:
+   * a single owned, identity-verified stop still armed for more than the
+   * position holds. Binance clamps a conditional close to the actual position
+   * at trigger time, so it closes what is there and no more.
+   *
+   * Every condition is required, and each rules out a state the evidence does
+   * not cover: an unreadable leg could be the real explanation; a leg that is
+   * firing is a different situation with its own deferral; TWO active stops is
+   * duplicate protection rather than a stale quantity, and stays fail-closed;
+   * a stop that contradicts our own intent is not conclusively ours; and a take
+   * profit exceeding exposure is not the stop's excess at all.
+   *
+   * Extracted so the two places that must make this judgement — the
+   * over-coverage branch and the pair's pre-submission freshness check — apply
+   * exactly the same rule rather than two paraphrases of it.
+   */
+  private safeOversizedStopOnly(coverageNow: VerifiedCoverage, openQuantity: string): boolean {
+    return (
+      coverageNow.unresolved.length === 0 &&
+      coverageNow.executing.length === 0 &&
+      coverageNow.activeStopLegs === 1 &&
+      coverageNow.stopIdentityVerified &&
+      new D(coverageNow.stop).greaterThan(openQuantity) &&
+      new D(coverageNow.takeProfit).lessThanOrEqualTo(openQuantity)
+    );
+  }
+
   private async advanceProtection(
     execution: TradeExecution,
     openQuantity: string,
@@ -1313,17 +1342,7 @@ export class ProtectionLifecycleService {
        * this lifecycle cannot yet express without also minting a redundant
        * second stop. That is deliberately left to its own change.
        */
-      const excessIsOwnedStopOnly =
-        coverageNow.unresolved.length === 0 &&
-        coverageNow.executing.length === 0 &&
-        // EXACTLY ONE stop, not merely "every stop is ours". The evidence
-        // covers a single stop carrying a stale quantity; two active stops
-        // against one position is duplicate protection, which is a different
-        // condition with no such evidence behind it.
-        coverageNow.activeStopLegs === 1 &&
-        coverageNow.stopIdentityVerified &&
-        new D(coverageNow.stop).greaterThan(openQuantity) &&
-        new D(coverageNow.takeProfit).lessThanOrEqualTo(openQuantity);
+      const excessIsOwnedStopOnly = this.safeOversizedStopOnly(coverageNow, openQuantity);
 
       if (excessIsOwnedStopOnly) {
         logger.info(
@@ -2020,19 +2039,51 @@ export class ProtectionLifecycleService {
       ) };
     }
 
-    /**
-     * THE RESERVED QUANTITY IS AN OPINION FROM THE PAST.
-     *
-     * Everything above re-proves the SHAPE of protection from the exchange, but
-     * the number that actually reaches Binance is `originalQuantity`, frozen
-     * when the tranche was reserved. Take-profit coverage that was invisible at
-     * reservation can become visible before the POST, and then the frozen
-     * number is larger than the gap it is meant to fill.
-     *
-     * Nothing here assumes Binance would clamp an oversized TAKE_PROFIT_MARKET.
-     * We have no evidence for that, and it is exactly the assumption not to
-     * make, so the number is proved against the current gap instead.
-     */
+    return this.freshenTakeProfitIntent(execution, reserved, {
+      coverage,
+      coverageNow,
+      openQuantity: normalized.quantity,
+      markPrice: position.markPrice,
+      protection,
+      input,
+    });
+  }
+
+  /**
+   * THE RESERVED QUANTITY IS AN OPINION FROM THE PAST.
+   *
+   * The number that actually reaches Binance is `originalQuantity`, frozen when
+   * the tranche was reserved. Between that instant and the POST the position
+   * can shrink, or take-profit coverage that was invisible can appear, and then
+   * the frozen number is larger than the gap it is meant to fill.
+   *
+   * Nothing here assumes Binance would clamp an oversized TAKE_PROFIT_MARKET.
+   * We have no evidence for that, and it is exactly the assumption not to make,
+   * so the number is proved against the current gap instead.
+   *
+   * Shared by BOTH paths that submit a take profit, deliberately: the take-
+   * profit-only tranche, which proves the stop's health first, and the pair,
+   * whose own stop has just gone active. They differ in what must be true about
+   * the STOP, not in how the take-profit number is proved, so the caller does
+   * its own shape checks and this decides only the quantity.
+   */
+  private async freshenTakeProfitIntent(
+    execution: TradeExecution,
+    reserved: BinanceOrder,
+    context: {
+      coverage: CoverageResult;
+      coverageNow: VerifiedCoverage;
+      openQuantity: string;
+      markPrice: string | null;
+      protection: Awaited<ReturnType<ProtectionLifecycleService["loadProtection"]>>;
+      input: ProtectionLifecycleInput;
+    }
+  ): Promise<TakeProfitGate> {
+    const { coverage, coverageNow, openQuantity, protection, input } = context;
+    const direction = execution.direction as DirectionName;
+    const normalized = { quantity: openQuantity };
+    const position = { markPrice: context.markPrice };
+
     const gap = coverage.missingTakeProfitQuantity;
     if (!new D(reserved.originalQuantity.toString()).greaterThan(gap)) {
       /**
@@ -2123,6 +2174,138 @@ export class ProtectionLifecycleService {
     }
 
     return { kind: "PROCEED", takeProfit: refreshed.order, expectedVersion: refreshed.expectedVersion };
+  }
+
+  /**
+   * THE PAIR'S TAKE PROFIT IS ALSO AN OPINION FROM THE PAST.
+   *
+   * A pair freezes both quantities from ONE coverage measurement, then submits
+   * the STOP and waits for authoritative verification before the take profit
+   * goes anywhere. That wait is real exchange time, and the position can shrink
+   * inside it. The take profit was then POSTed at the reserved number with no
+   * re-measurement at all, so an oversized TAKE_PROFIT_MARKET could escape —
+   * the same defect already fixed for the take-profit-only tranche, reached by
+   * a different route.
+   *
+   * The number is proved by the SAME shared stage and revised by the SAME
+   * atomic primitive, so refresh and the submission claim stay mutually
+   * exclusive exactly as they already are. Only the shape checks differ, and
+   * they differ for one reason: this path's own STOP has just been placed and
+   * verified.
+   *
+   * That STOP is never touched here. It may already be live on the exchange,
+   * and it is the safety leg: not resized, not cancelled, not replaced, and its
+   * intent never refreshed. After a shrink it legitimately guards more than the
+   * position holds, which is why over-coverage is NOT a refusal on this path —
+   * refusing on it would strand the take profit behind our own healthy stop.
+   * The danger it would otherwise catch is on the take-profit side, and the gap
+   * arithmetic already fail-closes that: coverage at or above exposure leaves a
+   * gap of zero, and a zero gap places nothing.
+   */
+  private async pairTakeProfitFreshness(
+    execution: TradeExecution,
+    reserved: BinanceOrder,
+    input: ProtectionLifecycleInput
+  ): Promise<TakeProfitGate> {
+    const direction = execution.direction as DirectionName;
+    const protection = await this.loadProtection(execution.id);
+
+    /**
+     * RE-READ, never reuse the snapshot this tick started with. That snapshot
+     * is exactly the stale evidence the reserved quantity came from.
+     */
+    const position = await this.readPosition(execution.symbol, protectionPositionSide(direction));
+    if (position === "UNAVAILABLE") {
+      return { kind: "REFUSE", outcome: this.outcome(
+        false,
+        "POSITION_STATE_UNAVAILABLE",
+        "Exposure could not be re-read before the take profit; nothing is placed.",
+        execution,
+        protection
+      ) };
+    }
+
+    /**
+     * FLAT, WITH A STOP WE JUST ARMED.
+     *
+     * No take profit may be added to a position that is not there — but simply
+     * refusing would end the pass with a live conditional STOP against nothing,
+     * and direct testnet observation is that Binance leaves such an order armed
+     * until it is explicitly cancelled. So this hands the pass to closure,
+     * which cancels the siblings and records the terminal state, exactly as the
+     * emergency-close path already does when it confirms flat mid-pass.
+     */
+    const normalized = position === null ? null : normalizeOpenQuantity(position.quantity, direction);
+    if (position === null || normalized === null || !normalized.valid || new D(normalized.quantity).lessThanOrEqualTo(0)) {
+      return { kind: "REFUSE", outcome: await this.reconcileProtectionAndClosure(input) };
+    }
+
+    const coverageNow = await this.measureVerifiedCoverage(execution);
+
+    // Unreadable is not absent, and uncertainty is never normalised away by
+    // refresh arithmetic.
+    if (coverageNow.unresolved.length > 0) {
+      return { kind: "REFUSE", outcome: this.outcome(
+        false,
+        coverageNow.unresolved.includes("STOP_LOSS") ? "STOP_QUERY_UNAVAILABLE" : "TAKE_PROFIT_QUERY_UNAVAILABLE",
+        `Protection state is unreadable for ${coverageNow.unresolved.join(" and ")}; no take profit is placed.`,
+        execution,
+        protection
+      ) };
+    }
+
+    // A leg that is firing is closing the position; adding an exit order into
+    // that race is what the emergency-close path already refuses.
+    if (coverageNow.executing.length > 0) {
+      return { kind: "REFUSE", outcome: this.outcome(
+        false,
+        coverageNow.executing.includes("STOP_LOSS") ? "STOP_EXECUTION_IN_PROGRESS" : "TAKE_PROFIT_EXECUTION_IN_PROGRESS",
+        `${coverageNow.executing.join(" and ")} is executing; no take profit is placed.`,
+        execution,
+        protection
+      ) };
+    }
+
+    const coverage = calculateCoverage({
+      confirmedOpenQuantity: normalized.quantity,
+      activeStopQuantity: coverageNow.stop,
+      activeTakeProfitQuantity: coverageNow.takeProfit,
+    });
+
+    /**
+     * OVER-COVERAGE IS NOT WAVED THROUGH — ONLY ONE PROVEN SHAPE IS.
+     *
+     * After a shrink this path's own stop legitimately guards more than the
+     * position holds, and refusing on that alone would strand the take profit
+     * behind our own healthy stop. That is the ONLY exception: exactly one
+     * owned, identity-verified, readable, non-executing active stop, with take-
+     * profit coverage still within exposure.
+     *
+     * Anything else keeps the existing fail-closed behaviour. Two active stop
+     * generations above all: that is duplicate protection, the coverage model
+     * escalates it, and this must not become a side door that places a take
+     * profit while the lifecycle considers the state unsafe. Raw coverage is
+     * never normalised here — the arithmetic below still uses it as measured.
+     */
+    if (coverage.overProtected && !this.safeOversizedStopOnly(coverageNow, normalized.quantity)) {
+      return { kind: "REFUSE", outcome: this.outcome(
+        false,
+        "PROTECTION_COVERAGE_INCOMPLETE",
+        `Protection exceeds exposure (stop ${coverageNow.stop} across ${coverageNow.activeStopLegs} leg(s), ` +
+          `take profit ${coverageNow.takeProfit}, exposure ${normalized.quantity}); no take profit is placed.`,
+        execution,
+        protection
+      ) };
+    }
+
+    return this.freshenTakeProfitIntent(execution, reserved, {
+      coverage,
+      coverageNow,
+      openQuantity: normalized.quantity,
+      markPrice: position.markPrice,
+      protection,
+      input,
+    });
   }
 
   private async submitTranche(
@@ -2220,7 +2403,7 @@ export class ProtectionLifecycleService {
     await this.setProtectionState(protection.id, "STOP_VERIFIED", "PROTECTION_VERIFIED", "Stop is verified active.");
     }
 
-    const takeProfit = reservedTakeProfit;
+    let takeProfit = reservedTakeProfit;
     if (!takeProfit) {
       // THREE situations reach here, and conflating them hides a real gap or
       // invents one:
@@ -2284,6 +2467,21 @@ export class ProtectionLifecycleService {
         execution,
         await this.loadProtection(execution.id)
       );
+    }
+
+    /**
+     * The STOP is verified and the take profit has not been claimed yet, which
+     * is the last moment its quantity can still be corrected. A take-profit-
+     * only tranche was already proved by its own barrier above, so only a pair
+     * is re-proved here.
+     */
+    if (stop) {
+      const fresh = await this.pairTakeProfitFreshness(execution, takeProfit, owned);
+      if (fresh.kind === "REFUSE") return fresh.outcome;
+      // Carry both forward: the row because it is what gets POSTed, the version
+      // because a revision advances it and anything later CASes against it.
+      takeProfit = fresh.takeProfit;
+      owned = { ...owned, expectedVersion: fresh.expectedVersion };
     }
 
     await this.setProtectionState(protection.id, "PLACING_TAKE_PROFIT", null, null);
