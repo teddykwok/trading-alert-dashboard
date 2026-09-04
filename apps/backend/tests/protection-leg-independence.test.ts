@@ -213,15 +213,21 @@ const SERVICE = readFileSync(
 describe("structural: only the stop can withhold protection", () => {
   it("the reservation gate reads the STOP leg, never the combined verdict", () => {
     // The exact line that caused the incident was `if (!validation.valid)`.
-    expect(SERVICE).toContain("if (!validation.stop.valid)");
+    // Reservation is now role-aware, so the stop verdict is read for the stop
+    // and the take-profit verdict for the take profit. The invariant is
+    // unchanged: the COMBINED verdict never withholds anything.
+    expect(SERVICE).toContain("validateFor(missing.stopQuantity).stop");
+    expect(SERVICE).toContain("validateFor(missing.takeProfitQuantity).takeProfit");
     expect(SERVICE).not.toContain("if (!validation.valid)");
   });
 
   it("an unplaceable take profit is dropped from the tranche, not faked", () => {
     // No TAKE_PROFIT order row is created, so nothing downstream can measure
-    // coverage for a leg that does not exist.
-    expect(SERVICE).toContain("const takeProfitForTranche = validation.takeProfit.valid ? takeProfitTrigger : null;");
-    expect(SERVICE).toContain('role === "STOP_LOSS" ? stopTrigger : takeProfitForTranche');
+    // coverage for a leg that does not exist. The rows to create are now
+    // assembled explicitly, and the take profit joins them only when it is
+    // both present and placeable.
+    expect(SERVICE).toContain("if (takeProfitTrigger !== null && verdict.valid)");
+    expect(SERVICE).toContain("for (const row of rowsToReserve)");
   });
 
   it("F. a verified stop is never rolled back because the take profit failed", () => {
@@ -235,18 +241,27 @@ describe("structural: only the stop can withhold protection", () => {
     expect(SERVICE).toContain("takeProfitOmittedReason,");
   });
 
-  it("G. a dropped take profit leaves the tranche INCOMPLETE, so the next tick resumes it", () => {
-    // `findIncompleteTranche` treats a missing TP as incomplete, which is what
-    // makes the next tick RESUME generation N instead of minting a new one —
-    // the property that prevents a duplicate stop.
-    // Asserted without line endings: the file is CRLF and the guarantee is
-    // about the condition itself, not about how the source happens to wrap.
+  it("G. no duplicate stop can be reserved for a dropped take profit", () => {
+    // This guarantee MOVED, and got stronger.
+    //
+    // It used to rest on `findIncompleteTranche` treating a missing take
+    // profit as incomplete, so the next tick resumed generation N rather than
+    // minting a new one. That also made every single-role generation
+    // permanently incomplete, which starved repair of the other role.
+    //
+    // Reservation now refuses to create a role whose gap is zero, so a
+    // duplicate stop cannot be reserved in the first place — the guarantee no
+    // longer depends on resume behaviour at all. Incompleteness is now a
+    // property of the rows that exist.
+    expect(SERVICE).toContain("const wantStop = new D(missing.stopQuantity).greaterThan(0);");
+    expect(SERVICE).toContain("if (wantStop) {");
+
     const condition = SERVICE.slice(
-      SERVICE.indexOf("const incomplete ="),
+      SERVICE.indexOf("const rows = orders.filter"),
       SERVICE.indexOf("if (incomplete) return generation;")
     );
-    expect(condition).toContain("!stop");
-    expect(condition).toContain("!takeProfit");
+    expect(condition).toContain("rows.some");
+    expect(condition).not.toContain("!takeProfit");
   });
 
   it("K/L. this change touches no admission, capacity or authorization logic", () => {

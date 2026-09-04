@@ -1519,6 +1519,283 @@ describe("execution status reflects verified protection", () => {
     expect(alerts).toBe(0);
   });
 
+  // =========================================================================
+  // ROLE-AWARE TRANCHES — reserve only what is missing, sized to its own gap.
+  //
+  // Reservation used to walk both roles and size both from
+  // max(missingStop, missingTakeProfit), so every single-leg repair minted a
+  // redundant second leg. The redundant stop is the dangerous one: two active
+  // stops against one position read as over-coverage and, since multiple active
+  // stop generations are deliberately not exempt, fail-close into
+  // MANUAL_INTERVENTION.
+  // =========================================================================
+
+  const stopIdOf = (id: string, generation: number) => buildClientOrderId(id, "STOP_LOSS", generation);
+  const tpIdOf = (id: string, generation: number) => buildClientOrderId(id, "TAKE_PROFIT", generation);
+  const orderFor = async (id: string, role: "STOP_LOSS" | "TAKE_PROFIT", generation: number) =>
+    (await ordersOf(id)).find((order) => order.role === role && order.generation === generation);
+
+  maybe()("R1. a missing take profit reserves a TAKE-PROFIT-ONLY generation", async () => {
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+
+    await protect(await reload(execution.id));
+
+    // The whole point: the healthy stop is not duplicated.
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
+    expect(scenario.submitted.map((entry) => entry.role)).not.toContain("STOP_LOSS");
+
+    // And it actually POSTED. The pre-submit barrier runs while this very row
+    // is still SUBMITTING and absent from the exchange, so this is what proves
+    // the barrier asks "is the STOP safe enough" rather than "is protection
+    // already complete" -- the latter would block the take profit on its own
+    // not-yet-existing coverage, for ever.
+    expect(scenario.submitted.map((entry) => entry.role)).toContain("TAKE_PROFIT");
+    expect((await orderFor(execution.id, "TAKE_PROFIT", 2))!.status).toBe("NEW");
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R2. a missing stop reserves a STOP-ONLY generation", async () => {
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(stopIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+
+    await protect(await reload(execution.id));
+
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1, 2]);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1]);
+    expect(scenario.submitted.map((entry) => entry.role)).not.toContain("TAKE_PROFIT");
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R2b. a stop-only repair does not report the target as unplaceable", async () => {
+    // The target is covered by generation 1, so this execution is healthy and
+    // must not be written PROTECTION_INCOMPLETE or alerted on.
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(stopIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+
+    await protect(await reload(execution.id));
+
+    const alerts = await prisma!.criticalAlert.findMany({ where: { tradeExecutionId: execution.id } });
+    expect(alerts.map((alert) => alert.reasonCode)).not.toContain("TAKE_PROFIT_TRIGGER_INVALID");
+    expect((await protectionOf(execution.id)).state).toBe("PROTECTED");
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R3. both legs missing still reserves a pair", async () => {
+    const execution = await protectedExecution();
+    for (const role of ["STOP_LOSS", "TAKE_PROFIT"] as const) {
+      scenario.algoOrders.get(buildClientOrderId(execution.id, role, 1))!.algoStatus = "CANCELED";
+    }
+
+    await protect(await reload(execution.id));
+
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1, 2]);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R4. each role is reserved for its OWN missing quantity", async () => {
+    // Exposure 0.200 with a stop covering 0.100 and no take profit:
+    // missing stop 0.100, missing take profit 0.200. The shared max used to
+    // size BOTH at 0.200, over-reserving the stop by 0.100 and manufacturing
+    // the very over-coverage the lifecycle fails closed on.
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    scenario.positionAmt = "0.200";
+
+    await protect(await reload(execution.id));
+
+    expect((await orderFor(execution.id, "STOP_LOSS", 2))!.originalQuantity.toString()).toBe("0.1");
+    expect((await orderFor(execution.id, "TAKE_PROFIT", 2))!.originalQuantity.toString()).toBe("0.2");
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R4b. the reverse asymmetry also uses each role's own quantity", async () => {
+    // Exposure 0.200 with no stop and a take profit covering 0.100:
+    // missing stop 0.200, missing take profit 0.100. The shared max would have
+    // sized BOTH at 0.200, over-reserving the take profit this time.
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(stopIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    scenario.positionAmt = "0.200";
+
+    await protect(await reload(execution.id));
+
+    expect((await orderFor(execution.id, "STOP_LOSS", 2))!.originalQuantity.toString()).toBe("0.2");
+    expect((await orderFor(execution.id, "TAKE_PROFIT", 2))!.originalQuantity.toString()).toBe("0.1");
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R2c. a genuinely missing target is still reported and alerted", async () => {
+    // The other side of R2b. Both legs are gone and the target is unplaceable,
+    // so the tranche is stop-only for the LEGACY reason and aggregate coverage
+    // really is short. That must keep the existing operator signal.
+    const execution = await protectedExecution();
+    for (const role of ["STOP_LOSS", "TAKE_PROFIT"] as const) {
+      scenario.algoOrders.get(buildClientOrderId(execution.id, role, 1))!.algoStatus = "CANCELED";
+    }
+    scenario.markPrice = "120"; // a LONG target at 108 can no longer be placed
+
+    const outcome = await protect(await reload(execution.id));
+
+    // Stop-only generation, and the missing target is surfaced rather than
+    // absorbed by the intentional-omission path.
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1, 2]);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1]);
+    expect(outcome.reasonCode).toBe("TAKE_PROFIT_TRIGGER_INVALID");
+    const alerts = await prisma!.criticalAlert.findMany({ where: { tradeExecutionId: execution.id } });
+    expect(alerts.map((alert) => alert.reasonCode)).toContain("TAKE_PROFIT_TRIGGER_INVALID");
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R5. a pair still submits the stop before the take profit", async () => {
+    const execution = await protectedExecution();
+    for (const role of ["STOP_LOSS", "TAKE_PROFIT"] as const) {
+      scenario.algoOrders.get(buildClientOrderId(execution.id, role, 1))!.algoStatus = "CANCELED";
+    }
+    scenario.submitted = [];
+
+    await protect(await reload(execution.id));
+
+    const roles = scenario.submitted.map((entry) => entry.role);
+    expect(roles.indexOf("STOP_LOSS")).toBeGreaterThanOrEqual(0);
+    expect(roles.indexOf("STOP_LOSS")).toBeLessThan(roles.indexOf("TAKE_PROFIT"));
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R6. nothing to reserve creates NO generation and no churn", async () => {
+    // The stop already covers the exposure and the target is not placeable.
+    // Role filtering drops the stop, trigger filtering drops the take profit,
+    // and an empty generation must never be manufactured.
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    scenario.markPrice = "120"; // a LONG target at 108 can no longer be placed
+    const versionBefore = (await reload(execution.id)).version;
+    const ordersBefore = (await ordersOf(execution.id)).length;
+    scenario.submitted = [];
+    scenario.mutations = [];
+
+    for (let index = 0; index < 3; index += 1) {
+      const outcome = await protect(await reload(execution.id));
+      expect(outcome.reasonCode).toBe("TAKE_PROFIT_TRIGGER_INVALID");
+    }
+
+    expect((await ordersOf(execution.id)).length).toBe(ordersBefore);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1]);
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect((await reload(execution.id)).version).toBe(versionBefore);
+    expect(scenario.submitted).toEqual([]);
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  /** A take-profit-only generation left reserved but unsubmitted. */
+  async function pendingTakeProfitOnly() {
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    // The POST neither lands nor acknowledges, so the row stays reserved and
+    // unresolved -- which is what makes the next tick resume it.
+    scenario.submitFailure = "TIMEOUT";
+    scenario.submitLands = false;
+    await protect(await reload(execution.id));
+    scenario.submitFailure = null;
+    scenario.submitLands = true;
+    // Reserved, stop untouched, and still unresolved so the next tick resumes.
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
+    scenario.submitted = [];
+    scenario.mutations = [];
+    return execution;
+  }
+
+  maybe()("R7. a pending take-profit-only tranche is not submitted once the stop is insufficient", async () => {
+    const execution = await pendingTakeProfitOnly();
+    // Exposure grows, so the surviving stop no longer covers it.
+    scenario.positionAmt = "0.200";
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect(scenario.submitted).toEqual([]);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R8. multiple active stops over-covering still block the take profit", async () => {
+    // The PR1 invariant, re-applied at the pre-submit barrier: two owned stops
+    // guarding one position is not something a take profit may be added to.
+    const execution = await pendingTakeProfitOnly();
+    scenario.positionAmt = "0.200";
+    await protect(await reload(execution.id)); // reserves a stop for the gap
+    scenario.positionAmt = "0.040";            // both stops now over-cover
+    scenario.submitted = [];
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).not.toBe("PROTECTION_VERIFIED");
+    expect(scenario.submitted).toEqual([]);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R9. a flat position is never given a take profit", async () => {
+    const execution = await pendingTakeProfitOnly();
+    scenario.positionAmt = "0";
+
+    await protect(await reload(execution.id));
+
+    expect(scenario.submitted).toEqual([]);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R10. an unreadable stop blocks the take profit", async () => {
+    const execution = await pendingTakeProfitOnly();
+    scenario.queryFailures.add(stopIdOf(execution.id, 1));
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).toBe("STOP_QUERY_UNAVAILABLE");
+    expect(scenario.submitted).toEqual([]);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R11. a verified single-role generation no longer starves later repair", async () => {
+    // Generation 2 is take-profit-only and ACTIVE. It used to count as
+    // permanently incomplete, so advanceProtection resumed it for ever and
+    // could never reserve the stop repair below.
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    await protect(await reload(execution.id));
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
+
+    // Now the stop disappears. A third generation must be reachable.
+    scenario.algoOrders.get(stopIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    await protect(await reload(execution.id));
+
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1, 3]);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R12. repeated ticks mint no duplicate single-role generation", async () => {
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+
+    for (let index = 0; index < 3; index += 1) await protect(await reload(execution.id));
+
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1, 2]);
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("R13. ordinary fresh protection is unchanged", async () => {
+    const execution = await entryFilledExecution();
+
+    await protect(execution);
+
+    expect((await reload(execution.id)).status).toBe("PROTECTED");
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1]);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
   maybe()("a locally terminal generation never blocks the health path", async () => {
     // A dead generation 1 whose query later becomes unreadable must not stall
     // repair forever: we already know it is finished.
