@@ -63,6 +63,17 @@ export const PROTECTION_REASON_CODES = [
   "TAKE_PROFIT_IDENTITY_MISMATCH",
   "TAKE_PROFIT_NOT_VERIFIED",
   "PROTECTION_COVERAGE_INCOMPLETE",
+  /**
+   * The owned, identity-verified stop guards MORE than the position still
+   * holds, and nothing else is unexplained.
+   *
+   * Deliberately NOT in CRITICAL_REASON_CODES: exposure is over-guarded, not
+   * unguarded. Binance clamps a conditional close to the actual position at
+   * trigger time, so an over-covering stop closes what is there and no more.
+   * Distinct from PROTECTION_COVERAGE_INCOMPLETE, which stays the code for
+   * over-coverage nothing of ours explains.
+   */
+  "STOP_COVERAGE_EXCEEDS_EXPOSURE",
   "PROTECTION_GENERATION_CONFLICT",
   "EMERGENCY_CLOSE_DISABLED",
   "EMERGENCY_CLOSE_NOT_ELIGIBLE",

@@ -116,6 +116,24 @@ interface VerifiedCoverage {
   takeProfit: string;
   unresolved: ReadonlyArray<"STOP_LOSS" | "TAKE_PROFIT">;
   /**
+   * False when a stop leg counted as coverage contradicted our local intent.
+   *
+   * OBSERVED ONLY: a mismatching leg still contributes coverage exactly as it
+   * always has, so no existing behaviour changes. The flag exists solely to
+   * gate the over-coverage exemption below, which must never fire on an order
+   * we cannot conclusively call ours.
+   */
+  stopIdentityVerified: boolean;
+  /**
+   * How many stop legs actually contributed active coverage.
+   *
+   * The tranche model is ADDITIVE: a coverage gap mints a further generation
+   * beside the existing one, so two stops being active at once is ordinary.
+   * The over-coverage exemption below is only evidenced for ONE stop carrying a
+   * stale quantity, so it needs the count, not merely "everything is ours".
+   */
+  activeStopLegs: number;
+  /**
    * Legs the exchange reported as TRIGGERED or PARTIALLY_FILLED.
    *
    * Neither contributes ACTIVE coverage, and both explain why exposure may
@@ -1231,6 +1249,71 @@ export class ProtectionLifecycleService {
         );
       }
 
+      /**
+       * THE STOP GUARDS MORE THAN IS LEFT, AND THAT IS SAFE.
+       *
+       * A conditional close order is clamped by Binance to the actual position
+       * when it triggers: a stop armed for 10 against a position of 4 closes 4
+       * and stops. Direct USD-M testnet observation, hedge mode, both
+       * directions. It cannot over-close and cannot open the opposite side.
+       *
+       * So a stop still configured for the pre-shrink quantity is over-guarded,
+       * not dangerous, and the ORPHAN_PROTECTION_ORDER escalation was naming an
+       * orphan that does not exist. Resizing it is also not the answer: there is
+       * no amend primitive, cancelling first would leave confirmed exposure
+       * unguarded, and replacing first would double the exit coverage.
+       *
+       * The exemption is deliberately narrow. EVERY condition must hold:
+       *
+       *   - the excess is the STOP's: take-profit coverage does not exceed
+       *     exposure, so a TP anomaly can never be waved through here;
+       *   - nothing is unreadable: an UNKNOWN leg could be the real
+       *     explanation, so it keeps the escalation;
+       *   - nothing is mid-execution: that state has its own deferral above and
+       *     the two must not be conflated;
+       *   - every counted stop leg still matches our own deterministic
+       *     identity - id, symbol, side, positionSide, order type, trigger,
+       *     working type. An order we cannot call ours is never exempt.
+       *
+       * Read-only. Nothing is cancelled, submitted, reserved or written, and
+       * the early return means the repair path below is not reached: replacing
+       * the missing take profit needs a take-profit-only reservation, which
+       * this lifecycle cannot yet express without also minting a redundant
+       * second stop. That is deliberately left to its own change.
+       */
+      const excessIsOwnedStopOnly =
+        coverageNow.unresolved.length === 0 &&
+        coverageNow.executing.length === 0 &&
+        // EXACTLY ONE stop, not merely "every stop is ours". The evidence
+        // covers a single stop carrying a stale quantity; two active stops
+        // against one position is duplicate protection, which is a different
+        // condition with no such evidence behind it.
+        coverageNow.activeStopLegs === 1 &&
+        coverageNow.stopIdentityVerified &&
+        new D(coverageNow.stop).greaterThan(openQuantity) &&
+        new D(coverageNow.takeProfit).lessThanOrEqualTo(openQuantity);
+
+      if (excessIsOwnedStopOnly) {
+        logger.info(
+          {
+            executionId: execution.id,
+            measuredStop: coverageNow.stop,
+            measuredTakeProfit: coverageNow.takeProfit,
+            confirmedOpenQuantity: openQuantity,
+          },
+          "Owned verified stop guards more than the position holds; safe and left alone"
+        );
+        return this.outcome(
+          false,
+          "STOP_COVERAGE_EXCEEDS_EXPOSURE",
+          `The owned stop still guards ${coverageNow.stop} against ${openQuantity} of exposure. ` +
+            "The exchange clamps a conditional close to the actual position, so this is " +
+            "over-guarded rather than unprotected; the stop is left exactly as it is.",
+          execution,
+          protection
+        );
+      }
+
       // Nothing of ours explains it: the exchange is reporting something we
       // did not intend â€” an identity contradiction or an order we do not own.
       // It is never silently accepted as "protected".
@@ -2188,6 +2271,9 @@ export class ProtectionLifecycleService {
     let takeProfit = new D(0);
     const unresolved = new Set<"STOP_LOSS" | "TAKE_PROFIT">();
     const executing = new Set<"STOP_LOSS" | "TAKE_PROFIT">();
+    const policy = this.protectionPolicy();
+    let stopIdentityVerified = true;
+    let activeStopLegs = 0;
 
     for (const order of orders) {
       const role = order.role as "STOP_LOSS" | "TAKE_PROFIT";
@@ -2219,7 +2305,44 @@ export class ProtectionLifecycleService {
         // to know rather than seeing an unexplained coverage gap.
         if (isExecutingProtection(status)) executing.add(role);
         if (!countsAsActiveCoverage(status)) continue; // proven inactive
+
+        // Is this counted stop still the order we intended? Recorded, never
+        // acted on here: coverage arithmetic is untouched.
+        if (role === "STOP_LOSS" && order.triggerPrice !== null) {
+          const mismatches = findProtectionIdentityMismatches(
+            {
+              clientAlgoId: order.clientAlgoId!,
+              symbol: execution.symbol,
+              orderType: order.orderType as "STOP_MARKET" | "TAKE_PROFIT_MARKET",
+              side: order.side as "BUY" | "SELL",
+              positionSide: order.positionSide as "LONG" | "SHORT",
+              quantity: order.originalQuantity.toString(),
+              triggerPrice: order.triggerPrice.toString(),
+              workingType: order.workingType ?? protectionWorkingType("STOP_LOSS", policy),
+              priceProtect: order.priceProtect ?? false,
+            },
+            {
+              clientAlgoId: query.order.clientAlgoId,
+              symbol: query.order.symbol,
+              orderType: query.order.orderType,
+              side: query.order.side,
+              positionSide: query.order.positionSide,
+              quantity: query.order.quantity,
+              triggerPrice: query.order.triggerPrice,
+              workingType: query.order.workingType,
+              priceProtect: query.order.priceProtect,
+              closePosition: query.order.closePosition,
+              reduceOnly: query.order.reduceOnly,
+            }
+          );
+          if (mismatches.length > 0) stopIdentityVerified = false;
+        } else if (role === "STOP_LOSS") {
+          // No local trigger to compare against: not conclusively ours.
+          stopIdentityVerified = false;
+        }
+
         const quantity = new D(query.order.quantity ?? order.originalQuantity.toString());
+        if (role === "STOP_LOSS") activeStopLegs += 1;
         if (role === "STOP_LOSS") stop = stop.plus(quantity);
         else takeProfit = takeProfit.plus(quantity);
         continue;
@@ -2235,6 +2358,8 @@ export class ProtectionLifecycleService {
       takeProfit: takeProfit.toString(),
       unresolved: [...unresolved],
       executing: [...executing],
+      stopIdentityVerified,
+      activeStopLegs,
     };
   }
 
