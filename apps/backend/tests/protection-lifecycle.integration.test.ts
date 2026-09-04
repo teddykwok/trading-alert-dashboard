@@ -6967,3 +6967,342 @@ describe("working-type policy is not retroactive", () => {
     expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
   });
 });
+
+describe("stale unsubmitted protection intent", () => {
+  const tpIdOf = (id: string, generation: number) => buildClientOrderId(id, "TAKE_PROFIT", generation);
+  const stopIdOf = (id: string, generation: number) => buildClientOrderId(id, "STOP_LOSS", generation);
+
+  const tick = async (id: string) =>
+    protectionService.ensureProtectionForExposure({
+      executionId: id,
+      expectedVersion: (await reload(id)).version,
+      evaluatedAt: at(),
+    });
+
+  const takeProfitPosts = () =>
+    scenario.submitted.filter((entry) => entry.role === "TAKE_PROFIT").map((entry) => entry.quantity);
+
+  const rowOf = async (id: string, role: string, generation: number) =>
+    prisma!.binanceOrder.findFirstOrThrow({ where: { tradeExecutionId: id, role: role as "TAKE_PROFIT", generation } });
+
+  const refreshEvents = async (id: string) =>
+    prisma!.executionEvent.findMany({
+      where: { tradeExecutionId: id, eventType: "ORDER_UPDATED" },
+      orderBy: { sequenceNumber: "asc" },
+    });
+
+  /**
+   * The genuine current-main shape: a take-profit-only generation is reserved
+   * for the whole gap, and take-profit coverage that was not visible then
+   * becomes visible before its first POST. The stop still covers the exposure
+   * exactly, so nothing above the barrier refuses and the frozen quantity is
+   * simply too large.
+   */
+  async function staleTakeProfitIntent(options: { covering?: string; reserved?: string } = {}) {
+    const execution = await filledExecution();
+    await protect(execution);
+    // Coverage that appeared after the tranche was reserved.
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.quantity = options.covering ?? "0.060";
+    const first = await rowOf(execution.id, "TAKE_PROFIT", 1);
+    await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: execution.id,
+        role: "TAKE_PROFIT",
+        generation: 2,
+        clientOrderId: tpIdOf(execution.id, 2),
+        clientAlgoId: tpIdOf(execution.id, 2),
+        side: first.side,
+        positionSide: first.positionSide,
+        orderType: "TAKE_PROFIT_MARKET",
+        originalQuantity: options.reserved ?? "0.100",
+        triggerPrice: first.triggerPrice,
+        workingType: first.workingType,
+        priceProtect: first.priceProtect,
+        status: "SUBMITTING",
+      },
+    });
+    scenario.submitted = [];
+    scenario.mutations = [];
+    return execution;
+  }
+
+  const clearAlerts = async (id: string) =>
+    prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: id } });
+
+  maybe()("1/2. the stale quantity is never sent, and the current gap is", async () => {
+    const execution = await staleTakeProfitIntent();
+
+    await tick(execution.id);
+
+    expect(takeProfitPosts()).toEqual(["0.04"]);
+    expect(takeProfitPosts()).not.toContain("0.1");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("3. the revision is journalled with both quantities", async () => {
+    const execution = await staleTakeProfitIntent();
+
+    await tick(execution.id);
+
+    const events = await refreshEvents(execution.id);
+    expect(events).toHaveLength(1);
+    const metadata = events[0]!.metadata as Record<string, unknown>;
+    expect(metadata.previousQuantity).toBe("0.1");
+    expect(metadata.revisedQuantity).toBe("0.04");
+    expect(metadata.reason).toBe("STALE_UNSUBMITTED_INTENT");
+    expect(metadata.generation).toBe(2);
+    // The sequence number is a real version, so the history stays ordered.
+    expect(events[0]!.sequenceNumber).toBeGreaterThan(0);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("4. once refreshed, a worker holding the stale quantity cannot claim it", async () => {
+    const execution = await staleTakeProfitIntent();
+    const before = await rowOf(execution.id, "TAKE_PROFIT", 2);
+    await tick(execution.id);
+
+    // Exactly the claim the submission path issues, with the quantity a stale
+    // worker would still be holding.
+    const staleClaim = await prisma!.binanceOrder.updateMany({
+      where: { id: before.id, submissionUnknownAt: null, originalQuantity: before.originalQuantity },
+      data: { submissionUnknownAt: at() },
+    });
+    expect(staleClaim.count).toBe(0);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("5/10. a claimed intent is never rewritten and nothing is sent", async () => {
+    const execution = await staleTakeProfitIntent();
+    const row = await rowOf(execution.id, "TAKE_PROFIT", 2);
+    // The submission claim won first.
+    await prisma!.binanceOrder.update({ where: { id: row.id }, data: { submissionUnknownAt: at() } });
+
+    await tick(execution.id);
+
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 2)).originalQuantity.toString()).toBe("0.1");
+    expect(takeProfitPosts()).toEqual([]);
+    expect(await refreshEvents(execution.id)).toHaveLength(0);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("6. repeated ticks make exactly one durable revision", async () => {
+    const execution = await staleTakeProfitIntent();
+
+    for (let index = 0; index < 3; index += 1) await tick(execution.id);
+
+    expect(await refreshEvents(execution.id)).toHaveLength(1);
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 2)).originalQuantity.toString()).toBe("0.04");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("7. a gap below the exchange minimum is neither sent nor persisted", async () => {
+    // minQty is 0.001 for this symbol, so a gap of 0.0005 is unplaceable.
+    const execution = await staleTakeProfitIntent({ covering: "0.0995" });
+
+    const outcome = await tick(execution.id);
+
+    expect(outcome.reasonCode).toBe("PROTECTION_QUANTITY_UNSUPPORTED");
+    expect(takeProfitPosts()).toEqual([]);
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 2)).originalQuantity.toString()).toBe("0.1");
+    expect(await refreshEvents(execution.id)).toHaveLength(0);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("8. an intent SMALLER than the gap is never enlarged", async () => {
+    const execution = await staleTakeProfitIntent({ reserved: "0.010" });
+
+    await tick(execution.id);
+
+    expect(takeProfitPosts()).toEqual(["0.01"]);
+    expect(await refreshEvents(execution.id)).toHaveLength(0);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("9. a zero gap sends nothing, writes nothing, and does not starve", async () => {
+    const execution = await staleTakeProfitIntent({ covering: "0.100" });
+
+    for (let index = 0; index < 3; index += 1) await tick(execution.id);
+
+    expect(takeProfitPosts()).toEqual([]);
+    expect(await refreshEvents(execution.id)).toHaveLength(0);
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 2)).originalQuantity.toString()).toBe("0.1");
+
+    // A real gap reappearing is still repaired through the same row.
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.quantity = "0.060";
+    await tick(execution.id);
+    expect(takeProfitPosts()).toEqual(["0.04"]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("11. an UNKNOWN-status intent is never rewritten", async () => {
+    const execution = await staleTakeProfitIntent();
+    const row = await rowOf(execution.id, "TAKE_PROFIT", 2);
+    await prisma!.binanceOrder.update({ where: { id: row.id }, data: { status: "UNKNOWN" } });
+
+    await tick(execution.id);
+
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 2)).originalQuantity.toString()).toBe("0.1");
+    expect(await refreshEvents(execution.id)).toHaveLength(0);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("12. an intent the exchange has acknowledged is never rewritten", async () => {
+    const execution = await staleTakeProfitIntent();
+    const row = await rowOf(execution.id, "TAKE_PROFIT", 2);
+    await prisma!.binanceOrder.update({ where: { id: row.id }, data: { exchangeAlgoId: "A-observed" } });
+
+    await tick(execution.id);
+
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 2)).originalQuantity.toString()).toBe("0.1");
+    expect(await refreshEvents(execution.id)).toHaveLength(0);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("14. after a persisted claim the same id is reconciled, never re-sized", async () => {
+    const execution = await staleTakeProfitIntent();
+    const row = await rowOf(execution.id, "TAKE_PROFIT", 2);
+    // A crash between the claim and the response leaves exactly this state.
+    await prisma!.binanceOrder.update({ where: { id: row.id }, data: { submissionUnknownAt: at() } });
+
+    await tick(execution.id);
+
+    const after = await rowOf(execution.id, "TAKE_PROFIT", 2);
+    expect(after.originalQuantity.toString()).toBe("0.1");
+    expect(after.clientAlgoId).toBe(tpIdOf(execution.id, 2));
+    expect(scenario.mutations).toEqual([]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("17/18/19. a fresh revision changes nothing else about the row", async () => {
+    const execution = await staleTakeProfitIntent();
+    const before = await rowOf(execution.id, "TAKE_PROFIT", 2);
+
+    await tick(execution.id);
+
+    const after = await rowOf(execution.id, "TAKE_PROFIT", 2);
+    // NO synthetic exchange terminal status is invented for a local decision.
+    expect(after.status).not.toBe("CANCELED");
+    expect(after.status).not.toBe("EXPIRED");
+    expect(after.status).not.toBe("REJECTED");
+    // Same identity, same generation, same trigger: only the quantity moved.
+    expect(after.clientAlgoId).toBe(before.clientAlgoId);
+    expect(after.generation).toBe(before.generation);
+    expect(after.triggerPrice!.toString()).toBe(before.triggerPrice!.toString());
+    expect(after.workingType).toBe(before.workingType);
+    // And no duplicate generation was minted.
+    const takeProfits = await prisma!.binanceOrder.findMany({
+      where: { tradeExecutionId: execution.id, role: "TAKE_PROFIT" },
+    });
+    expect(takeProfits.map((order) => order.generation).sort()).toEqual([1, 2]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("15/16. an ordinary pair still submits STOP first, unrevised", async () => {
+    const execution = await filledExecution();
+
+    await protect(execution);
+
+    // Stop before take profit, both at the reserved quantity, no revision.
+    expect(scenario.submitted.map((entry) => entry.role)).toEqual(["STOP_LOSS", "TAKE_PROFIT"]);
+    expect(scenario.submitted.map((entry) => entry.quantity)).toEqual(["0.1", "0.1"]);
+    expect(await refreshEvents(execution.id)).toHaveLength(0);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("21. a dormant TP intent does not starve STOP repair", async () => {
+    // Generation 2 holds a take-profit-only intent that is no longer needed --
+    // the target already covers the exposure -- while the STOP has gone away.
+    // Repairing the stop is safety-critical and must not wait behind it.
+    const execution = await staleTakeProfitIntent({ covering: "0.100" });
+    scenario.algoOrders.get(stopIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+
+    for (let index = 0; index < 3; index += 1) await tick(execution.id);
+
+    // A stop is actually placed again.
+    expect(scenario.submitted.filter((entry) => entry.role === "STOP_LOSS").map((entry) => entry.quantity)).toEqual([
+      "0.1",
+    ]);
+    // And the dormant target is neither posted nor duplicated.
+    expect(takeProfitPosts()).toEqual([]);
+    const takeProfits = await prisma!.binanceOrder.findMany({
+      where: { tradeExecutionId: execution.id, role: "TAKE_PROFIT" },
+    });
+    expect(takeProfits.map((order) => order.generation).sort()).toEqual([1, 2]);
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(false);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("22. a dormant STOP intent neither starves nor duplicates protection", async () => {
+    // The mirror: generation 2 holds a stop-only intent that is no longer
+    // needed -- the stop already covers the exposure -- while the target has
+    // gone. Submitting that stop would put a SECOND stop against one position,
+    // which the coverage model fail-closes on.
+    const execution = await filledExecution();
+    await protect(execution);
+    const first = await rowOf(execution.id, "STOP_LOSS", 1);
+    await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: execution.id,
+        role: "STOP_LOSS",
+        generation: 2,
+        clientOrderId: stopIdOf(execution.id, 2),
+        clientAlgoId: stopIdOf(execution.id, 2),
+        side: first.side,
+        positionSide: first.positionSide,
+        orderType: "STOP_MARKET",
+        originalQuantity: "0.100",
+        triggerPrice: first.triggerPrice,
+        workingType: first.workingType,
+        priceProtect: first.priceProtect,
+        status: "SUBMITTING",
+      },
+    });
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    scenario.submitted = [];
+
+    for (let index = 0; index < 3; index += 1) await tick(execution.id);
+
+    // No second stop is ever sent.
+    expect(scenario.submitted.filter((entry) => entry.role === "STOP_LOSS")).toEqual([]);
+    // The target that really is missing gets repaired.
+    expect(takeProfitPosts()).toEqual(["0.1"]);
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(false);
+    // The dormant stop row is left exactly as it was: no fabricated status.
+    const dormant = await rowOf(execution.id, "STOP_LOSS", 2);
+    expect(dormant.status).toBe("SUBMITTING");
+    expect(dormant.originalQuantity.toString()).toBe("0.1");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("23. a dormant intent is reused, not duplicated, when its gap returns", async () => {
+    const execution = await staleTakeProfitIntent({ covering: "0.100" });
+    // Dormant while the target covers the exposure.
+    await tick(execution.id);
+    expect(takeProfitPosts()).toEqual([]);
+
+    // The gap returns: the SAME generation-2 row is refreshed and placed.
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.quantity = "0.060";
+    await tick(execution.id);
+
+    expect(takeProfitPosts()).toEqual(["0.04"]);
+    const takeProfits = await prisma!.binanceOrder.findMany({
+      where: { tradeExecutionId: execution.id, role: "TAKE_PROFIT" },
+    });
+    expect(takeProfits.map((order) => order.generation).sort()).toEqual([1, 2]);
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 2)).clientAlgoId).toBe(tpIdOf(execution.id, 2));
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("20. the revised intent is what a restart reads back", async () => {
+    const execution = await staleTakeProfitIntent();
+    await tick(execution.id);
+
+    // Nothing in memory: exactly what a fresh process would load.
+    const reloaded = await prisma!.binanceOrder.findUniqueOrThrow({
+      where: { clientAlgoId: tpIdOf(execution.id, 2) },
+    });
+    expect(reloaded.originalQuantity.toString()).toBe("0.04");
+    expect(reloaded.submittedAt).not.toBeNull();
+    await clearAlerts(execution.id);
+  });
+});
