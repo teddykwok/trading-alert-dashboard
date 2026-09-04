@@ -8113,3 +8113,232 @@ describe("take-profit repair behind a safe oversized stop", () => {
     await clearAlerts(execution.id);
   });
 });
+
+describe("modality-aware protection representation", () => {
+  const tpIdOf = (id: string, generation: number) => buildClientOrderId(id, "TAKE_PROFIT", generation);
+  const stopIdOf = (id: string, generation: number) => buildClientOrderId(id, "STOP_LOSS", generation);
+
+  const tick = async (id: string) =>
+    protectionService.ensureProtectionForExposure({
+      executionId: id,
+      expectedVersion: (await reload(id)).version,
+      evaluatedAt: at(),
+    });
+
+  const clearAlerts = async (id: string) =>
+    prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: id } });
+
+  /**
+   * A hypothetical STANDARD protection row: role TAKE_PROFIT, orderType LIMIT,
+   * addressed by clientOrderId with NO clientAlgoId. Nothing in the runtime
+   * creates one yet -- it is persisted directly so the representation can be
+   * proved before any submission path exists.
+   */
+  async function standardTakeProfitRow(executionId: string, generation: number, quantity: string) {
+    const first = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: executionId, role: "TAKE_PROFIT", generation: 1 },
+    });
+    const clientOrderId = tpIdOf(executionId, generation);
+    await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: executionId,
+        role: "TAKE_PROFIT",
+        generation,
+        clientOrderId,
+        clientAlgoId: null,
+        side: first.side,
+        positionSide: first.positionSide,
+        orderType: "LIMIT",
+        timeInForce: "GTC",
+        price: first.triggerPrice,
+        originalQuantity: quantity,
+        status: "NEW",
+      },
+    });
+    return clientOrderId;
+  }
+
+  maybe()("L. a standard protection row with no clientAlgoId is visible to the loader", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    // Generation 1's algo target is gone; a STANDARD target covers 0.040.
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    const clientOrderId = await standardTakeProfitRow(execution.id, 2, "0.040");
+    scenario.standardOrders.set(clientOrderId, {
+      status: "NEW", origQty: "0.040", executedQty: "0", avgPrice: "0", orderId: "S1",
+      side: "SELL", type: "LIMIT", price: "108",
+    });
+    scenario.positionAmt = "0.040";
+    scenario.submitted = [];
+
+    const outcome = await tick(execution.id);
+
+    // Counted as real coverage: the execution is not treated as unprotected,
+    // and no replacement target is minted for a leg that is already covered.
+    expect(outcome.reasonCode).not.toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect(scenario.submitted.filter((entry) => entry.role === "TAKE_PROFIT")).toEqual([]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("K. a partially filled standard target and an active algo stop are both represented", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    const clientOrderId = await standardTakeProfitRow(execution.id, 2, "0.100");
+    // Testnet #4 shape: part traded, the remnant still rests and still covers.
+    scenario.standardOrders.set(clientOrderId, {
+      status: "PARTIALLY_FILLED", origQty: "0.100", executedQty: "0.060", avgPrice: "108",
+      orderId: "S2", side: "SELL", type: "LIMIT", price: "108",
+    });
+    scenario.positionAmt = "0.040";
+    scenario.submitted = [];
+
+    const outcome = await tick(execution.id);
+
+    // The algo STOP still covers 0.100 and the standard remnant covers 0.040,
+    // so neither hides the other: the stop over-covers the shrunken position
+    // and the target is complete, which is the ordinary safe deferral.
+    expect(outcome.reasonCode).toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    expect(scenario.submitted.filter((entry) => entry.role === "TAKE_PROFIT")).toEqual([]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("F/O. an EXPIRED standard remnant covers nothing, and repair sees the gap", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    const clientOrderId = await standardTakeProfitRow(execution.id, 2, "0.100");
+    // origQty - executedQty is still positive, but the order is terminal.
+    scenario.standardOrders.set(clientOrderId, {
+      status: "EXPIRED", origQty: "0.100", executedQty: "0.060", avgPrice: "108",
+      orderId: "S3", side: "SELL", type: "LIMIT", price: "108",
+    });
+    scenario.positionAmt = "0.040";
+    scenario.submitted = [];
+
+    const outcome = await tick(execution.id);
+
+    // Zero coverage, so the target is genuinely missing: the lifecycle must
+    // NOT read this as covered. And EXPIRED on its own parks nothing.
+    expect(outcome.reasonCode).not.toBe("PROTECTION_VERIFIED");
+    expect(outcome.reasonCode).not.toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(false);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("J. an unreadable standard target is unresolved, never zero", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    await standardTakeProfitRow(execution.id, 2, "0.100");
+    // No scenario.standardOrders entry AND the query itself is unavailable, so
+    // the state is genuinely unreadable rather than proven absent.
+    scenario.entryQueryUnavailable = true;
+    scenario.submitted = [];
+
+    const outcome = await tick(execution.id);
+    scenario.entryQueryUnavailable = false;
+
+    // Fail closed: it defers on unreadability instead of repairing blindly.
+    expect(outcome.reasonCode).toBe("TAKE_PROFIT_QUERY_UNAVAILABLE");
+    expect(scenario.submitted).toEqual([]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("M. an ENTRY limit row is never loaded as protection", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    // An ENTRY row is a LIMIT with a clientOrderId and no clientAlgoId -- the
+    // exact shape the widened loader must still refuse, on role alone.
+    const entry = await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: execution.id,
+        role: "ENTRY",
+        generation: 1,
+        clientOrderId: buildClientOrderId(execution.id, "ENTRY", 1),
+        clientAlgoId: null,
+        side: "BUY",
+        positionSide: "LONG",
+        orderType: "LIMIT",
+        timeInForce: "GTC",
+        price: "100",
+        originalQuantity: "0.100",
+        status: "NEW",
+      },
+    });
+    expect(entry.orderType).toBe("LIMIT");
+    expect(entry.clientAlgoId).toBeNull();
+
+    const loaded = await prisma!.binanceOrder.findMany({
+      where: { tradeExecutionId: execution.id, role: { in: ["STOP_LOSS", "TAKE_PROFIT"] } },
+    });
+    expect(loaded.some((order) => order.id === entry.id)).toBe(false);
+    expect(loaded.map((order) => order.role).sort()).toEqual(["STOP_LOSS", "TAKE_PROFIT"]);
+
+    // And a real tick still measures only the two protection legs.
+    const outcome = await tick(execution.id);
+    expect(outcome.reasonCode).toBe("PROTECTION_VERIFIED");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("an unsupported protection order type is owned but never interpreted", async () => {
+    // role proves the lifecycle owns it, so the loader must SEE it -- but its
+    // order type is one this lifecycle never places, so it can be read as
+    // neither modality and must not be queried as a conditional order.
+    const execution = await filledExecution();
+    await protect(execution);
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: execution.id,
+        role: "TAKE_PROFIT",
+        generation: 2,
+        clientOrderId: tpIdOf(execution.id, 2),
+        clientAlgoId: null,
+        side: "SELL",
+        positionSide: "LONG",
+        orderType: "MARKET",
+        originalQuantity: "0.100",
+        status: "NEW",
+      },
+    });
+    scenario.submitted = [];
+    scenario.mutations = [];
+
+    const outcome = await tick(execution.id);
+
+    // Fail closed: unresolved coverage, and nothing sent to the exchange.
+    expect(outcome.reasonCode).toBe("TAKE_PROFIT_QUERY_UNAVAILABLE");
+    expect(scenario.submitted).toEqual([]);
+    expect(scenario.mutations).toEqual([]);
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(false);
+    // The row is still owned and untouched -- not reinterpreted, not rewritten.
+    const row = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id, role: "TAKE_PROFIT", generation: 2 },
+    });
+    expect(row.orderType).toBe("MARKET");
+    expect(row.status).toBe("NEW");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("P. an algo quantity rewrite never overwrites the durable intent", async () => {
+    const execution = await filledExecution();
+    await protect(execution);
+    const stopRow = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id, role: "STOP_LOSS", generation: 1 },
+    });
+    expect(stopRow.originalQuantity.toString()).toBe("0.1");
+    // Testnet #4: after a clamped execution Binance reports the EXECUTED size
+    // where the armed size used to be.
+    const stop = scenario.algoOrders.get(stopIdOf(execution.id, 1))!;
+    stop.quantity = "0.040";
+    stop.algoStatus = "FINISHED";
+    scenario.positionAmt = "0";
+
+    await tick(execution.id);
+
+    const after = await prisma!.binanceOrder.findFirstOrThrow({ where: { id: stopRow.id } });
+    expect(after.originalQuantity.toString()).toBe("0.1");
+    await clearAlerts(execution.id);
+  });
+});
