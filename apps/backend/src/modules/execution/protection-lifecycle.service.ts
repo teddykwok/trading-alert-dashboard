@@ -1409,7 +1409,15 @@ export class ProtectionLifecycleService {
     // version; a fresh reservation reports the version it committed.
     const reserved: ReservedTranche | ProtectionOutcome =
       pending === null
-        ? await this.reserveNextTranche(execution, coverage.missingQuantity, position, input)
+        ? await this.reserveNextTranche(
+            execution,
+            {
+              stopQuantity: coverage.missingStopQuantity,
+              takeProfitQuantity: coverage.missingTakeProfitQuantity,
+            },
+            position,
+            input
+          )
         : { generation: pending, expectedVersion: input.expectedVersion };
 
     if (!("generation" in reserved)) return reserved; // a failure outcome
@@ -1425,25 +1433,57 @@ export class ProtectionLifecycleService {
     const orders = await this.loadProtectionOrders(execution.id);
     const generations = [...new Set(orders.map((order) => order.generation))].sort((a, b) => a - b);
     for (const generation of generations) {
-      const stop = orders.find((order) => order.role === "STOP_LOSS" && order.generation === generation);
-      const takeProfit = orders.find((order) => order.role === "TAKE_PROFIT" && order.generation === generation);
-      const incomplete =
-        !stop ||
-        !takeProfit ||
-        ["PLANNED", "SUBMITTING", "UNKNOWN"].includes(stop.status) ||
-        ["PLANNED", "SUBMITTING", "UNKNOWN"].includes(takeProfit.status);
+      /**
+       * A ROLE THAT WAS NEVER RESERVED IS NOT UNFINISHED WORK.
+       *
+       * This used to read `!stop || !takeProfit`, so any generation holding a
+       * single role was incomplete for ever. `advanceProtection` resumes a
+       * pending generation INSTEAD of reserving, so such a generation silently
+       * starved every later repair — which is exactly what already happens to
+       * the stop-only generations the unplaceable-take-profit path creates.
+       *
+       * Absence is provable intent rather than damage: one code path creates
+       * protection rows, inside one transaction, under the advisory lock and
+       * version CAS, together with the reservation event. A committed
+       * generation's rows ARE its intended roles.
+       *
+       * So incompleteness is now a property of the rows that exist. A
+       * generation with none is not reachable from that path at all, and is
+       * left to the malformed-state handling in `submitTranche` rather than
+       * being quietly treated as finished.
+       */
+      const rows = orders.filter((order) => order.generation === generation);
+      if (rows.length === 0) return generation;
+      const incomplete = rows.some((order) =>
+        ["PLANNED", "SUBMITTING", "UNKNOWN"].includes(order.status)
+      );
       if (incomplete) return generation;
     }
     return null;
   }
 
   /**
-   * Reserves one paired STOP_LOSS + TAKE_PROFIT tranche for exactly the
-   * missing delta, in ONE transaction, before any exchange call.
+   * Reserves ONE generation holding only the roles that are actually missing,
+   * each for its own missing quantity, in ONE transaction, before any exchange
+   * call.
+   *
+   * ## Why per-role
+   *
+   * This used to walk both roles and size both from
+   * max(missingStop, missingTakeProfit), so every single-leg repair minted a
+   * redundant second leg. Repairing a cancelled take profit also created and
+   * submitted a second STOP — leaving two active stops against one position,
+   * which the coverage model reports as over-coverage and, since multiple
+   * active stop generations are deliberately not exempt, fail-closes into
+   * MANUAL_INTERVENTION. The shared max compounded it by over-reserving
+   * whichever leg had the smaller gap.
+   *
+   * A role whose gap is zero is simply not reserved. A role whose gap is
+   * positive is reserved for exactly that gap.
    */
   private async reserveNextTranche(
     execution: TradeExecution,
-    missingQuantity: string,
+    missing: { stopQuantity: string; takeProfitQuantity: string },
     position: PositionSnapshot,
     input: ProtectionLifecycleInput
   ): Promise<ReservedTranche | ProtectionOutcome> {
@@ -1451,7 +1491,9 @@ export class ProtectionLifecycleService {
     const positionSide = protectionPositionSide(direction);
     const side = closingSide(direction);
 
-    if (new D(missingQuantity).lessThanOrEqualTo(0)) {
+    const wantStop = new D(missing.stopQuantity).greaterThan(0);
+    const wantTakeProfit = new D(missing.takeProfitQuantity).greaterThan(0);
+    if (!wantStop && !wantTakeProfit) {
       return this.outcome(true, "PROTECTION_VERIFIED", "No missing coverage.", execution, await this.loadProtection(execution.id));
     }
 
@@ -1472,43 +1514,57 @@ export class ProtectionLifecycleService {
       return this.outcome(false, "PROTECTION_FILTER_MISMATCH", "Symbol is no longer PERPETUAL.", execution);
     }
 
-    const validation = validateProtectionTriggers({
-      direction,
-      stopTriggerPrice: stopTrigger,
-      takeProfitTriggerPrice: takeProfitTrigger,
-      workingPrice: position.markPrice,
-      tickSize: inspection.filters.tickSize,
-      stepSize: inspection.filters.stepSize,
-      minQty: inspection.filters.minQty,
-      quantity: missingQuantity,
-    });
     /**
-     * ONLY the stop decides whether protection is attempted.
+     * Each requested role is judged against ITS OWN quantity, because the two
+     * gaps can legitimately differ and the step-size and minimum-quantity
+     * rules are quantity-dependent. Pure computation, so calling it once per
+     * requested role costs nothing.
+     */
+    const validateFor = (quantity: string) =>
+      validateProtectionTriggers({
+        direction,
+        stopTriggerPrice: stopTrigger,
+        takeProfitTriggerPrice: takeProfitTrigger,
+        workingPrice: position.markPrice,
+        tickSize: inspection.filters.tickSize,
+        stepSize: inspection.filters.stepSize,
+        minQty: inspection.filters.minQty,
+        quantity,
+      });
+
+    const rowsToReserve: Array<{ role: "STOP_LOSS" | "TAKE_PROFIT"; quantity: string; trigger: string }> = [];
+
+    /**
+     * ONLY the stop decides whether protection is attempted — and only when a
+     * stop is actually being reserved.
      *
      * This used to read `!validation.valid`, which meant an unplaceable take
      * profit withheld the stop as well. A take profit becomes unplaceable for
      * an entirely benign reason — price reaching the target — and refusing the
      * whole tranche for it left a filled position with no stop at all. The
-     * stop is the safety-critical leg and is now judged on its own.
+     * stop is the safety-critical leg and is judged on its own.
      */
-    if (!validation.stop.valid) {
-      await this.alerts.raise({
-        tradeExecutionId: execution.id,
-        alertType: "STOP_NOT_VERIFIED",
-        reasonCode: validation.stop.reasonCode!,
-        details: {
-          symbol: execution.symbol,
-          positionSide,
-          confirmedOpenQuantity: missingQuantity,
-          requiredAction: "The frozen protection is incompatible with current exchange state; protect manually.",
-        },
-      });
-      return this.escalate(execution, validation.stop.reasonCode!, validation.stop.message ?? "Protection is invalid.", input);
+    if (wantStop) {
+      const verdict = validateFor(missing.stopQuantity).stop;
+      if (!verdict.valid) {
+        await this.alerts.raise({
+          tradeExecutionId: execution.id,
+          alertType: "STOP_NOT_VERIFIED",
+          reasonCode: verdict.reasonCode!,
+          details: {
+            symbol: execution.symbol,
+            positionSide,
+            confirmedOpenQuantity: missing.stopQuantity,
+            requiredAction: "The frozen protection is incompatible with current exchange state; protect manually.",
+          },
+        });
+        return this.escalate(execution, verdict.reasonCode!, verdict.message ?? "Protection is invalid.", input);
+      }
+      rowsToReserve.push({ role: "STOP_LOSS", quantity: missing.stopQuantity, trigger: stopTrigger });
     }
 
     /**
-     * The stop is placeable. If the take profit is not, it is left OUT of this
-     * tranche rather than blocking it.
+     * An unplaceable take profit is left OUT rather than blocking anything.
      *
      * Omitting it is not the same as pretending it succeeded: no TAKE_PROFIT
      * order row is created, so nothing downstream can measure take-profit
@@ -1516,8 +1572,39 @@ export class ProtectionLifecycleService {
      * position fully covered, and `submitTranche` raises the operator alert
      * once the stop is actually verified.
      */
-    const takeProfitForTranche = validation.takeProfit.valid ? takeProfitTrigger : null;
-    const takeProfitOmittedReason = validation.takeProfit.valid ? null : validation.takeProfit.reasonCode;
+    let takeProfitOmittedReason: string | null = null;
+    if (wantTakeProfit) {
+      const verdict = validateFor(missing.takeProfitQuantity).takeProfit;
+      if (takeProfitTrigger !== null && verdict.valid) {
+        rowsToReserve.push({ role: "TAKE_PROFIT", quantity: missing.takeProfitQuantity, trigger: takeProfitTrigger });
+      } else {
+        takeProfitOmittedReason = verdict.reasonCode ?? null;
+      }
+    }
+
+    /**
+     * NOTHING LEFT TO RESERVE.
+     *
+     * Reachable when the stop already covers the exposure and the take profit
+     * cannot currently be placed — the legacy unplaceable-target state. There
+     * is no such thing as an empty generation: creating one would burn a
+     * generation number, write a PROTECTION_RESERVED event describing no
+     * orders, bump the execution version and hand `submitTranche` a tranche
+     * with no rows, every tick, for as long as the target stays unplaceable.
+     *
+     * So this returns BEFORE the transaction is opened. Nothing is written,
+     * no generation is consumed and no mutation is sent, which makes repeated
+     * ticks in this state completely inert.
+     */
+    if (rowsToReserve.length === 0) {
+      return this.outcome(
+        false,
+        "TAKE_PROFIT_TRIGGER_INVALID",
+        "The stop already covers the exposure and the take profit is not currently placeable; nothing was reserved.",
+        execution,
+        await this.loadProtection(execution.id)
+      );
+    }
 
     const generation = (await this.highestGeneration(execution.id)) + 1;
     // The role -> workingType rule lives in ONE place, shared with the demo
@@ -1544,9 +1631,8 @@ export class ProtectionLifecycleService {
 
       const next = await tx.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
 
-      for (const role of ["STOP_LOSS", "TAKE_PROFIT"] as const) {
-        const trigger = role === "STOP_LOSS" ? stopTrigger : takeProfitForTranche;
-        if (!trigger) continue;
+      for (const row of rowsToReserve) {
+        const role = row.role;
         await tx.binanceOrder.create({
           data: {
             tradeExecutionId: execution.id,
@@ -1557,8 +1643,9 @@ export class ProtectionLifecycleService {
             side,
             positionSide,
             orderType: role === "STOP_LOSS" ? "STOP_MARKET" : "TAKE_PROFIT_MARKET",
-            originalQuantity: new D(missingQuantity),
-            triggerPrice: new D(trigger),
+            // Its OWN gap, never the larger of the two.
+            originalQuantity: new D(row.quantity),
+            triggerPrice: new D(row.trigger),
             // Frozen into the intent so a retry cannot silently change policy.
             workingType: protectionWorkingType(role, policy),
             priceProtect,
@@ -1575,10 +1662,14 @@ export class ProtectionLifecycleService {
           fromStatus: execution.status,
           toStatus: next.status,
           reasonCode: "PROTECTION_COVERAGE_INCOMPLETE",
-          message: `Reserved protection generation ${generation} for ${missingQuantity}.`,
+          message:
+            `Reserved protection generation ${generation}: ` +
+            rowsToReserve.map((row) => `${row.role} ${row.quantity}`).join(", ") + ".",
           metadata: {
             generation,
-            quantity: missingQuantity,
+            reservedRoles: rowsToReserve.map((row) => row.role),
+            stopQuantity: wantStop ? missing.stopQuantity : null,
+            takeProfitQuantity: wantTakeProfit ? missing.takeProfitQuantity : null,
             workingTypeStop,
             workingTypeTakeProfit,
             // Written inside the same transaction as the order rows, so the
@@ -1622,6 +1713,106 @@ export class ProtectionLifecycleService {
   }
 
   /** Submits STOP first, verifies it, and only then submits TP. */
+  /**
+   * May a take-profit-only tranche be submitted right now?
+   *
+   * Returns an outcome to RETURN when it may not, or null when it may.
+   *
+   * The reservation only omitted the stop because coverage already sufficed,
+   * and that is a statement about a moment that has passed. Between then and
+   * this POST the stop can be cancelled, fill, start executing, become
+   * unreadable or be joined by a second generation, and the position can go
+   * flat. So the whole question is asked again here, from the exchange.
+   *
+   * The rules are deliberately the SAME ones `advanceProtection` applies, not a
+   * weaker paraphrase of them. In particular it refuses on `overProtected`
+   * rather than on a bare "stop coverage is at least exposure" test: that one
+   * check is what carries the multiple-active-stop invariant, which treats two
+   * owned stops guarding one position as unsafe, and the single oversized stop
+   * whose exemption is deliberately read-only. Neither may be turned into a
+   * licence to place an order here.
+   *
+   * Nothing is written on any path through this, so a tick that defers leaves
+   * no trace.
+   */
+  private async takeProfitOnlyBarrier(
+    execution: TradeExecution,
+    position: PositionSnapshot,
+    input: ProtectionLifecycleInput
+  ): Promise<ProtectionOutcome | null> {
+    const direction = execution.direction as DirectionName;
+    const protection = await this.loadProtection(execution.id);
+
+    // Flat, or a sign that contradicts the direction: closure owns this, and
+    // an exit order must never be added to a position that is not there.
+    const normalized = normalizeOpenQuantity(position.quantity, direction);
+    if (!normalized.valid || new D(normalized.quantity).lessThanOrEqualTo(0)) {
+      return this.outcome(
+        false,
+        "PROTECTION_COVERAGE_INCOMPLETE",
+        "No open exposure remains; closure owns this execution and no take profit is placed.",
+        execution,
+        protection
+      );
+    }
+
+    const coverageNow = await this.measureVerifiedCoverage(execution);
+
+    // Unreadable is not absent, and it is certainly not proof the stop holds.
+    if (coverageNow.unresolved.length > 0) {
+      return this.outcome(
+        false,
+        coverageNow.unresolved.includes("STOP_LOSS") ? "STOP_QUERY_UNAVAILABLE" : "TAKE_PROFIT_QUERY_UNAVAILABLE",
+        `Protection state is unreadable for ${coverageNow.unresolved.join(" and ")}; no take profit is placed.`,
+        execution,
+        protection
+      );
+    }
+
+    // A leg that is firing is closing the position; adding an exit order into
+    // that race is exactly what the emergency-close path already refuses.
+    if (coverageNow.executing.length > 0) {
+      return this.outcome(
+        false,
+        coverageNow.executing.includes("STOP_LOSS") ? "STOP_EXECUTION_IN_PROGRESS" : "TAKE_PROFIT_EXECUTION_IN_PROGRESS",
+        `${coverageNow.executing.join(" and ")} is executing; no take profit is placed.`,
+        execution,
+        protection
+      );
+    }
+
+    const coverage = calculateCoverage({
+      confirmedOpenQuantity: normalized.quantity,
+      activeStopQuantity: coverageNow.stop,
+      activeTakeProfitQuantity: coverageNow.takeProfit,
+    });
+
+    // The single check that carries the over-coverage invariants wholesale.
+    if (coverage.overProtected) {
+      return this.outcome(
+        false,
+        "PROTECTION_COVERAGE_INCOMPLETE",
+        `Protection exceeds exposure (stop ${coverageNow.stop}, take profit ${coverageNow.takeProfit}, ` +
+          `exposure ${normalized.quantity}); no take profit is placed.`,
+        execution,
+        protection
+      );
+    }
+
+    if (coverage.missingStopQuantity !== "0") {
+      return this.outcome(
+        false,
+        "PROTECTION_COVERAGE_INCOMPLETE",
+        `The stop no longer covers the exposure (stop ${coverageNow.stop} of ${normalized.quantity}); ` +
+          "the stop is repaired before any take profit is placed.",
+        execution,
+        protection
+      );
+    }
+
+    return null;
+  }
+
   private async submitTranche(
     execution: TradeExecution,
     generation: number,
@@ -1631,8 +1822,26 @@ export class ProtectionLifecycleService {
     const protection = await this.ensureProtectionRow(execution.id);
 
     const stop = await this.loadOrder(execution.id, "STOP_LOSS", generation);
+    const reservedTakeProfit = await this.loadOrder(execution.id, "TAKE_PROFIT", generation);
+
+    /**
+     * A generation with NO rows cannot come from the reservation path, which
+     * refuses to open a transaction with nothing to create. Reaching here means
+     * the row set was damaged out of band, so it stays fail-closed.
+     */
+    if (!stop && !reservedTakeProfit) {
+      return this.outcome(false, "STOP_INTENT_CONFLICT", "No protection reservation exists for this tranche.", execution, protection);
+    }
+
+    /**
+     * A take-profit-only generation was reserved because the stop already
+     * covered the exposure. That was true when it was reserved; it must still
+     * be true now, so it is re-proved from authoritative exchange evidence
+     * BEFORE anything is written or claimed.
+     */
     if (!stop) {
-      return this.outcome(false, "STOP_INTENT_CONFLICT", "No stop reservation exists for this tranche.", execution, protection);
+      const barrier = await this.takeProfitOnlyBarrier(execution, position, input);
+      if (barrier) return barrier;
     }
 
     // Protection placement is starting. This is the single funnel for BOTH a
@@ -1651,6 +1860,7 @@ export class ProtectionLifecycleService {
     const owned: ProtectionLifecycleInput =
       placing.committedVersion === null ? input : { ...input, expectedVersion: placing.committedVersion };
 
+    if (stop) {
     const stopResult = await this.submitAndVerifyProtection(execution, stop, input.evaluatedAt);
     if (!stopResult.verified) {
       // DEFERRED, NOT FAILED. An unreadable existence query says nothing is
@@ -1689,14 +1899,39 @@ export class ProtectionLifecycleService {
     }
 
     await this.setProtectionState(protection.id, "STOP_VERIFIED", "PROTECTION_VERIFIED", "Stop is verified active.");
+    }
 
-    const takeProfit = await this.loadOrder(execution.id, "TAKE_PROFIT", generation);
+    const takeProfit = reservedTakeProfit;
     if (!takeProfit) {
-      // Two different situations reach here, and conflating them would hide a
-      // real gap: the plan may never have had a take profit, or it had one that
-      // was not placeable when this tranche was reserved.
+      // THREE situations reach here, and conflating them hides a real gap or
+      // invents one:
+      //   - the plan never had a take profit;
+      //   - this generation was intentionally stop-only because the target was
+      //     already covered by another generation;
+      //   - the target existed and could not be placed.
       if (execution.takeProfit === null) {
         // A plan with no take profit: a verified stop is the whole protection.
+        return this.verifyAggregateCoverage(execution, owned);
+      }
+
+      /**
+       * Is the target actually missing, or merely absent FROM THIS GENERATION?
+       *
+       * Role-aware reservation omits a role whose gap is zero, so a stop-only
+       * generation is the ordinary shape of a stop repair. Reading that as
+       * "the take profit was not placeable" wrote PROTECTION_INCOMPLETE and
+       * raised an operator alert on a perfectly healthy execution whose target
+       * is covered by an earlier generation. Aggregate coverage decides, from
+       * real orders rather than from this generation's row set.
+       */
+      const measured = await this.measureVerifiedCoverage(execution);
+      const openNow = normalizeOpenQuantity(position.quantity, execution.direction as DirectionName).quantity;
+      const aggregate = calculateCoverage({
+        confirmedOpenQuantity: openNow,
+        activeStopQuantity: measured.stop,
+        activeTakeProfitQuantity: measured.takeProfit,
+      });
+      if (measured.unresolved.length === 0 && aggregate.missingTakeProfitQuantity === "0") {
         return this.verifyAggregateCoverage(execution, owned);
       }
 
