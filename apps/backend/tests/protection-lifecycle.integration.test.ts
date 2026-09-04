@@ -1283,6 +1283,242 @@ describe("execution status reflects verified protection", () => {
     expect(scenario.mutations).toEqual([]);
   });
 
+  // =========================================================================
+  // OWNED STOP OVER-COVERAGE — over-guarded is not unguarded.
+  //
+  // Direct USD-M testnet observation, hedge mode, both directions: a
+  // conditional close armed for 10 against a position of 4 clamps to 4 when it
+  // triggers, closes the position and leaves the opposite side at zero. An
+  // owned stop that still guards the pre-shrink quantity therefore cannot
+  // over-close or reverse.
+  //
+  // It used to escalate anyway — ORPHAN_PROTECTION_ORDER plus
+  // MANUAL_INTERVENTION — naming an orphan that does not exist. The exemption
+  // below is deliberately narrow, and everything it does not cover keeps the
+  // existing fail-closed behaviour exactly.
+  // =========================================================================
+
+  /**
+   * The canonical case: exposure shrank, the take profit is conclusively
+   * resolved, and the owned stop alone still guards the pre-shrink quantity.
+   */
+  async function stopOverCovers() {
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(buildClientOrderId(execution.id, "TAKE_PROFIT", 1))!.algoStatus = "CANCELED";
+    scenario.positionAmt = "0.040";
+    return execution;
+  }
+
+  maybe()("P1-A. an owned verified stop guarding more than the position is left alone", async () => {
+    const execution = await stopOverCovers();
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    const after = await reload(execution.id);
+    expect(after.requiresManualIntervention).toBe(false);
+    expect(after.status).toBe("PROTECTED");
+    // Read-only: nothing cancelled, nothing sent, no new identity minted.
+    expect(scenario.submitted).toEqual([]);
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  maybe()("P1-A2. no ORPHAN_PROTECTION_ORDER alert is raised for our own stop", async () => {
+    const execution = await stopOverCovers();
+
+    await protect(await reload(execution.id));
+
+    const alerts = await prisma!.criticalAlert.findMany({ where: { tradeExecutionId: execution.id } });
+    expect(alerts.map((alert) => alert.alertType)).not.toContain("ORPHAN_PROTECTION_ORDER");
+  });
+
+  maybe()("P1-B. NO replacement tranche is reserved by this path", async () => {
+    // The take profit is a real gap here, and repairing it needs a
+    // take-profit-only reservation this lifecycle cannot yet express without
+    // also minting a redundant second stop. So this path must reserve nothing.
+    const execution = await stopOverCovers();
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toEqual([1]);
+    expect(await generationsOf(execution.id, "TAKE_PROFIT")).toEqual([1]);
+    expect(scenario.submitted).toEqual([]);
+  });
+
+  maybe()("P1-G. BOTH legs over-covering is not blanket-ignored", async () => {
+    // Only the stop has testnet evidence behind it. An excess that also covers
+    // the take profit is not something this exemption may wave through.
+    const execution = await protectedExecution();
+    scenario.positionAmt = "0.040";
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).not.toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(true);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("P1-H. TWO active owned stop generations are never exempted", async () => {
+    // The tranche model is additive, so two stops can legitimately be active at
+    // once: a coverage gap mints generation 2 beside generation 1. Both may be
+    // ours and both identity-valid, yet their AGGREGATE guarding more than the
+    // position is duplicate protection, not the single stale stop the testnet
+    // evidence covers. It must keep failing closed.
+    const execution = await protectedExecution();
+
+    // Exposure grows, so the health path reserves and submits generation 2.
+    scenario.positionAmt = "0.200";
+    await protect(await reload(execution.id));
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toContain(2);
+
+    // Both stop generations are now ACTIVE and aggregate to 0.200.
+    for (const generation of [1, 2]) {
+      expect(scenario.algoOrders.get(buildClientOrderId(execution.id, "STOP_LOSS", generation))!.algoStatus).toBe("NEW");
+      // Take profits resolved, so ONLY the stops over-cover — otherwise the
+      // take-profit guard would be what refuses, and this would prove nothing.
+      scenario.algoOrders.get(buildClientOrderId(execution.id, "TAKE_PROFIT", generation))!.algoStatus = "CANCELED";
+    }
+
+    // Now exposure collapses well below the aggregate stop coverage.
+    scenario.positionAmt = "0.040";
+    scenario.submitted = [];
+    scenario.mutations = [];
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).not.toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    const after = await reload(execution.id);
+    expect(after.requiresManualIntervention).toBe(true);
+    expect(after.status).toBe("MANUAL_INTERVENTION");
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("P1-C. take-profit over-coverage is NOT exempted", async () => {
+    // Only the stop may be over-covering. A take profit guarding more than the
+    // position is not something this exemption has evidence about.
+    const execution = await protectedExecution();
+    scenario.algoOrders.get(buildClientOrderId(execution.id, "STOP_LOSS", 1))!.algoStatus = "CANCELED";
+    scenario.positionAmt = "0.040";
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).not.toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(true);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("P1-D. an identity-mismatched stop is never exempted", async () => {
+    // The observed order carries our id but contradicts our intent, so it is
+    // not conclusively ours and the escalation must stand.
+    const execution = await stopOverCovers();
+    scenario.algoOrders.get(buildClientOrderId(execution.id, "STOP_LOSS", 1))!.positionSide = "SHORT";
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).not.toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(true);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("P1-D2. a mismatched trigger price is likewise never exempted", async () => {
+    const execution = await stopOverCovers();
+    scenario.algoOrders.get(buildClientOrderId(execution.id, "STOP_LOSS", 1))!.triggerPrice = "1.2345";
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(true);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("P1-E. an unreadable leg is never exempted", async () => {
+    // UNKNOWN could be the real explanation for the excess, so it keeps the
+    // pre-existing fail-closed behaviour.
+    const execution = await stopOverCovers();
+    scenario.queryFailures.add(buildClientOrderId(execution.id, "TAKE_PROFIT", 1));
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).not.toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(true);
+    expect(scenario.submitted).toEqual([]);
+    await prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: execution.id } });
+  });
+
+  maybe()("P1-I. an owned EXECUTING stop keeps its own pre-existing deferral", async () => {
+    // The two deferrals stay distinct: this one means the stop is firing, the
+    // exemption above means it is resting and merely oversized.
+    const execution = await protectedExecution();
+    const stop = scenario.algoOrders.get(buildClientOrderId(execution.id, "STOP_LOSS", 1))!;
+    stop.algoStatus = "PARTIALLY_FILLED";
+    stop.executedQty = "0.060";
+    scenario.positionAmt = "0.040";
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.reasonCode).toBe("STOP_EXECUTION_IN_PROGRESS");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(false);
+  });
+
+  maybe()("P1-J. a fully covered execution is unchanged", async () => {
+    const execution = await protectedExecution();
+
+    const outcome = await protect(await reload(execution.id));
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reasonCode).toBe("PROTECTION_VERIFIED");
+    expect(scenario.submitted).toEqual([]);
+  });
+
+  maybe()("P1-K. an ordinary gap with no over-coverage still repairs", async () => {
+    // Exposure GREW: the stop under-covers, nothing over-covers, so the normal
+    // replacement path must be completely unaffected.
+    const execution = await protectedExecution();
+    scenario.positionAmt = "0.200";
+
+    await protect(await reload(execution.id));
+
+    expect(await generationsOf(execution.id, "STOP_LOSS")).toContain(2);
+    expect(scenario.submitted.map((entry) => entry.role)).toContain("STOP_LOSS");
+  });
+
+  maybe()("P1-L. the stop is still submitted and verified before the take profit", async () => {
+    const execution = await protectedExecution();
+    scenario.positionAmt = "0.200";
+    scenario.submitted = [];
+
+    await protect(await reload(execution.id));
+
+    const roles = scenario.submitted.map((entry) => entry.role);
+    expect(roles.indexOf("STOP_LOSS")).toBeGreaterThanOrEqual(0);
+    expect(roles.indexOf("STOP_LOSS")).toBeLessThan(roles.indexOf("TAKE_PROFIT"));
+  });
+
+  maybe()("P1-N. repeated safe ticks cause no mutation and no state churn", async () => {
+    const execution = await stopOverCovers();
+    const before = await ordersOf(execution.id);
+    const versionBefore = (await reload(execution.id)).version;
+
+    for (let index = 0; index < 3; index += 1) {
+      const outcome = await protect(await reload(execution.id));
+      expect(outcome.reasonCode).toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    }
+
+    const after = await ordersOf(execution.id);
+    expect(after.length).toBe(before.length);
+    expect((await reload(execution.id)).version).toBe(versionBefore);
+    expect(scenario.submitted).toEqual([]);
+    expect(scenario.mutations).toEqual([]);
+    const alerts = await prisma!.criticalAlert.count({ where: { tradeExecutionId: execution.id } });
+    expect(alerts).toBe(0);
+  });
+
   maybe()("a locally terminal generation never blocks the health path", async () => {
     // A dead generation 1 whose query later becomes unreadable must not stall
     // repair forever: we already know it is finished.
