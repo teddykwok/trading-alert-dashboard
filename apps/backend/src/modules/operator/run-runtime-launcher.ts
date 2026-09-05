@@ -10,6 +10,8 @@ import {
   FileStateStore,
   LAUNCHER_ROLES,
   LIVE_READY_CONFIRMATION,
+  STANDARD_LIMIT_TAKE_PROFIT_CONFIRMATION,
+  isStandardLimitTakeProfitConfirmed,
   applyGates,
   classifyDiskMode,
   defaultStatePath,
@@ -26,6 +28,7 @@ import {
   verifyOwnership,
   verifyRuntimeMode,
   windowsSpawnPlan,
+  standardLimitTakeProfitOf,
   type DiskMode,
   type LauncherRole,
   type OwnedProcess,
@@ -127,11 +130,33 @@ function portOpen(port: number): Promise<boolean> {
 }
 
 /**
+ * Asks whether this runtime should place take profits as resting LIMIT orders.
+ *
+ * Off unless the operator types the phrase. The choice lives for exactly one
+ * runtime: it is pinned into the children's environment and recorded in the
+ * launcher state, never written to .env, so the next launch asks again.
+ */
+async function askStandardLimitTakeProfit(ask: (question: string) => Promise<string>): Promise<boolean> {
+  console.log("");
+  console.log("Take profits are placed as conditional TAKE_PROFIT_MARKET orders by default.");
+  console.log("Enabling the resting LIMIT modality affects NEW executions only: an execution");
+  console.log("that already has a take profit keeps the modality it started with.");
+  const typed = await ask(`Type ${STANDARD_LIMIT_TAKE_PROFIT_CONFIRMATION} to enable it, or press Enter to leave it off: `);
+  const enabled = isStandardLimitTakeProfitConfirmed(typed);
+  console.log(enabled ? "Standard LIMIT take profit will be ENABLED for this runtime." : "Standard LIMIT take profit stays DISABLED.");
+  return enabled;
+}
+
+/**
  * Starts one role. The command shape lives in `windowsSpawnPlan`, which is pure
  * and tested; this only performs the spawn.
  */
-function spawnRole(role: LauncherRole, mode: "SAFE" | "LIVE_READY"): ChildProcess {
-  const plan = windowsSpawnPlan(role, REPO_ROOT, mode);
+function spawnRole(
+  role: LauncherRole,
+  mode: "SAFE" | "LIVE_READY",
+  standardLimitTakeProfit: boolean
+): ChildProcess {
+  const plan = windowsSpawnPlan(role, REPO_ROOT, mode, process.env, standardLimitTakeProfit);
   return spawn(plan.command, plan.args, plan.options);
 }
 
@@ -341,10 +366,11 @@ async function superviseWorkerOnce(budget: RestartBudget): Promise<{
     probe: (pid) => probeProcesses([pid]).get(pid) ?? null,
     terminate: (pid) => terminateTree(pid),
     spawnWorker: () => {
-      // The RECORDED mode, never a fresh choice. `windowsSpawnPlan` pins the
-      // three gates into the child environment, so this reproduces exactly the
-      // posture the stack was started in.
-      const child = spawnRole("worker", state.mode);
+      // The RECORDED mode and the RECORDED take-profit modality, never a fresh
+      // choice of either. `windowsSpawnPlan` pins the three gates and the
+      // modality switch into the child environment, so this reproduces exactly
+      // the posture the stack was started in.
+      const child = spawnRole("worker", state.mode, standardLimitTakeProfitOf(state));
       if (typeof child.pid !== "number") return null;
       child.unref();
       return child.pid;
@@ -469,7 +495,10 @@ async function waitForPorts(): Promise<{ backend: boolean; frontend: boolean }> 
 // Actions
 // ---------------------------------------------------------------------------
 
-async function startRuntime(mode: "SAFE" | "LIVE_READY"): Promise<void> {
+async function startRuntime(
+  mode: "SAFE" | "LIVE_READY",
+  standardLimitTakeProfit = false
+): Promise<void> {
   const state = store.read();
   const { alive } = liveProcesses(state);
   const [backendPortOpen, frontendPortOpen] = await Promise.all([
@@ -496,10 +525,13 @@ async function startRuntime(mode: "SAFE" | "LIVE_READY"): Promise<void> {
   }
   writeEnvText(rewritten.text);
   console.log(`Deployment gates written: ${mode}`);
+  // The SAME value handed to every child below, never a second read of the
+  // environment: what is printed is what the runtime will run with.
+  console.log(`Standard LIMIT take profit: ${standardLimitTakeProfit ? "ENABLED" : "DISABLED"}`);
 
   const started: OwnedProcess[] = [];
   for (const role of LAUNCHER_ROLES) {
-    const child = spawnRole(role, mode);
+    const child = spawnRole(role, mode, standardLimitTakeProfit);
     if (typeof child.pid !== "number") {
       console.log(`FAILED — ${role} could not be started.`);
       break;
@@ -516,6 +548,7 @@ async function startRuntime(mode: "SAFE" | "LIVE_READY"): Promise<void> {
     mode,
     startedAtMs: Date.now(),
     processes: started,
+    standardLimitTakeProfit,
   });
 
   if (started.length !== LAUNCHER_ROLES.length) {
@@ -612,7 +645,7 @@ async function startLiveReady(ask: (question: string) => Promise<string>): Promi
     console.log("Cancelled. Nothing was changed.");
     return;
   }
-  await startRuntime("LIVE_READY");
+  await startRuntime("LIVE_READY", await askStandardLimitTakeProfit(ask));
 }
 
 async function stopRuntime(): Promise<void> {
@@ -689,7 +722,7 @@ async function main(): Promise<void> {
 
       const choice = (await ask("Choose: ")).trim();
       if (choice === "1") continue;
-      else if (choice === "2") await startRuntime("SAFE");
+      else if (choice === "2") await startRuntime("SAFE", await askStandardLimitTakeProfit(ask));
       else if (choice === "3") await startLiveReady(ask);
       else if (choice === "4") await stopRuntime();
       else if (choice === "5") await superviseWorker(ask);

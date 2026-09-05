@@ -228,6 +228,13 @@ export interface TradingControlStatusDto {
   systemState: TradingSystemState;
   profile: TradingControlProfileDto | null;
   environmentGates: TradingControlGatesDto;
+  /**
+   * Startup-scoped configuration of THIS process, reported so an operator can
+   * prove what the running runtime will do. Read-only: the environment is
+   * parsed once per process, so changing a runtime's behaviour means launching
+   * it with a different choice, never editing this.
+   */
+  startupConfiguration: { standardLimitTakeProfitEnabled: boolean };
   runtimeAttestation: TradingControlAttestationDto;
   allowedSymbols: string[];
   /**
@@ -470,6 +477,18 @@ export class TradingControlService {
         globalKillSwitch: env.EXECUTION_GLOBAL_KILL_SWITCH,
         liveEntryEnabled: env.EXECUTION_LIVE_ENTRY_ENABLED,
         protectionReady: env.EXECUTION_PROTECTION_READY,
+      },
+      /**
+       * Which take-profit modality THIS PROCESS was started with.
+       *
+       * Read-only and startup-scoped: the environment is parsed once per
+       * process, so this reports what the running runtime will do and cannot be
+       * changed by looking at it. It also decides nothing for work already in
+       * flight — an execution that already has a take profit keeps the modality
+       * of its own lineage regardless of this value.
+       */
+      startupConfiguration: {
+        standardLimitTakeProfitEnabled: env.EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED,
       },
       runtimeAttestation: attestation,
       allowedSymbols: profileRow?.safetyPolicy?.allowedSymbols ?? [],

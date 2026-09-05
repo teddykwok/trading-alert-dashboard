@@ -829,7 +829,10 @@ describe("the launcher exposes supervision and keeps its existing guards", () =>
   });
 
   it("spawns the replacement in the RECORDED mode, never a chosen one", () => {
-    expect(CLI).toContain('spawnRole("worker", state.mode)');
+    // Both arguments come from the RECORDED state: the mode, and the take-profit
+    // modality that runtime was started with. A supervised restart reproduces
+    // the runtime it is replacing and never re-decides either.
+    expect(CLI).toContain('spawnRole("worker", state.mode, standardLimitTakeProfitOf(state))');
     // No second spawn path and no gate write was introduced.
     expect(CLI.match(/spawnRole\(/g) ?? []).toHaveLength(3); // definition, whole-stack start, supervision
   });

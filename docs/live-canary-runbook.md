@@ -53,6 +53,12 @@ Run these yourself; nothing here changes a Windows setting automatically.
 | Worker running | `pnpm --filter @trading-alert-dashboard/backend worker` |
 | Notification scheduler alive | preflight reports `notificationSchedulerReady` |
 
+**A canary never borrows the vitest database.** Point a TESTNET canary at its
+own database, not at the one `pnpm test` uses. The suite truncates and reseeds
+what it finds, and rows a canary leaves behind outlive the canary: a previous
+run's residue surfaced later as an unexplained `critical alert outbox` failure
+that cost more to diagnose than a separate database costs to create.
+
 **Timezone is irrelevant to signing.** Binance signs against epoch milliseconds
 and the client applies a measured server-clock offset, so only *absolute* clock
 accuracy matters — never the displayed zone.
