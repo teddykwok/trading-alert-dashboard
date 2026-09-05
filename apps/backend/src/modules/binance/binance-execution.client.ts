@@ -181,6 +181,32 @@ export interface ProtectionSubmissionContext {
   readonly priceProtect: boolean;
 }
 
+/**
+ * Permission to place ONE resting take-profit LIMIT for a protection tranche.
+ *
+ * Separate from the conditional context on purpose. Both eventually reach
+ * POST /fapi/v1/order-shaped transports, but an ENTRY authorization opens a
+ * position and this one may only close one, so reusing the entry brand here
+ * would let a protection bug submit an opening order. The brand, not the
+ * endpoint, is what the transport checks.
+ */
+export interface StandardProtectionSubmissionContext {
+  readonly [AUTHORIZATION_BRAND]: "STANDARD_PROTECTION_SUBMISSION";
+  readonly symbol: string;
+  readonly clientOrderId: string;
+  readonly side: "BUY" | "SELL";
+  readonly positionSide: "LONG" | "SHORT";
+  readonly quantity: string;
+  readonly price: string;
+}
+
+/** Permission to cancel ONE resting protection LIMIT by its own client id. */
+export interface StandardProtectionCancellationContext {
+  readonly [AUTHORIZATION_BRAND]: "STANDARD_PROTECTION_CANCELLATION";
+  readonly symbol: string;
+  readonly clientOrderId: string;
+}
+
 export interface ProtectionCancellationContext {
   readonly [AUTHORIZATION_BRAND]: "PROTECTION_CANCELLATION";
   readonly symbol: string;
@@ -501,6 +527,78 @@ export class BinanceUsdMExecutionClient {
     };
   }
 
+  /**
+   * Permission to place a take-profit tranche as a resting close-side LIMIT.
+   *
+   * Enforces exactly what the conditional authorization enforces, minus the
+   * trigger: the role is a protection role, the identity is this execution's
+   * own deterministic tranche id, and the side CLOSES the hedge leg rather than
+   * increasing it. A standard protection order may only ever be a take profit —
+   * the stop stays conditional, because a resting stop cannot guarantee a fill.
+   */
+  authorizeStandardProtectionSubmission(input: {
+    executionId: string;
+    symbol: string;
+    role: "STOP_LOSS" | "TAKE_PROFIT";
+    generation: number;
+    clientOrderId: string;
+    side: "BUY" | "SELL";
+    positionSide: "LONG" | "SHORT";
+    quantity: string;
+    price: string;
+  }): StandardProtectionSubmissionContext {
+    if (input.role !== "TAKE_PROFIT") {
+      throw new BinanceMutationViolationError("Only a TAKE_PROFIT tranche may be placed as a standard LIMIT.");
+    }
+    if (!Number.isSafeInteger(input.generation) || input.generation < 1) {
+      throw new BinanceMutationViolationError("Protection generation must be a positive integer.");
+    }
+    if (buildClientOrderId(input.executionId, input.role, input.generation) !== input.clientOrderId) {
+      throw new BinanceMutationViolationError(
+        "The client order id does not match this execution's reserved protection tranche."
+      );
+    }
+    const expectedSide = input.positionSide === "LONG" ? "SELL" : "BUY";
+    if (input.side !== expectedSide) {
+      throw new BinanceMutationViolationError("Protection side must close the position, not increase it.");
+    }
+    if (!isPositiveDecimal(input.quantity) || !isPositiveDecimal(input.price)) {
+      throw new BinanceMutationViolationError("Protection quantity and price must be positive decimals.");
+    }
+    return {
+      [AUTHORIZATION_BRAND]: "STANDARD_PROTECTION_SUBMISSION",
+      symbol: input.symbol.trim().toUpperCase(),
+      clientOrderId: input.clientOrderId,
+      side: input.side,
+      positionSide: input.positionSide,
+      quantity: input.quantity,
+      price: input.price,
+    };
+  }
+
+  /** Permission to cancel ONE resting protection LIMIT by its own client id. */
+  authorizeStandardProtectionCancellation(input: {
+    executionId: string;
+    symbol: string;
+    role: "STOP_LOSS" | "TAKE_PROFIT";
+    generation: number;
+    clientOrderId: string;
+  }): StandardProtectionCancellationContext {
+    if (input.role !== "TAKE_PROFIT") {
+      throw new BinanceMutationViolationError("Only a TAKE_PROFIT tranche exists as a standard LIMIT.");
+    }
+    if (buildClientOrderId(input.executionId, input.role, input.generation) !== input.clientOrderId) {
+      throw new BinanceMutationViolationError(
+        "The client order id does not belong to this execution's protection tranche."
+      );
+    }
+    return {
+      [AUTHORIZATION_BRAND]: "STANDARD_PROTECTION_CANCELLATION",
+      symbol: input.symbol.trim().toUpperCase(),
+      clientOrderId: input.clientOrderId,
+    };
+  }
+
   /** Permission to cancel ONE persisted protection order by its own algo id. */
   authorizeProtectionCancellation(input: {
     executionId: string;
@@ -566,6 +664,65 @@ export class BinanceUsdMExecutionClient {
       positionSide: input.positionSide,
       quantity: input.quantity,
       clientOrderId: input.clientOrderId,
+    };
+  }
+
+  /**
+   * POST /fapi/v1/order — one resting close-side take-profit LIMIT, ACK.
+   *
+   * `reduceOnly` is deliberately NOT sent, matching the entry submitter and the
+   * conditional one, which record that the parameter is invalid in hedge mode.
+   *
+   * What direct USD-M testnet observation adds is that omitting it is
+   * sufficient: a close-side LIMIT placed in hedge mode without the parameter
+   * was accepted and came back reported as reduceOnly by the exchange. Sending
+   * it explicitly was never attempted, so nothing here rests on how that would
+   * be answered.
+   *
+   * The parameter set is exactly what this order needs and nothing else — no
+   * trailing, no iceberg, no closePosition.
+   */
+  async submitStandardProtectionOrder(context: StandardProtectionSubmissionContext): Promise<AcknowledgedOrderDto> {
+    if (context?.[AUTHORIZATION_BRAND] !== "STANDARD_PROTECTION_SUBMISSION") {
+      throw new BinanceMutationViolationError("Standard protection submission requires a service-issued context.");
+    }
+    const params: QueryParams = {
+      symbol: context.symbol,
+      side: context.side,
+      positionSide: context.positionSide,
+      type: "LIMIT",
+      timeInForce: "GTC",
+      quantity: context.quantity,
+      price: context.price,
+      newClientOrderId: context.clientOrderId,
+      newOrderRespType: "ACK",
+    };
+
+    const payload = await this.mutate<Record<string, unknown>>("newOrder", params);
+    return {
+      orderId: payload?.orderId === undefined || payload?.orderId === null ? null : String(payload.orderId),
+      clientOrderId: typeof payload?.clientOrderId === "string" ? payload.clientOrderId : null,
+      symbol: typeof payload?.symbol === "string" ? payload.symbol : null,
+      status: typeof payload?.status === "string" ? payload.status : null,
+    };
+  }
+
+  /** DELETE /fapi/v1/order — retires ONE resting protection LIMIT. */
+  async cancelStandardProtectionOrder(
+    context: StandardProtectionCancellationContext
+  ): Promise<AcknowledgedOrderDto> {
+    if (context?.[AUTHORIZATION_BRAND] !== "STANDARD_PROTECTION_CANCELLATION") {
+      throw new BinanceMutationViolationError("Standard protection cancellation requires a service-issued context.");
+    }
+    const payload = await this.mutate<Record<string, unknown>>("cancelOrder", {
+      symbol: context.symbol,
+      origClientOrderId: context.clientOrderId,
+    });
+    return {
+      orderId: payload?.orderId === undefined || payload?.orderId === null ? null : String(payload.orderId),
+      clientOrderId: typeof payload?.clientOrderId === "string" ? payload.clientOrderId : null,
+      symbol: typeof payload?.symbol === "string" ? payload.symbol : null,
+      status: typeof payload?.status === "string" ? payload.status : null,
     };
   }
 
