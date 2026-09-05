@@ -107,6 +107,11 @@ interface Scenario {
   positionAfterEntryCleanup: string | null;
   /** Makes the algo readback report closePosition=true (a real contradiction). */
   closePositionOnReadback: boolean;
+  /** Every standard protection POST context, in order. */
+  standardSubmitted: Record<string, string>[];
+  standardSubmitFailure: Error | null;
+  standardSubmitLands: boolean;
+  standardCancelFailure: Error | null;
   /**
    * Called right after an algo order lands, so a test can change what the
    * exchange will report about it BEFORE the next coverage measurement in the
@@ -147,6 +152,10 @@ function resetScenario() {
     entryQueryUnavailable: false,
     positionAfterEntryCleanup: null,
     closePositionOnReadback: false,
+    standardSubmitted: [],
+    standardSubmitFailure: null,
+    standardSubmitLands: true,
+    standardCancelFailure: null,
     onSubmitted: null,
   } satisfies Scenario);
 }
@@ -313,6 +322,23 @@ const mutationStub = {
     }
     return { ...input, kind: "PROTECTION_CANCELLATION" };
   },
+  authorizeStandardProtectionSubmission(input: Record<string, unknown>) {
+    if (input.role !== "TAKE_PROFIT") {
+      throw new Error("only a take profit may be standard");
+    }
+    if (buildClientOrderId(String(input.executionId), String(input.role), Number(input.generation)) !== input.clientOrderId) {
+      throw new Error("client order id does not belong to this tranche");
+    }
+    const expectedSide = input.positionSide === "LONG" ? "SELL" : "BUY";
+    if (input.side !== expectedSide) throw new Error("standard protection must close the position");
+    return { ...input, kind: "STANDARD_PROTECTION_SUBMISSION" };
+  },
+  authorizeStandardProtectionCancellation(input: Record<string, unknown>) {
+    if (buildClientOrderId(String(input.executionId), String(input.role), Number(input.generation)) !== input.clientOrderId) {
+      throw new Error("client order id does not belong to this tranche");
+    }
+    return { ...input, kind: "STANDARD_PROTECTION_CANCELLATION" };
+  },
   authorizeMarginAddition(input: Record<string, unknown>) {
     return { ...input, kind: "MARGIN_ADDITION" };
   },
@@ -335,6 +361,31 @@ const mutationStub = {
     landAlgoOrder(context);
     scenario.onSubmitted?.(context.clientAlgoId);
     return { algoId: "A1", clientAlgoId: context.clientAlgoId, symbol: SYMBOL, algoStatus: "NEW" };
+  },
+  async submitStandardProtectionOrder(context: Record<string, string>) {
+    dispatched += 1;
+    scenario.mutations.push("POST /fapi/v1/order LIMIT TAKE_PROFIT");
+    scenario.standardSubmitted.push({ ...context });
+    if (scenario.standardSubmitFailure) {
+      const error = scenario.standardSubmitFailure;
+      scenario.standardSubmitFailure = null;
+      if (scenario.standardSubmitLands) landStandardOrder(context);
+      throw error;
+    }
+    landStandardOrder(context);
+    return { orderId: "S-1", clientOrderId: context.clientOrderId, symbol: SYMBOL, status: "NEW" };
+  },
+  async cancelStandardProtectionOrder(context: Record<string, string>) {
+    dispatched += 1;
+    scenario.mutations.push("DELETE /fapi/v1/order");
+    if (scenario.standardCancelFailure) {
+      const error = scenario.standardCancelFailure;
+      scenario.standardCancelFailure = null;
+      throw error;
+    }
+    const row = scenario.standardOrders.get(context.clientOrderId);
+    if (row) row.status = "CANCELED";
+    return { orderId: "S-1", clientOrderId: context.clientOrderId, symbol: SYMBOL, status: "CANCELED" };
   },
   async cancelProtectionOrder(context: Record<string, string>) {
     dispatched += 1;
@@ -422,6 +473,21 @@ function landAlgoOrder(context: Record<string, string>) {
     priceProtect: Boolean(context.priceProtect),
     executedQty: "0",
     avgPrice: "0",
+  });
+}
+
+/** A submitted standard protection LIMIT becomes a resting NEW order. */
+function landStandardOrder(context: Record<string, string>) {
+  scenario.standardOrders.set(context.clientOrderId, {
+    status: "NEW",
+    origQty: context.quantity,
+    executedQty: "0",
+    avgPrice: "0",
+    orderId: `S-${scenario.standardOrders.size + 1}`,
+    side: context.side,
+    positionSide: context.positionSide,
+    type: "LIMIT",
+    price: context.price,
   });
 }
 
@@ -8129,41 +8195,44 @@ describe("modality-aware protection representation", () => {
     prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: id } });
 
   /**
-   * A hypothetical STANDARD protection row: role TAKE_PROFIT, orderType LIMIT,
-   * addressed by clientOrderId with NO clientAlgoId. Nothing in the runtime
-   * creates one yet -- it is persisted directly so the representation can be
-   * proved before any submission path exists.
+   * Converts the execution's ONLY take-profit generation to a standard resting
+   * LIMIT: role TAKE_PROFIT, orderType LIMIT, addressed by clientOrderId with no
+   * clientAlgoId.
+   *
+   * Converting rather than adding a second differently-shaped generation is
+   * deliberate. A single execution holding both modalities is exactly the mixed
+   * lineage the reservation rule refuses, so a fixture that mixed them would be
+   * describing a state the lifecycle now escalates rather than the state under
+   * test.
    */
   async function standardTakeProfitRow(executionId: string, generation: number, quantity: string) {
-    const first = await prisma!.binanceOrder.findFirstOrThrow({
-      where: { tradeExecutionId: executionId, role: "TAKE_PROFIT", generation: 1 },
+    const row = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: executionId, role: "TAKE_PROFIT", generation },
     });
-    const clientOrderId = tpIdOf(executionId, generation);
-    await prisma!.binanceOrder.create({
+    await prisma!.binanceOrder.update({
+      where: { id: row.id },
       data: {
-        tradeExecutionId: executionId,
-        role: "TAKE_PROFIT",
-        generation,
-        clientOrderId,
         clientAlgoId: null,
-        side: first.side,
-        positionSide: first.positionSide,
         orderType: "LIMIT",
         timeInForce: "GTC",
-        price: first.triggerPrice,
+        price: row.triggerPrice,
         originalQuantity: quantity,
         status: "NEW",
+        submittedAt: null,
+        submissionUnknownAt: null,
       },
     });
-    return clientOrderId;
+    // The conditional readback must disappear with it: this identity is no
+    // longer an algo order.
+    scenario.algoOrders.delete(tpIdOf(executionId, generation));
+    return row.clientOrderId;
   }
 
   maybe()("L. a standard protection row with no clientAlgoId is visible to the loader", async () => {
     const execution = await filledExecution();
     await protect(execution);
     // Generation 1's algo target is gone; a STANDARD target covers 0.040.
-    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
-    const clientOrderId = await standardTakeProfitRow(execution.id, 2, "0.040");
+    const clientOrderId = await standardTakeProfitRow(execution.id, 1, "0.040");
     scenario.standardOrders.set(clientOrderId, {
       status: "NEW", origQty: "0.040", executedQty: "0", avgPrice: "0", orderId: "S1",
       side: "SELL", type: "LIMIT", price: "108",
@@ -8183,8 +8252,7 @@ describe("modality-aware protection representation", () => {
   maybe()("K. a partially filled standard target and an active algo stop are both represented", async () => {
     const execution = await filledExecution();
     await protect(execution);
-    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
-    const clientOrderId = await standardTakeProfitRow(execution.id, 2, "0.100");
+    const clientOrderId = await standardTakeProfitRow(execution.id, 1, "0.100");
     // Testnet #4 shape: part traded, the remnant still rests and still covers.
     scenario.standardOrders.set(clientOrderId, {
       status: "PARTIALLY_FILLED", origQty: "0.100", executedQty: "0.060", avgPrice: "108",
@@ -8206,8 +8274,7 @@ describe("modality-aware protection representation", () => {
   maybe()("F/O. an EXPIRED standard remnant covers nothing, and repair sees the gap", async () => {
     const execution = await filledExecution();
     await protect(execution);
-    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
-    const clientOrderId = await standardTakeProfitRow(execution.id, 2, "0.100");
+    const clientOrderId = await standardTakeProfitRow(execution.id, 1, "0.100");
     // origQty - executedQty is still positive, but the order is terminal.
     scenario.standardOrders.set(clientOrderId, {
       status: "EXPIRED", origQty: "0.100", executedQty: "0.060", avgPrice: "108",
@@ -8229,8 +8296,7 @@ describe("modality-aware protection representation", () => {
   maybe()("J. an unreadable standard target is unresolved, never zero", async () => {
     const execution = await filledExecution();
     await protect(execution);
-    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
-    await standardTakeProfitRow(execution.id, 2, "0.100");
+    await standardTakeProfitRow(execution.id, 1, "0.100");
     // No scenario.standardOrders entry AND the query itself is unavailable, so
     // the state is genuinely unreadable rather than proven absent.
     scenario.entryQueryUnavailable = true;
@@ -8339,6 +8405,575 @@ describe("modality-aware protection representation", () => {
 
     const after = await prisma!.binanceOrder.findFirstOrThrow({ where: { id: stopRow.id } });
     expect(after.originalQuantity.toString()).toBe("0.1");
+    await clearAlerts(execution.id);
+  });
+});
+
+describe("standard limit take-profit submission", () => {
+  const tpIdOf = (id: string, generation: number) => buildClientOrderId(id, "TAKE_PROFIT", generation);
+  const stopIdOf = (id: string, generation: number) => buildClientOrderId(id, "STOP_LOSS", generation);
+
+  const tick = async (id: string) =>
+    protectionService.ensureProtectionForExposure({
+      executionId: id,
+      expectedVersion: (await reload(id)).version,
+      evaluatedAt: at(),
+    });
+
+  const clearAlerts = async (id: string) =>
+    prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: id } });
+
+  const rowOf = async (id: string, role: string, generation: number) =>
+    prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: id, role: role as "TAKE_PROFIT", generation },
+    });
+
+  const takeProfitRows = async (id: string) =>
+    (await ordersOf(id)).filter((order) => order.role === "TAKE_PROFIT");
+
+  /** Runs `run` with the standard-limit switch forced to `enabled`. */
+  const withStandardTakeProfit = async <T>(enabled: boolean, run: () => Promise<T>): Promise<T> => {
+    const key = "EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED" as const;
+    const previous = (runtimeEnv as Record<string, unknown>)[key];
+    (runtimeEnv as Record<string, unknown>)[key] = enabled;
+    try {
+      return await run();
+    } finally {
+      (runtimeEnv as Record<string, unknown>)[key] = previous;
+    }
+  };
+
+  // ---------------------------------------------------------------- default
+
+  maybe()("1/38. with the switch off the take profit is still a conditional order", async () => {
+    const execution = await filledExecution();
+
+    await withStandardTakeProfit(false, () => protect(execution));
+
+    const takeProfit = await rowOf(execution.id, "TAKE_PROFIT", 1);
+    expect(takeProfit.orderType).toBe("TAKE_PROFIT_MARKET");
+    expect(takeProfit.clientAlgoId).toBe(tpIdOf(execution.id, 1));
+    // Not one standard protection order was sent.
+    expect(scenario.standardSubmitted).toEqual([]);
+    expect(scenario.mutations).toEqual([
+      "POST /fapi/v1/algoOrder STOP_LOSS",
+      "POST /fapi/v1/algoOrder TAKE_PROFIT",
+    ]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("26. the default configuration is off", async () => {
+    // The switch is fail-closed in config, so an unset environment is off.
+    expect(runtimeEnv.EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED).toBe(false);
+  });
+
+  // ------------------------------------------------------------ first intent
+
+  maybe()("2/3/4/5. with the switch on the first take profit is a resting LIMIT", async () => {
+    const execution = await filledExecution();
+
+    await withStandardTakeProfit(true, () => protect(execution));
+
+    const takeProfit = await rowOf(execution.id, "TAKE_PROFIT", 1);
+    expect(takeProfit.orderType).toBe("LIMIT");
+    // Standard identity only: no algo id is fabricated for it.
+    expect(takeProfit.clientOrderId).toBe(tpIdOf(execution.id, 1));
+    expect(takeProfit.clientAlgoId).toBeNull();
+    expect(takeProfit.price!.toString()).toBe("108");
+    expect(takeProfit.timeInForce).toBe("GTC");
+    // The stop is untouched and still conditional, and still goes first.
+    const stop = await rowOf(execution.id, "STOP_LOSS", 1);
+    expect(stop.orderType).toBe("STOP_MARKET");
+    expect(scenario.mutations).toEqual([
+      "POST /fapi/v1/algoOrder STOP_LOSS",
+      "POST /fapi/v1/order LIMIT TAKE_PROFIT",
+    ]);
+    // The exact request shape, and nothing else.
+    expect(scenario.standardSubmitted).toHaveLength(1);
+    const sent = scenario.standardSubmitted[0]!;
+    expect(sent.symbol).toBe(SYMBOL);
+    expect(sent.side).toBe("SELL");
+    expect(sent.positionSide).toBe("LONG");
+    expect(sent.quantity).toBe("0.1");
+    expect(sent.price).toBe("108");
+    expect(sent.clientOrderId).toBe(tpIdOf(execution.id, 1));
+    expect("clientAlgoId" in sent).toBe(false);
+    expect("reduceOnly" in sent).toBe(false);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("6. a SHORT execution closes with a BUY limit on the SHORT leg", async () => {
+    const execution = await filledExecution({ direction: "SHORT" });
+    scenario.positionAmt = "-0.100";
+
+    await withStandardTakeProfit(true, () => protect(execution));
+
+    const sent = scenario.standardSubmitted[0]!;
+    expect(sent.side).toBe("BUY");
+    expect(sent.positionSide).toBe("SHORT");
+    await clearAlerts(execution.id);
+  });
+
+  // -------------------------------------------------------------- verifying
+
+  maybe()("7. a resting NEW standard take profit verifies", async () => {
+    const execution = await filledExecution();
+
+    const outcome = await withStandardTakeProfit(true, () => protect(execution));
+
+    expect(outcome.reasonCode).toBe("PROTECTION_VERIFIED");
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 1)).status).toBe("NEW");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("8/22. a partially filled remnant is resting coverage, not a gap", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    // Part of the target traded; the remnant still rests and still covers.
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.status = "PARTIALLY_FILLED";
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.executedQty = "0.040";
+    scenario.positionAmt = "0.060";
+    scenario.standardSubmitted = [];
+
+    const outcome = await withStandardTakeProfit(true, () => tick(execution.id));
+
+    // 0.060 of remnant against 0.060 of exposure: the target is NOT missing, so
+    // nothing is reserved or sent. The tick reports the ordinary safe-overstop
+    // deferral because the conditional stop still guards the pre-fill size --
+    // which is exactly the proof that the remnant was counted as coverage.
+    expect(outcome.reasonCode).toBe("STOP_COVERAGE_EXCEEDS_EXPOSURE");
+    expect(scenario.standardSubmitted).toEqual([]);
+    expect(await takeProfitRows(execution.id)).toHaveLength(1);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("15. a partial fill is persisted on the durable row", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.status = "PARTIALLY_FILLED";
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.executedQty = "0.040";
+    scenario.positionAmt = "0.060";
+
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    const row = await rowOf(execution.id, "TAKE_PROFIT", 1);
+    expect(row.status).toBe("PARTIALLY_FILLED");
+    // Intent history is never overwritten by the exchange's own quantities.
+    expect(row.originalQuantity.toString()).toBe("0.1");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("16/17/18. an expired remnant syncs once and then stops writing", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.status = "EXPIRED";
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.executedQty = "0.040";
+    scenario.positionAmt = "0.040";
+
+    await withStandardTakeProfit(true, () => tick(execution.id));
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 1)).status).toBe("EXPIRED");
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 1)).originalQuantity.toString()).toBe("0.1");
+
+    // A second read of the SAME status writes nothing and churns nothing.
+    const versionBefore = (await reload(execution.id)).version;
+    const updatedBefore = (await rowOf(execution.id, "TAKE_PROFIT", 1)).updatedAt;
+    await withStandardTakeProfit(true, () => tick(execution.id));
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 1)).updatedAt).toEqual(updatedBefore);
+    expect((await reload(execution.id)).version).toBe(versionBefore);
+    await clearAlerts(execution.id);
+  });
+
+  // ------------------------------------------------------- lineage / repair
+
+  maybe()("10/13. an expired standard target is repaired as a STANDARD limit", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.status = "EXPIRED";
+    scenario.positionAmt = "0.060";
+    scenario.standardSubmitted = [];
+    scenario.mutations = [];
+
+    // Even with the switch OFF, the lineage decides.
+    await withStandardTakeProfit(false, () => tick(execution.id));
+
+    const replacement = await rowOf(execution.id, "TAKE_PROFIT", 2);
+    expect(replacement.orderType).toBe("LIMIT");
+    expect(replacement.originalQuantity.toString()).toBe("0.06");
+    expect(replacement.price!.toString()).toBe("108");
+    expect(scenario.mutations).not.toContain("POST /fapi/v1/algoOrder TAKE_PROFIT");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("11/12. a cancelled or rejected standard target repairs as STANDARD too", async () => {
+    for (const terminal of ["CANCELED", "REJECTED"] as const) {
+      scenario.positionAmt = "0.100";
+      const execution = await filledExecution();
+      await withStandardTakeProfit(true, () => protect(execution));
+      scenario.standardOrders.get(tpIdOf(execution.id, 1))!.status = terminal;
+      scenario.positionAmt = "0.060";
+      scenario.mutations = [];
+
+      await withStandardTakeProfit(true, () => tick(execution.id));
+
+      expect((await rowOf(execution.id, "TAKE_PROFIT", 2)).orderType).toBe("LIMIT");
+      expect(scenario.mutations).not.toContain("POST /fapi/v1/algoOrder TAKE_PROFIT");
+      await clearAlerts(execution.id);
+    }
+  });
+
+  maybe()("19. an ALGO lineage stays ALGO after the switch is turned on", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(false, () => protect(execution));
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    scenario.positionAmt = "0.040";
+    scenario.mutations = [];
+
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 2)).orderType).toBe("TAKE_PROFIT_MARKET");
+    expect(scenario.standardSubmitted).toEqual([]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("21. a mixed-modality history fails closed", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(false, () => protect(execution));
+    // Something wrote a second take profit of the other modality.
+    const first = await rowOf(execution.id, "TAKE_PROFIT", 1);
+    await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: execution.id,
+        role: "TAKE_PROFIT",
+        generation: 2,
+        clientOrderId: tpIdOf(execution.id, 2),
+        clientAlgoId: null,
+        side: first.side,
+        positionSide: first.positionSide,
+        orderType: "LIMIT",
+        timeInForce: "GTC",
+        price: first.triggerPrice,
+        originalQuantity: "0.040",
+        status: "CANCELED",
+      },
+    });
+    scenario.algoOrders.get(tpIdOf(execution.id, 1))!.algoStatus = "CANCELED";
+    scenario.positionAmt = "0.040";
+    scenario.mutations = [];
+    scenario.standardSubmitted = [];
+
+    const outcome = await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect(outcome.reasonCode).toBe("TAKE_PROFIT_INTENT_CONFLICT");
+    expect((await reload(execution.id)).requiresManualIntervention).toBe(true);
+    expect(scenario.mutations).toEqual([]);
+    expect(scenario.standardSubmitted).toEqual([]);
+    expect(await takeProfitRows(execution.id)).toHaveLength(2);
+    await clearAlerts(execution.id);
+  });
+
+  // ------------------------------------------------------------- submission
+
+  maybe()("25. a claimed standard intent is never re-sent", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    const row = await rowOf(execution.id, "TAKE_PROFIT", 1);
+    // The claim persisted but the response was lost, and the order is not
+    // visible: this identity may still be live.
+    await prisma!.binanceOrder.update({
+      where: { id: row.id },
+      data: { status: "SUBMITTING", submittedAt: null, submissionUnknownAt: at() },
+    });
+    scenario.standardOrders.delete(tpIdOf(execution.id, 1));
+    scenario.standardSubmitted = [];
+
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect(scenario.standardSubmitted).toEqual([]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("26b. an ambiguous submission is reconciled by client order id, never re-POSTed", async () => {
+    const execution = await filledExecution();
+    scenario.standardSubmitFailure = timeoutError("newOrder");
+    scenario.standardSubmitLands = true;
+
+    await withStandardTakeProfit(true, () => protect(execution));
+    expect(scenario.standardSubmitted).toHaveLength(1);
+
+    // A restart re-reads the same identity and finds it resting.
+    scenario.standardSubmitted = [];
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect(scenario.standardSubmitted).toEqual([]);
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 1)).status).toBe("NEW");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("24. a stale reserved quantity is refreshed before the standard POST", async () => {
+    const execution = await filledExecution();
+    scenario.positionAmtSequence = ["0.100"];
+    // 0.060 x 108 = 6.48, above this symbol's notional floor, so the refresh
+    // itself is what is under test rather than the floor.
+    scenario.positionAmt = "0.060";
+
+    await withStandardTakeProfit(true, () => protect(execution));
+
+    // The pair freshness rule applies to a standard target exactly as it does
+    // to a conditional one: the stale 0.1 is never sent.
+    expect(scenario.standardSubmitted.map((entry) => entry.quantity)).toEqual(["0.06"]);
+    const row = await rowOf(execution.id, "TAKE_PROFIT", 1);
+    expect(row.originalQuantity.toString()).toBe("0.06");
+    // 20. the frozen target price does not move with the quantity.
+    expect(row.price!.toString()).toBe("108");
+    expect(row.clientOrderId).toBe(tpIdOf(execution.id, 1));
+    await clearAlerts(execution.id);
+  });
+
+  // ---------------------------------------------------------------- closure
+
+  maybe()("31/32. closure cancels a resting standard target through the order endpoint", async () => {
+    for (const resting of ["NEW", "PARTIALLY_FILLED"] as const) {
+      scenario.positionAmt = "0.100";
+      const execution = await filledExecution();
+      await withStandardTakeProfit(true, () => protect(execution));
+      scenario.standardOrders.get(tpIdOf(execution.id, 1))!.status = resting;
+      scenario.positionAmt = "0";
+      scenario.mutations = [];
+
+      await withStandardTakeProfit(true, () => tick(execution.id));
+
+      // The standard endpoint, never the algo DELETE.
+      expect(scenario.mutations).toContain("DELETE /fapi/v1/order");
+      expect((await rowOf(execution.id, "TAKE_PROFIT", 1)).status).toBe("CANCELED");
+      await clearAlerts(execution.id);
+    }
+  });
+
+  maybe()("33. an already terminal standard target is not cancelled again", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.status = "EXPIRED";
+    scenario.positionAmt = "0";
+    scenario.mutations = [];
+
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect(scenario.mutations).not.toContain("DELETE /fapi/v1/order");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("34. an unresolved standard cancellation leaves cleanup incomplete", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    scenario.standardCancelFailure = timeoutError("cancelOrder");
+    scenario.positionAmt = "0";
+
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    // Still resting after an unknown DELETE: cleanup is not claimed as done.
+    expect((await protectionOf(execution.id)).state).not.toBe("CLOSED");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("30. a stop that fires while the standard target rests leaves no replacement", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    // Testnet #4: the stop takes the remaining exposure and the remnant expires.
+    scenario.algoOrders.get(stopIdOf(execution.id, 1))!.algoStatus = "FILLED";
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.status = "EXPIRED";
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.executedQty = "0.040";
+    scenario.positionAmt = "0";
+    scenario.standardSubmitted = [];
+
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect(scenario.standardSubmitted).toEqual([]);
+    expect(await takeProfitRows(execution.id)).toHaveLength(1);
+    expect((await reload(execution.id)).status).toBe("CLOSED_SL");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("35. a standard target that fills immediately closes the execution", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.status = "FILLED";
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.executedQty = "0.100";
+    scenario.positionAmt = "0";
+    scenario.standardSubmitted = [];
+
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect(scenario.standardSubmitted).toEqual([]);
+    expect(await takeProfitRows(execution.id)).toHaveLength(1);
+    expect((await reload(execution.id)).status).toBe("CLOSED_TP");
+    await clearAlerts(execution.id);
+  });
+
+  // ------------------------------------------------------------ composition
+
+  maybe()("28. a take-profit gap behind one safe oversized stop repairs as STANDARD", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.status = "EXPIRED";
+    scenario.positionAmt = "0.060"; // the stop now guards 0.1 against 0.06
+    scenario.mutations = [];
+
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    const replacement = await rowOf(execution.id, "TAKE_PROFIT", 2);
+    expect(replacement.orderType).toBe("LIMIT");
+    expect(replacement.originalQuantity.toString()).toBe("0.06");
+    // The stop is never resized, cancelled or duplicated by the repair.
+    expect((await ordersOf(execution.id)).filter((o) => o.role === "STOP_LOSS")).toHaveLength(1);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("13b. an unreadable standard target repairs nothing", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    scenario.standardOrders.delete(tpIdOf(execution.id, 1));
+    scenario.entryQueryUnavailable = true;
+    scenario.standardSubmitted = [];
+    scenario.mutations = [];
+
+    const outcome = await withStandardTakeProfit(true, () => tick(execution.id));
+    scenario.entryQueryUnavailable = false;
+
+    expect(outcome.reasonCode).toBe("TAKE_PROFIT_QUERY_UNAVAILABLE");
+    expect(scenario.standardSubmitted).toEqual([]);
+    expect(await takeProfitRows(execution.id)).toHaveLength(1);
+    await clearAlerts(execution.id);
+  });
+
+  // ------------------------------------------------- minimum notional
+
+  maybe()("N1. a refresh that would fall below the notional floor is never sent", async () => {
+    // Reserved 0.100 at 108 = 10.8, comfortably above the floor of 5. Exposure
+    // then shrinks to 0.040, whose notional is 4.32 and therefore unplaceable.
+    const execution = await filledExecution();
+    scenario.positionAmtSequence = ["0.100"];
+    scenario.positionAmt = "0.040";
+
+    await withStandardTakeProfit(true, () => protect(execution));
+
+    // Nothing may reach the exchange, and the durable intent must NOT be
+    // shrunk into a size that can never be placed.
+    expect(scenario.standardSubmitted).toEqual([]);
+    const row = await rowOf(execution.id, "TAKE_PROFIT", 1);
+    expect(row.originalQuantity.toString()).toBe("0.1");
+    expect(row.price!.toString()).toBe("108");
+    expect(row.submittedAt).toBeNull();
+    expect(row.submissionUnknownAt).toBeNull();
+    expect(row.clientOrderId).toBe(tpIdOf(execution.id, 1));
+    // The stop is placed and untouched; only the target is deferred.
+    expect((await rowOf(execution.id, "STOP_LOSS", 1)).orderType).toBe("STOP_MARKET");
+    expect(await takeProfitRows(execution.id)).toHaveLength(1);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("N2. repeated under-notional ticks churn nothing", async () => {
+    const execution = await filledExecution();
+    scenario.positionAmtSequence = ["0.100"];
+    scenario.positionAmt = "0.040";
+    await withStandardTakeProfit(true, () => protect(execution));
+
+    const versionBefore = (await reload(execution.id)).version;
+    const updatedBefore = (await rowOf(execution.id, "TAKE_PROFIT", 1)).updatedAt;
+    const revisionsBefore = await prisma!.executionEvent.count({
+      where: { tradeExecutionId: execution.id, eventType: "ORDER_UPDATED" },
+    });
+    scenario.standardSubmitted = [];
+
+    for (let index = 0; index < 3; index += 1) await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect(scenario.standardSubmitted).toEqual([]);
+    expect((await reload(execution.id)).version).toBe(versionBefore);
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 1)).updatedAt).toEqual(updatedBefore);
+    expect(
+      await prisma!.executionEvent.count({
+        where: { tradeExecutionId: execution.id, eventType: "ORDER_UPDATED" },
+      })
+    ).toBe(revisionsBefore);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("N3. once the gap is placeable again the SAME intent is refreshed and sent", async () => {
+    const execution = await filledExecution();
+    scenario.positionAmtSequence = ["0.100"];
+    scenario.positionAmt = "0.040";
+    await withStandardTakeProfit(true, () => protect(execution));
+    expect(scenario.standardSubmitted).toEqual([]);
+
+    // 0.060 x 108 = 6.48, above the floor.
+    scenario.positionAmt = "0.060";
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect(scenario.standardSubmitted.map((entry) => entry.quantity)).toEqual(["0.06"]);
+    const row = await rowOf(execution.id, "TAKE_PROFIT", 1);
+    expect(row.originalQuantity.toString()).toBe("0.06");
+    expect(row.price!.toString()).toBe("108");
+    expect(row.clientOrderId).toBe(tpIdOf(execution.id, 1));
+    // Same generation: the deferral did not strand or duplicate the tranche.
+    expect(await takeProfitRows(execution.id)).toHaveLength(1);
+    expect((await ordersOf(execution.id)).filter((o) => o.role === "STOP_LOSS")).toHaveLength(1);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("N4. an already under-notional durable intent is never posted", async () => {
+    // Defensive: a row that is already too small, however it got there.
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    const row = await rowOf(execution.id, "TAKE_PROFIT", 1);
+    await prisma!.binanceOrder.update({
+      where: { id: row.id },
+      data: { originalQuantity: "0.040", status: "SUBMITTING", submittedAt: null, submissionUnknownAt: null },
+    });
+    scenario.standardOrders.delete(tpIdOf(execution.id, 1));
+    scenario.positionAmt = "0.040";
+    scenario.standardSubmitted = [];
+    scenario.mutations = [];
+
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect(scenario.standardSubmitted).toEqual([]);
+    const after = await rowOf(execution.id, "TAKE_PROFIT", 1);
+    expect(after.submittedAt).toBeNull();
+    expect(after.submissionUnknownAt).toBeNull();
+    expect(after.orderType).toBe("LIMIT");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("N5. a repair delta below the floor reserves nothing and never falls back to ALGO", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    scenario.standardOrders.get(tpIdOf(execution.id, 1))!.status = "EXPIRED";
+    // 0.040 x 108 = 4.32, below the floor.
+    scenario.positionAmt = "0.040";
+    scenario.mutations = [];
+    scenario.standardSubmitted = [];
+
+    for (let index = 0; index < 3; index += 1) await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect(scenario.standardSubmitted).toEqual([]);
+    expect(scenario.mutations).not.toContain("POST /fapi/v1/algoOrder TAKE_PROFIT");
+    // No second generation is minted for a tranche that cannot be placed.
+    expect(await takeProfitRows(execution.id)).toHaveLength(1);
+    expect((await ordersOf(execution.id)).filter((o) => o.role === "STOP_LOSS")).toHaveLength(1);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("27. a dormant standard intent is reused, not duplicated", async () => {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(true, () => protect(execution));
+    // The target covers the exposure exactly, so a stale sibling has no work.
+    scenario.positionAmt = "0.100";
+    scenario.standardSubmitted = [];
+
+    await withStandardTakeProfit(true, () => tick(execution.id));
+
+    expect(scenario.standardSubmitted).toEqual([]);
+    expect(await takeProfitRows(execution.id)).toHaveLength(1);
+    expect((await rowOf(execution.id, "TAKE_PROFIT", 1)).clientOrderId).toBe(tpIdOf(execution.id, 1));
     await clearAlerts(execution.id);
   });
 });

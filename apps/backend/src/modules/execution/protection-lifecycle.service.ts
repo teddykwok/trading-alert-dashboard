@@ -19,7 +19,7 @@ import { NotFoundError } from "../../utils/errors";
 import { BinanceError } from "../binance/binance.errors";
 import type { BinanceUsdMExecutionClient, WorkingTypeName } from "../binance/binance-execution.client";
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
-import type { BinanceAlgoOrderDto } from "../binance/binance.types";
+import type { BinanceAlgoOrderDto, BinanceQueriedOrderDto } from "../binance/binance.types";
 import type { CriticalAlertService, CriticalAlertType } from "./critical-alert.service";
 import {
   classifyMutationOutcome,
@@ -34,6 +34,7 @@ import {
   calculateCoverage,
   protectionModality,
   readStandardOrderCoverage,
+  takeProfitLineage,
   type StandardCoverageReading,
   type CoverageResult,
   classifyPostCleanupPosition,
@@ -130,6 +131,15 @@ export interface ProtectionOutcome {
  * the distinction that separates "there is a real gap to repair" from "we
  * could not look". Only the former may drive a mutation.
  */
+/** The outcome of submitting and then proving ONE protection order. */
+interface ProtectionSubmissionResult {
+  verified: boolean;
+  reasonCode: ProtectionReasonCode;
+  message: string;
+  /** Present only when the exchange actually returned a state to normalize. */
+  observedStatus?: NormalizedProtectionStatus;
+}
+
 interface VerifiedCoverage {
   stop: string;
   takeProfit: string;
@@ -924,6 +934,17 @@ export class ProtectionLifecycleService {
     const orders = await this.loadProtectionOrders(execution.id);
     const observed: Array<{ order: BinanceOrder; status: NormalizedProtectionStatus; dto: BinanceAlgoOrderDto | null }> = [];
     for (const order of orders) {
+      /**
+       * A standard protection row lives on a different endpoint under a
+       * different id, so closure must read it as one. Querying it by a
+       * `clientAlgoId` it does not have would make every closure treat it as
+       * unreadable and leave cleanup permanently incomplete.
+       */
+      if (protectionModality(order.orderType) === "STANDARD") {
+        observed.push({ order, status: await this.observeStandardProtection(execution, order), dto: null });
+        continue;
+      }
+
       const query = await this.queryProtection(execution.symbol, order.clientAlgoId!, {
         executionId: execution.id,
         role: order.role,
@@ -1043,7 +1064,9 @@ export class ProtectionLifecycleService {
 
     // STEP 4-6: the entry can no longer refill, so cleanup is now unrestricted.
     const siblings: SiblingCandidate[] = observed.map((entry) => ({
-      clientAlgoId: entry.order.clientAlgoId!,
+      clientAlgoId: entry.order.clientAlgoId,
+      clientOrderId: entry.order.clientOrderId,
+      modality: protectionModality(entry.order.orderType),
       role: entry.order.role as "STOP_LOSS" | "TAKE_PROFIT",
       generation: entry.order.generation,
       status: entry.status,
@@ -1679,6 +1702,46 @@ export class ProtectionLifecycleService {
         quantity,
       });
 
+    /**
+     * THE TAKE-PROFIT MODALITY IS DECIDED ONCE PER EXECUTION, NOT PER TICK.
+     *
+     * Existing take-profit history wins outright; configuration is consulted
+     * only when this execution has never had a take profit at all. That is what
+     * stops an operator flipping the switch, or a restart, from turning a
+     * resting LIMIT lineage into a conditional one halfway through a trade.
+     *
+     * Disagreeing history is refused rather than resolved: this rule cannot
+     * produce it, so seeing it means something else wrote protection history,
+     * and picking a winner could put a second live exit against one position.
+     */
+    const lineage = takeProfitLineage(await this.loadProtectionOrders(execution.id));
+    if (lineage.kind === "AMBIGUOUS") {
+      await this.alerts.raise({
+        tradeExecutionId: execution.id,
+        alertType: "PROTECTION_COVERAGE_INCOMPLETE",
+        reasonCode: "TAKE_PROFIT_INTENT_CONFLICT",
+        details: {
+          symbol: execution.symbol,
+          positionSide,
+          protectionState: `TAKE PROFIT MODALITIES: ${lineage.modalities.join(", ")}`,
+          requiredAction:
+            "This execution has take-profit orders of more than one modality; reconcile them manually.",
+        },
+      });
+      return this.escalate(
+        execution,
+        "TAKE_PROFIT_INTENT_CONFLICT",
+        `Take-profit history spans more than one modality (${lineage.modalities.join(", ")}); nothing is reserved.`,
+        input
+      );
+    }
+    const takeProfitModality: "ALGO" | "STANDARD" =
+      lineage.kind === "SETTLED"
+        ? lineage.modality
+        : env.EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED
+          ? "STANDARD"
+          : "ALGO";
+
     const rowsToReserve: Array<{ role: "STOP_LOSS" | "TAKE_PROFIT"; quantity: string; trigger: string }> = [];
 
     /**
@@ -1723,7 +1786,28 @@ export class ProtectionLifecycleService {
     if (wantTakeProfit) {
       const verdict = validateFor(missing.takeProfitQuantity).takeProfit;
       if (takeProfitTrigger !== null && verdict.valid) {
-        rowsToReserve.push({ role: "TAKE_PROFIT", quantity: missing.takeProfitQuantity, trigger: takeProfitTrigger });
+        /**
+         * A RESTING LIMIT IS SUBJECT TO A FILTER A CONDITIONAL CLOSE IS NOT.
+         *
+         * `validateProtectionTriggers` already proves the target price sits on
+         * the tick grid and the quantity on the step grid, which is all a
+         * conditional order needs. A standard LIMIT also carries a notional,
+         * and a tranche too small to meet the symbol minimum would be rejected
+         * at the exchange. It is refused here instead, exactly as an unplaceable
+         * target already is: no row is reserved, nothing is written.
+         *
+         * The target price itself is never moved. It is the frozen plan value,
+         * already proven tick-valid, and quantizing it would change the trade's
+         * geometry rather than its placement.
+         */
+        const floorRaw = inspection.filters.minNotional;
+        const notionalFloor = floorRaw === null || floorRaw === undefined || floorRaw.trim() === "" ? null : new D(floorRaw);
+        const notional = new D(missing.takeProfitQuantity).times(takeProfitTrigger);
+        if (takeProfitModality === "STANDARD" && notionalFloor !== null && notional.lessThan(notionalFloor)) {
+          takeProfitOmittedReason = "PROTECTION_QUANTITY_UNSUPPORTED";
+        } else {
+          rowsToReserve.push({ role: "TAKE_PROFIT", quantity: missing.takeProfitQuantity, trigger: takeProfitTrigger });
+        }
       } else {
         takeProfitOmittedReason = verdict.reasonCode ?? null;
       }
@@ -1780,19 +1864,34 @@ export class ProtectionLifecycleService {
 
       for (const row of rowsToReserve) {
         const role = row.role;
+        const identity = buildClientOrderId(execution.id, role, generation);
+        /**
+         * A standard row is addressed by `clientOrderId` on the ordinary order
+         * endpoint and has no algo identity at all. Fabricating a `clientAlgoId`
+         * it will never use would make it look conditional to anything reading
+         * ids rather than `orderType`.
+         *
+         * The stop is always conditional; only the target has a choice.
+         */
+        const standard = role === "TAKE_PROFIT" && takeProfitModality === "STANDARD";
         await tx.binanceOrder.create({
           data: {
             tradeExecutionId: execution.id,
             role,
             generation,
-            clientOrderId: buildClientOrderId(execution.id, role, generation),
-            clientAlgoId: buildClientOrderId(execution.id, role, generation),
+            clientOrderId: identity,
+            clientAlgoId: standard ? null : identity,
             side,
             positionSide,
-            orderType: role === "STOP_LOSS" ? "STOP_MARKET" : "TAKE_PROFIT_MARKET",
+            orderType: standard ? "LIMIT" : role === "STOP_LOSS" ? "STOP_MARKET" : "TAKE_PROFIT_MARKET",
             // Its OWN gap, never the larger of the two.
             originalQuantity: new D(row.quantity),
-            triggerPrice: new D(row.trigger),
+            // The resting price of a LIMIT is the target itself; a conditional
+            // order carries the same number as its trigger. Both are the frozen
+            // plan value, never recomputed here.
+            ...(standard
+              ? { price: new D(row.trigger), timeInForce: "GTC", triggerPrice: new D(row.trigger) }
+              : { triggerPrice: new D(row.trigger) }),
             // Frozen into the intent so a retry cannot silently change policy.
             workingType: protectionWorkingType(role, policy),
             priceProtect,
@@ -2132,6 +2231,40 @@ export class ProtectionLifecycleService {
    * the STOP, not in how the take-profit number is proved, so the caller does
    * its own shape checks and this decides only the quantity.
    */
+  /**
+   * Whether a standard tranche of `quantity` would be worth less than the
+   * symbol's minimum notional at its own frozen price.
+   *
+   * Returns the reason it is unplaceable, or null when it is fine. An
+   * unreadable symbol is treated as unplaceable rather than assumed placeable:
+   * this decides whether to send an order, so not knowing is a reason to wait.
+   */
+  private async standardNotionalShortfall(
+    execution: TradeExecution,
+    reserved: BinanceOrder,
+    quantity: string
+  ): Promise<string | null> {
+    const price = reserved.price;
+    if (!price) return "The standard take profit has no resting price to value.";
+
+    let inspection;
+    try {
+      inspection = await this.readOnly.inspectSymbol(execution.symbol);
+    } catch {
+      return "Symbol filters could not be read, so the take-profit notional cannot be proved.";
+    }
+    const raw = inspection.filters.minNotional;
+    if (raw === null || raw === undefined || raw.trim() === "") return null;
+
+    const floor = new D(raw);
+    const notional = new D(quantity).times(price.toString());
+    if (notional.greaterThanOrEqualTo(floor)) return null;
+    return (
+      `A take profit of ${quantity} at ${price.toString()} is worth ${notional.toString()}, ` +
+      `below the symbol minimum of ${floor.toString()}; the reserved intent is left unchanged.`
+    );
+  }
+
   private async freshenTakeProfitIntent(
     execution: TradeExecution,
     reserved: BinanceOrder,
@@ -2150,6 +2283,46 @@ export class ProtectionLifecycleService {
     const position = { markPrice: context.markPrice };
 
     const gap = coverage.missingTakeProfitQuantity;
+
+    /**
+     * A RESTING LIMIT HAS A FLOOR THE REFRESH CAN FALL THROUGH.
+     *
+     * Reservation already refuses a standard tranche below the symbol's minimum
+     * notional, but the quantity does not stay frozen: the freshness rule may
+     * shrink an unsubmitted intent to the current gap, and a gap that is valid
+     * on step size and minimum quantity can still be worth too little to place.
+     *
+     * Checking it here, on the number that will actually be sent, protects both
+     * paths at once — the shrunk gap and an intent proceeding at its own size —
+     * and does so BEFORE anything is persisted or claimed. That ordering is the
+     * point: a quantity that cannot be placed must never consume the durable
+     * network-attempt marker, and must never be written over a larger intent
+     * that is still perfectly placeable.
+     *
+     * The second half matters more than the first. Persisting the shrink would
+     * be irreversible: an intent is never enlarged again, so a row written down
+     * to an unplaceable size could never recover even once exposure grew back.
+     * It is left alone instead, and re-sized when the gap is worth sending.
+     *
+     * Conditional protection is untouched. A STOP_MARKET or TAKE_PROFIT_MARKET
+     * close carries no notional to satisfy, and never did.
+     */
+    if (protectionModality(reserved.orderType) === "STANDARD" && gap !== "0") {
+      const willSend = new D(reserved.originalQuantity.toString()).greaterThan(gap)
+        ? gap
+        : reserved.originalQuantity.toString();
+      const blocked = await this.standardNotionalShortfall(execution, reserved, willSend);
+      if (blocked !== null) {
+        return { kind: "REFUSE", outcome: this.outcome(
+          false,
+          "PROTECTION_QUANTITY_UNSUPPORTED",
+          blocked,
+          execution,
+          protection
+        ) };
+      }
+    }
+
     if (!new D(reserved.originalQuantity.toString()).greaterThan(gap)) {
       /**
        * Under-covering is left exactly as it is. A tranche smaller than the gap
@@ -2586,18 +2759,288 @@ export class ProtectionLifecycleService {
    * Submits ONE protection order and proves the result by querying the same
    * clientAlgoId. A timeout is never treated as failure.
    */
+  /**
+   * THE AT-MOST-ONE-POST CLAIM. One implementation, both modalities.
+   *
+   * The external POST and the local record of it can never be one transaction,
+   * so a crash between them is unavoidable — but WHICH SIDE holds the durable
+   * evidence is a choice. Recording only after the response left `submittedAt`
+   * null on rows whose order may already be live, and the next worker read a
+   * -2013 and submitted a second one. The marker therefore goes FIRST: after
+   * this commit the system can never again believe no attempt was made.
+   *
+   * The conditional `updateMany` makes it a CLAIM rather than a note. Two
+   * workers reading the same unattempted intent both see null, but only one
+   * UPDATE can match, because Postgres serialises writes to one row. Being a
+   * single atomic statement it holds across processes and restarts; no
+   * process-local lock is involved.
+   *
+   * Fail-closed: if this write throws, the exception propagates and no
+   * submission is reached, so nothing can escape unrecorded.
+   *
+   * Shared deliberately. A resting LIMIT take profit is a different exchange
+   * primitive but the same economic hazard — one intent, at most one mutation —
+   * so it must not get a second, weaker claim of its own.
+   */
+  private async claimProtectionSubmission(
+    order: BinanceOrder,
+    role: "STOP_LOSS" | "TAKE_PROFIT",
+    evaluatedAt: Date
+  ): Promise<
+    | { claimed: true; order: BinanceOrder }
+    | { claimed: false; result: ProtectionSubmissionResult }
+  > {
+    const claim = await this.prisma.binanceOrder.updateMany({
+      where: {
+        id: order.id,
+        submissionUnknownAt: null,
+        /**
+         * THE CLAIM ASSERTS WHAT IT IS ABOUT TO SEND.
+         *
+         * The request body is built from the row loaded by the caller, so
+         * testing only the marker would let a worker holding a pre-refresh
+         * quantity win the claim and send a number the row no longer holds.
+         * Naming the quantity here makes "re-size an unsubmitted intent" and
+         * "authorise this exact intent for submission" two conditional writes
+         * to one row, which Postgres serialises: whichever lands second finds
+         * its precondition gone.
+         */
+        originalQuantity: order.originalQuantity,
+      },
+      data: { submissionUnknownAt: evaluatedAt },
+    });
+    if (claim.count === 0) {
+      const current = await this.prisma.binanceOrder.findUniqueOrThrow({ where: { id: order.id } });
+      // Still unattempted means the claim lost on the QUANTITY, not to another
+      // submitter: the intent was revised under us and nothing was sent.
+      // Reporting that as an unresolved submission would invent an ambiguity
+      // that does not exist, and would bound a deadline against an attempt that
+      // never happened.
+      if (current.submittedAt === null && current.submissionUnknownAt === null) {
+        return {
+          claimed: false,
+          result: {
+            verified: false,
+            reasonCode: role === "STOP_LOSS" ? "STOP_INTENT_CONFLICT" : "TAKE_PROFIT_INTENT_CONFLICT",
+            message: "The reserved quantity was revised before submission; nothing was sent.",
+          },
+        };
+      }
+      // Another worker claimed it between our read and this write.
+      return { claimed: false, result: await this.unresolvedAcceptedSubmission(current, role, evaluatedAt) };
+    }
+    return { claimed: true, order: { ...order, submissionUnknownAt: evaluatedAt } };
+  }
+
+  /**
+   * Authoritative state of one STANDARD protection order, with the same
+   * three-way outcome the conditional query reports: the exchange returned it,
+   * the exchange PROVED this exact id does not exist, or we could not tell.
+   *
+   * The third answer is the one that matters. A timeout is not an absence, and
+   * treating it as one is what would let a second live exit be placed.
+   */
+  private async queryStandardProtection(
+    symbol: string,
+    clientOrderId: string
+  ): Promise<{ outcome: MutationOutcome; order: BinanceQueriedOrderDto | null }> {
+    try {
+      const order = await this.readOnly.queryOrderByClientOrderId(symbol, clientOrderId);
+      return { outcome: "CONFIRMED_ACCEPTED", order: order ?? null };
+    } catch (error) {
+      const outcome = classifyMutationOutcome(this.asFailureShape(error));
+      return { outcome, order: null };
+    }
+  }
+
+  /**
+   * Persists what the exchange says about a STANDARD protection order.
+   *
+   * Representation could already READ a standard order, but the durable row
+   * kept whatever status it was reserved with, so a target the exchange had
+   * long since expired still looked live in our own history. Coverage is always
+   * measured from the authoritative query, so this changes no arithmetic — it
+   * makes the stored history true.
+   *
+   * Deliberately narrow. It writes only the status, only when the row does not
+   * already say that, and never for a status it does not understand: an
+   * unreadable order must not be given a terminal state it never reached.
+   * `originalQuantity` is intent history and is never overwritten by the
+   * exchange's `origQty`, and the deterministic identity is never touched.
+   */
+  private async syncStandardProtectionStatus(order: BinanceOrder, dto: BinanceQueriedOrderDto): Promise<void> {
+    const raw = typeof dto.status === "string" ? dto.status.trim().toUpperCase() : null;
+    const mapped =
+      raw === "NEW" || raw === "PARTIALLY_FILLED" || raw === "FILLED" || raw === "EXPIRED" || raw === "REJECTED"
+        ? raw
+        : raw === "CANCELED" || raw === "CANCELLED"
+          ? "CANCELED"
+          : null;
+    if (mapped === null || mapped === order.status) return;
+    await this.prisma.binanceOrder.update({
+      where: { id: order.id },
+      data: {
+        status: mapped,
+        lastExchangeUpdateAt: new Date(),
+        ...(dto.orderId ? { exchangeOrderId: dto.orderId } : {}),
+      },
+    });
+  }
+
+  /**
+   * Places and proves ONE standard resting take-profit LIMIT.
+   *
+   * The shape mirrors the conditional path exactly — pre-query, refuse to
+   * re-send an identity that may already be live, CLAIM before sending, then
+   * prove the result from the exchange — and shares the claim itself, so there
+   * is one at-most-one-POST rule rather than a weaker second one. What differs
+   * is only what a standard order IS: a different endpoint, addressed by
+   * `clientOrderId`, whose statuses mean different things.
+   *
+   * Above all, `PARTIALLY_FILLED` here is a SUCCESS. A conditional order in
+   * that state is firing and covering nothing; a resting LIMIT in that state
+   * has traded part of itself and its remnant is still working.
+   */
+  private async submitAndVerifyStandardProtection(
+    execution: TradeExecution,
+    initial: BinanceOrder,
+    evaluatedAt: Date
+  ): Promise<ProtectionSubmissionResult> {
+    let order = initial;
+    const role = order.role as "STOP_LOSS" | "TAKE_PROFIT";
+    const unknownCode: ProtectionReasonCode =
+      role === "STOP_LOSS" ? "STOP_SUBMISSION_RESULT_UNKNOWN" : "TAKE_PROFIT_SUBMISSION_RESULT_UNKNOWN";
+    const notVerifiedCode: ProtectionReasonCode =
+      role === "STOP_LOSS" ? "STOP_NOT_VERIFIED" : "TAKE_PROFIT_NOT_VERIFIED";
+    const queryUnavailableCode: ProtectionReasonCode =
+      role === "STOP_LOSS" ? "STOP_QUERY_UNAVAILABLE" : "TAKE_PROFIT_QUERY_UNAVAILABLE";
+
+    const restingPrice = order.price;
+    if (!order.clientOrderId || !restingPrice) {
+      return {
+        verified: false,
+        reasonCode: role === "STOP_LOSS" ? "STOP_INTENT_CONFLICT" : "TAKE_PROFIT_INTENT_CONFLICT",
+        message: "A standard protection intent needs both a client order id and a resting price.",
+      };
+    }
+
+    let existing = await this.queryStandardProtection(execution.symbol, order.clientOrderId);
+    if (existing.outcome !== "CONFIRMED_ACCEPTED" && existing.outcome !== "NOT_FOUND_CONFIRMED") {
+      // Unreadable is not absent, so nothing is sent.
+      return { verified: false, reasonCode: queryUnavailableCode, message: "Standard protection state is unreadable." };
+    }
+
+    // AT MOST ONE EXTERNAL MUTATION PER PROTECTION INTENT. Either anchor means
+    // an order bearing this id MAY be live, and an absence is then a visibility
+    // fact rather than permission to place a second one.
+    const identityMayBeLive = !LOCALLY_RESOLVED_ORDER_STATUSES.includes(order.status);
+    const attemptAnchor = order.submittedAt ?? order.submissionUnknownAt;
+    if (existing.outcome !== "CONFIRMED_ACCEPTED" && attemptAnchor && identityMayBeLive) {
+      return this.unresolvedAcceptedSubmission(order, role, evaluatedAt);
+    }
+
+    if (existing.outcome !== "CONFIRMED_ACCEPTED") {
+      if (identityMayBeLive) {
+        const claim = await this.claimProtectionSubmission(order, role, evaluatedAt);
+        if (!claim.claimed) return claim.result;
+        order = claim.order;
+      }
+
+      try {
+        const context = this.mutations.authorizeStandardProtectionSubmission({
+          executionId: execution.id,
+          symbol: execution.symbol,
+          role,
+          generation: order.generation,
+          clientOrderId: order.clientOrderId,
+          side: order.side as "BUY" | "SELL",
+          positionSide: order.positionSide as "LONG" | "SHORT",
+          quantity: order.originalQuantity.toString(),
+          price: restingPrice.toString(),
+        });
+        await this.mutations.submitStandardProtectionOrder(context);
+      } catch (error) {
+        const outcome = classifyMutationOutcome(this.asFailureShape(error), "SUBMIT_ALGO");
+        if (outcome === "CONFIRMED_REJECTED") {
+          await this.prisma.binanceOrder.update({ where: { id: order.id }, data: { status: "REJECTED" } });
+          return {
+            verified: false,
+            reasonCode: role === "STOP_LOSS" ? "STOP_SUBMISSION_REJECTED" : "TAKE_PROFIT_SUBMISSION_REJECTED",
+            message: "Standard protection submission was rejected.",
+          };
+        }
+        // Anything else stays ambiguous: the claim already recorded that an
+        // attempt may have escaped, and it is re-proved below by querying.
+      }
+
+      // WRITE-ONCE, and only once an attempt has actually been made.
+      if (order.submittedAt === null) {
+        await this.prisma.binanceOrder.update({
+          where: { id: order.id },
+          data: { submittedAt: evaluatedAt },
+        });
+        order = { ...order, submittedAt: evaluatedAt };
+      }
+
+      existing = await this.queryStandardProtection(execution.symbol, order.clientOrderId);
+    }
+
+    if (existing.outcome !== "CONFIRMED_ACCEPTED" || !existing.order) {
+      return {
+        verified: false,
+        reasonCode: existing.outcome === "NOT_FOUND_CONFIRMED" ? unknownCode : queryUnavailableCode,
+        message: "The standard protection order could not be proved on the exchange.",
+      };
+    }
+
+    await this.syncStandardProtectionStatus(order, existing.order);
+
+    const reading = readStandardOrderCoverage({
+      status: existing.order.status,
+      originalQuantity: existing.order.origQty,
+      executedQuantity: existing.order.executedQty,
+    });
+    if (reading.kind === "RESTING") {
+      // NEW or PARTIALLY_FILLED: the order is placed and its remnant is working.
+      return { verified: true, reasonCode: "PROTECTION_VERIFIED", message: "Standard take profit is resting." };
+    }
+    if (reading.kind === "TERMINAL") {
+      // FILLED means the target traded and closure owns what happens next;
+      // every other terminal state means it is simply not covering. Neither is
+      // a verified resting order, and neither is decided here.
+      return {
+        verified: false,
+        reasonCode: notVerifiedCode,
+        message: `The standard take profit is ${reading.status} and is not resting.`,
+      };
+    }
+    return { verified: false, reasonCode: queryUnavailableCode, message: "Standard protection state is unreadable." };
+  }
+
   private async submitAndVerifyProtection(
     execution: TradeExecution,
     order: BinanceOrder,
     evaluatedAt: Date
-  ): Promise<{
-    verified: boolean;
-    reasonCode: ProtectionReasonCode;
-    message: string;
-    /** Present only when the exchange actually returned a state to normalize. */
-    observedStatus?: NormalizedProtectionStatus;
-  }> {
+  ): Promise<ProtectionSubmissionResult> {
     const role = order.role as "STOP_LOSS" | "TAKE_PROFIT";
+
+    /**
+     * A standard intent is a different exchange primitive and is placed and
+     * proved by its own path. Everything below this line is the conditional
+     * lifecycle and is reached only by conditional rows, exactly as before.
+     */
+    const modality = protectionModality(order.orderType);
+    if (modality === "STANDARD") {
+      return this.submitAndVerifyStandardProtection(execution, order, evaluatedAt);
+    }
+    if (modality === "UNSUPPORTED") {
+      return {
+        verified: false,
+        reasonCode: role === "STOP_LOSS" ? "STOP_INTENT_CONFLICT" : "TAKE_PROFIT_INTENT_CONFLICT",
+        message: `A protection row of type ${order.orderType} is not placeable by this lifecycle.`,
+      };
+    }
+
     const unknownCode: ProtectionReasonCode =
       role === "STOP_LOSS" ? "STOP_SUBMISSION_RESULT_UNKNOWN" : "TAKE_PROFIT_SUBMISSION_RESULT_UNKNOWN";
     const notVerifiedCode: ProtectionReasonCode = role === "STOP_LOSS" ? "STOP_NOT_VERIFIED" : "TAKE_PROFIT_NOT_VERIFIED";
@@ -2726,43 +3169,9 @@ export class ProtectionLifecycleService {
       // claim must not strand it. Without this a REJECTED order — proven not
       // live — could never be retried at all.
       if (identityMayBeLive) {
-        const claim = await this.prisma.binanceOrder.updateMany({
-          where: {
-            id: order.id,
-            submissionUnknownAt: null,
-            /**
-             * THE CLAIM ASSERTS WHAT IT IS ABOUT TO SEND.
-             *
-             * The POST body is built from the row loaded at the top of this
-             * call, so testing only the marker would let a worker holding a
-             * pre-refresh quantity win the claim and send a number the row no
-             * longer holds. Naming the quantity here makes "re-size an
-             * unsubmitted intent" and "authorise this exact intent for POST"
-             * two conditional writes to one row, which Postgres serialises:
-             * whichever lands second finds its precondition gone.
-             */
-            originalQuantity: order.originalQuantity,
-          },
-          data: { submissionUnknownAt: evaluatedAt },
-        });
-        if (claim.count === 0) {
-          const current = await this.prisma.binanceOrder.findUniqueOrThrow({ where: { id: order.id } });
-          // Still unattempted means the claim lost on the QUANTITY, not to
-          // another submitter: the intent was revised under us and nothing was
-          // sent. Reporting that as an unresolved submission would invent an
-          // ambiguity that does not exist, and would bound a deadline against
-          // an attempt that never happened.
-          if (current.submittedAt === null && current.submissionUnknownAt === null) {
-            return {
-              verified: false,
-              reasonCode: role === "STOP_LOSS" ? "STOP_INTENT_CONFLICT" : "TAKE_PROFIT_INTENT_CONFLICT",
-              message: "The reserved quantity was revised before submission; nothing was sent.",
-            };
-          }
-          // Another worker claimed it between our read and this write.
-          return this.unresolvedAcceptedSubmission(current, role, evaluatedAt);
-        }
-        order = { ...order, submissionUnknownAt: evaluatedAt };
+        const claim = await this.claimProtectionSubmission(order, role, evaluatedAt);
+        if (!claim.claimed) return claim.result;
+        order = claim.order;
       }
 
       let outcome: MutationOutcome = "CONFIRMED_ACCEPTED";
@@ -3865,7 +4274,55 @@ export class ProtectionLifecycleService {
   // ==========================================================================
 
   /** Cancels one sibling and PROVES the result with a follow-up query. */
+  /**
+   * Reads ONE standard protection row for closure, normalised onto the same
+   * status vocabulary the conditional siblings use.
+   *
+   * A resting LIMIT — NEW or PARTIALLY_FILLED — maps to ACTIVE because that is
+   * what closure needs to know: it is still on the book and still cancellable.
+   * That is not the conditional reading of PARTIALLY_FILLED, and deliberately
+   * so: a partially filled resting order has a live remnant, while a partially
+   * filled conditional order is firing.
+   */
+  private async observeStandardProtection(
+    execution: TradeExecution,
+    order: BinanceOrder
+  ): Promise<NormalizedProtectionStatus> {
+    if (!order.clientOrderId) return "UNKNOWN";
+    const query = await this.queryStandardProtection(execution.symbol, order.clientOrderId);
+    if (query.outcome === "NOT_FOUND_CONFIRMED") return "ABSENT";
+    if (query.outcome !== "CONFIRMED_ACCEPTED" || !query.order) return "UNKNOWN";
+
+    await this.syncStandardProtectionStatus(order, query.order);
+    const reading = readStandardOrderCoverage({
+      status: query.order.status,
+      originalQuantity: query.order.origQty,
+      executedQuantity: query.order.executedQty,
+    });
+    if (reading.kind === "RESTING") return "ACTIVE";
+    if (reading.kind === "UNRESOLVED") return "UNKNOWN";
+    switch (reading.status) {
+      case "FILLED":
+        return "FILLED";
+      case "EXPIRED":
+        return "EXPIRED";
+      case "REJECTED":
+        return "REJECTED";
+      default:
+        return "CANCELED";
+    }
+  }
+
   private async cancelSibling(execution: TradeExecution, sibling: SiblingCandidate, evaluatedAt: Date): Promise<boolean> {
+    /**
+     * A standard sibling is retired through the ordinary order endpoint under
+     * its own client id. Using the algo DELETE on it would address an order
+     * that does not exist there, and the retirement would silently never
+     * happen.
+     */
+    if (sibling.modality === "STANDARD") return this.cancelStandardSibling(execution, sibling);
+    if (sibling.modality === "UNSUPPORTED" || !sibling.clientAlgoId) return false;
+
     try {
       const context = this.mutations.authorizeProtectionCancellation({
         executionId: execution.id,
@@ -3889,6 +4346,49 @@ export class ProtectionLifecycleService {
     if (order) await this.applyProtectionObservation(order, after.order, status, evaluatedAt);
 
     return !countsAsActiveCoverage(status);
+  }
+
+  /**
+   * Retires ONE resting protection LIMIT and proves the result.
+   *
+   * The DELETE response is never the proof: an unknown cancellation is decided
+   * by re-reading the order, exactly as the conditional path does. Anything
+   * still resting afterwards leaves cleanup incomplete rather than assumed
+   * done.
+   */
+  private async cancelStandardSibling(execution: TradeExecution, sibling: SiblingCandidate): Promise<boolean> {
+    try {
+      const context = this.mutations.authorizeStandardProtectionCancellation({
+        executionId: execution.id,
+        symbol: execution.symbol,
+        role: sibling.role,
+        generation: sibling.generation,
+        clientOrderId: sibling.clientOrderId,
+      });
+      await this.mutations.cancelStandardProtectionOrder(context);
+    } catch (error) {
+      const outcome = classifyMutationOutcome(this.asFailureShape(error), "CANCEL");
+      if (outcome === "CONFIRMED_REJECTED") return false;
+      // Unknown: the query below decides, never the DELETE response.
+    }
+
+    const after = await this.queryStandardProtection(execution.symbol, sibling.clientOrderId);
+    if (after.outcome === "NOT_FOUND_CONFIRMED") return true;
+    if (after.outcome !== "CONFIRMED_ACCEPTED" || !after.order) return false;
+
+    const order = await this.prisma.binanceOrder.findFirst({
+      where: { tradeExecutionId: execution.id, clientOrderId: sibling.clientOrderId },
+    });
+    if (order) await this.syncStandardProtectionStatus(order, after.order);
+
+    const reading = readStandardOrderCoverage({
+      status: after.order.status,
+      originalQuantity: after.order.origQty,
+      executedQuantity: after.order.executedQty,
+    });
+    // Only a terminal order is retired. A remnant still resting, or a state we
+    // could not read, keeps cleanup incomplete.
+    return reading.kind === "TERMINAL";
   }
 
   // ==========================================================================
@@ -4350,18 +4850,27 @@ export class ProtectionLifecycleService {
     order: BinanceOrder
   ): Promise<StandardCoverageReading> {
     if (!order.clientOrderId) return { kind: "UNRESOLVED" };
-    try {
-      const dto = await this.readOnly.queryOrderByClientOrderId(symbol, order.clientOrderId);
-      if (!dto) return { kind: "UNRESOLVED" };
-      return readStandardOrderCoverage({
-        status: dto.status,
-        originalQuantity: dto.origQty,
-        executedQuantity: dto.executedQty,
-      });
-    } catch {
-      // Unreadable is not absent.
-      return { kind: "UNRESOLVED" };
-    }
+    const query = await this.queryStandardProtection(symbol, order.clientOrderId);
+
+    /**
+     * PROVEN ABSENT IS NOT UNREADABLE.
+     *
+     * Binance answering -2013 for this exact id is conclusive: the order is not
+     * there, so it covers nothing. Collapsing that into "unresolved" would make
+     * a freshly reserved intent — which by definition is not on the exchange
+     * yet — report the protection state as unreadable, and the pre-submission
+     * checks would then refuse to place the very order that is missing. The
+     * intent would block its own submission for ever.
+     */
+    if (query.outcome === "NOT_FOUND_CONFIRMED") return { kind: "TERMINAL", status: "ABSENT" };
+    if (query.outcome !== "CONFIRMED_ACCEPTED" || !query.order) return { kind: "UNRESOLVED" };
+
+    await this.syncStandardProtectionStatus(order, query.order);
+    return readStandardOrderCoverage({
+      status: query.order.status,
+      originalQuantity: query.order.origQty,
+      executedQuantity: query.order.executedQty,
+    });
   }
 
   private async loadProtectionOrders(executionId: string): Promise<BinanceOrder[]> {

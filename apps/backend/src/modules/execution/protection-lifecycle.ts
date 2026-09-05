@@ -586,6 +586,48 @@ export function protectionModality(orderType: ExecutionOrderTypeName): Protectio
 }
 
 /**
+ * WHICH MODALITY A NEW TAKE-PROFIT MUST USE.
+ *
+ * A global switch may only decide the modality of an execution's FIRST take
+ * profit. After that the execution has a lineage, and every repair follows it:
+ * a runtime restart, or an operator flipping the switch mid-trade, must never
+ * turn a resting LIMIT lineage into a conditional one or the reverse. So the
+ * decision is read from durable history first and from configuration only when
+ * there is no history to read.
+ *
+ * Rows that never reached the exchange are still lineage: a reserved intent is
+ * a decision this execution already made, and re-deciding it from a switch that
+ * has since moved is exactly the drift this prevents.
+ *
+ * Disagreement is not resolved, it is refused. Two take-profit generations of
+ * different modalities cannot arise from this rule, so seeing them means
+ * something wrote history this lifecycle does not understand, and guessing
+ * which one wins could place a second live exit against one position.
+ */
+export type TakeProfitLineage =
+  | { readonly kind: "NONE" }
+  | { readonly kind: "SETTLED"; readonly modality: "ALGO" | "STANDARD" }
+  | { readonly kind: "AMBIGUOUS"; readonly modalities: readonly string[] };
+
+export function takeProfitLineage(
+  rows: readonly { role: string; orderType: ExecutionOrderTypeName }[]
+): TakeProfitLineage {
+  const modalities = new Set<string>();
+  for (const row of rows) {
+    if (row.role !== "TAKE_PROFIT") continue;
+    modalities.add(protectionModality(row.orderType));
+  }
+  if (modalities.size === 0) return { kind: "NONE" };
+  if (modalities.size === 1) {
+    const only = [...modalities][0]!;
+    // An UNSUPPORTED historical row is not a modality this may continue.
+    if (only === "ALGO" || only === "STANDARD") return { kind: "SETTLED", modality: only };
+    return { kind: "AMBIGUOUS", modalities: [only] };
+  }
+  return { kind: "AMBIGUOUS", modalities: [...modalities].sort() };
+}
+
+/**
  * What a STANDARD protection order is worth right now.
  *
  * Direct USD-M testnet evidence (hedge mode, both directions): a close-side GTC
@@ -939,7 +981,11 @@ export function classifyClosure(input: ClosureClassificationInput): ClosureClass
 }
 
 export interface SiblingCandidate {
-  clientAlgoId: string;
+  /** Present only for a conditional sibling; a standard one has no algo id. */
+  clientAlgoId: string | null;
+  /** The deterministic identity every protection row has. */
+  clientOrderId: string;
+  modality: ProtectionModality;
   role: "STOP_LOSS" | "TAKE_PROFIT";
   generation: number;
   status: NormalizedProtectionStatus;

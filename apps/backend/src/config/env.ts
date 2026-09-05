@@ -236,6 +236,21 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((value) => value === "true"),
+
+  /**
+   * Whether a NEWLY created take-profit lineage may be placed as a standard
+   * resting LIMIT instead of a conditional TAKE_PROFIT_MARKET.
+   *
+   * Fail-closed, and deliberately narrow: it decides the modality of the FIRST
+   * take-profit intent of an execution and nothing else. Once an execution has
+   * a take-profit lineage, that lineage's modality is what every later repair
+   * follows, so flipping this switch can never change the modality of a trade
+   * already in flight.
+   */
+  EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   // DISABLED: never send a MARKET close — park for a human instead.
   // ON_UNVERIFIED_STOP: last-resort close when the stop cannot be verified.
   EXECUTION_EMERGENCY_CLOSE_MODE: z.enum(["DISABLED", "ON_UNVERIFIED_STOP"]).default("DISABLED"),
