@@ -48,6 +48,30 @@ export const LIVE_READY_GATES: GateValues = {
   EXECUTION_PROTECTION_READY: "true",
 };
 
+/**
+ * The take-profit modality switch.
+ *
+ * Deliberately NOT a member of `RUNTIME_GATE_KEYS`: those are the three gates
+ * this tool WRITES to .env, and this one is never written there. It is a launch
+ * choice, pinned into the child environment for the life of that runtime and
+ * nowhere else, so an operator does not have to edit or clean a file to change
+ * it — and so a stale file value can never contradict the running processes.
+ */
+export const STANDARD_LIMIT_TAKE_PROFIT_KEY = "EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED";
+
+/**
+ * The child's value for the take-profit modality switch, ALWAYS explicit.
+ *
+ * Omitting the key would let an exported shell value decide it: `dotenv` does
+ * not overwrite a variable that is already present, so an ambient `true` would
+ * silently win over both the file and the operator's intent, and place real
+ * take profits as resting LIMIT orders nobody chose. Pinning "false" is what
+ * makes "I did not ask for it" mean it is off.
+ */
+export function standardLimitTakeProfitEnv(enabled: boolean): Record<string, string> {
+  return { [STANDARD_LIMIT_TAKE_PROFIT_KEY]: enabled ? "true" : "false" };
+}
+
 export type DiskMode = "SAFE" | "LIVE_READY" | "INVALID";
 
 /**
@@ -181,6 +205,21 @@ export function operatorTokenState(envText: string): "CONFIGURED" | "NOT CONFIGU
 
 export const LIVE_READY_CONFIRMATION = "ENABLE LIVE RUNTIME";
 
+/**
+ * The typed phrase that turns the take-profit modality switch on for ONE
+ * runtime.
+ *
+ * A typed phrase rather than a y/n, for the same reason LIVE-READY uses one:
+ * this decides how real take profits are placed, and it should not be reachable
+ * by an absent-minded keystroke. Anything else — including empty input, which
+ * is what an operator who just wants to start the runtime will press — is off.
+ */
+export const STANDARD_LIMIT_TAKE_PROFIT_CONFIRMATION = "ENABLE LIMIT TAKE PROFIT";
+
+export function isStandardLimitTakeProfitConfirmed(typed: unknown): boolean {
+  return typeof typed === "string" && typed.trim().toUpperCase() === STANDARD_LIMIT_TAKE_PROFIT_CONFIRMATION;
+}
+
 /** Exact match, for the same reason the ARM confirmation is exact. */
 export function isLiveReadyConfirmed(typed: unknown): boolean {
   return typed === LIVE_READY_CONFIRMATION;
@@ -205,6 +244,18 @@ export interface RuntimeState {
   mode: Exclude<DiskMode, "INVALID">;
   startedAtMs: number;
   processes: OwnedProcess[];
+  /**
+   * The take-profit modality this runtime was started with. Recorded because a
+   * supervised worker restart must reproduce the RUNTIME it is replacing, not
+   * re-derive the choice; absent in state written before this existed, which
+   * `standardLimitTakeProfitOf` reads as off.
+   */
+  standardLimitTakeProfit?: boolean;
+}
+
+/** The recorded choice, with a missing or malformed value read as OFF. */
+export function standardLimitTakeProfitOf(state: Pick<RuntimeState, "standardLimitTakeProfit">): boolean {
+  return state.standardLimitTakeProfit === true;
 }
 
 /** What the OS reports about a live PID. Supplied by the CLI, faked in tests. */
@@ -317,7 +368,15 @@ export function windowsSpawnPlan(
   role: LauncherRole,
   repoRoot: string,
   mode: Exclude<DiskMode, "INVALID">,
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  /**
+   * The operator's EXPLICIT take-profit modality choice for this runtime.
+   *
+   * Defaulted to false on purpose: every existing caller, and every future one
+   * that forgets, pins the feature off rather than inheriting whatever the
+   * launching shell happened to carry.
+   */
+  standardLimitTakeProfit = false
 ): SpawnPlan {
   const { filter, script } = ROLE_COMMANDS[role];
   return {
@@ -343,7 +402,10 @@ export function windowsSpawnPlan(
       //
       // Inheriting everything else is deliberate: credentials, DATABASE_URL and
       // the rest must reach the child untouched.
-      env: { ...env, ...gatesFor(mode) },
+      // The take-profit modality switch is pinned the same way and for the same
+      // reason, but it is a launch choice rather than a gate: it is never
+      // written to .env, so the running processes are its only record.
+      env: { ...env, ...gatesFor(mode), ...standardLimitTakeProfitEnv(standardLimitTakeProfit) },
     },
   };
 }

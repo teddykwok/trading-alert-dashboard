@@ -27,6 +27,12 @@ import {
   verifyOwnership,
   verifyRuntimeMode,
   windowsSpawnPlan,
+  standardLimitTakeProfitEnv,
+  standardLimitTakeProfitOf,
+  isStandardLimitTakeProfitConfirmed,
+  STANDARD_LIMIT_TAKE_PROFIT_KEY,
+  STANDARD_LIMIT_TAKE_PROFIT_CONFIRMATION,
+  RUNTIME_GATE_KEYS,
   ROLE_COMMANDS,
   type OwnedProcess,
   type ProcessProbe,
@@ -456,7 +462,7 @@ describe("runtime launcher: the Windows spawn shape", () => {
       path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"),
       "utf8"
     );
-    expect(source).toContain("windowsSpawnPlan(role, REPO_ROOT, mode)");
+    expect(source).toContain("windowsSpawnPlan(role, REPO_ROOT, mode, process.env, standardLimitTakeProfit)");
     expect(source).not.toContain("pnpm.cmd");
     expect(source).not.toContain("shell: true");
     // One spawn call site for roles; the probe/kill adapters use spawnSync.
@@ -1409,5 +1415,89 @@ describe("runtime launcher: structural guarantees", () => {
     const source = cli();
     expect(source).toContain("renameSync");
     expect(source).toContain(".tmp");
+  });
+});
+
+describe("standard LIMIT take profit is a launch choice, never an inherited one", () => {
+  const REPO = "C:\Projects\trading-alert-dashboard";
+  const KEY = STANDARD_LIMIT_TAKE_PROFIT_KEY;
+  const childEnv = (parent: NodeJS.ProcessEnv, enabled?: boolean) =>
+    windowsSpawnPlan("worker", REPO, "SAFE", parent, enabled).options.env;
+
+  it("2. an ambient true does NOT reach the worker without an explicit choice", () => {
+    // The load-bearing case. dotenv will not overwrite a variable that is
+    // already present, so an exported shell value would otherwise decide how
+    // real take profits are placed.
+    const parent = { [KEY]: "true" } as NodeJS.ProcessEnv;
+    expect(childEnv(parent)[KEY]).toBe("false");
+  });
+
+  it("3/4. an ambient false, or no value at all, stays false", () => {
+    expect(childEnv({ [KEY]: "false" } as NodeJS.ProcessEnv)[KEY]).toBe("false");
+    expect(childEnv({} as NodeJS.ProcessEnv)[KEY]).toBe("false");
+  });
+
+  it("5. an explicit false beats an ambient true", () => {
+    expect(childEnv({ [KEY]: "true" } as NodeJS.ProcessEnv, false)[KEY]).toBe("false");
+  });
+
+  it("6/7. an explicit true is what reaches the worker, whatever the shell said", () => {
+    expect(childEnv({ [KEY]: "false" } as NodeJS.ProcessEnv, true)[KEY]).toBe("true");
+    expect(childEnv({ [KEY]: "true" } as NodeJS.ProcessEnv, true)[KEY]).toBe("true");
+    expect(childEnv({} as NodeJS.ProcessEnv, true)[KEY]).toBe("true");
+  });
+
+  it("15/16. every role receives the value explicitly, never by omission", () => {
+    for (const role of ["backend", "worker", "frontend"] as const) {
+      const env = windowsSpawnPlan(role, REPO, "SAFE", {} as NodeJS.ProcessEnv, true).options.env;
+      expect(Object.prototype.hasOwnProperty.call(env, KEY)).toBe(true);
+      expect(env[KEY]).toBe("true");
+    }
+  });
+
+  it("11/12/13. the choice cannot move any execution gate", () => {
+    const parent = { EXECUTION_LIVE_ENTRY_ENABLED: "true" } as NodeJS.ProcessEnv;
+    for (const mode of ["SAFE", "LIVE_READY"] as const) {
+      const off = windowsSpawnPlan("worker", REPO, mode, parent, false).options.env;
+      const on = windowsSpawnPlan("worker", REPO, mode, parent, true).options.env;
+      for (const gate of RUNTIME_GATE_KEYS) expect(on[gate]).toBe(off[gate]);
+      // And the gates are still the mode's own values, not the ambient ones.
+      expect(on.EXECUTION_GLOBAL_KILL_SWITCH).toBe(mode === "SAFE" ? "true" : "false");
+      expect(on.EXECUTION_LIVE_ENTRY_ENABLED).toBe(mode === "SAFE" ? "false" : "true");
+      expect(on.EXECUTION_PROTECTION_READY).toBe(mode === "SAFE" ? "false" : "true");
+    }
+  });
+
+  it("14. no runtime mode enables it on its own", () => {
+    for (const mode of ["SAFE", "LIVE_READY"] as const) {
+      expect(windowsSpawnPlan("worker", REPO, mode, {} as NodeJS.ProcessEnv).options.env[KEY]).toBe("false");
+    }
+  });
+
+  it("is not a gate this tool writes to .env", () => {
+    // The three gates are persisted; this is a per-runtime choice and must not
+    // join them, or a stale file could contradict the running processes.
+    expect((RUNTIME_GATE_KEYS as readonly string[]).includes(KEY)).toBe(false);
+  });
+
+  it("only the exact phrase enables it", () => {
+    expect(isStandardLimitTakeProfitConfirmed(STANDARD_LIMIT_TAKE_PROFIT_CONFIRMATION)).toBe(true);
+    expect(isStandardLimitTakeProfitConfirmed(` ${STANDARD_LIMIT_TAKE_PROFIT_CONFIRMATION.toLowerCase()} `)).toBe(true);
+    for (const typed of ["", "y", "yes", "true", "enable", undefined, null, 1]) {
+      expect(isStandardLimitTakeProfitConfirmed(typed)).toBe(false);
+    }
+  });
+
+  it("the recorded choice survives a supervised worker restart, and absence reads off", () => {
+    expect(standardLimitTakeProfitOf({ standardLimitTakeProfit: true })).toBe(true);
+    expect(standardLimitTakeProfitOf({ standardLimitTakeProfit: false })).toBe(false);
+    // State written before this existed, or damaged, is read as OFF.
+    expect(standardLimitTakeProfitOf({})).toBe(false);
+    expect(standardLimitTakeProfitOf({ standardLimitTakeProfit: undefined })).toBe(false);
+  });
+
+  it("the pinned value is a plain boolean string", () => {
+    expect(standardLimitTakeProfitEnv(true)).toEqual({ [KEY]: "true" });
+    expect(standardLimitTakeProfitEnv(false)).toEqual({ [KEY]: "false" });
   });
 });
