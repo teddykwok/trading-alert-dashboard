@@ -7,6 +7,7 @@ import type {
   ProtectionState,
   TradeExecution,
 } from "@prisma/client";
+import { standardTakeProfitMeetsMinNotional } from "./take-profit-notional";
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import {
@@ -35,6 +36,7 @@ import {
   protectionModality,
   readStandardOrderCoverage,
   takeProfitLineage,
+  resolveTakeProfitModality,
   type StandardCoverageReading,
   type CoverageResult,
   classifyPostCleanupPosition,
@@ -416,6 +418,17 @@ const MAX_RECOVERY_ATTEMPTS_PER_EPISODE = 3;
 interface ReservedTranche {
   generation: number;
   expectedVersion: number;
+  /**
+   * Why this generation has no TAKE_PROFIT row, when it has none.
+   *
+   * Carried in memory from the reservation to the submission step because only
+   * the reservation knows it: it read the symbol filters and evaluated the
+   * target. `submitTranche` would otherwise have to re-read them purely to
+   * label an alert, or keep asserting the one reason it happened to be given.
+   * Null means "not omitted, or not known this pass" — a RESUMED generation is
+   * submitted without a reservation and has nothing to carry.
+   */
+  takeProfitOmittedReason?: ProtectionReasonCode | null;
 }
 
 /**
@@ -1551,10 +1564,13 @@ export class ProtectionLifecycleService {
 
     if (!("generation" in reserved)) return reserved; // a failure outcome
 
-    return this.submitTranche(execution, reserved.generation, position, {
-      ...input,
-      expectedVersion: reserved.expectedVersion,
-    });
+    return this.submitTranche(
+      execution,
+      reserved.generation,
+      position,
+      { ...input, expectedVersion: reserved.expectedVersion },
+      reserved.takeProfitOmittedReason ?? null
+    );
   }
 
   /** The lowest generation whose STOP or TP is not yet verified active. */
@@ -1735,12 +1751,10 @@ export class ProtectionLifecycleService {
         input
       );
     }
+    // AMBIGUOUS was already escalated above, so the resolver cannot return
+    // null here; the fallback keeps the type total without inventing a branch.
     const takeProfitModality: "ALGO" | "STANDARD" =
-      lineage.kind === "SETTLED"
-        ? lineage.modality
-        : env.EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED
-          ? "STANDARD"
-          : "ALGO";
+      resolveTakeProfitModality(lineage, env.EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED) ?? "ALGO";
 
     const rowsToReserve: Array<{ role: "STOP_LOSS" | "TAKE_PROFIT"; quantity: string; trigger: string }> = [];
 
@@ -1782,7 +1796,7 @@ export class ProtectionLifecycleService {
      * position fully covered, and `submitTranche` raises the operator alert
      * once the stop is actually verified.
      */
-    let takeProfitOmittedReason: string | null = null;
+    let takeProfitOmittedReason: ProtectionReasonCode | null = null;
     if (wantTakeProfit) {
       const verdict = validateFor(missing.takeProfitQuantity).takeProfit;
       if (takeProfitTrigger !== null && verdict.valid) {
@@ -1800,10 +1814,12 @@ export class ProtectionLifecycleService {
          * already proven tick-valid, and quantizing it would change the trade's
          * geometry rather than its placement.
          */
-        const floorRaw = inspection.filters.minNotional;
-        const notionalFloor = floorRaw === null || floorRaw === undefined || floorRaw.trim() === "" ? null : new D(floorRaw);
-        const notional = new D(missing.takeProfitQuantity).times(takeProfitTrigger);
-        if (takeProfitModality === "STANDARD" && notionalFloor !== null && notional.lessThan(notionalFloor)) {
+        const meetsFloor = standardTakeProfitMeetsMinNotional({
+          quantity: missing.takeProfitQuantity,
+          price: takeProfitTrigger,
+          minNotional: inspection.filters.minNotional,
+        });
+        if (takeProfitModality === "STANDARD" && !meetsFloor) {
           takeProfitOmittedReason = "PROTECTION_QUANTITY_UNSUPPORTED";
         } else {
           rowsToReserve.push({ role: "TAKE_PROFIT", quantity: missing.takeProfitQuantity, trigger: takeProfitTrigger });
@@ -1830,7 +1846,11 @@ export class ProtectionLifecycleService {
     if (rowsToReserve.length === 0) {
       return this.outcome(
         false,
-        "TAKE_PROFIT_TRIGGER_INVALID",
+        // The reason the take profit was actually omitted, not a blanket claim
+        // that its trigger is wrong. A target refused for its NOTIONAL has a
+        // perfectly valid trigger, and telling an operator otherwise sends them
+        // to look at the price when the quantity is what cannot be placed.
+        takeProfitOmittedReason ?? "TAKE_PROFIT_TRIGGER_INVALID",
         "The stop already covers the exposure and the take profit is not currently placeable; nothing was reserved.",
         execution,
         await this.loadProtection(execution.id)
@@ -1955,7 +1975,7 @@ export class ProtectionLifecycleService {
 
     // The reservation advanced the row, so everything later in THIS call â€” an
     // escalation above all â€” must CAS against the version it produced.
-    return { generation, expectedVersion: committed.version };
+    return { generation, expectedVersion: committed.version, takeProfitOmittedReason };
   }
 
   /** Submits STOP first, verifies it, and only then submits TP. */
@@ -2550,7 +2570,13 @@ export class ProtectionLifecycleService {
     execution: TradeExecution,
     generation: number,
     position: PositionSnapshot,
-    input: ProtectionLifecycleInput
+    input: ProtectionLifecycleInput,
+    /**
+     * Why the reservation left this generation without a take profit, when it
+     * did and when this pass is the one that reserved it. Null for a RESUMED
+     * generation, where no reservation ran and the reason is genuinely unknown.
+     */
+    takeProfitOmittedReason: ProtectionReasonCode | null = null
   ): Promise<ProtectionOutcome> {
     const protection = await this.ensureProtectionRow(execution.id);
 
@@ -2679,28 +2705,46 @@ export class ProtectionLifecycleService {
       // verified and stays exactly as it is; the missing leg is surfaced for a
       // human rather than quietly absorbed. Coverage is measured from real
       // orders, so the execution cannot read as fully protected either way.
+      /**
+       * The reason the take profit is absent, not a blanket trigger claim.
+       *
+       * FLOCKUSDT reached exactly here with a perfectly valid SHORT trigger
+       * (0.03691, below the mark) and a notional of 4.46611 against a floor of
+       * 5. Reporting TAKE_PROFIT_TRIGGER_INVALID sent the operator to inspect a
+       * price that was never the problem.
+       */
+      const omissionReason = takeProfitOmittedReason ?? "TAKE_PROFIT_TRIGGER_INVALID";
+      const omissionDetail =
+        omissionReason === "PROTECTION_QUANTITY_UNSUPPORTED"
+          ? "STOP: VERIFIED | TAKE PROFIT: BELOW EXCHANGE MINIMUM NOTIONAL"
+          : "STOP: VERIFIED | TAKE PROFIT: NOT PLACEABLE";
       await this.setProtectionState(
         protection.id,
         "PROTECTION_INCOMPLETE",
-        "TAKE_PROFIT_TRIGGER_INVALID",
-        "Stop is verified; the take profit was not placeable and is absent."
+        omissionReason,
+        omissionReason === "PROTECTION_QUANTITY_UNSUPPORTED"
+          ? "Stop is verified; the take profit is below the symbol minimum notional and is absent."
+          : "Stop is verified; the take profit was not placeable and is absent."
       );
       await this.alerts.raise({
         tradeExecutionId: execution.id,
         alertType: "PROTECTION_COVERAGE_INCOMPLETE",
-        reasonCode: "TAKE_PROFIT_TRIGGER_INVALID",
+        reasonCode: omissionReason,
         details: {
           symbol: execution.symbol,
           positionSide: protectionPositionSide(execution.direction as DirectionName),
           // Spelled out so the operator sees WHICH leg holds and which does
           // not, instead of an undifferentiated "incomplete".
-          protectionState: "STOP: VERIFIED | TAKE PROFIT: NOT PLACEABLE",
-          requiredAction: "Stop is in place; the take profit trigger is no longer valid — handle the target manually.",
+          protectionState: omissionDetail,
+          requiredAction:
+            omissionReason === "PROTECTION_QUANTITY_UNSUPPORTED"
+              ? "Stop is in place; the take profit is worth less than the symbol minimum notional and cannot be placed — handle the target manually."
+              : "Stop is in place; the take profit trigger is no longer valid — handle the target manually.",
         },
       });
       return this.outcome(
         false,
-        "TAKE_PROFIT_TRIGGER_INVALID",
+        omissionReason,
         "Stop is verified; the take profit was not placeable.",
         execution,
         await this.loadProtection(execution.id)

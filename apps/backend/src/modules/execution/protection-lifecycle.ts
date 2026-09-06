@@ -609,6 +609,25 @@ export type TakeProfitLineage =
   | { readonly kind: "SETTLED"; readonly modality: "ALGO" | "STANDARD" }
   | { readonly kind: "AMBIGUOUS"; readonly modalities: readonly string[] };
 
+/**
+ * Which modality the NEXT take profit for an execution would use.
+ *
+ * Durable history wins: once a lineage is SETTLED every later repair follows
+ * it, so flipping the runtime switch can never change the modality of a trade
+ * already in flight. Configuration decides only when no take-profit lineage
+ * exists yet. AMBIGUOUS returns null — a history spanning modalities is not
+ * something to continue, and every caller must fail closed on it rather than
+ * pick one.
+ */
+export function resolveTakeProfitModality(
+  lineage: TakeProfitLineage,
+  standardEnabled: boolean
+): "ALGO" | "STANDARD" | null {
+  if (lineage.kind === "AMBIGUOUS") return null;
+  if (lineage.kind === "SETTLED") return lineage.modality;
+  return standardEnabled ? "STANDARD" : "ALGO";
+}
+
 export function takeProfitLineage(
   rows: readonly { role: string; orderType: ExecutionOrderTypeName }[]
 ): TakeProfitLineage {

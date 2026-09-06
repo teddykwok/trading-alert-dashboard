@@ -36,6 +36,16 @@ process.env.EXECUTION_MAX_TOTAL_ISOLATED_MARGIN_USD = "5.00";
 process.env.EXECUTION_MAX_ACTIVE_PER_SYMBOL_SIDE = "1";
 process.env.EXECUTION_MAX_ALERT_AGE_SECONDS = "300";
 process.env.BINANCE_FUTURES_REST_BASE_URL = "https://testnet.binancefuture.com";
+/**
+ * ON for this file so the pre-entry standard take-profit rule is reachable at
+ * all — with it OFF the modality resolves to ALGO and the rule is inert, which
+ * is itself the flag-off guarantee and is asserted at the engine layer.
+ *
+ * Safe to set here: vitest runs each file in its own forked process, and `env`
+ * is parsed once per process, so this cannot reach any other suite. Every other
+ * test in this file leaves `takeProfit` null, where the rule cannot fire.
+ */
+process.env.EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED = "true";
 
 // Integration state lives in the DEDICATED test database. The helper refuses
 // to fall back to the runtime/canary database, so a misconfiguration fails the
@@ -65,6 +75,7 @@ interface StubState {
   assetMode: "SINGLE_ASSET" | "MULTI_ASSET";
   failAccount: boolean;
   failSymbol: boolean;
+  minNotional: string | null;
   calls: string[];
 }
 
@@ -76,6 +87,9 @@ const stub: StubState = {
   assetMode: "SINGLE_ASSET",
   failAccount: false,
   failSymbol: false,
+  // What the connector reports as the symbol's authoritative minimum notional.
+  // The admission gate must read THIS, never a constant of its own.
+  minNotional: "5" as string | null,
   calls: [],
 };
 
@@ -87,6 +101,7 @@ function resetStub() {
   stub.assetMode = "SINGLE_ASSET";
   stub.failAccount = false;
   stub.failSymbol = false;
+  stub.minNotional = "5";
   stub.calls = [];
 }
 
@@ -119,6 +134,7 @@ const readOnlyStub = {
         marginAsset: "USDT",
         tickSize: "0.01",
         stepSize: "0.001",
+        minNotional: stub.minNotional,
       },
       brackets: [{ bracket: 1, initialLeverage: 50, notionalCap: "10000", notionalFloor: "0", maintMarginRatio: "0.01", cum: "0" }],
       maxInitialLeverage: 50,
@@ -209,6 +225,7 @@ async function createExecution(options: {
   triggeredAt?: Date;
   plan?: Partial<DynamicLeveragePlan>;
   positionSide?: "LONG" | "SHORT";
+  takeProfit?: string;
 } = {}) {
   sequence += 1;
   const alertId = await createSyntheticAlert(`e${sequence}`, options.triggeredAt);
@@ -217,6 +234,7 @@ async function createExecution(options: {
     alertId,
     plan: readyPlan(options.plan),
     positionSide: options.positionSide,
+    takeProfit: options.takeProfit,
     selectedLookback: 200,
   });
 }
@@ -1129,5 +1147,134 @@ describe("safety policy administration", () => {
     ).rejects.toThrow(/invalid symbol/i);
 
     await policies.updateForProfile(profileId, updated.version, { allowedSymbols: [] });
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// The FLOCKUSDT deadlock, through the real admission service
+// ---------------------------------------------------------------------------
+
+describe("a standard take profit that could never be placed never reaches entry", () => {
+  /**
+   * The exact production geometry, driven through the REAL
+   * SafetyAdmissionService against a real database — not the pure engine in
+   * isolation. What this proves that the unit tests cannot is the WIRING: the
+   * authoritative minimum notional actually travels from the connector read to
+   * the decision, the frozen target and planned quantity are the ones the plan
+   * carries, and the modality is resolved from durable rows.
+   *
+   * SHORT 121 @ 0.05548, frozen target 0.03691, floor 5.
+   * 121 x 0.03691 = 4.46611 < 5.
+   *
+   * In production this filled, verified its stop, could never place its target,
+   * and parked at PLACING_PROTECTION — which held countRecoveryRequired() above
+   * zero and globally refused every later admission until a human intervened.
+   */
+  const FLOCK_PLAN = {
+    direction: "SHORT" as const,
+    entryPrice: "0.05548",
+    stopLoss: "0.06786",
+    calculatedStopLoss: "0.06786",
+    executableStopLoss: "0.06786",
+    stopDistance: "0.01238",
+    quantityRaw: "121",
+    roundedQuantity: "121",
+    quantityStepSize: "1",
+    positionNotional: "6.71308",
+    // SHORT geometry: liquidation sits ABOVE the required boundary, which is
+    // the safe direction for a short. The fixture's defaults are LONG-shaped.
+    estimatedLiquidationPrice: "0.08",
+    requiredLiquidationBoundary: "0.075",
+    liquidationDistance: "0.02452",
+  };
+
+  const flockExecution = () =>
+    createExecution({ plan: FLOCK_PLAN, positionSide: "SHORT", takeProfit: "0.03691" });
+
+  maybe()("refuses it terminally, naming the minimum notional and not the trigger", async () => {
+    stub.minNotional = "5";
+    const execution = await flockExecution();
+
+    const outcome = await admissions.evaluateAndReserveSafetyAdmission({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: new Date(),
+    });
+
+    expect(outcome.decision).toBe("SKIP");
+    expect(outcome.reasonCode).toBe("PROTECTION_QUANTITY_UNSUPPORTED");
+
+    // The durable decision an operator reads must name the real condition.
+    const admission = await prisma!.safetyAdmission.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id },
+    });
+    expect(admission.decision).toBe("SKIP");
+    expect(admission.reasonCode).toBe("PROTECTION_QUANTITY_UNSUPPORTED");
+    expect(admission.message).toMatch(/minimum notional/i);
+    expect(admission.message).not.toMatch(/trigger/i);
+
+    // Nothing was spent: no capacity, no risk, no margin reservation.
+    expect(admission.reservedRiskUsd === null || admission.reservedRiskUsd.toString() === "0").toBe(true);
+    expect(admission.reservedMarginUsd === null || admission.reservedMarginUsd.toString() === "0").toBe(true);
+
+    // No entry was reserved, no protection generation minted, and the
+    // execution never entered a recovery-required state.
+    const reloaded = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    expect(reloaded.status).toBe("SKIPPED");
+    expect(reloaded.requiresManualIntervention).toBe(false);
+    expect(await prisma!.binanceOrder.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+    expect(
+      await prisma!.executionProtectionState.count({ where: { tradeExecutionId: execution.id } })
+    ).toBe(0);
+  });
+
+  maybe()("reads the floor from the connector rather than any constant of its own", async () => {
+    // The same plan against a symbol whose floor is BELOW the notional. If the
+    // gate ever hardcoded 5 — or stopped reading the connector — this admits
+    // nothing and the test fails.
+    stub.minNotional = "4";
+    const execution = await flockExecution();
+
+    const outcome = await admissions.evaluateAndReserveSafetyAdmission({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: new Date(),
+    });
+
+    expect(outcome.decision).toBe("PASS");
+    expect(stub.calls.some((call) => call.startsWith("inspectSymbol:"))).toBe(true);
+  });
+
+  maybe()("admits a target worth exactly the floor", async () => {
+    // 121 x 0.04132... is awkward; use the floor exactly: 100 x 0.05 = 5.00.
+    stub.minNotional = "5";
+    const execution = await createExecution({
+      plan: { ...FLOCK_PLAN, quantityRaw: "100", roundedQuantity: "100", positionNotional: "5.548" },
+      positionSide: "SHORT",
+      takeProfit: "0.05",
+    });
+
+    const outcome = await admissions.evaluateAndReserveSafetyAdmission({
+      executionId: execution.id,
+      expectedVersion: execution.version,
+      evaluatedAt: new Date(),
+    });
+
+    expect(outcome.decision).toBe("PASS");
+  });
+
+  maybe()("a PLAN_READY execution has no take-profit lineage to be ambiguous about", async () => {
+    // The invariant the STANDARD-only predicate rests on: nothing in production
+    // writes a TAKE_PROFIT row before admission, so the lineage is NONE and
+    // configuration decides. If that ever changed, an AMBIGUOUS lineage would
+    // resolve to null and this gate would stop firing — so it is pinned here.
+    const execution = await flockExecution();
+    expect(execution.status).toBe("PLAN_READY");
+    expect(
+      await prisma!.binanceOrder.count({
+        where: { tradeExecutionId: execution.id, role: "TAKE_PROFIT" },
+      })
+    ).toBe(0);
   });
 });

@@ -56,6 +56,11 @@ function proposed(overrides: Partial<ProposedExecution> = {}): ProposedExecution
     marginPlanStatus: "READY",
     selectedLeverage: 5,
     hasMarginPlanSnapshot: true,
+    plannedQuantity: "1",
+    // Null by default so the standard-TP notional rule cannot fire in tests
+    // that are about something else; the tests that exercise it opt in.
+    takeProfit: null,
+    intendedTakeProfitModality: null,
     ...overrides,
   };
 }
@@ -123,6 +128,7 @@ function symbolState(overrides: Partial<SymbolStateSnapshot> = {}): SymbolStateS
     contractType: "PERPETUAL",
     quoteAsset: "USDT",
     marginAsset: "USDT",
+    minNotional: "5",
     hasFiltersSnapshot: true,
     hasBracketSnapshot: true,
     ...overrides,
@@ -889,12 +895,12 @@ const NATURAL_AUTHORIZATION_CODES = [
 ] as const satisfies readonly SafetyReasonCode[];
 
 describe("reason code catalogue", () => {
-  it("exposes exactly the 45 stable reason codes", () => {
+  it("exposes exactly the 46 stable reason codes", () => {
     // 30 through Phase 11, plus the 7 natural-authorization codes added in
     // Phase 12.3, plus the 2 source-timeframe eligibility codes, plus the
     // USDT-only collateral code, plus the 4 session-budget codes, plus
-    // SESSION_PAUSED. The count is pinned so a code cannot be added without a
-    // deliberate edit here.
+    // SESSION_PAUSED, plus PROTECTION_QUANTITY_UNSUPPORTED. The count is
+    // pinned so a code cannot be added without a deliberate edit here.
     //
     // The session codes are separate from the authorization ones on purpose:
     // NATURAL_AUTHORIZATION_EXHAUSTED would tell an operator their permission
@@ -904,8 +910,12 @@ describe("reason code catalogue", () => {
     // SESSION_PAUSED is separate from SESSION_REVOKED for the same reason, and
     // it is the distinction the whole pause/resume feature rests on: revoked
     // means start a new session, paused means resume this one.
-    expect(SAFETY_REASON_CODES).toHaveLength(45);
-    expect(new Set(SAFETY_REASON_CODES).size).toBe(45);
+    expect(SAFETY_REASON_CODES).toHaveLength(46);
+    expect(new Set(SAFETY_REASON_CODES).size).toBe(46);
+    // Deliberately the SAME identifier the protection lifecycle already uses
+    // for an under-minimum-notional take profit. One condition, one name,
+    // whichever gate catches it — a second spelling would let the two drift.
+    expect(SAFETY_REASON_CODES).toContain("PROTECTION_QUANTITY_UNSUPPORTED");
     // Its own code, never folded into UNSUPPORTED_CONTRACT: "not a perpetual"
     // and "a perpetual we do not trade" send an operator to different places.
     expect(SAFETY_REASON_CODES).toContain("USDT_ONLY_CONTRACT_REQUIRED");
@@ -971,6 +981,15 @@ describe("reason code catalogue", () => {
     collect(evaluate({ policy: policy({ expectedMarginType: "CROSS" }) }));
     collect(evaluate({ policy: policy({ policyPresent: false }) }));
     collect(evaluate({ proposed: proposed({ signalTriggeredAt: null }) }));
+    collect(
+      evaluate({
+        proposed: proposed({
+          plannedQuantity: "121",
+          takeProfit: "0.03691",
+          intendedTakeProfitModality: "STANDARD",
+        }),
+      })
+    );
     collect(evaluate({ proposed: proposed({ signalTriggeredAt: new Date(EVALUATED_AT.getTime() - 400_000) }) }));
     collect(evaluate({ local: local({ alreadyAdmitted: true }) }));
     collect(evaluate({ policy: policy({ allowedSymbols: ["OTHERUSDT"] }) }));
@@ -1039,5 +1058,129 @@ describe("reason code catalogue", () => {
     ]);
     const pureCodes = SAFETY_REASON_CODES.filter((code) => !serviceOnly.has(code));
     expect([...emitted].sort()).toEqual([...pureCodes].sort());
+  });
+});
+
+
+describe("a resting LIMIT take profit that could never be placed is refused before entry", () => {
+  /**
+   * The FLOCKUSDT geometry, exactly as production produced it.
+   *
+   * SHORT 121 @ 0.05548 with a frozen target of 0.03691. The trigger is
+   * perfectly valid — it sits below the mark, which is where a SHORT target
+   * belongs — and the notional is 121 x 0.03691 = 4.46611 against a floor of 5.
+   * The position filled, the stop was verified, the target was refused, and the
+   * execution parked at PLACING_PROTECTION forever, which held the global
+   * recovery barrier open and refused every later admission.
+   */
+  const FLOCK = {
+    plannedQuantity: "121",
+    takeProfit: "0.03691",
+    intendedTakeProfitModality: "STANDARD" as const,
+  };
+
+  it("refuses the exact FLOCK plan, terminally, before anything is spent", () => {
+    const result = evaluate({
+      proposed: proposed({ ...FLOCK, positionSide: "SHORT", estimatedLiquidationPrice: "110", requiredLiquidationBoundary: "105" }),
+      symbolState: symbolState({ minNotional: "5" }),
+    });
+
+    expect(result.decision).toBe("SKIP");
+    expect(reasonCodes(result)).toContain("PROTECTION_QUANTITY_UNSUPPORTED");
+    // SKIP is terminal: nothing about a frozen quantity and a frozen price can
+    // change, so this must never be retried into existence later.
+    expect(classifySafetyReasonRetryability("PROTECTION_QUANTITY_UNSUPPORTED")).toBe("TERMINAL");
+  });
+
+  it("says minimum notional, and never claims the trigger is invalid", () => {
+    const result = evaluate({
+      proposed: proposed({ ...FLOCK }),
+      symbolState: symbolState({ minNotional: "5" }),
+    });
+    // The whole point of the fix: the operator is told what is actually wrong.
+    expect(result.message).toMatch(/minimum notional/i);
+    expect(reasonCodes(result)).not.toContain("TAKE_PROFIT_TRIGGER_INVALID" as never);
+    expect(result.message).not.toMatch(/trigger/i);
+  });
+
+  it("admits a target worth EXACTLY the floor", () => {
+    // 100 x 0.05 = 5.00, equal to the floor. The exchange accepts equality, so
+    // this must not be refused by an off-by-one boundary.
+    const result = evaluate({
+      proposed: proposed({ plannedQuantity: "100", takeProfit: "0.05", intendedTakeProfitModality: "STANDARD" }),
+      symbolState: symbolState({ minNotional: "5" }),
+    });
+    expect(reasonCodes(result)).not.toContain("PROTECTION_QUANTITY_UNSUPPORTED" as never);
+    expect(result.decision).toBe("PASS");
+  });
+
+  it("admits a comfortably placeable target", () => {
+    const result = evaluate({
+      proposed: proposed({ plannedQuantity: "1000", takeProfit: "0.05", intendedTakeProfitModality: "STANDARD" }),
+      symbolState: symbolState({ minNotional: "5" }),
+    });
+    expect(result.decision).toBe("PASS");
+  });
+
+  it("leaves the ALGO path completely alone", () => {
+    // The same under-floor geometry. A conditional TAKE_PROFIT_MARKET carries
+    // no notional filter, so this feature must not refuse it — that would be a
+    // silent policy change to a path this fix does not own.
+    const result = evaluate({
+      proposed: proposed({ ...FLOCK, intendedTakeProfitModality: "ALGO" }),
+      symbolState: symbolState({ minNotional: "5" }),
+    });
+    expect(reasonCodes(result)).not.toContain("PROTECTION_QUANTITY_UNSUPPORTED" as never);
+    expect(result.decision).toBe("PASS");
+  });
+
+  it("does nothing when the plan has no take profit at all", () => {
+    const result = evaluate({
+      proposed: proposed({ plannedQuantity: "121", takeProfit: null, intendedTakeProfitModality: "STANDARD" }),
+      symbolState: symbolState({ minNotional: "5" }),
+    });
+    expect(result.decision).toBe("PASS");
+  });
+
+  it("does nothing when the lineage is AMBIGUOUS (modality null)", () => {
+    // A history spanning modalities resolves to null and is failed closed
+    // elsewhere; this rule must not be the thing that judges it.
+    const result = evaluate({
+      proposed: proposed({ ...FLOCK, intendedTakeProfitModality: null }),
+      symbolState: symbolState({ minNotional: "5" }),
+    });
+    expect(reasonCodes(result)).not.toContain("PROTECTION_QUANTITY_UNSUPPORTED" as never);
+  });
+
+  it("never invents a floor when the symbol reported none", () => {
+    // Null is "we could not look", and an unreadable read is already refused on
+    // the retryable path by the filters check. It must not become "floor = 0"
+    // here, nor a hardcoded 5.
+    const result = evaluate({
+      proposed: proposed({ ...FLOCK }),
+      symbolState: symbolState({ minNotional: null }),
+    });
+    expect(reasonCodes(result)).not.toContain("PROTECTION_QUANTITY_UNSUPPORTED" as never);
+  });
+
+  it("does not fire while the symbol read itself is unavailable", () => {
+    // An unavailable symbol is retryable and must stay that way: refusing it
+    // terminally on a floor we never read would destroy a recoverable signal.
+    const result = evaluate({
+      proposed: proposed({ ...FLOCK }),
+      symbolState: symbolState({ available: false, minNotional: null }),
+    });
+    expect(reasonCodes(result)).not.toContain("PROTECTION_QUANTITY_UNSUPPORTED" as never);
+  });
+
+  it("uses decimal arithmetic, not floating point", () => {
+    // 0.1 x 3 is 0.30000000000000004 in binary floating point and would clear a
+    // floor of 0.3 by accident. Exact decimals must call it equal, and equal is
+    // placeable.
+    const result = evaluate({
+      proposed: proposed({ plannedQuantity: "3", takeProfit: "0.1", intendedTakeProfitModality: "STANDARD" }),
+      symbolState: symbolState({ minNotional: "0.3" }),
+    });
+    expect(reasonCodes(result)).not.toContain("PROTECTION_QUANTITY_UNSUPPORTED" as never);
   });
 });

@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { symbolSideKey } from "./capacity-status";
+import { standardTakeProfitMeetsMinNotional } from "./take-profit-notional";
 
 /**
  * Phase 5 — pure safety and capacity decision engine.
@@ -90,6 +91,17 @@ export const SAFETY_REASON_CODES = [
   "UNSAFE_LIQUIDATION_BUFFER",
   "MARGIN_PLAN_NOT_READY",
   "MARGIN_PLAN_SNAPSHOT_MISSING",
+  /**
+   * The FIRST take profit this plan would place is a resting LIMIT worth less
+   * than the symbol's minimum notional, so it could never be placed.
+   *
+   * The same identifier the protection lifecycle already uses for this exact
+   * condition, deliberately rather than a new one: one condition, one name,
+   * whichever gate catches it. TERMINAL — it is absent from RETRYABLE_REASONS
+   * because both inputs are frozen (planned quantity, plan take-profit price),
+   * so a retry can only ever reach the same answer.
+   */
+  "PROTECTION_QUANTITY_UNSUPPORTED",
   "BINANCE_ACCOUNT_STATE_UNAVAILABLE",
   "BINANCE_SYMBOL_STATE_UNAVAILABLE",
   "CAPACITY_CONFLICT_RETRY",
@@ -205,6 +217,17 @@ export interface ProposedExecution {
   marginPlanWarnings?: string[];
   selectedLeverage: number | null;
   hasMarginPlanSnapshot: boolean;
+  /** Final rounded quantity that would actually be submitted. */
+  plannedQuantity: string;
+  /** The FROZEN plan take-profit price. Null means the plan has no target. */
+  takeProfit: string | null;
+  /**
+   * Which modality this execution's FIRST take profit would use, resolved from
+   * durable lineage and configuration by the caller (the same resolver the
+   * protection lifecycle uses). Null when no take profit is intended, or when
+   * the lineage is AMBIGUOUS and no modality may be continued.
+   */
+  intendedTakeProfitModality: "ALGO" | "STANDARD" | null;
 }
 
 export interface EffectiveSafetyPolicy {
@@ -287,6 +310,12 @@ export interface SymbolStateSnapshot {
    */
   quoteAsset: string | null;
   marginAsset: string | null;
+  /**
+   * The symbol's authoritative minimum notional, exactly as Binance reported
+   * it, or null when the read did not carry one. Never defaulted and never
+   * hardcoded: a null is "we could not look", which is not permission.
+   */
+  minNotional: string | null;
   hasFiltersSnapshot: boolean;
   hasBracketSnapshot: boolean;
 }
@@ -675,6 +704,56 @@ export function evaluateSafetyAdmission(input: SafetyEvaluationInput): SafetyDec
     fail(
       "BINANCE_SYMBOL_STATE_UNAVAILABLE",
       "Symbol filters or leverage brackets were incomplete in this read; nothing was recalculated."
+    );
+  }
+
+  /**
+   * --- 5b. A resting LIMIT take profit that could never be placed ----------
+   *
+   * A STANDARD take profit is an ordinary order and must clear the symbol's
+   * MIN_NOTIONAL; a conditional TAKE_PROFIT_MARKET need not. So a plan whose
+   * frozen target is worth less than the floor is, before a single order
+   * exists, already guaranteed to fill and then be unable to place its target.
+   *
+   * FLOCKUSDT proved why this belongs BEFORE entry rather than after the fill.
+   * It filled 121 @ 0.05548 with a frozen target of 0.03691 — a notional of
+   * 4.46611 against a floor of 5. The stop was placed and verified, the target
+   * was refused, and the execution parked at PLACING_PROTECTION permanently:
+   * both inputs to that comparison are frozen, so no later tick could ever
+   * reach a different answer. That single row then held
+   * `countRecoveryRequired() > 0` open, which globally refused EVERY new
+   * admission until a human closed the position by hand.
+   *
+   * Placed with the other admission rules and therefore BEFORE anything is
+   * spent: the authorization claim and the capacity reservation are reached
+   * only when this whole evaluation returns PASS, so a refusal here costs no
+   * claim, no risk, no margin and no capacity slot.
+   *
+   * Deliberately NARROW. It fires only when the take profit would actually be
+   * STANDARD, so the ALGO path is untouched and the flag-off runtime behaves
+   * exactly as it did. It never moves the target, never resizes the plan and
+   * never converts modality — the plan is refused, not rewritten.
+   *
+   * A null floor is NOT treated as zero. `hasFiltersSnapshot` above already
+   * refuses an incomplete read on the retryable path, so reaching here with no
+   * floor means the symbol genuinely reported none, and the shared rule then
+   * answers "placeable" rather than inventing a minimum.
+   */
+  if (
+    proposed.intendedTakeProfitModality === "STANDARD" &&
+    proposed.takeProfit !== null &&
+    symbolState.available &&
+    !standardTakeProfitMeetsMinNotional({
+      quantity: proposed.plannedQuantity,
+      price: proposed.takeProfit,
+      minNotional: symbolState.minNotional,
+    })
+  ) {
+    fail(
+      "PROTECTION_QUANTITY_UNSUPPORTED",
+      `A resting LIMIT take profit of ${proposed.plannedQuantity} at ${proposed.takeProfit} is worth less than ` +
+        `${symbol}'s minimum notional of ${symbolState.minNotional}; this plan would fill and then be unable to ` +
+        `place its target, so no exposure is opened.`
     );
   }
 

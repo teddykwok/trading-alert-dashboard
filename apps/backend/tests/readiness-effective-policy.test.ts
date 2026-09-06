@@ -314,6 +314,11 @@ function proposed(overrides: Partial<ProposedExecution> = {}): ProposedExecution
     marginPlanStatus: "READY",
     selectedLeverage: 5,
     hasMarginPlanSnapshot: true,
+    plannedQuantity: "1",
+    // Null by default so the standard-TP notional rule cannot fire in tests
+    // that are about something else; the tests that exercise it opt in.
+    takeProfit: null,
+    intendedTakeProfitModality: null,
     ...overrides,
   };
 }
@@ -353,6 +358,7 @@ function symbolState(overrides: Partial<SymbolStateSnapshot> = {}): SymbolStateS
     contractType: "PERPETUAL",
     quoteAsset: "USDT",
     marginAsset: "USDT",
+    minNotional: "5",
     hasFiltersSnapshot: true,
     hasBracketSnapshot: true,
     ...overrides,

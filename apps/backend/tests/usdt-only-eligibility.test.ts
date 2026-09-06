@@ -87,6 +87,7 @@ function symbolState(overrides: Partial<SymbolStateSnapshot> = {}): SymbolStateS
     contractType: "PERPETUAL",
     quoteAsset: "USDT",
     marginAsset: "USDT",
+    minNotional: "5",
     hasFiltersSnapshot: true,
     hasBracketSnapshot: true,
     ...overrides,

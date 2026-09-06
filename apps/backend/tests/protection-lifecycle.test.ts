@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { standardTakeProfitMeetsMinNotional } from "../src/modules/execution/take-profit-notional";
 import type { ExecutionOrderType } from "@prisma/client";
 import {
   CRITICAL_REASON_CODES,
@@ -12,6 +13,7 @@ import {
   countsAsActiveCoverage,
   isExecutingProtection,
   protectionModality,
+  resolveTakeProfitModality,
   readStandardOrderCoverage,
   evaluateEmergencyCloseEligibility,
   evaluateLiquidationSafety,
@@ -903,5 +905,61 @@ describe("standard protection coverage reading", () => {
 
   it("tolerates casing and surrounding whitespace", () => {
     expect(read(" partially_filled ", "10", "4")).toEqual({ kind: "RESTING", remaining: "6" });
+  });
+});
+
+
+describe("the standard take-profit notional rule is one rule, shared by both gates", () => {
+  const meets = standardTakeProfitMeetsMinNotional;
+
+  it("refuses the exact FLOCK geometry", () => {
+    // 121 x 0.03691 = 4.46611, against a floor of 5.
+    expect(meets({ quantity: "121", price: "0.03691", minNotional: "5" })).toBe(false);
+  });
+
+  it("treats a notional EXACTLY equal to the floor as placeable", () => {
+    // The boundary the exchange itself uses. Off by one here means either a
+    // rejected order or a refused plan that was always fine.
+    expect(meets({ quantity: "100", price: "0.05", minNotional: "5" })).toBe(true);
+    expect(meets({ quantity: "1", price: "5", minNotional: "5" })).toBe(true);
+  });
+
+  it("refuses a notional one tick under the floor", () => {
+    expect(meets({ quantity: "1", price: "4.999999999999", minNotional: "5" })).toBe(false);
+  });
+
+  it("is exact decimal arithmetic, not floating point", () => {
+    // 0.1 * 3 === 0.30000000000000004 in binary floating point, which would
+    // clear a floor of 0.3 by accident. Decimals must call it exactly equal.
+    expect(meets({ quantity: "3", price: "0.1", minNotional: "0.3" })).toBe(true);
+    expect(0.1 * 3 > 0.3).toBe(true); // the trap this avoids
+  });
+
+  it("never invents a floor", () => {
+    // Null/empty is "the symbol reported none", never "the floor is zero" and
+    // never a hardcoded 5. The caller decides what an unreadable filter means.
+    for (const floor of [null, undefined, "", "   "]) {
+      expect(meets({ quantity: "1", price: "0.0000001", minNotional: floor })).toBe(true);
+    }
+  });
+});
+
+describe("take-profit modality resolution: durable history wins over configuration", () => {
+  it("continues a SETTLED lineage whatever the flag says", () => {
+    for (const enabled of [true, false]) {
+      expect(resolveTakeProfitModality({ kind: "SETTLED", modality: "ALGO" }, enabled)).toBe("ALGO");
+      expect(resolveTakeProfitModality({ kind: "SETTLED", modality: "STANDARD" }, enabled)).toBe("STANDARD");
+    }
+  });
+
+  it("lets configuration decide ONLY when no lineage exists", () => {
+    expect(resolveTakeProfitModality({ kind: "NONE" }, true)).toBe("STANDARD");
+    expect(resolveTakeProfitModality({ kind: "NONE" }, false)).toBe("ALGO");
+  });
+
+  it("returns null for an AMBIGUOUS history so no modality is continued", () => {
+    const lineage = { kind: "AMBIGUOUS", modalities: ["ALGO", "STANDARD"] } as const;
+    expect(resolveTakeProfitModality(lineage, true)).toBeNull();
+    expect(resolveTakeProfitModality(lineage, false)).toBeNull();
   });
 });

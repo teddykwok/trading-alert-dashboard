@@ -7,6 +7,7 @@ import { naturalWindowAdmitsDirection, naturalWindowState } from "./natural-auth
 import { connectorEnvironmentMatches } from "../binance/binance-environment";
 import { BinanceError } from "../binance/binance.errors";
 import { profileLockKey } from "./profile-lock";
+import { resolveTakeProfitModality, takeProfitLineage } from "./protection-lifecycle";
 import { env } from "../../config/env";
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { NotFoundError } from "../../utils/errors";
@@ -379,6 +380,27 @@ export class SafetyAdmissionService {
 
       const local = await this.buildLocalSnapshot(tx, execution);
 
+      /**
+       * Which modality this execution's FIRST take profit would use.
+       *
+       * Read from durable rows rather than assumed: a PLAN_READY execution
+       * normally has none, but "normally" is not a guarantee worth encoding,
+       * and the same resolver the protection lifecycle uses is the only thing
+       * that may answer this — durable lineage wins over configuration, and an
+       * AMBIGUOUS history resolves to null so no modality is continued.
+       */
+      const protectionRows = await tx.binanceOrder.findMany({
+        where: { tradeExecutionId: execution.id },
+        select: { role: true, orderType: true },
+      });
+      const intendedTakeProfitModality =
+        execution.takeProfit === null
+          ? null
+          : resolveTakeProfitModality(
+              takeProfitLineage(protectionRows),
+              env.EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED
+            );
+
       let result = evaluateSafetyAdmission({
         evaluatedAt: input.evaluatedAt,
         proposed: {
@@ -398,6 +420,9 @@ export class SafetyAdmissionService {
           marginPlanStatus: readPlanStatus(execution.marginPlanSnapshot),
           selectedLeverage: execution.selectedLeverage,
           hasMarginPlanSnapshot: execution.marginPlanSnapshot !== null,
+          plannedQuantity: execution.plannedQuantity.toString(),
+          takeProfit: execution.takeProfit?.toString() ?? null,
+          intendedTakeProfitModality,
         },
         policy: effective,
         local,
@@ -699,6 +724,9 @@ export class SafetyAdmissionService {
         // reader — decides what a missing asset means.
         quoteAsset: inspection.filters.quoteAsset,
         marginAsset: inspection.filters.marginAsset,
+        // Verbatim, nulls included — the engine decides what a missing floor
+        // means, exactly as it does for the assets above.
+        minNotional: inspection.filters.minNotional,
         hasFiltersSnapshot: inspection.filters.tickSize !== null && inspection.filters.stepSize !== null,
         hasBracketSnapshot: inspection.brackets.length > 0,
       };
@@ -758,6 +786,8 @@ const UNAVAILABLE_SYMBOL: SymbolStateSnapshot = {
   // Null, never "USDT". An unread symbol must never look eligible.
   quoteAsset: null,
   marginAsset: null,
+  // Null, never a number. An unread floor is not a floor of zero.
+  minNotional: null,
   hasFiltersSnapshot: false,
   hasBracketSnapshot: false,
 };

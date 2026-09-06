@@ -122,6 +122,7 @@ const symbolState = (): SymbolStateSnapshot => ({
   contractType: "PERPETUAL",
   quoteAsset: "USDT",
   marginAsset: "USDT",
+  minNotional: "5",
   hasFiltersSnapshot: true,
   hasBracketSnapshot: true,
 });

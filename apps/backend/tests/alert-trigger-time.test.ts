@@ -65,6 +65,9 @@ function evaluateFreshness(input: { signalTriggeredAt: Date | null; evaluatedAt:
       marginPlanStatus: "READY",
       selectedLeverage: 10,
       hasMarginPlanSnapshot: true,
+      plannedQuantity: "1",
+      takeProfit: null,
+      intendedTakeProfitModality: null,
     },
     policy: {
       killSwitchActive: false,
@@ -112,6 +115,7 @@ function evaluateFreshness(input: { signalTriggeredAt: Date | null; evaluatedAt:
       contractType: "PERPETUAL",
       quoteAsset: "USDT",
       marginAsset: "USDT",
+      minNotional: "5",
       hasFiltersSnapshot: true,
       hasBracketSnapshot: true,
     } as unknown as SafetyEvaluationInput["symbolState"],

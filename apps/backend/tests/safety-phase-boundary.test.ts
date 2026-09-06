@@ -39,9 +39,41 @@ const PHASE_5_FILES = [
 describe("pure engine purity", () => {
   const engine = readCode("safety-engine.ts");
 
-  it("imports nothing but decimal support and the capacity classification", () => {
+  it("imports nothing but decimal support, capacity classification and the take-profit floor", () => {
+    /**
+     * A DELIBERATELY short allow-list. The engine may reach for arbitrary
+     * precision, the capacity classification it decides with, and one
+     * narrowly-scoped domain rule — and nothing else.
+     *
+     * `./take-profit-notional` exists precisely so this dependency is not on
+     * the protection LIFECYCLE. The engine and the lifecycle must agree on the
+     * standard take-profit minimum-notional comparison, but neither may depend
+     * on the other to get it: a decision engine pointed at a lifecycle module
+     * is the wrong direction however pure that module happens to be today, and
+     * a second copy of the formula is how the two drift apart. Both depend on
+     * the rule instead.
+     */
     const imports = [...engine.matchAll(/^import .*? from "([^"]+)";$/gm)].map((match) => match[1]);
-    expect(imports.sort()).toEqual(["./capacity-status", "@prisma/client"]);
+    expect(imports.sort()).toEqual(["./capacity-status", "./take-profit-notional", "@prisma/client"]);
+  });
+
+  it("still depends on no lifecycle, service or infrastructure module", () => {
+    // The property the allow-list above exists to protect, asserted directly so
+    // widening that list can never quietly re-introduce the coupling.
+    const imports = [...engine.matchAll(/^import .*? from "([^"]+)";$/gm)].map((match) => match[1]);
+    for (const forbidden of ["lifecycle", "service", "orchestrator", "client", "repository"]) {
+      expect(imports.filter((name) => name.startsWith(".")).join(" ")).not.toContain(forbidden);
+    }
+  });
+
+  it("the shared take-profit floor module is itself pure", () => {
+    // The engine's purity is only as good as what it imports.
+    const shared = readCode("take-profit-notional.ts");
+    const imports = [...shared.matchAll(/^import .*? from "([^"]+)";$/gm)].map((match) => match[1]);
+    expect(imports).toEqual(["@prisma/client"]);
+    for (const forbidden of ["process.env", "Date.now()", "new Date()", "fetch(", "prisma.", "console.", "logger."]) {
+      expect(shared).not.toContain(forbidden);
+    }
   });
 
   it("never reads a clock", () => {

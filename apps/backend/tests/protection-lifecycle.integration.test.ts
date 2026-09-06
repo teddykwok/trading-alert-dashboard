@@ -7631,6 +7631,31 @@ describe("pair take-profit submission freshness", () => {
     await clearAlerts(execution.id);
   });
 
+  maybe()("9b. an under-minimum take profit is never reported as an invalid TRIGGER", async () => {
+    /**
+     * The FLOCKUSDT mislabel, as a regression.
+     *
+     * Its SHORT trigger sat correctly below the mark; only the notional was
+     * short (4.46611 against a floor of 5). Reporting
+     * TAKE_PROFIT_TRIGGER_INVALID sent the operator to inspect a price that was
+     * never wrong. The reason an operator sees must name the real condition.
+     */
+    const execution = await filledExecution();
+    shrinkAfterReservation("0.0005");
+
+    const outcome = await protect(execution);
+    expect(outcome.reasonCode).toBe("PROTECTION_QUANTITY_UNSUPPORTED");
+    expect(outcome.reasonCode).not.toBe("TAKE_PROFIT_TRIGGER_INVALID");
+
+    // And the same accurate reason must reach the durable operator surfaces,
+    // not just the return value.
+    const alerts = await prisma!.criticalAlert.findMany({ where: { tradeExecutionId: execution.id } });
+    for (const alert of alerts) {
+      expect(alert.reasonCode).not.toBe("TAKE_PROFIT_TRIGGER_INVALID");
+    }
+    await clearAlerts(execution.id);
+  });
+
   maybe()("10. after a refresh a worker holding the stale quantity cannot claim it", async () => {
     const execution = await filledExecution();
     const before = "0.1";
