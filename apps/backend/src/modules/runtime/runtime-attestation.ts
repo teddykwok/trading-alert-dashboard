@@ -120,8 +120,39 @@ export interface ReconciliationAttestation {
      * the count failed, which is distinct from an empty pool.
      */
     reconcilableTotal: number | null;
-    /** Whether the fairness cursor was mid-rotation. Carries no row identity. */
+    /** Whether the fairness cursor was mid-rotation. */
     cursorActive: boolean;
+    /**
+     * One entry per execution SERVED by the last pass, bounded by the batch
+     * size and replaced wholesale each tick.
+     *
+     * This block, and ONLY this block, carries a row identity — the execution
+     * id. Every field above it stays identity-free, which is the invariant the
+     * fairness suite still enforces. The exception was made after a live
+     * incident: "reached and did nothing" and "never reached" leave identical
+     * durable state, the worker's stdout is discarded by the launcher, and the
+     * question is otherwise unanswerable from any evidence the system keeps.
+     *
+     * The SYMBOL is deliberately absent. An execution id answers the question;
+     * a symbol would add a second, more legible identifier for no gain.
+     *
+     * Ids, statuses and enum names only — no credential, token, signature,
+     * URL, quantity, price, order id or exchange payload.
+     *
+     * WHERE THIS CAN BE READ: the worker's attestation record only — a local
+     * process / local Redis boundary. It is NOT served by `/health`, and it is
+     * NOT part of `TradingControlAttestationDto`, so it reaches no public and
+     * no operator HTTP endpoint. Nothing here should be described as
+     * authenticated: the Redis instance carrying it has no password today, and
+     * it already holds the account identifier and gate values.
+     */
+    rows: {
+      executionId: string;
+      statusBefore: string;
+      reasonCode: string | null;
+      positionObservation: "FLAT" | "NON_ZERO" | "UNAVAILABLE" | "NOT_READ";
+      errorCode: string | null;
+    }[];
   } | null;
 }
 

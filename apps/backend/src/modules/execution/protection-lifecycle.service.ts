@@ -116,6 +116,15 @@ export interface VerifiedCoverageSnapshot {
   verifiedAt: Date;
 }
 
+/**
+ * What the authoritative position read returned, when one was made.
+ *
+ * TELEMETRY ONLY. Nothing branches on it: it records a value the caller had
+ * already computed so an operator can tell the two write-free closure returns
+ * apart, which is otherwise impossible from durable state alone.
+ */
+export type PositionObservation = "FLAT" | "NON_ZERO" | "UNAVAILABLE" | "NOT_READ";
+
 export interface ProtectionOutcome {
   ok: boolean;
   reasonCode: ProtectionReasonCode;
@@ -123,6 +132,8 @@ export interface ProtectionOutcome {
   execution: TradeExecution;
   protection: ExecutionProtectionState | null;
   mutationsDispatched: number;
+  /** Defaults to NOT_READ: most paths never reach a position read at all. */
+  positionObservation?: PositionObservation;
 }
 
 /**
@@ -938,10 +949,19 @@ export class ProtectionLifecycleService {
 
     const position = await this.readPosition(execution.symbol, positionSide);
     if (position === "UNAVAILABLE") {
-      return this.outcome(false, "POSITION_STATE_UNAVAILABLE", "Position state could not be read.", execution, protection);
+      return this.outcome(
+        false,
+        "POSITION_STATE_UNAVAILABLE",
+        "Position state could not be read.",
+        execution,
+        protection,
+        "UNAVAILABLE"
+      );
     }
 
     const remaining = position === null ? "0" : normalizeOpenQuantity(position.quantity, direction).quantity;
+    // Recorded from the value just computed — no second read, no branch.
+    const observation: PositionObservation = new D(remaining).abs().isZero() ? "FLAT" : "NON_ZERO";
 
     // Refresh every local protection order from the exchange.
     const orders = await this.loadProtectionOrders(execution.id);
@@ -1006,7 +1026,14 @@ export class ProtectionLifecycleService {
     }
 
     if (!closure.positionClosed) {
-      return this.outcome(false, "PROTECTION_COVERAGE_INCOMPLETE", "Position is still open.", execution, protection);
+      return this.outcome(
+        false,
+        "PROTECTION_COVERAGE_INCOMPLETE",
+        "Position is still open.",
+        execution,
+        protection,
+        observation
+      );
     }
 
     // ---------------------------------------------------------------------
@@ -4981,8 +5008,17 @@ export class ProtectionLifecycleService {
     reasonCode: ProtectionReasonCode,
     message: string,
     execution: TradeExecution,
-    protection: ExecutionProtectionState | null = null
+    protection: ExecutionProtectionState | null = null,
+    positionObservation: PositionObservation = "NOT_READ"
   ): ProtectionOutcome {
-    return { ok, reasonCode, message, execution, protection, mutationsDispatched: this.mutations.mutationsDispatched };
+    return {
+      ok,
+      reasonCode,
+      message,
+      execution,
+      protection,
+      mutationsDispatched: this.mutations.mutationsDispatched,
+      positionObservation,
+    };
   }
 }

@@ -61,6 +61,12 @@ function harness(options: {
   softOpenPositionTarget?: number;
   /** null = no policy row exists for the profile. */
   policyRow?: null;
+  /** Reason code the closure reconciliation returns. */
+  closureReasonCode?: string;
+  /** Position observation the closure reconciliation reports. */
+  closurePositionObservation?: "FLAT" | "NON_ZERO" | "UNAVAILABLE" | "NOT_READ";
+  /** Execution id whose reconciliation throws, to exercise error capture. */
+  throwForExecutionId?: string;
 } = {}) {
   const calls: Call[] = [];
   const executions = options.executions ?? [];
@@ -88,10 +94,19 @@ function harness(options: {
         : entryCall && options.entryResultStatus !== undefined
           ? options.entryResultStatus
           : (source?.status as string | undefined);
+    if (options.throwForExecutionId === input.executionId) {
+      throw new TypeError("stubbed reconciliation failure");
+    }
     return {
       mutationsDispatched: mutations,
       execution: { id: input.executionId, version: input.expectedVersion + 1, status },
-      reasonCode: "OK",
+      reasonCode:
+        method === "reconcileProtectionAndClosure" && options.closureReasonCode !== undefined
+          ? options.closureReasonCode
+          : "OK",
+      ...(method === "reconcileProtectionAndClosure" && options.closurePositionObservation !== undefined
+        ? { positionObservation: options.closurePositionObservation }
+        : {}),
     };
   };
 
@@ -171,6 +186,7 @@ function harness(options: {
 
 const execution = (overrides: Record<string, unknown> = {}) => ({
   id: "exec-1",
+  symbol: "SYNTHUSDT",
   version: 3,
   status: "PLAN_READY",
   executionProfileId: "profile-1",
@@ -1029,5 +1045,159 @@ describe("S. same-tick protection", () => {
     expect(
       source.match(/protection\.ensureProtectionForExposure\(\{\s*\.\.\.input,\s*expectedVersion: reconciledExecution\.version/g) ?? []
     ).toHaveLength(1);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Bounded reconciliation diagnostics
+// ---------------------------------------------------------------------------
+
+describe("a tick reports which rows it served and what they decided", () => {
+  /**
+   * These exist because a live incident could not be diagnosed: an execution
+   * that is "reached and does nothing" and one that is "never reached" leave
+   * identical durable state, and the launcher discards worker stdout, so the
+   * per-row log line goes to NUL. The counters alone cannot separate them.
+   */
+  const rows = (result: { rows: Array<Record<string, unknown>> }) => result.rows;
+
+  it("A. captures the served ids exactly, in order", async () => {
+    const { orchestrator } = harness({
+      executions: [
+        execution({ id: "a", status: "PROTECTED" }),
+        execution({ id: "b", status: "ENTRY_PENDING" }),
+        execution({ id: "c", status: "MANUAL_INTERVENTION" }),
+      ],
+    });
+    const result = await orchestrator.runExecutionReconciliationTick();
+    expect(rows(result).map((row) => row.executionId)).toEqual(["a", "b", "c"]);
+    expect(result.inspected).toBe(3);
+    // Selection is answerable without inferring it from durable writes.
+    expect(rows(result).map((row) => row.statusBefore)).toEqual([
+      "PROTECTED",
+      "ENTRY_PENDING",
+      "MANUAL_INTERVENTION",
+    ]);
+  });
+
+  it("B. never reports more rows than the batch served", async () => {
+    const many = Array.from({ length: 12 }, (_, index) =>
+      execution({ id: `e${index}`, status: "PROTECTED" })
+    );
+    const { orchestrator } = harness({ executions: many });
+    const result = await orchestrator.runExecutionReconciliationTick({ batchSize: 4 });
+    // The stub returns every row, so this pins the bound to what was SERVED.
+    expect(rows(result).length).toBe(result.inspected);
+    expect(rows(result).length).toBeLessThanOrEqual(many.length);
+  });
+
+  it("C. makes POSITION_STATE_UNAVAILABLE visible", async () => {
+    const { orchestrator } = harness({
+      executions: [execution({ id: "zro", status: "MANUAL_INTERVENTION" })],
+      closureResultStatus: "MANUAL_INTERVENTION",
+      closureReasonCode: "POSITION_STATE_UNAVAILABLE",
+      closurePositionObservation: "UNAVAILABLE",
+    });
+    const result = await orchestrator.runExecutionReconciliationTick();
+    expect(rows(result)[0]).toMatchObject({
+      executionId: "zro",
+      statusBefore: "MANUAL_INTERVENTION",
+      reasonCode: "POSITION_STATE_UNAVAILABLE",
+      positionObservation: "UNAVAILABLE",
+      errorCode: null,
+    });
+  });
+
+  it("D. makes the write-free 'position still open' return visible", async () => {
+    // Same status and the same absence of durable change as C — only the
+    // diagnostic separates them, which is the whole point.
+    const { orchestrator } = harness({
+      executions: [execution({ id: "zro", status: "MANUAL_INTERVENTION" })],
+      closureResultStatus: "MANUAL_INTERVENTION",
+      closureReasonCode: "PROTECTION_COVERAGE_INCOMPLETE",
+      closurePositionObservation: "NON_ZERO",
+    });
+    const result = await orchestrator.runExecutionReconciliationTick();
+    expect(rows(result)[0]).toMatchObject({
+      reasonCode: "PROTECTION_COVERAGE_INCOMPLETE",
+      positionObservation: "NON_ZERO",
+    });
+  });
+
+  it("E. makes a flat closure visible", async () => {
+    const { orchestrator } = harness({
+      executions: [execution({ id: "zro", status: "MANUAL_INTERVENTION" })],
+      closureResultStatus: "CLOSED_TP",
+      closureReasonCode: "PROTECTION_VERIFIED",
+      closurePositionObservation: "FLAT",
+    });
+    const result = await orchestrator.runExecutionReconciliationTick();
+    expect(rows(result)[0]).toMatchObject({
+      reasonCode: "PROTECTION_VERIFIED",
+      positionObservation: "FLAT",
+      errorCode: null,
+    });
+  });
+
+  it("F. makes a per-row throw visible, by class name only", async () => {
+    const { orchestrator } = harness({
+      executions: [execution({ id: "boom", status: "MANUAL_INTERVENTION" })],
+      throwForExecutionId: "boom",
+    });
+    const result = await orchestrator.runExecutionReconciliationTick();
+    expect(rows(result)[0].errorCode).toBe("TypeError");
+    // The row is still reported rather than vanishing with the exception.
+    expect(rows(result)[0].executionId).toBe("boom");
+    // And the throw is still swallowed: the batch completes as before.
+    expect(result.failed).toBe(false);
+  });
+
+  it("G. adds no exchange call of its own", async () => {
+    const { orchestrator, calls } = harness({
+      executions: [execution({ id: "zro", status: "MANUAL_INTERVENTION" })],
+      closureResultStatus: "MANUAL_INTERVENTION",
+    });
+    await orchestrator.runExecutionReconciliationTick();
+    // Exactly the calls the routing already made — the diagnostic reads values
+    // those calls returned and never asks the exchange anything itself.
+    expect(calls.map((call) => call.method)).toEqual([
+      "reconcileProtectionAndClosure",
+      "attemptProtectionRecovery",
+    ]);
+  });
+
+  it("H. leaves cursor and selection semantics untouched", async () => {
+    const many = Array.from({ length: 6 }, (_, index) =>
+      execution({ id: `e${index}`, status: "PROTECTED" })
+    );
+    const { orchestrator } = harness({ executions: many });
+    const full = await orchestrator.runExecutionReconciliationTick({ batchSize: 6 });
+    // A full window keeps the cursor; the diagnostic does not disturb it.
+    expect(full.cursorActive).toBe(true);
+    const short = await orchestrator.runExecutionReconciliationTick({ batchSize: 10 });
+    expect(short.cursorActive).toBe(false);
+  });
+
+  it("I. carries ids and enums only — never a secret-bearing field", async () => {
+    const { orchestrator } = harness({
+      executions: [execution({ id: "zro", status: "MANUAL_INTERVENTION" })],
+      closureResultStatus: "MANUAL_INTERVENTION",
+    });
+    const result = await orchestrator.runExecutionReconciliationTick();
+    expect(Object.keys(rows(result)[0]).sort()).toEqual([
+      "errorCode",
+      "executionId",
+      "positionObservation",
+      "reasonCode",
+      "statusBefore",
+    ]);
+    // The symbol is deliberately absent: the id answers the question and a
+    // symbol would add a second, more legible identifier for no gain.
+    expect(JSON.stringify(rows(result))).not.toContain("SYNTHUSDT");
+    const serialized = JSON.stringify(rows(result));
+    for (const forbidden of ["apiKey", "secret", "signature", "authorization", "token", "postgres", "redis", "http"]) {
+      expect(serialized.toLowerCase()).not.toContain(forbidden.toLowerCase());
+    }
   });
 });

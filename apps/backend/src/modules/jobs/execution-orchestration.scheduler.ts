@@ -8,7 +8,19 @@ import { ExecutionService } from "../execution/execution.service";
 import { ProtectionLifecycleService } from "../execution/protection-lifecycle.service";
 import { CriticalAlertService } from "../execution/critical-alert.service";
 import { ExecutionOrchestrator } from "../execution/execution-orchestrator";
-import type { ReconcileTickResult } from "../execution/execution-orchestrator";
+import type {
+  ReconcileTickResult,
+  ReconciliationRowDiagnostic,
+} from "../execution/execution-orchestrator";
+
+/**
+ * Hard ceiling on published diagnostic rows.
+ *
+ * The batch is already bounded by EXECUTION_RECONCILE_BATCH_SIZE (max 50), so
+ * this is a second, independent bound: telemetry that rides a heartbeat must
+ * not be able to grow because a limit elsewhere was raised.
+ */
+const MAX_PUBLISHED_DIAGNOSTIC_ROWS = 50;
 
 /**
  * Phase 11A.1 — production registration of the execution orchestrator.
@@ -135,6 +147,7 @@ export function reconciliationAttestation(): {
     recoveryPending: number;
     reconcilableTotal: number | null;
     cursorActive: boolean;
+    rows: ReconciliationRowDiagnostic[];
   } | null;
 } {
   return {
@@ -156,6 +169,12 @@ export function reconciliationAttestation(): {
             // one tick covers rather than as the amount of work outstanding.
             reconcilableTotal: lastTickResult.reconcilableTotal,
             cursorActive: lastTickResult.cursorActive,
+            // Already bounded by the batch size where it is built; sliced again
+            // here so the published payload can never grow if that ever changes.
+            // `?? []` is not defensive padding: telemetry that can throw would
+            // take down the heartbeat that carries the health signal, so a
+            // result missing the field publishes an empty list instead.
+            rows: (lastTickResult.rows ?? []).slice(0, MAX_PUBLISHED_DIAGNOSTIC_ROWS),
           },
   };
 }

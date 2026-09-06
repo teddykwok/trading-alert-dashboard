@@ -89,6 +89,7 @@ function orchestratorReturning(
     reconcilableTotal: null,
     cursorActive: false,
     failed: false,
+    rows: [],
     ...result,
   };
   const run = async () => {
@@ -275,6 +276,7 @@ describe("T5. heartbeat activity is not reconciliation activity", () => {
       recoveryPending: 3,
       reconcilableTotal: null,
       cursorActive: false,
+      rows: [],
     });
   });
 });
@@ -373,7 +375,7 @@ describe("T8/T10. counters and unchanged health semantics", () => {
     );
     expect(reconciliationAttestation().lastTickResult).toEqual({
       inspected: 10, attempted: 5, progressed: 5, recoveryPending: 0,
-      reconcilableTotal: null, cursorActive: false,
+      reconcilableTotal: null, cursorActive: false, rows: [],
     });
 
     // A failing pass must not overwrite them with its own numbers.
@@ -382,7 +384,7 @@ describe("T8/T10. counters and unchanged health semantics", () => {
     );
     expect(reconciliationAttestation().lastTickResult).toEqual({
       inspected: 10, attempted: 5, progressed: 5, recoveryPending: 0,
-      reconcilableTotal: null, cursorActive: false,
+      reconcilableTotal: null, cursorActive: false, rows: [],
     });
 
     // A later good pass replaces them wholesale.
@@ -391,7 +393,7 @@ describe("T8/T10. counters and unchanged health semantics", () => {
     );
     expect(reconciliationAttestation().lastTickResult).toEqual({
       inspected: 1, attempted: 0, progressed: 0, recoveryPending: 2,
-      reconcilableTotal: null, cursorActive: false,
+      reconcilableTotal: null, cursorActive: false, rows: [],
     });
   });
 
@@ -466,6 +468,7 @@ describe("B7. reconciliation backlog reaches the published payload", () => {
       recoveryPending: 1,
       reconcilableTotal: 327,
       cursorActive: true,
+      rows: [],
     });
     // Additive optional fields inside an optional block. No version bump.
     expect(payload.schemaVersion).toBe(RUNTIME_ATTESTATION_SCHEMA_VERSION);

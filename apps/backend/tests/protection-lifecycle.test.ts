@@ -963,3 +963,38 @@ describe("take-profit modality resolution: durable history wins over configurati
     expect(resolveTakeProfitModality(lineage, false)).toBeNull();
   });
 });
+
+
+describe("the ZRO decision shape is unchanged by the diagnostics", () => {
+  /**
+   * The live incident's exact geometry, as a behaviour pin.
+   *
+   * The observability change must not alter what closure DECIDES — only make
+   * the decision visible. If this ever stops saying TAKE_PROFIT, something
+   * changed trading behaviour, not telemetry.
+   */
+  it("flat + take profit filled still classifies as TAKE_PROFIT", () => {
+    const closure = classifyClosure({
+      stopStatus: null,
+      takeProfitStatus: "FILLED",
+      emergencyFilled: false,
+      remainingPositionQuantity: "0",
+    });
+    expect(closure.reason).toBe("TAKE_PROFIT");
+    expect(closure.positionClosed).toBe(true);
+    expect(closure.partialProtectionExit).toBe(false);
+  });
+
+  it("a non-zero read with a fired leg still escalates as a partial exit", () => {
+    // The 11:12:20 escalation. Unchanged: this task fixes nothing here.
+    const closure = classifyClosure({
+      stopStatus: null,
+      takeProfitStatus: "FILLED",
+      emergencyFilled: false,
+      remainingPositionQuantity: "68.8",
+    });
+    expect(closure.partialProtectionExit).toBe(true);
+    expect(closure.reasonCode).toBe("PARTIAL_PROTECTION_EXIT");
+    expect(closure.positionClosed).toBe(false);
+  });
+});

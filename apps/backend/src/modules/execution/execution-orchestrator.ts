@@ -4,7 +4,7 @@ import { logger } from "../../config/logger";
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import type { EntryLifecycleService } from "./entry-lifecycle.service";
 import type { ExecutionService } from "./execution.service";
-import type { ProtectionLifecycleService } from "./protection-lifecycle.service";
+import type { PositionObservation, ProtectionLifecycleService } from "./protection-lifecycle.service";
 import type { SafetyAdmissionService } from "./safety-admission.service";
 // The SAME open-position classification and min-merge admission uses, so the
 // soft-target decision here cannot drift from the one the safety engine makes.
@@ -186,6 +186,58 @@ export interface ReconcileTickResult {
    */
   cursorActive: boolean;
   failed: boolean;
+  /**
+   * One entry per execution SERVED by this tick, in the order served.
+   *
+   * Bounded by construction: the loop that fills it iterates the batch, so it
+   * can never hold more than `batchSize` entries, and each tick builds a fresh
+   * array rather than appending to the last one.
+   *
+   * This exists because "reached and did nothing" and "never reached" are
+   * indistinguishable from durable state, and the launcher spawns the worker
+   * with `stdio: "ignore"`, so a per-row log line goes to NUL. A live incident
+   * turned on exactly that ambiguity and could not be resolved from evidence.
+   *
+   * Telemetry only. Nothing reads it to make a decision.
+   */
+  rows: ReconciliationRowDiagnostic[];
+}
+
+/**
+ * What one served execution did, in terms an operator can act on.
+ *
+ * Deliberately reuses the vocabulary the services already return — the
+ * lifecycle `reasonCode` and the two statuses — rather than inventing a
+ * parallel outcome enum that could drift from them. `positionObservation` is
+ * the one addition, because it is the only thing that separates the two
+ * write-free closure returns from each other.
+ *
+ * Carries NO credential, token, signature, URL, quantity, price or exchange
+ * payload — ids, statuses and enum names only.
+ */
+export interface ReconciliationRowDiagnostic {
+  /**
+   * The ONLY row identity in this payload, and the only one anywhere in
+   * reconciliation telemetry.
+   *
+   * Counters, cursor state and every pre-existing field stay identity-free —
+   * that invariant is unchanged and still enforced. This block is the narrow
+   * exception, because the question it exists to answer ("was THIS execution
+   * served, and what did it see?") cannot be asked without naming the row.
+   * Deliberately NOT the symbol: an id answers it and a symbol adds a second,
+   * more legible identifier for no diagnostic gain.
+   */
+  executionId: string;
+  /** Which lifecycle branch the row was routed down. */
+  statusBefore: string;
+  /** The lifecycle reason the row's own service returned, when it returned one. */
+  reasonCode: string | null;
+  positionObservation: PositionObservation;
+  /**
+   * The error CLASS NAME only, never a message or payload — a message can
+   * carry an endpoint or a request detail and this is published telemetry.
+   */
+  errorCode: string | null;
 }
 
 /** Where the last reconciliation window stopped, in the selector's ordering. */
@@ -330,6 +382,7 @@ export class ExecutionOrchestrator {
       reconcilableTotal: null,
       cursorActive: false,
       failed: false,
+      rows: [],
     };
     const versionsBefore = new Map<string, number>();
 
@@ -345,13 +398,37 @@ export class ExecutionOrchestrator {
 
       for (const execution of executions) {
         result.inspected += 1;
-        const dispatched = await this.reconcileOne(
-          execution,
-          evaluatedAt,
-          softTargetReached.has(execution.executionProfileId)
-        );
-        result.mutationsDispatched += dispatched;
-        if (dispatched > 0) result.advanced += 1;
+        const probe: {
+          reasonCode: string | null;
+          positionObservation: PositionObservation;
+          error: string | null;
+        } = { reasonCode: null, positionObservation: "NOT_READ", error: null };
+        // Recorded BEFORE the call so a throw still leaves the row visible.
+        const row: ReconciliationRowDiagnostic = {
+          executionId: execution.id,
+          statusBefore: execution.status,
+          reasonCode: null,
+          positionObservation: "NOT_READ",
+          errorCode: null,
+        };
+        result.rows.push(row);
+        try {
+          const dispatched = await this.reconcileOne(
+            execution,
+            evaluatedAt,
+            softTargetReached.has(execution.executionProfileId),
+            probe
+          );
+          result.mutationsDispatched += dispatched;
+          if (dispatched > 0) result.advanced += 1;
+        } finally {
+          // `finally`, so a row that threw still publishes what it managed to
+          // observe. `reconcileOne` swallows its own errors and records them,
+          // so this does not change who handles the exception.
+          row.reasonCode = probe.reasonCode;
+          row.positionObservation = probe.positionObservation;
+          row.errorCode = probe.error;
+        }
         versionsBefore.set(execution.id, execution.version);
       }
 
@@ -597,10 +674,34 @@ export class ExecutionOrchestrator {
     return protection.mutationsDispatched + withdrawn.mutationsDispatched;
   }
 
+  /**
+   * Copies an already-returned outcome into the diagnostic sink.
+   *
+   * Never throws and never reads anything: a telemetry helper that could fail
+   * would be able to abort the reconciliation it reports on, which is the one
+   * thing instrumentation must not do.
+   */
+  private recordProbe(
+    probe: { reasonCode: string | null; positionObservation: PositionObservation; error: string | null } | undefined,
+    outcome: { reasonCode?: string | null; positionObservation?: PositionObservation }
+  ): void {
+    if (!probe) return;
+    probe.reasonCode = outcome.reasonCode ?? probe.reasonCode;
+    if (outcome.positionObservation && outcome.positionObservation !== "NOT_READ") {
+      probe.positionObservation = outcome.positionObservation;
+    }
+  }
+
   private async reconcileOne(
     execution: TradeExecution,
     evaluatedAt: Date,
-    softOpenTargetReached = false
+    softOpenTargetReached = false,
+    /**
+     * WRITE-ONLY diagnostic sink. Every branch below returns exactly what it
+     * returned before; this only records what those branches already computed,
+     * so nothing here can change a routing decision or an exchange call.
+     */
+    probe?: { reasonCode: string | null; positionObservation: PositionObservation; error: string | null }
   ): Promise<number> {
     const input = { executionId: execution.id, expectedVersion: execution.version, evaluatedAt };
 
@@ -731,6 +832,7 @@ export class ExecutionOrchestrator {
         // as it does today.
         case "ENTRY_FILLED": {
           const closure = await this.deps.protection.reconcileProtectionAndClosure(input);
+          this.recordProbe(probe, closure);
           // Terminalized, escalated, or otherwise moved on: closure owns it.
           if (closure.execution.status !== "ENTRY_FILLED") return closure.mutationsDispatched;
 
@@ -823,6 +925,7 @@ export class ExecutionOrchestrator {
         // before, so nothing about the live-exposure path changes.
         case "PLACING_PROTECTION": {
           const closure = await this.deps.protection.reconcileProtectionAndClosure(input);
+          this.recordProbe(probe, closure);
           // Terminalized, escalated, or otherwise moved on: closure owns it.
           if (closure.execution.status !== "PLACING_PROTECTION") return closure.mutationsDispatched;
 
@@ -853,6 +956,7 @@ export class ExecutionOrchestrator {
         // PROTECTED afterwards — the full health path runs too.
         case "PROTECTED": {
           const closure = await this.deps.protection.reconcileProtectionAndClosure(input);
+          this.recordProbe(probe, closure);
           // Terminalized, escalated, or otherwise moved on: closure owns it.
           if (closure.execution.status !== "PROTECTED") return closure.mutationsDispatched;
 
@@ -879,6 +983,7 @@ export class ExecutionOrchestrator {
         // straight through and stays exactly where it is.
         case "MANUAL_INTERVENTION": {
           const closure = await this.deps.protection.reconcileProtectionAndClosure(input);
+          this.recordProbe(probe, closure);
           if (closure.execution.status !== "MANUAL_INTERVENTION") return closure.mutationsDispatched;
 
           const recovery = await this.deps.protection.attemptProtectionRecovery({
@@ -894,6 +999,9 @@ export class ExecutionOrchestrator {
     } catch (error) {
       // One bad execution must not abort the whole batch.
       const detail = error instanceof Error ? error.message.slice(0, 200) : "unknown";
+      // The class NAME only. The message can carry an endpoint or request
+      // detail and this value is published on the worker heartbeat.
+      if (probe) probe.error = error instanceof Error ? error.constructor.name : "unknown";
       logger.warn(
         { executionId: execution.id, status: execution.status, error: detail },
         "Execution reconciliation failed for one execution — continuing with the rest"

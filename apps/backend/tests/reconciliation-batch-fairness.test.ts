@@ -782,18 +782,53 @@ describe("B1-B8. reconciliation backlog telemetry", () => {
     // rather than altered.
     const flags: boolean[] = [];
     const payloads: string[] = [];
+    const results: Array<Awaited<ReturnType<typeof worker.tick>>["result"]> = [];
     for (let index = 0; index < 3; index += 1) {
       const { result } = await worker.tick();
       flags.push(result.cursorActive);
       payloads.push(JSON.stringify(result));
+      results.push(result);
     }
     expect(flags).toEqual([true, true, false]);
 
-    // Nothing that could identify a row reaches telemetry.
-    for (const payload of payloads) {
+    /**
+     * The privacy invariant, NARROWED — not relaxed.
+     *
+     * Counters, cursor state and every other tick field remain completely
+     * identity-free, which is what this test has always protected and still
+     * does. The single exception is the bounded per-row diagnostic block,
+     * which may name the execution it served: an incident turned on the
+     * difference between "reached and did nothing" and "never reached", and
+     * those leave identical durable state while the worker's stdout is
+     * discarded by the launcher.
+     *
+     * The symbol stays forbidden EVERYWHERE, including inside that block.
+     */
+    for (let index = 0; index < payloads.length; index += 1) {
+      const result = results[index]!;
+      const { rows, ...withoutRows } = result;
+      const outsideRows = JSON.stringify(withoutRows);
+
       for (const row of [parked, ...planned]) {
-        expect(payload).not.toContain(row.id);
-        expect(payload).not.toContain(row.symbol);
+        // 1. No identity of any kind outside the bounded diagnostic block.
+        expect(outsideRows).not.toContain(row.id);
+        expect(outsideRows).not.toContain(row.symbol);
+        // 2. The symbol is forbidden inside it too.
+        expect(JSON.stringify(rows)).not.toContain(row.symbol);
+      }
+
+      // 3. Inside the block, the execution id is the ONE permitted identity,
+      //    and the block is bounded by what the tick actually served.
+      expect(rows.length).toBe(result.inspected);
+      expect(rows.length).toBeLessThanOrEqual(10);
+      for (const row of rows) {
+        expect(Object.keys(row).sort()).toEqual([
+          "errorCode",
+          "executionId",
+          "positionObservation",
+          "reasonCode",
+          "statusBefore",
+        ]);
       }
     }
   });
