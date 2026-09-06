@@ -75,8 +75,18 @@ interface AlgoOrderRow {
 
 interface Scenario {
   positionAmt: string | null;
-  /** Consumed one entry per position read, then falls back to positionAmt. */
+  /**
+   * Consumed one entry per position read, then falls back to positionAmt. The
+   * entry "UNAVAILABLE" makes that read throw instead, so a test can make one
+   * specific read in a sequence unreadable.
+   */
   positionAmtSequence: string[];
+  /** Counts every position read so a test can prove none was added. */
+  positionReadCalls: number;
+  /** When true, the open-order listings throw: evidence is unavailable. */
+  openOrdersUnavailable: boolean;
+  /** Counts every listing call so a test can prove none was made. */
+  openOrderListCalls: number;
   markPrice: string;
   liquidationPrice: string | null;
   isolatedMargin: string | null;
@@ -86,7 +96,11 @@ interface Scenario {
   contractType: string;
   positionMissing: boolean;
   algoOrders: Map<string, AlgoOrderRow>;
-  /** clientAlgoId values whose query must fail. */
+  /**
+   * Client ids whose DIRECT query must fail, on either endpoint. The listing is
+   * unaffected: a per-id query and the open-order book are separate calls, and
+   * the race being modelled is precisely one failing while the other answers.
+   */
   queryFailures: Set<string>;
   /** clientAlgoId -> how many further reads still answer -2013 despite existing. */
   invisibleReads: Map<string, number>;
@@ -126,6 +140,9 @@ function resetScenario() {
   Object.assign(scenario, {
     positionAmt: "0.100",
     positionAmtSequence: [],
+    positionReadCalls: 0,
+    openOrdersUnavailable: false,
+    openOrderListCalls: 0,
     markPrice: "100",
     liquidationPrice: "90",
     isolatedMargin: "3.00",
@@ -158,6 +175,11 @@ function resetScenario() {
     standardCancelFailure: null,
     onSubmitted: null,
   } satisfies Scenario);
+}
+
+/** Whether a status means the order is still resting on the live book. */
+function openOnExchange(status: string): boolean {
+  return !["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(status.toUpperCase());
 }
 
 function timeoutError(endpoint: string) {
@@ -196,17 +218,17 @@ const readOnlyStub = {
     };
   },
   async getPositionForSide(_symbol: string, positionSide: string) {
+    scenario.positionReadCalls += 1;
     if (scenario.positionMissing) return null;
+    const scripted = scenario.positionAmtSequence.length > 0 ? scenario.positionAmtSequence.shift()! : null;
+    if (scripted === "UNAVAILABLE") throw timeoutError("positionRisk");
     return {
       symbol: SYMBOL,
       positionSide,
       // A scripted sequence lets a test change the position BETWEEN reads, which
       // is the only way to exercise a race that opens after one observation and
       // closes before the next.
-      positionAmt:
-        scenario.positionAmtSequence.length > 0
-          ? (scenario.positionAmtSequence.shift() as string)
-          : scenario.positionAmt,
+      positionAmt: scripted ?? scenario.positionAmt,
       entryPrice: "100",
       markPrice: scenario.markPrice,
       liquidationPrice: scenario.liquidationPrice,
@@ -217,6 +239,23 @@ const readOnlyStub = {
       notional: "10",
       marginType: "isolated",
     };
+  },
+  async getOpenAlgoOrders(_symbol: string) {
+    scenario.openOrderListCalls += 1;
+    if (scenario.openOrdersUnavailable) throw timeoutError("openAlgoOrders");
+    // Derived from the SAME exchange state the direct query answers from, never
+    // a second list a test could set independently: a fixture must not be able
+    // to report an order as gone from the book while it is still live.
+    return [...scenario.algoOrders.values()]
+      .filter((row) => openOnExchange(row.algoStatus))
+      .map((row) => ({ clientAlgoId: row.clientAlgoId, algoStatus: row.algoStatus }));
+  },
+  async getOpenOrders(_symbol?: string) {
+    scenario.openOrderListCalls += 1;
+    if (scenario.openOrdersUnavailable) throw timeoutError("openOrders");
+    return [...scenario.standardOrders.entries()]
+      .filter(([, row]) => openOnExchange(row.status))
+      .map(([clientOrderId, row]) => ({ clientOrderId, status: row.status }));
   },
   async queryAlgoOrderByClientAlgoId(_symbol: string, clientAlgoId: string) {
     if (scenario.queryFailures.has(clientAlgoId)) throw timeoutError("algoOrder");
@@ -272,6 +311,7 @@ const readOnlyStub = {
   },
   async queryOrderByClientOrderId(_symbol: string, clientOrderId: string) {
     if (scenario.entryQueryUnavailable) throw timeoutError("order");
+    if (scenario.queryFailures.has(clientOrderId)) throw timeoutError("order");
     const row = scenario.standardOrders.get(clientOrderId);
     if (!row) {
       throw new BinanceError({ kind: "MALFORMED_RESPONSE", message: "Order does not exist", binanceCode: -2013, endpoint: "order" });
@@ -8999,6 +9039,362 @@ describe("standard limit take-profit submission", () => {
     expect(scenario.standardSubmitted).toEqual([]);
     expect(await takeProfitRows(execution.id)).toHaveLength(1);
     expect((await rowOf(execution.id, "TAKE_PROFIT", 1)).clientOrderId).toBe(tpIdOf(execution.id, 1));
+    await clearAlerts(execution.id);
+  });
+});
+
+// ===========================================================================
+// A protection order that closes the WHOLE position and the position reading
+// zero are not simultaneous at Binance. The fill lands on the order endpoint
+// first; positionRisk settles after. One read taken inside that window says
+// "filled, and exposure remains" - indistinguishable from a genuine partial
+// exit - and ZROUSDT was escalated to MANUAL_INTERVENTION and parked for hours
+// on exactly that reading, with the exchange already flat and clean.
+//
+// The same window auto-cancels the other leg, so the sibling's own
+// verification query can come back unresolved about an order that is already
+// gone. Both halves are covered here.
+// ===========================================================================
+
+describe("protection exit confirmation and sibling absence", () => {
+  const tpIdOf = (id: string) => buildClientOrderId(id, "TAKE_PROFIT", 1);
+  const stopIdOf = (id: string) => buildClientOrderId(id, "STOP_LOSS", 1);
+
+  const clearAlerts = async (id: string) =>
+    prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: id } });
+
+  const closeOut = async (id: string) =>
+    protectionService.reconcileProtectionAndClosure({
+      executionId: id,
+      expectedVersion: (await reload(id)).version,
+      evaluatedAt: at(),
+    });
+
+  /** Runs `run` with the standard-limit take-profit switch forced on. */
+  const withStandardTakeProfit = async <T>(run: () => Promise<T>): Promise<T> => {
+    const key = "EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED" as const;
+    const previous = (runtimeEnv as Record<string, unknown>)[key];
+    (runtimeEnv as Record<string, unknown>)[key] = true;
+    try {
+      return await run();
+    } finally {
+      (runtimeEnv as Record<string, unknown>)[key] = previous;
+    }
+  };
+
+  /**
+   * The ZRO shape, built by the real machinery: an ALGO STOP_MARKET and a
+   * STANDARD resting LIMIT take profit on one LONG position.
+   */
+  async function standardTakeProfitFixture() {
+    const execution = await filledExecution();
+    await withStandardTakeProfit(() => protect(execution));
+    const takeProfit = await prisma!.binanceOrder.findFirstOrThrow({
+      where: { tradeExecutionId: execution.id, role: "TAKE_PROFIT", generation: 1 },
+    });
+    expect(takeProfit.orderType).toBe("LIMIT");
+    expect(takeProfit.clientAlgoId).toBeNull();
+    scenario.mutations = [];
+    scenario.submitted = [];
+    scenario.standardSubmitted = [];
+    scenario.openOrderListCalls = 0;
+    scenario.positionReadCalls = 0;
+    return reload(execution.id);
+  }
+
+  /** Both protection legs conditional, which is the pre-switch default. */
+  async function algoFixture(direction: "LONG" | "SHORT" = "LONG") {
+    const execution = await filledExecution({ direction });
+    if (direction === "SHORT") scenario.positionAmt = "-0.100";
+    await protect(execution);
+    scenario.mutations = [];
+    scenario.submitted = [];
+    scenario.openOrderListCalls = 0;
+    scenario.positionReadCalls = 0;
+    return reload(execution.id);
+  }
+
+  /** The standard take profit fills for the whole position. */
+  const fillStandardTakeProfit = (id: string) => {
+    const row = scenario.standardOrders.get(tpIdOf(id))!;
+    row.status = "FILLED";
+    row.executedQty = "0.100";
+    row.avgPrice = "108";
+  };
+
+  /**
+   * Binance auto-cancels the other leg in the same moment, and the per-id
+   * verification query issued inside that window does not resolve.
+   */
+  const autoCancelledAlgoSibling = (id: string, role: "STOP_LOSS" | "TAKE_PROFIT") => {
+    const clientAlgoId = buildClientOrderId(id, role, 1);
+    scenario.algoOrders.get(clientAlgoId)!.algoStatus = "CANCELED";
+    scenario.queryFailures.add(clientAlgoId);
+  };
+
+  // ------------------------------------------------------- the ZRO regression
+
+  maybe()("1. a settling position read does not turn a full TP exit into a partial one", async () => {
+    const execution = await standardTakeProfitFixture();
+    fillStandardTakeProfit(execution.id);
+    autoCancelledAlgoSibling(execution.id, "STOP_LOSS");
+    // Read 1 still shows the whole position; every later read shows it flat.
+    scenario.positionAmtSequence = ["0.100"];
+    scenario.positionAmt = "0";
+
+    const outcome = await closeOut(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reasonCode).not.toBe("PARTIAL_PROTECTION_EXIT");
+    expect(outcome.reasonCode).not.toBe("SIBLING_CLEANUP_INCOMPLETE");
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_TP");
+    expect(closed.exitReason).toBe("TAKE_PROFIT");
+    expect(closed.requiresManualIntervention).toBe(false);
+    expect((await protectionOf(execution.id)).state).toBe("CLOSED");
+    // Nothing was sent to fix it: no duplicate protection, no emergency close,
+    // and no cancel of an order that was already gone.
+    expect(scenario.mutations).toEqual([]);
+    expect(scenario.submitted).toEqual([]);
+    expect(scenario.standardSubmitted).toEqual([]);
+  });
+
+  maybe()("2. it takes exactly ONE confirmation read, and only when a leg fired", async () => {
+    const execution = await standardTakeProfitFixture();
+    fillStandardTakeProfit(execution.id);
+    autoCancelledAlgoSibling(execution.id, "STOP_LOSS");
+    scenario.positionAmtSequence = ["0.100"];
+    scenario.positionAmt = "0";
+
+    await closeOut(execution.id);
+
+    // The closure path reads the position twice by design: once up front, and
+    // once after entry cleanup to prove the entry cannot refill. The
+    // confirmation is the third and last - no loop, no retry budget.
+    expect(scenario.positionReadCalls).toBe(3);
+    // And ONE listing, shared by every sibling that needed it.
+    expect(scenario.openOrderListCalls).toBe(1);
+  });
+
+  maybe()("3. a first read that is already flat adds no confirmation read at all", async () => {
+    const execution = await standardTakeProfitFixture();
+    fillStandardTakeProfit(execution.id);
+    scenario.positionAmt = "0";
+
+    await closeOut(execution.id);
+
+    expect((await reload(execution.id)).status).toBe("CLOSED_TP");
+    // The ordinary two reads, and not one more.
+    expect(scenario.positionReadCalls).toBe(2);
+    // Every sibling resolved on its own query, so the book was never listed.
+    expect(scenario.openOrderListCalls).toBe(0);
+  });
+
+  maybe()("4. an ordinary protected tick with nothing fired reads the position once", async () => {
+    const execution = await algoFixture();
+    scenario.positionAmt = "0.100";
+
+    const outcome = await closeOut(execution.id);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect(scenario.positionReadCalls).toBe(1);
+    expect(scenario.openOrderListCalls).toBe(0);
+    // Left exactly as it was: an open position is not a closure of any kind.
+    expect((await reload(execution.id)).status).toBe(execution.status);
+  });
+
+  // ------------------------------------------------------------- fail closed
+
+  maybe()("5. a genuinely partial exit still escalates", async () => {
+    const execution = await standardTakeProfitFixture();
+    const row = scenario.standardOrders.get(tpIdOf(execution.id))!;
+    row.status = "FILLED";
+    row.executedQty = "0.040";
+    row.origQty = "0.040";
+    row.avgPrice = "108";
+    // Both reads agree: the exposure is real.
+    scenario.positionAmt = "0.060";
+
+    const outcome = await closeOut(execution.id);
+
+    expect(outcome.reasonCode).toBe("PARTIAL_PROTECTION_EXIT");
+    const parked = await reload(execution.id);
+    expect(parked.status).toBe("MANUAL_INTERVENTION");
+    expect(parked.requiresManualIntervention).toBe(true);
+    expect(parked.status).not.toBe("CLOSED_TP");
+    expect(scenario.positionReadCalls).toBe(2);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("6. an unreadable confirmation is not flat, and never closes the trade", async () => {
+    const execution = await standardTakeProfitFixture();
+    fillStandardTakeProfit(execution.id);
+    autoCancelledAlgoSibling(execution.id, "STOP_LOSS");
+    // Read 1 sees exposure; the confirmation cannot be taken at all.
+    scenario.positionAmtSequence = ["0.100", "UNAVAILABLE"];
+    scenario.positionAmt = "0";
+
+    const outcome = await closeOut(execution.id);
+
+    expect(outcome.reasonCode).toBe("PARTIAL_PROTECTION_EXIT");
+    const parked = await reload(execution.id);
+    expect(parked.status).toBe("MANUAL_INTERVENTION");
+    expect(parked.status).not.toBe("CLOSED_TP");
+    await clearAlerts(execution.id);
+  });
+
+  // ----------------------------------------------------------- STOP symmetry
+
+  maybe()("7. the same race on a filled STOP converges to CLOSED_SL", async () => {
+    const execution = await standardTakeProfitFixture();
+    const stopId = stopIdOf(execution.id);
+    const stop = scenario.algoOrders.get(stopId)!;
+    stop.algoStatus = "FILLED";
+    stop.executedQty = "0.100";
+    stop.avgPrice = "96";
+    // The STANDARD take profit is the unresolved sibling this time: cancelled
+    // by the exchange, and its own query does not answer.
+    scenario.standardOrders.get(tpIdOf(execution.id))!.status = "CANCELED";
+    scenario.queryFailures.add(tpIdOf(execution.id));
+    scenario.positionAmtSequence = ["0.100"];
+    scenario.positionAmt = "0";
+
+    const outcome = await closeOut(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_SL");
+    expect(closed.exitReason).toBe("STOP_LOSS");
+    expect(closed.requiresManualIntervention).toBe(false);
+    expect(scenario.positionReadCalls).toBe(3);
+    expect(scenario.mutations).toEqual([]);
+  });
+
+  maybe()("8. a SHORT position confirms the same way", async () => {
+    const execution = await algoFixture("SHORT");
+    const takeProfit = scenario.algoOrders.get(tpIdOf(execution.id))!;
+    takeProfit.algoStatus = "FILLED";
+    takeProfit.executedQty = "0.100";
+    autoCancelledAlgoSibling(execution.id, "STOP_LOSS");
+    scenario.positionAmtSequence = ["-0.100"];
+    scenario.positionAmt = "0";
+
+    await closeOut(execution.id);
+
+    expect((await reload(execution.id)).status).toBe("CLOSED_TP");
+  });
+
+  // ------------------------------------------- absence must be PROVEN, always
+
+  maybe()("9. an unreadable book is not absence, and cleanup stays incomplete", async () => {
+    const execution = await standardTakeProfitFixture();
+    fillStandardTakeProfit(execution.id);
+    autoCancelledAlgoSibling(execution.id, "STOP_LOSS");
+    scenario.openOrdersUnavailable = true;
+    scenario.positionAmt = "0";
+
+    const outcome = await closeOut(execution.id);
+
+    expect(outcome.reasonCode).toBe("SIBLING_CLEANUP_INCOMPLETE");
+    expect((await reload(execution.id)).status).not.toBe("CLOSED_TP");
+    expect((await protectionOf(execution.id)).reasonCode).toBe("SIBLING_CLEANUP_INCOMPLETE");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("10. a sibling STILL RESTING on the book is not absent", async () => {
+    const execution = await standardTakeProfitFixture();
+    fillStandardTakeProfit(execution.id);
+    // The STOP is genuinely live; only its per-id query is unreadable. An
+    // UNKNOWN sibling is never cancelled blind, so nothing resolves it.
+    scenario.queryFailures.add(stopIdOf(execution.id));
+    scenario.positionAmt = "0";
+
+    const outcome = await closeOut(execution.id);
+
+    expect(outcome.reasonCode).toBe("SIBLING_CLEANUP_INCOMPLETE");
+    expect((await reload(execution.id)).status).not.toBe("CLOSED_TP");
+    // The listing was consulted and answered; it just did not say what a
+    // closure needs to hear.
+    expect(scenario.openOrderListCalls).toBe(1);
+    expect(scenario.mutations.filter((call) => call.startsWith("DELETE"))).toEqual([]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("11. absence alone never closes a trade whose position is not flat", async () => {
+    // Nothing about the live book says anything about exposure. With no leg
+    // fired and the position open, the closure never gets that far.
+    const execution = await standardTakeProfitFixture();
+    scenario.queryFailures.add(stopIdOf(execution.id));
+    scenario.positionAmt = "0.100";
+
+    const outcome = await closeOut(execution.id);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reasonCode).toBe("PROTECTION_COVERAGE_INCOMPLETE");
+    expect(scenario.openOrderListCalls).toBe(0);
+    expect((await reload(execution.id)).status).toBe(execution.status);
+  });
+
+  // ------------------------------------------------------ restart / self-heal
+
+  maybe()("12. a trade parked by this race converges on an ordinary later pass", async () => {
+    // The whole ZRO incident end to end, built by the real machinery: escalate
+    // on a settling read, then stay parked while the sibling is unverifiable,
+    // then close cleanly once the exchange can be read.
+    const execution = await standardTakeProfitFixture();
+    fillStandardTakeProfit(execution.id);
+    autoCancelledAlgoSibling(execution.id, "STOP_LOSS");
+
+    // Pass A: the position genuinely still reads non-zero, twice.
+    scenario.positionAmt = "0.100";
+    expect((await closeOut(execution.id)).reasonCode).toBe("PARTIAL_PROTECTION_EXIT");
+    const parked = await reload(execution.id);
+    expect(parked.status).toBe("MANUAL_INTERVENTION");
+    expect(parked.decisionReasonCode).toBe("PARTIAL_PROTECTION_EXIT");
+
+    // Pass B: flat now, but the book cannot be read, so it stays parked.
+    scenario.positionAmt = "0";
+    scenario.openOrdersUnavailable = true;
+    expect((await closeOut(execution.id)).reasonCode).toBe("SIBLING_CLEANUP_INCOMPLETE");
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+    const midway = await protectionOf(execution.id);
+    expect(midway.state).toBe("CLOSURE_CLEANUP");
+    expect(midway.reasonCode).toBe("SIBLING_CLEANUP_INCOMPLETE");
+
+    // Pass C: nothing changes except that the exchange can be read.
+    scenario.openOrdersUnavailable = false;
+    const outcome = await closeOut(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_TP");
+    expect(closed.exitReason).toBe("TAKE_PROFIT");
+    expect(closed.requiresManualIntervention).toBe(false);
+    expect((await protectionOf(execution.id)).state).toBe("CLOSED");
+    // Self-healed with no operator mutation of any kind.
+    expect(scenario.mutations).toEqual([]);
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("13. the STOP mirror of that recovery closes CLOSED_SL", async () => {
+    const execution = await algoFixture();
+    const stop = scenario.algoOrders.get(stopIdOf(execution.id))!;
+    stop.algoStatus = "FILLED";
+    stop.executedQty = "0.100";
+    autoCancelledAlgoSibling(execution.id, "TAKE_PROFIT");
+
+    scenario.positionAmt = "0.100";
+    expect((await closeOut(execution.id)).reasonCode).toBe("PARTIAL_PROTECTION_EXIT");
+    expect((await reload(execution.id)).status).toBe("MANUAL_INTERVENTION");
+
+    scenario.positionAmt = "0";
+    const outcome = await closeOut(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_SL");
+    expect(closed.requiresManualIntervention).toBe(false);
     await clearAlerts(execution.id);
   });
 });

@@ -34,6 +34,7 @@ import { protectionWorkingType, type ProtectionPolicy } from "./protection-polic
 import {
   calculateCoverage,
   protectionModality,
+  type ProtectionModality,
   readStandardOrderCoverage,
   takeProfitLineage,
   resolveTakeProfitModality,
@@ -961,7 +962,7 @@ export class ProtectionLifecycleService {
 
     const remaining = position === null ? "0" : normalizeOpenQuantity(position.quantity, direction).quantity;
     // Recorded from the value just computed — no second read, no branch.
-    const observation: PositionObservation = new D(remaining).abs().isZero() ? "FLAT" : "NON_ZERO";
+    let observation: PositionObservation = new D(remaining).abs().isZero() ? "FLAT" : "NON_ZERO";
 
     // Refresh every local protection order from the exchange.
     const orders = await this.loadProtectionOrders(execution.id);
@@ -1001,12 +1002,53 @@ export class ProtectionLifecycleService {
     const takeProfitFilled = observed.find((entry) => entry.order.role === "TAKE_PROFIT" && entry.status === "FILLED");
     const emergency = await this.loadOrder(execution.id, "EMERGENCY_CLOSE", 1);
 
-    const closure = classifyClosure({
-      stopStatus: stopFilled ? "FILLED" : null,
-      takeProfitStatus: takeProfitFilled ? "FILLED" : null,
+    const legs = {
+      stopStatus: stopFilled ? ("FILLED" as const) : null,
+      takeProfitStatus: takeProfitFilled ? ("FILLED" as const) : null,
       emergencyFilled: emergency?.status === "FILLED",
-      remainingPositionQuantity: remaining,
-    });
+    };
+    let closure = classifyClosure({ ...legs, remainingPositionQuantity: remaining });
+
+    /**
+     * ONE CONFIRMATION READ BEFORE CALLING A FULL EXIT A PARTIAL ONE.
+     *
+     * A protection order that closes the whole position and the position going
+     * to zero are not simultaneous at the exchange: the fill is visible on the
+     * order endpoint before positionRisk settles. A single read taken inside
+     * that window says "filled, and exposure remains", which is exactly what a
+     * genuine partial exit looks like — so a completely ordinary full
+     * TAKE-PROFIT closure was escalated to MANUAL_INTERVENTION, and stayed
+     * there. That was FLOCK's successor incident on ZROUSDT: TP filled the full
+     * 68.8, the next read still showed 68.8 open, and the trade was parked for
+     * hours before a later pass found the settled state and closed it CLOSED_TP
+     * on its own.
+     *
+     * So the SECOND read decides, and only in this one situation: a leg is
+     * authoritatively FILLED and the first read was non-zero. It is exactly one
+     * extra call — no loop, no sleep, no retry budget — and it happens nowhere
+     * else. An already-flat first read never reaches here, and neither does an
+     * ordinary protected position with nothing fired.
+     *
+     * Role-neutral by construction: `classifyClosure` is re-run with the same
+     * leg evidence, so a filled STOP converges to CLOSED_SL exactly as a filled
+     * TAKE_PROFIT converges to CLOSED_TP.
+     *
+     * FAIL CLOSED both other ways. Still non-zero means the exposure is real
+     * and the existing escalation stands. UNAVAILABLE proves nothing at all, so
+     * it must not be read as flat — the escalation stands there too, because
+     * the last thing we actually saw was live exposure behind a fired leg.
+     */
+    if (closure.partialProtectionExit) {
+      const confirmation = await this.readPosition(execution.symbol, positionSide);
+      if (confirmation !== "UNAVAILABLE") {
+        const confirmed =
+          confirmation === null ? "0" : normalizeOpenQuantity(confirmation.quantity, direction).quantity;
+        if (new D(confirmed).abs().isZero()) {
+          observation = "FLAT";
+          closure = classifyClosure({ ...legs, remainingPositionQuantity: confirmed });
+        }
+      }
+    }
 
     if (closure.partialProtectionExit) {
       // A protection order fired but exposure remains: never a clean closure.
@@ -1112,12 +1154,44 @@ export class ProtectionLifecycleService {
       status: entry.status,
     }));
     const plan = planSiblingCancellation({ siblings, positionClosed: true });
+    // At most ONE listing per modality per closure pass, shared by every
+    // sibling that needs it.
+    const absenceCache = new Map<ProtectionModality, Set<string> | null>();
 
     // An order whose state could not be read is NOT proof that there is
     // nothing left to cancel â€” cleanup stays incomplete until we can see it.
     // A CONFIRMED-ABSENT sibling is different: Binance proved that exact id
     // does not exist, so there is provably nothing to cancel.
-    let cleanupComplete = !observed.some((entry) => entry.status === "UNKNOWN");
+    /**
+     * INDEPENDENT ABSENCE EVIDENCE, for the one case a direct query cannot
+     * settle.
+     *
+     * A closing fill and the exchange's own cancellation of the other leg
+     * happen together, and a per-id query issued inside that window can come
+     * back unresolved about an order that is already gone. ZROUSDT hit exactly
+     * that: the STOP was auto-cancelled in the same second cleanup ran, its
+     * verification query did not confirm, and cleanup stayed incomplete while
+     * the order had in fact been CANCELED all along.
+     *
+     * The authoritative OPEN-ORDER listing answers a DIFFERENT question than
+     * the per-id query, which is what makes it evidence rather than a retry: an
+     * id absent from the live book is not live. It is consulted only when
+     * everything else is already settled - the position is proven flat and one
+     * of our own legs is proven FILLED - and only for siblings that are
+     * actually unresolved, so an ordinary tick never reaches it.
+     */
+    // One of OUR OWN protection legs is proven FILLED. Not "the position is
+    // closed": an emergency close or an external exit says nothing about why
+    // the other leg would be gone, and only a leg that actually fired explains
+    // the exchange cancelling its sibling underneath us.
+    const protectionLegFired = Boolean(stopFilled || takeProfitFilled);
+    let cleanupComplete = true;
+    for (const entry of observed) {
+      if (entry.status !== "UNKNOWN") continue;
+      const proven =
+        protectionLegFired && (await this.provenAbsentFromOpenOrders(execution, entry.order, absenceCache));
+      if (!proven) cleanupComplete = false;
+    }
     for (const sibling of plan.cancel) {
       const cancelled = await this.cancelSibling(execution, sibling, input.evaluatedAt);
       if (!cancelled) cleanupComplete = false;
@@ -1125,6 +1199,13 @@ export class ProtectionLifecycleService {
 
     if (!cleanupComplete) {
       await this.setProtectionState(protection.id, "CLOSURE_CLEANUP", "SIBLING_CLEANUP_INCOMPLETE", "Sibling cleanup is unresolved.");
+      // The alert TYPE is a persisted enum value and is deliberately left as
+      // it is; the reason code `SIBLING_CLEANUP_INCOMPLETE` is the accurate
+      // one and is what this branch actually means. What an operator reads,
+      // though, has to be true: this branch is reached whenever a sibling
+      // cannot be PROVEN resolved, which includes an order nobody ever tried
+      // to cancel because its state could not be read. Telling an operator to
+      // cancel it sends them looking for an order that may not exist.
       await this.alerts.raise({
         tradeExecutionId: execution.id,
         alertType: "SIBLING_CANCELLATION_FAILED",
@@ -1133,7 +1214,8 @@ export class ProtectionLifecycleService {
           symbol: execution.symbol,
           positionSide,
           protectionState: "CLOSURE_CLEANUP",
-          requiredAction: "Cancel the remaining protection orders manually.",
+          requiredAction:
+            "Protection cleanup is unverified: confirm no protection order is still open for this position, and cancel any that is.",
         },
       });
       return this.outcome(
@@ -4382,6 +4464,49 @@ export class ProtectionLifecycleService {
       default:
         return "CANCELED";
     }
+  }
+
+  /**
+   * Is this exact protection identity provably absent from the live book?
+   *
+   * EXACT IDENTITY, never a symbol-wide shortcut: a standard row is matched by
+   * its `clientOrderId` against open orders, a conditional row by its
+   * `clientAlgoId` against open ALGO orders. Those are different books and an
+   * id from one does not exist in the other, so the modality decides which
+   * listing is authoritative for it.
+   *
+   * Returns FALSE for everything that is not a proof - an unreadable listing, a
+   * row with no id to match, an UNSUPPORTED modality. Absence of evidence is
+   * never evidence of absence, so the caller keeps cleanup incomplete.
+   */
+  private async provenAbsentFromOpenOrders(
+    execution: TradeExecution,
+    order: BinanceOrder,
+    cache: Map<ProtectionModality, Set<string> | null>
+  ): Promise<boolean> {
+    const modality = protectionModality(order.orderType);
+    const identity = modality === "STANDARD" ? order.clientOrderId : order.clientAlgoId;
+    if (modality === "UNSUPPORTED" || !identity) return false;
+
+    if (!cache.has(modality)) {
+      try {
+        const live =
+          modality === "STANDARD"
+            ? (await this.readOnly.getOpenOrders(execution.symbol)).map((row) => row.clientOrderId)
+            : (await this.readOnly.getOpenAlgoOrders(execution.symbol)).map((row) => row.clientAlgoId);
+        cache.set(
+          modality,
+          new Set(live.filter((value): value is string => typeof value === "string" && value !== ""))
+        );
+      } catch {
+        // Could not look. That is not absence.
+        cache.set(modality, null);
+      }
+    }
+
+    const openIdentities = cache.get(modality) ?? null;
+    if (openIdentities === null) return false;
+    return !openIdentities.has(identity);
   }
 
   private async cancelSibling(execution: TradeExecution, sibling: SiblingCandidate, evaluatedAt: Date): Promise<boolean> {

@@ -204,6 +204,7 @@ export function normalizeOpenOrders(payload: unknown): BinanceOpenOrderDto[] {
   return asRows(payload)
     .map((row) => ({
       orderId: decimalString(row.orderId),
+      clientOrderId: text(row.clientOrderId),
       symbol: text(row.symbol) ?? "",
       side: text(row.side),
       positionSide: row.positionSide === undefined ? null : normalizePositionSide(row.positionSide),

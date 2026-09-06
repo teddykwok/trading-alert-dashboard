@@ -56,6 +56,15 @@ export interface BinancePositionDto {
 
 export interface BinanceOpenOrderDto {
   orderId: string | null;
+  /**
+   * The order's own client id, as Binance returns it.
+   *
+   * Carried so an owned protection row can be matched against the live book by
+   * the SAME identity it was submitted under. Without it the only way to ask
+   * "is my order still open?" from a listing is a symbol-wide guess, which is
+   * not identity and must never stand in for one.
+   */
+  clientOrderId: string | null;
   symbol: string;
   side: string | null;
   positionSide: BinancePositionSide | null;
