@@ -191,9 +191,20 @@ describe("phase boundary", () => {
     const service = readCode(SERVICE);
     expect(service).toContain('role: "ENTRY"');
     expect(service).not.toMatch(/generation:\s*2/);
-    for (const role of ["STOP_LOSS", "TAKE_PROFIT"]) {
-      expect(service).not.toContain(role);
+    /**
+     * The property is that this service never RESERVES a protection order, so
+     * the assertion names the role field rather than the bare word.
+     *
+     * A bare substring also matched `EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED`
+     * — a configuration flag the terminal-partial rule must read to know whether
+     * the take profit would be STANDARD at all. Reading that flag creates no
+     * order; writing `role: "TAKE_PROFIT"` would, and that is what stays banned.
+     */
+    for (const role of ["STOP_LOSS", "TAKE_PROFIT", "EMERGENCY_CLOSE"]) {
+      expect(service).not.toContain(`role: "${role}"`);
     }
+    // Nothing in this service may create a protection or close order at all.
+    expect(service).not.toMatch(/submitProtectionOrder|submitStandardProtectionOrder|submitEmergencyMarketClose/);
   });
 });
 

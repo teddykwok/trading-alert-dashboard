@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { PrismaClient } from "@prisma/client";
+import { Prisma, PrismaClient } from "@prisma/client";
 import { connectTestDatabase } from "./helpers/test-database";
 import type { DynamicLeveragePlan } from "@trading-alert-dashboard/shared";
 
@@ -33,6 +33,13 @@ process.env.EXECUTION_MAX_ALERT_AGE_SECONDS = "300";
 // network: every real client in this suite is built with a transport that
 // throws if it is ever called.
 process.env.BINANCE_FUTURES_REST_BASE_URL = "https://demo-fapi.binance.com";
+/**
+ * ON so the terminal-partial standard take-profit rule is reachable at all.
+ * With it OFF the modality resolves to ALGO and the rule is inert — which is
+ * the flag-off guarantee, asserted separately below by forcing ALGO lineage.
+ * Safe here: vitest forks each file and `env` is parsed once per process.
+ */
+process.env.EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED = "true";
 
 // Integration state lives in the DEDICATED test database. The helper refuses
 // to fall back to the runtime/canary database, so a misconfiguration fails the
@@ -81,6 +88,8 @@ interface Scenario {
   positionSymbols: string[];
   openOrderSymbols: string[];
   symbolStatus: string;
+  /** The symbol's authoritative minimum notional, as the connector reports it. */
+  minNotional: string | null;
   contractType: string;
   marginType: "ISOLATED" | "CROSS";
   leverage: string;
@@ -122,6 +131,7 @@ function resetScenario() {
     positionSymbols: [],
     openOrderSymbols: [],
     symbolStatus: "TRADING",
+    minNotional: "5",
     contractType: "PERPETUAL",
     marginType: "ISOLATED",
     leverage: "10",
@@ -192,7 +202,7 @@ const readOnlyStub = {
         tickSize: "0.01",
         stepSize: "0.001",
         minQty: "0.001",
-        minNotional: "5",
+        minNotional: scenario.minNotional,
       },
       brackets: [{ bracket: 1, initialLeverage: 50, notionalCap: "100000", notionalFloor: "0", maintMarginRatio: "0.01", cum: "0" }],
       maxInitialLeverage: 50,
@@ -3079,5 +3089,241 @@ describe("production creation path freezes exchange filters", () => {
     expect(result.ok).toBe(false);
     expect(result.reasonCode).toBe("SAFETY_ADMISSION_NOT_READY");
     expect(await prisma!.binanceOrder.count({ where: { tradeExecutionId: admitted.id } })).toBe(0);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Layer 2: a terminal partial fill that cannot carry its standard take profit
+// ---------------------------------------------------------------------------
+
+describe("terminal partial fill below the standard take-profit floor", () => {
+  /**
+   * Geometry, end to end through the REAL EntryLifecycleService:
+   *
+   *   planned 100 x 0.06 = 6  -> Layer 1 admits the plan
+   *   filled   50 x 0.06 = 3  -> below the connector's floor of 5
+   *
+   * The soft open target withdraws the remainder, freezing the confirmed
+   * quantity at 50. What this proves beyond the pure mapping test is the
+   * RESOLVER: the modality is read from durable rows, the floor comes from the
+   * connector, and the frozen target is the execution's own.
+   */
+  const reload = (id: string) => prisma!.tradeExecution.findUniqueOrThrow({ where: { id } });
+
+  async function partialThenWithdrawn(takeProfit: string | undefined) {
+    const execution = await admittedExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { takeProfit: takeProfit === undefined ? null : new Prisma.Decimal(takeProfit) },
+    });
+    await entries.prepareEntrySubmission({
+      executionId: execution.id,
+      expectedVersion: (await reload(execution.id)).version,
+      evaluatedAt: at(),
+    });
+    scenario.order!.status = "CANCELED";
+    scenario.order!.executedQty = "50";
+    const current = await reload(execution.id);
+    await entries.reconcileEntryOrder(
+      { executionId: execution.id, expectedVersion: current.version, evaluatedAt: at() },
+      "SOFT_OPEN_TARGET"
+    );
+    return reload(execution.id);
+  }
+
+  maybe()("parks it for an operator instead of promoting it to ENTRY_FILLED", async () => {
+    scenario.minNotional = "5";
+    const reloaded = await partialThenWithdrawn("0.06");
+
+    expect(reloaded.status).toBe("MANUAL_INTERVENTION");
+    expect(reloaded.requiresManualIntervention).toBe(true);
+    expect(reloaded.decisionReasonCode).toBe("PROTECTION_QUANTITY_UNSUPPORTED");
+    // The exposure is real and recorded — nothing is fabricated away.
+    expect(reloaded.filledQuantity?.toString()).toBe("50");
+    // No take profit of either modality was invented for it.
+    const tp = await prisma!.binanceOrder.count({
+      where: { tradeExecutionId: reloaded.id, role: "TAKE_PROFIT" },
+    });
+    expect(tp).toBe(0);
+    // And no emergency close was attempted.
+    expect(scenario.calls.some((call) => call.includes("EmergencyClose"))).toBe(false);
+  });
+
+  maybe()("leaves a placeable terminal partial exactly as before", async () => {
+    // 50 x 0.20 = 10, comfortably above the floor.
+    scenario.minNotional = "5";
+    const reloaded = await partialThenWithdrawn("0.20");
+    expect(reloaded.status).toBe("ENTRY_FILLED");
+    expect(reloaded.requiresManualIntervention).toBe(false);
+  });
+
+  maybe()("treats a notional EXACTLY at the floor as placeable", async () => {
+    // 50 x 0.10 = 5.00, equal to the floor.
+    scenario.minNotional = "5";
+    const reloaded = await partialThenWithdrawn("0.10");
+    expect(reloaded.status).toBe("ENTRY_FILLED");
+    expect(reloaded.requiresManualIntervention).toBe(false);
+  });
+
+  maybe()("B. the SAME geometry clears a floor of 3, exactly at the boundary", async () => {
+    // 50 x 0.06 = 3.00 against a floor of 3: equality is placeable, and the
+    // floor is plainly the connector's rather than a constant of ours — the
+    // identical geometry was parked one test above against a floor of 5.
+    scenario.minNotional = "3";
+    const reloaded = await partialThenWithdrawn("0.06");
+    expect(reloaded.status).toBe("ENTRY_FILLED");
+    expect(reloaded.requiresManualIntervention).toBe(false);
+  });
+
+  maybe()("does nothing when the plan has no take profit", async () => {
+    scenario.minNotional = "5";
+    const reloaded = await partialThenWithdrawn(undefined);
+    expect(reloaded.status).toBe("ENTRY_FILLED");
+  });
+
+  maybe()("does not apply to an ALGO lineage, whatever the flag says", async () => {
+    /**
+     * Durable history wins over configuration. An execution whose take-profit
+     * lineage is already ALGO continues as ALGO, and a conditional
+     * TAKE_PROFIT_MARKET carries no notional floor — so the standard-order rule
+     * must not leak into it and park a perfectly normal position.
+     */
+    scenario.minNotional = "5";
+    const execution = await admittedExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { takeProfit: new Prisma.Decimal("0.06") },
+    });
+    await entries.prepareEntrySubmission({
+      executionId: execution.id,
+      expectedVersion: (await reload(execution.id)).version,
+      evaluatedAt: at(),
+    });
+    // A settled ALGO take-profit lineage on this execution.
+    await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: execution.id,
+        role: "TAKE_PROFIT",
+        generation: 1,
+        clientOrderId: `algo-lineage-${execution.id}`,
+        side: "SELL",
+        positionSide: "LONG",
+        orderType: "TAKE_PROFIT_MARKET",
+        originalQuantity: new Prisma.Decimal("50"),
+        status: "NEW",
+      },
+    });
+
+    scenario.order!.status = "CANCELED";
+    scenario.order!.executedQty = "50";
+    const current = await reload(execution.id);
+    await entries.reconcileEntryOrder(
+      { executionId: execution.id, expectedVersion: current.version, evaluatedAt: at() },
+      "SOFT_OPEN_TARGET"
+    );
+
+    const reloaded = await reload(execution.id);
+    expect(reloaded.status).toBe("ENTRY_FILLED");
+    expect(reloaded.requiresManualIntervention).toBe(false);
+  });
+
+  maybe()("C. parks the position when the authoritative floor cannot be established", async () => {
+    /**
+     * FAIL CLOSED. The connector fails ONLY at reconcile time, so entry
+     * preparation is unaffected and this is exactly the terminal scenario minus
+     * the ability to prove feasibility. Promoting here would commit to
+     * retaining exposure whose target may be impossible.
+     */
+    scenario.minNotional = "5";
+    const execution = await admittedExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { takeProfit: new Prisma.Decimal("0.06") },
+    });
+    await entries.prepareEntrySubmission({
+      executionId: execution.id,
+      expectedVersion: (await reload(execution.id)).version,
+      evaluatedAt: at(),
+    });
+    scenario.order!.status = "CANCELED";
+    scenario.order!.executedQty = "50";
+
+    const original = readOnlyStub.inspectSymbol;
+    readOnlyStub.inspectSymbol = async () => {
+      throw new Error("stubbed connector failure");
+    };
+    try {
+      const current = await reload(execution.id);
+      await entries.reconcileEntryOrder(
+        { executionId: execution.id, expectedVersion: current.version, evaluatedAt: at() },
+        "SOFT_OPEN_TARGET"
+      );
+    } finally {
+      readOnlyStub.inspectSymbol = original;
+    }
+
+    const reloaded = await reload(execution.id);
+    expect(reloaded.status).not.toBe("ENTRY_FILLED");
+    expect(reloaded.status).toBe("MANUAL_INTERVENTION");
+    expect(reloaded.requiresManualIntervention).toBe(true);
+    // Names the unreadable symbol state, never a floor we did not obtain.
+    expect(reloaded.decisionReasonCode).toBe("SYMBOL_STATE_CHANGED");
+    expect(reloaded.decisionReasonCode).not.toBe("PROTECTION_QUANTITY_UNSUPPORTED");
+    // The exposure stays recorded, nothing is fabricated and nothing is closed.
+    expect(reloaded.filledQuantity?.toString()).toBe("50");
+    expect(
+      await prisma!.binanceOrder.count({ where: { tradeExecutionId: reloaded.id, role: "TAKE_PROFIT" } })
+    ).toBe(0);
+    expect(
+      await prisma!.binanceOrder.count({ where: { tradeExecutionId: reloaded.id, role: "EMERGENCY_CLOSE" } })
+    ).toBe(0);
+  });
+
+  maybe()("C2. treats a symbol that reports NO floor as unestablished, not as permission", async () => {
+    scenario.minNotional = null;
+    const reloaded = await partialThenWithdrawn("0.06");
+    expect(reloaded.status).toBe("MANUAL_INTERVENTION");
+    expect(reloaded.decisionReasonCode).toBe("SYMBOL_STATE_CHANGED");
+  });
+
+  maybe()("D. leaves a still-live partial fill alone when inspection is unavailable", async () => {
+    /**
+     * The remainder is still resting and can still grow past the floor. A
+     * transient connector failure must not terminalise a healthy entry — the
+     * rule belongs only at the withdrawal boundary.
+     */
+    scenario.minNotional = "5";
+    const execution = await admittedExecution();
+    await prisma!.tradeExecution.update({
+      where: { id: execution.id },
+      data: { takeProfit: new Prisma.Decimal("0.06") },
+    });
+    await entries.prepareEntrySubmission({
+      executionId: execution.id,
+      expectedVersion: (await reload(execution.id)).version,
+      evaluatedAt: at(),
+    });
+    scenario.order!.status = "PARTIALLY_FILLED";
+    scenario.order!.executedQty = "20";
+
+    const original = readOnlyStub.inspectSymbol;
+    readOnlyStub.inspectSymbol = async () => {
+      throw new Error("stubbed connector failure");
+    };
+    try {
+      const current = await reload(execution.id);
+      await entries.reconcileEntryOrder({
+        executionId: execution.id,
+        expectedVersion: current.version,
+        evaluatedAt: at(),
+      });
+    } finally {
+      readOnlyStub.inspectSymbol = original;
+    }
+
+    const reloaded = await reload(execution.id);
+    expect(reloaded.status).toBe("PARTIALLY_FILLED");
+    expect(reloaded.requiresManualIntervention).toBe(false);
   });
 });

@@ -48,6 +48,16 @@ export const ENTRY_REASON_CODES = [
   "ENTRY_CANCEL_RESULT_UNKNOWN",
   "PARTIAL_FILL_REMAINDER_CANCELED",
   "UNPROTECTED_PARTIAL_FILL",
+  // A terminal partial fill whose confirmed quantity cannot support the
+  // STANDARD take profit its plan requires.
+  //
+  // Deliberately the SAME identifier the protection lifecycle and the Phase 5
+  // admission gate already use for an under-minimum-notional take profit: one
+  // condition, one name, whichever layer catches it. Distinct from
+  // UNPROTECTED_PARTIAL_FILL, which means "a position exists and nothing is
+  // protecting it" — here the stop may well be verified and the specific,
+  // permanent problem is the target.
+  "PROTECTION_QUANTITY_UNSUPPORTED",
   "CAPACITY_OR_VERSION_CONFLICT",
   "MANUAL_REVIEW_REQUIRED",
   // A PREFLIGHT execution released BEFORE any reservation existed, because new
@@ -168,6 +178,27 @@ export type ExecutionStatusName =
 /** Why an order stopped being open, when we know. */
 export type CancelCause = "TTL" | "OPERATOR" | "UNKNOWN" | "SOFT_OPEN_TARGET";
 
+/**
+ * Whether the quantity about to become FINAL can carry the take profit its plan
+ * requires.
+ *
+ * Four states rather than a boolean, because a boolean has nowhere to put "we
+ * could not find out" — and the only safe place for that answer is NOT beside
+ * "yes". At this boundary the remainder is being withdrawn, the confirmed
+ * quantity stops growing and promoting to ENTRY_FILLED commits to RETAINING the
+ * exposure, so feasibility has to be positively established rather than assumed
+ * from silence.
+ *
+ *   NOT_APPLICABLE — no take profit, not a terminal withdrawal, or the modality
+ *                    is ALGO, which carries no notional floor. Historical
+ *                    behaviour, unchanged.
+ *   PLACEABLE      — the floor was read and the notional clears it.
+ *   UNPLACEABLE    — the floor was read and the notional is below it.
+ *   UNKNOWN        — the authoritative floor could not be established. Never
+ *                    collapses into PLACEABLE.
+ */
+export type TerminalTakeProfitFeasibility = "NOT_APPLICABLE" | "PLACEABLE" | "UNPLACEABLE" | "UNKNOWN";
+
 export interface ExecutionStatusMapping {
   executionStatus: ExecutionStatusName;
   reasonCode: EntryReasonCode;
@@ -197,6 +228,15 @@ export function mapOrderToExecutionStatus(input: {
   localOrderStatus: LocalOrderStatusName;
   executedQuantity: string;
   cancelCause?: CancelCause;
+  /**
+   * Whether the confirmed quantity about to become final can carry the STANDARD
+   * take profit this plan requires.
+   *
+   * Absent or NOT_APPLICABLE preserves the historical mapping exactly. Only
+   * PLACEABLE promotes a terminal partial into ordinary retained exposure —
+   * UNPLACEABLE and UNKNOWN both go to a human, for different stated reasons.
+   */
+  standardTakeProfitFeasibility?: TerminalTakeProfitFeasibility;
 }): ExecutionStatusMapping {
   const filled = hasFill(input.executedQuantity);
   const cause = input.cancelCause ?? "UNKNOWN";
@@ -239,6 +279,50 @@ export function mapOrderToExecutionStatus(input: {
         // `ensureProtectionForExposure`. Raising manual intervention here would
         // page a human for the system doing exactly what it was told.
         if (cause === "SOFT_OPEN_TARGET") {
+          /**
+           * THE ONE PATH THAT USED TO PROMOTE A TERMINAL PARTIAL SILENTLY.
+           *
+           * Withdrawing the remainder freezes the confirmed quantity forever.
+           * If that final quantity cannot support its STANDARD take profit, the
+           * position is destined for a stop it can verify and a target it can
+           * never place — and the protection lifecycle then parks at
+           * PLACING_PROTECTION permanently, which holds
+           * `countRecoveryRequired()` above zero and globally refuses every new
+           * admission. That is the FLOCKUSDT deadlock, reached below the
+           * planned quantity the pre-entry gate validated.
+           *
+           * So it becomes a human's, loudly, exactly as every OTHER terminal
+           * partial cause in this function already does. Nothing is closed and
+           * nothing is faked: the exposure is real, the stop keeps being
+           * managed, and an operator decides what to do about a target that
+           * cannot exist.
+           */
+          if (input.standardTakeProfitFeasibility === "UNPLACEABLE") {
+            return {
+              executionStatus: "MANUAL_INTERVENTION",
+              reasonCode: "PROTECTION_QUANTITY_UNSUPPORTED",
+              requiresManualIntervention: true,
+              exposurePossible: true,
+            };
+          }
+          /**
+           * COULD NOT FIND OUT IS NOT A YES.
+           *
+           * Promoting here would commit to retaining exposure whose target may
+           * be impossible, on the strength of a read that failed. The exposure
+           * is real either way, so the safe direction is the human: the stop
+           * keeps being managed and nothing is closed, cancelled or faked.
+           * The reason names the unreadable symbol state rather than claiming a
+           * floor we never obtained.
+           */
+          if (input.standardTakeProfitFeasibility === "UNKNOWN") {
+            return {
+              executionStatus: "MANUAL_INTERVENTION",
+              reasonCode: "SYMBOL_STATE_CHANGED",
+              requiresManualIntervention: true,
+              exposurePossible: true,
+            };
+          }
           return {
             executionStatus: "ENTRY_FILLED",
             reasonCode: "ENTRY_RECONCILED",

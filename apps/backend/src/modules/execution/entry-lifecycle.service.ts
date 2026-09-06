@@ -29,6 +29,9 @@ import {
   type LocalOrderStatusName,
   type MutationOutcome,
 } from "./entry-lifecycle";
+import { resolveTakeProfitModality, takeProfitLineage } from "./protection-lifecycle";
+import { standardTakeProfitMeetsMinNotional } from "./take-profit-notional";
+import type { TerminalTakeProfitFeasibility } from "./entry-lifecycle";
 import { applySessionAccountingForStatus } from "./trading-session.service";
 
 /**
@@ -1330,6 +1333,80 @@ export class EntryLifecycleService {
   // -------------------------------------------------------------------------
 
   /**
+   * Can the quantity that is about to become FINAL still carry its take profit?
+   *
+   * Answers only the narrow question the soft-target withdrawal needs, and
+   * answers NOT_APPLICABLE for everything else so no other mapping changes:
+   *
+   *   - only a CANCELED order with a fill, withdrawn for SOFT_OPEN_TARGET —
+   *     every other terminal cause already routes to MANUAL_INTERVENTION, and
+   *     a still-resting order is not terminal at all, so a partial that can
+   *     still grow past the floor is never judged and a symbol read that fails
+   *     while it is still working changes nothing;
+   *   - only a plan that HAS a take profit;
+   *   - only when that take profit would be STANDARD, resolved from durable
+   *     lineage and configuration by the shared resolver, so the ALGO path and
+   *     every flag-off runtime are untouched — a conditional
+   *     TAKE_PROFIT_MARKET carries no notional floor.
+   *
+   * The floor is read live, because it is the exchange's answer rather than
+   * ours and the frozen plan snapshot is not guaranteed to carry it. The read
+   * happens only on this rare branch, never on an ordinary reconcile.
+   *
+   * FAILS CLOSED. A read that throws, and a read that returns no floor at all,
+   * both answer UNKNOWN rather than PLACEABLE: this boundary commits to
+   * RETAINING the exposure, so feasibility must be positively established, and
+   * an absent floor establishes nothing.
+   *
+   * That is a JUDGEMENT MADE HERE, not a change to the shared predicate. To be
+   * precise about the pre-entry gate it is deliberately asymmetric with: an
+   * absent floor there answers "placeable", so a plan is ADMITTED rather than
+   * rejected — the pre-entry gate never refuses a plan merely because a symbol
+   * reported no minimum notional. The predicate keeps that "no floor means
+   * nothing to fail" arithmetic unchanged for both callers; what an UNOBTAINED
+   * floor should MEAN is a question about consequences, and the consequences
+   * differ. Before entry, treating silence as permission risks a plan that can
+   * be refused later; here it risks stranding real exposure with a target that
+   * may be impossible, which is the outcome this whole layer exists to prevent.
+   */
+  private async terminalPartialTakeProfitFeasibility(
+    execution: TradeExecution,
+    localStatus: LocalOrderStatusName,
+    executedQuantity: string,
+    cancelCause: CancelCause
+  ): Promise<TerminalTakeProfitFeasibility> {
+    if (localStatus !== "CANCELED" || cancelCause !== "SOFT_OPEN_TARGET") return "NOT_APPLICABLE";
+    if (!new D(executedQuantity).greaterThan(0)) return "NOT_APPLICABLE";
+    if (execution.takeProfit === null) return "NOT_APPLICABLE";
+
+    const rows = await this.prisma.binanceOrder.findMany({
+      where: { tradeExecutionId: execution.id },
+      select: { role: true, orderType: true },
+    });
+    const modality = resolveTakeProfitModality(
+      takeProfitLineage(rows),
+      env.EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED
+    );
+    if (modality !== "STANDARD") return "NOT_APPLICABLE";
+
+    let minNotional: string | null | undefined;
+    try {
+      minNotional = (await this.readOnly.inspectSymbol(execution.symbol)).filters.minNotional;
+    } catch {
+      return "UNKNOWN";
+    }
+    if (minNotional === null || minNotional === undefined || minNotional.trim() === "") return "UNKNOWN";
+
+    return standardTakeProfitMeetsMinNotional({
+      quantity: executedQuantity,
+      price: execution.takeProfit.toString(),
+      minNotional,
+    })
+      ? "PLACEABLE"
+      : "UNPLACEABLE";
+  }
+
+  /**
    * One transaction: order fields, execution actuals, lifecycle status, one
    * version increment and one event. A failing event rolls all of it back.
    */
@@ -1355,6 +1432,12 @@ export class EntryLifecycleService {
       localOrderStatus: localStatus,
       executedQuantity: progress.executedQuantity,
       cancelCause,
+      standardTakeProfitFeasibility: await this.terminalPartialTakeProfitFeasibility(
+        execution,
+        localStatus,
+        progress.executedQuantity,
+        cancelCause
+      ),
     });
 
     const currentStatus = execution.status as TradeExecutionStatusName;

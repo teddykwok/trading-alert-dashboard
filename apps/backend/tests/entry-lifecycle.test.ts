@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   BINANCE_ORDER_STATUSES,
@@ -585,5 +587,240 @@ describe("reason codes", () => {
 
   it("has no duplicates", () => {
     expect(new Set(ENTRY_REASON_CODES).size).toBe(ENTRY_REASON_CODES.length);
+  });
+});
+
+
+describe("a terminal partial fill that cannot carry its standard take profit is a human's", () => {
+  /**
+   * The Layer 2 hole, as a mapping regression.
+   *
+   * Layer 1 refuses a PLAN whose full quantity cannot support its STANDARD take
+   * profit — 100 x 0.06 = 6 against a floor of 5 passes, so this plan is
+   * admitted. The entry then fills only 50, and the soft open target withdraws
+   * the remainder, freezing the confirmed quantity at 50: 50 x 0.06 = 3, below
+   * the floor. The target can now never be placed.
+   *
+   * The old mapping promoted that into an ordinary ENTRY_FILLED position. The
+   * protection lifecycle then verified a stop, refused the target, and parked
+   * at PLACING_PROTECTION forever — holding countRecoveryRequired() above zero
+   * and globally refusing every new admission. Silently.
+   */
+  it("routes it to MANUAL_INTERVENTION instead of ordinary ENTRY_FILLED", () => {
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "CANCELED",
+      executedQuantity: "50",
+      cancelCause: "SOFT_OPEN_TARGET",
+      standardTakeProfitFeasibility: "UNPLACEABLE",
+    });
+
+    expect(result.executionStatus).toBe("MANUAL_INTERVENTION");
+    expect(result.requiresManualIntervention).toBe(true);
+    // The exposure is REAL and must keep being reconciled and protected.
+    expect(result.exposurePossible).toBe(true);
+  });
+
+  it("names the condition accurately and never blames the trigger", () => {
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "CANCELED",
+      executedQuantity: "50",
+      cancelCause: "SOFT_OPEN_TARGET",
+      standardTakeProfitFeasibility: "UNPLACEABLE",
+    });
+    // The same identifier Layer 1 and the protection lifecycle already use for
+    // an under-minimum-notional take profit.
+    expect(result.reasonCode).toBe("PROTECTION_QUANTITY_UNSUPPORTED");
+    expect(result.reasonCode).not.toBe("TAKE_PROFIT_TRIGGER_INVALID");
+    // Distinct from the generic unprotected-partial case, so an operator can
+    // tell "nothing is protecting this" from "the target cannot exist".
+    expect(result.reasonCode).not.toBe("UNPROTECTED_PARTIAL_FILL");
+  });
+
+  it("leaves a FEASIBLE terminal partial exactly as it was", () => {
+    // Equality with the floor and anything above it both resolve PLACEABLE, and
+    // an absent value is the historical call shape. All must be untouched.
+    for (const feasibility of ["PLACEABLE", "NOT_APPLICABLE", undefined] as const) {
+      const result = mapOrderToExecutionStatus({
+        localOrderStatus: "CANCELED",
+        executedQuantity: "50",
+        cancelCause: "SOFT_OPEN_TARGET",
+        standardTakeProfitFeasibility: feasibility,
+      });
+      expect(result.executionStatus, String(feasibility)).toBe("ENTRY_FILLED");
+      expect(result.reasonCode, String(feasibility)).toBe("ENTRY_RECONCILED");
+      expect(result.requiresManualIntervention, String(feasibility)).toBe(false);
+    }
+  });
+
+  it("does not touch a still-working partial fill, however small", () => {
+    // The order is still PARTIALLY_FILLED on the exchange and can still grow
+    // past the floor. Killing it here would destroy a perfectly good trade.
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "PARTIALLY_FILLED",
+      executedQuantity: "20",
+      cancelCause: "SOFT_OPEN_TARGET",
+      standardTakeProfitFeasibility: "UNPLACEABLE",
+    });
+    expect(result.executionStatus).toBe("PARTIALLY_FILLED");
+    expect(result.requiresManualIntervention).toBe(false);
+  });
+
+  it("changes nothing about a zero-fill withdrawal", () => {
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "CANCELED",
+      executedQuantity: "0",
+      cancelCause: "SOFT_OPEN_TARGET",
+      standardTakeProfitFeasibility: "UNPLACEABLE",
+    });
+    // No exposure was ever created, so there is nothing to park.
+    expect(result.executionStatus).toBe("CANCELED");
+    expect(result.requiresManualIntervention).toBe(false);
+    expect(result.exposurePossible).toBe(false);
+  });
+
+  it("changes nothing about the causes that already escalate", () => {
+    // TTL / OPERATOR / UNKNOWN already route to MANUAL_INTERVENTION with their
+    // own reason. Layer 2 must not rewrite their diagnosis.
+    for (const cause of ["TTL", "OPERATOR", "UNKNOWN"] as const) {
+      const result = mapOrderToExecutionStatus({
+        localOrderStatus: "CANCELED",
+        executedQuantity: "50",
+        cancelCause: cause,
+        standardTakeProfitFeasibility: "UNPLACEABLE",
+      });
+      expect(result.executionStatus, cause).toBe("MANUAL_INTERVENTION");
+      expect(result.reasonCode, cause).toBe("UNPROTECTED_PARTIAL_FILL");
+    }
+  });
+
+  it("never overrides an authoritative FILLED", () => {
+    // The cancel lost the race and the order filled completely. That is real
+    // exchange reality and the quantity is the FULL planned one, which Layer 1
+    // already proved can carry its target.
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "FILLED",
+      executedQuantity: "100",
+      cancelCause: "SOFT_OPEN_TARGET",
+      standardTakeProfitFeasibility: "UNPLACEABLE",
+    });
+    expect(result.executionStatus).toBe("ENTRY_FILLED");
+    expect(result.requiresManualIntervention).toBe(false);
+  });
+});
+
+
+describe("both terminal-partial routes are covered by construction", () => {
+  const SERVICE = readFileSync(
+    path.join(process.cwd(), "src", "modules", "execution", "entry-lifecycle.service.ts"),
+    "utf8"
+  );
+
+  it("has exactly one call site, and it supplies the feasibility fact", () => {
+    /**
+     * The analysis found TWO production routes to a SOFT_OPEN_TARGET terminal
+     * partial — `protectConfirmedFill` after a PARTIALLY_FILLED reconcile, and
+     * `expireEntryOrderIfDue` when its pre-cancel re-query discovers a fill.
+     * Both reach the mapping through `applyOrderState`, so covering that one
+     * call site covers both. Pinned here because patching one caller and
+     * missing the other is exactly how the hole would reopen.
+     */
+    const callSites = SERVICE.match(/mapOrderToExecutionStatus\(/g) ?? [];
+    expect(callSites).toHaveLength(1);
+    expect(SERVICE).toContain("standardTakeProfitFeasibility: await this.terminalPartialTakeProfitFeasibility(");
+  });
+
+  it("resolves feasibility only at the terminal boundary", () => {
+    // The resolver returns true for anything that is not a withdrawn, filled,
+    // soft-target cancellation, so an ordinary reconcile costs no extra read
+    // and a still-resting partial is never judged.
+    const body = SERVICE.slice(SERVICE.indexOf("private async terminalPartialTakeProfitFeasibility"));
+    expect(body).toContain('if (localStatus !== "CANCELED" || cancelCause !== "SOFT_OPEN_TARGET") return "NOT_APPLICABLE";');
+    expect(body).toContain('if (execution.takeProfit === null) return "NOT_APPLICABLE";');
+    expect(body).toContain('if (modality !== "STANDARD") return "NOT_APPLICABLE";');
+    // An unobtained floor must never answer PLACEABLE.
+    expect(body).toContain('return "UNKNOWN";');
+  });
+
+  it("reuses the shared floor predicate rather than restating it", () => {
+    expect(SERVICE).toContain("standardTakeProfitMeetsMinNotional({");
+    // No second copy of the arithmetic anywhere in this service.
+    expect(SERVICE).not.toMatch(/greaterThanOrEqualTo\(new D\(.*minNotional/);
+  });
+});
+
+
+describe("an unestablished take-profit floor is never treated as a yes", () => {
+  /**
+   * The boundary commits to RETAINING exposure, so feasibility must be proven.
+   * A connector read that failed proves nothing, and "we could not find out"
+   * must not share a disposition with "yes".
+   */
+  it("parks a terminal partial when the floor could not be established", () => {
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "CANCELED",
+      executedQuantity: "50",
+      cancelCause: "SOFT_OPEN_TARGET",
+      standardTakeProfitFeasibility: "UNKNOWN",
+    });
+    expect(result.executionStatus).toBe("MANUAL_INTERVENTION");
+    expect(result.requiresManualIntervention).toBe(true);
+    expect(result.exposurePossible).toBe(true);
+  });
+
+  it("says the symbol state could not be read, not that the notional is too small", () => {
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "CANCELED",
+      executedQuantity: "50",
+      cancelCause: "SOFT_OPEN_TARGET",
+      standardTakeProfitFeasibility: "UNKNOWN",
+    });
+    // Claiming PROTECTION_QUANTITY_UNSUPPORTED would assert a floor we never
+    // obtained. SYMBOL_STATE_CHANGED is this service's established reason for
+    // exactly "Symbol state could not be read."
+    expect(result.reasonCode).toBe("SYMBOL_STATE_CHANGED");
+    expect(result.reasonCode).not.toBe("PROTECTION_QUANTITY_UNSUPPORTED");
+  });
+
+  it("keeps UNKNOWN and PLACEABLE on opposite sides of the promotion", () => {
+    const dispositions = (["PLACEABLE", "NOT_APPLICABLE", "UNPLACEABLE", "UNKNOWN"] as const).map(
+      (feasibility) =>
+        mapOrderToExecutionStatus({
+          localOrderStatus: "CANCELED",
+          executedQuantity: "50",
+          cancelCause: "SOFT_OPEN_TARGET",
+          standardTakeProfitFeasibility: feasibility,
+        }).executionStatus
+    );
+    // Only a positively established yes promotes.
+    expect(dispositions).toEqual([
+      "ENTRY_FILLED",
+      "ENTRY_FILLED",
+      "MANUAL_INTERVENTION",
+      "MANUAL_INTERVENTION",
+    ]);
+  });
+
+  it("does not park a still-working partial fill when the floor is unknown", () => {
+    // The remainder can still fill and the quantity can still grow. A transient
+    // connector failure must not terminalise a healthy, live entry.
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "PARTIALLY_FILLED",
+      executedQuantity: "20",
+      cancelCause: "SOFT_OPEN_TARGET",
+      standardTakeProfitFeasibility: "UNKNOWN",
+    });
+    expect(result.executionStatus).toBe("PARTIALLY_FILLED");
+    expect(result.requiresManualIntervention).toBe(false);
+  });
+
+  it("changes nothing about a zero-fill withdrawal when the floor is unknown", () => {
+    const result = mapOrderToExecutionStatus({
+      localOrderStatus: "CANCELED",
+      executedQuantity: "0",
+      cancelCause: "SOFT_OPEN_TARGET",
+      standardTakeProfitFeasibility: "UNKNOWN",
+    });
+    expect(result.executionStatus).toBe("CANCELED");
+    expect(result.requiresManualIntervention).toBe(false);
   });
 });
