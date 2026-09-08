@@ -3,11 +3,13 @@ import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PrismaClient } from "@prisma/client";
+import type { Prisma, PrismaClient } from "@prisma/client";
 import {
   FINAL_REVIEW_STATUSES,
   TERMINAL_ALERT_STATUSES,
   deletableAlertWhere,
+  executionLineageWhere,
+  lineageProtectedAlertWhere,
   expiredScreenshotWhere,
   resolveScreenshotFile,
   retentionCutoff,
@@ -80,14 +82,49 @@ describe("retention where-clauses", () => {
 
   it("keeps alerts with open user-entered state (review OPEN/UNREVIEWED, or journal without finalized review)", () => {
     const where = deletableAlertWhere(cutoff);
-    expect(where.OR).toEqual([
+    // The user-state rule is UNCHANGED; it moved under AND so a second,
+    // independent release condition could be added beside it. Both branches
+    // are still exactly what they were.
+    const [releasedByUser] = where.AND as Prisma.AlertWhereInput[];
+    expect(releasedByUser.OR).toEqual([
       { AND: [{ tradeReview: { is: null } }, { tradeJournal: { is: null } }] },
       { tradeReview: { is: { status: { in: [...FINAL_REVIEW_STATUSES] } } } },
     ]);
     expect(FINAL_REVIEW_STATUSES).not.toContain("OPEN");
     expect(FINAL_REVIEW_STATUSES).not.toContain("UNREVIEWED");
   });
+
+  it("also requires that no execution still needs the alert's plan", () => {
+    const [, disposableLineage] = deletableAlertWhere(cutoff).AND as Prisma.AlertWhereInput[];
+    // Every state a plan can be in, enumerated rather than negated.
+    expect(disposableLineage.OR).toEqual([
+      { extremeRRPlan: { is: null } },
+      { extremeRRPlan: { is: { tradeExecutions: { none: {} } } } },
+    ]);
+    expect(executionLineageWhere()).toEqual({
+      extremeRRPlan: { is: { tradeExecutions: { some: {} } } },
+    });
+  });
+
+  it("the lineage rule is ANDed on, so age and status still gate everything", () => {
+    const where = deletableAlertWhere(cutoff);
+    expect(where.createdAt).toEqual({ lt: cutoff });
+    expect(where.status).toEqual({ in: ["ANALYZED", "FAILED"] });
+    // The lineage counter carries the SAME age/status/user-state gates, so the
+    // two skip reasons can never overlap.
+    const protectedWhere = lineageProtectedAlertWhere(cutoff);
+    expect(protectedWhere.createdAt).toEqual({ lt: cutoff });
+    expect(protectedWhere.status).toEqual({ in: ["ANALYZED", "FAILED"] });
+    const [protectedUserRule] = protectedWhere.AND as Prisma.AlertWhereInput[];
+    expect(protectedUserRule).toEqual(releasedByUserBranchOf(where));
+  });
 });
+
+/** The user-state branch of a deletion predicate, for comparison. */
+function releasedByUserBranchOf(where: Prisma.AlertWhereInput): Prisma.AlertWhereInput {
+  const [releasedByUser] = where.AND as Prisma.AlertWhereInput[];
+  return releasedByUser;
+}
 
 // ---------------------------------------------------------------------------
 // runRetentionCleanup — mocked Prisma transaction + real files in a temp dir
@@ -99,6 +136,7 @@ interface TxMockInput {
   deletable?: Array<{ id: string; screenshotUrl: string | null }>;
   agedNonTerminal?: number;
   agedTerminal?: number;
+  lineageProtected?: number;
 }
 
 function createTx(input: TxMockInput) {
@@ -112,7 +150,8 @@ function createTx(input: TxMockInput) {
       count: vi
         .fn()
         .mockResolvedValueOnce(input.agedNonTerminal ?? 0)
-        .mockResolvedValueOnce(input.agedTerminal ?? 0),
+        .mockResolvedValueOnce(input.agedTerminal ?? 0)
+        .mockResolvedValueOnce(input.lineageProtected ?? 0),
       update: vi.fn().mockResolvedValue({}),
       deleteMany: vi.fn().mockImplementation(({ where }: { where: { id: { in: string[] } } }) =>
         Promise.resolve({ count: where.id.in.length })

@@ -10,11 +10,18 @@ import { logger } from "../../config/logger";
  * after a few days and old *terminal* alerts are deleted after a safety
  * buffer. Nothing here archives anything — deletion is the feature.
  *
- * Alert relations (verified against prisma/schema.prisma):
- *  - TradeReview  1:1, onDelete: Cascade  -> removed with the alert
- *  - TradeJournal 1:1, onDelete: Cascade  -> removed with the alert
+ * Alert relations (re-verified against prisma/schema.prisma):
+ *  - TradeReview         1:1, onDelete: Cascade  -> removed with the alert
+ *  - TradeJournal        1:1, onDelete: Cascade  -> removed with the alert
+ *  - ExtremeRRPlan       1:1, onDelete: Cascade  -> removed with the alert
+ *  - SelectedPlanOutcome 1:1, onDelete: Cascade  -> removed with the alert
+ *  - TradeExecution      1:N, onDelete: SetNull  -> SURVIVES, alertId nulled
  *  - Asset is a parent reference and is never touched.
- * So deleting an Alert row cannot leave orphans.
+ *
+ * So deleting an Alert leaves no orphan rows, but it is NOT harmless: the two
+ * cascades this list previously omitted carry durable execution lineage. See
+ * `executionLineageWhere` — an alert is now protected when its plan is still
+ * part of an execution's history.
  */
 
 /** Alert pipeline states that are finished. RECEIVED / PROCESSING_* are never touched. */
@@ -64,20 +71,88 @@ export function expiredScreenshotWhere(cutoff: Date): Prisma.AlertWhereInput {
 }
 
 /**
+ * Whether deleting this alert would destroy lineage an execution still needs.
+ *
+ * `ExtremeRRPlan.alertId` cascades, and the plan is where a trade's ORIGIN is
+ * kept: `riskTemplateId`, `templateName`, `referenceCapital`, `riskPercent`,
+ * `rewardRatio`, the frozen lookback candidates. `TradeExecution` survives the
+ * cascade — `extremeRRPlanId` is SetNull — so nothing is orphaned and nothing
+ * fails; the execution simply stops being able to say how it was sized, and no
+ * later read can recover it. The execution's own frozen block keeps
+ * `riskBudgetUsd` and `estimatedRewardRatio`, so the loss is silent: the row
+ * still looks complete.
+ *
+ * `SelectedPlanOutcome` cascades from BOTH the alert and the plan, and carries
+ * the admission verdict for that plan, including the `executionId` it reached.
+ * The same condition protects it, because it hangs off the same alert.
+ *
+ * Deliberately narrow. A plan that no execution ever used is disposable: it is
+ * a rejected or unexecuted candidate, not history, and keeping its alert alive
+ * forever would quietly turn bounded retention into unbounded growth. The test
+ * for that case is as load-bearing as the one for this case.
+ */
+export function executionLineageWhere(): Prisma.AlertWhereInput {
+  return { extremeRRPlan: { is: { tradeExecutions: { some: {} } } } };
+}
+
+/**
+ * The complement: no plan at all, or a plan no execution ever used.
+ *
+ * Written as an explicit OR rather than `NOT: executionLineageWhere()` so the
+ * three possible states — no plan, plan without executions, plan with
+ * executions — are enumerated in the query itself, and a nullable relation can
+ * never fall through a negation into the wrong branch.
+ */
+const disposableLineageWhere: Prisma.AlertWhereInput = {
+  OR: [
+    { extremeRRPlan: { is: null } },
+    { extremeRRPlan: { is: { tradeExecutions: { none: {} } } } },
+  ],
+};
+
+/**
+ * The user-state release rule, unchanged: untouched by the user (no review and
+ * no journal), or the outcome was finalized.
+ */
+const releasedByUserWhere: Prisma.AlertWhereInput = {
+  OR: [
+    { AND: [{ tradeReview: { is: null } }, { tradeJournal: { is: null } }] },
+    { tradeReview: { is: { status: { in: [...FINAL_REVIEW_STATUSES] } } } },
+  ],
+};
+
+/**
  * Alerts old enough AND terminal AND released by the user:
  *  - untouched by the user (no review row and no journal row), or
  *  - the trade outcome was finalized (WIN/LOSS/BREAKEVEN/IGNORED).
  * A review in OPEN or UNREVIEWED state, or a journal without a finalized
  * review, keeps the alert alive past retention until the user concludes it.
+ *
+ * AND, since this fix, released by EXECUTION HISTORY too: an alert whose plan
+ * an execution still points at is never deleted here, whatever its age. Age
+ * and user state are unchanged; this is one additional condition, ANDed on.
  */
 export function deletableAlertWhere(cutoff: Date): Prisma.AlertWhereInput {
   return {
     createdAt: { lt: cutoff },
     status: { in: [...TERMINAL_ALERT_STATUSES] },
-    OR: [
-      { AND: [{ tradeReview: { is: null } }, { tradeJournal: { is: null } }] },
-      { tradeReview: { is: { status: { in: [...FINAL_REVIEW_STATUSES] } } } },
-    ],
+    AND: [releasedByUserWhere, disposableLineageWhere],
+  };
+}
+
+/**
+ * Aged terminal alerts held back ONLY by execution lineage.
+ *
+ * Counted with the user-state rule applied, so this and `skippedOpenUserState`
+ * describe disjoint sets and the residual arithmetic below stays exact. An
+ * alert kept for both reasons is reported as open user state, not double
+ * counted.
+ */
+export function lineageProtectedAlertWhere(cutoff: Date): Prisma.AlertWhereInput {
+  return {
+    createdAt: { lt: cutoff },
+    status: { in: [...TERMINAL_ALERT_STATUSES] },
+    AND: [releasedByUserWhere, executionLineageWhere()],
   };
 }
 
@@ -99,6 +174,13 @@ export interface RetentionReport {
   skippedNonTerminal: number;
   /** Old terminal alerts kept because of open/unfinalized user-entered state. */
   skippedOpenUserState: number;
+  /**
+   * Old terminal alerts kept ONLY because an execution still needs the plan
+   * they would cascade away. Reported separately so "retention deleted less
+   * than you expected" can be read as the safety rule working, rather than
+   * looking like unfinished user state.
+   */
+  skippedExecutionLineage: number;
   failures: number;
 }
 
@@ -160,6 +242,7 @@ export async function runRetentionCleanup(
     alertsDeleted: 0,
     skippedNonTerminal: 0,
     skippedOpenUserState: 0,
+    skippedExecutionLineage: 0,
     failures: 0,
   };
 
@@ -218,16 +301,20 @@ export async function runRetentionCleanup(
       });
       report.alertsSelected = deletable.length;
 
-      const [agedNonTerminal, agedTerminal] = await Promise.all([
+      const [agedNonTerminal, agedTerminal, lineageProtected] = await Promise.all([
         tx.alert.count({
           where: { ...agedWhere, status: { notIn: [...TERMINAL_ALERT_STATUSES] } },
         }),
         tx.alert.count({
           where: { ...agedWhere, status: { in: [...TERMINAL_ALERT_STATUSES] } },
         }),
+        tx.alert.count({ where: lineageProtectedAlertWhere(alertCutoff) }),
       ]);
       report.skippedNonTerminal = agedNonTerminal;
-      report.skippedOpenUserState = agedTerminal - deletable.length;
+      report.skippedExecutionLineage = lineageProtected;
+      // The residual, with lineage now accounted for separately so it keeps
+      // meaning exactly what its name says.
+      report.skippedOpenUserState = agedTerminal - deletable.length - lineageProtected;
 
       if (!options.dryRun) {
         for (const batch of chunk(deletable, DELETE_BATCH_SIZE)) {
@@ -247,8 +334,11 @@ export async function runRetentionCleanup(
               }
             }
 
-            // TradeReview / TradeJournal rows go with the alert via
-            // onDelete: Cascade (verified in schema) — no orphan rows.
+            // TradeReview / TradeJournal / ExtremeRRPlan / SelectedPlanOutcome
+            // all go with the alert via onDelete: Cascade (verified in
+            // schema) — no orphan rows. Every alert in this batch was proven
+            // above to have no plan an execution still points at, so no
+            // execution loses its lineage here.
             const result = await tx.alert.deleteMany({
               where: { id: { in: batch.map((row) => row.id) } },
             });
