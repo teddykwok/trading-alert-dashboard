@@ -24,9 +24,14 @@ import {
   expandExponentialNotation,
   isNonZeroPosition,
   normalizeLeverageBrackets,
+  normalizeAlgoOrder,
   normalizePositionMode,
+  normalizePositionSide,
   normalizePositions,
   normalizeSymbolFilters,
+  normalizeUserTrades,
+  strictExchangeId,
+  strictPositionSide,
 } from "../src/modules/binance/binance.normalize";
 
 const API_KEY = "test-api-key-000000";
@@ -1311,5 +1316,342 @@ describe("userTrades supports exactly three question shapes", () => {
     await expect(
       service().listRecentTrades("BTCUSDT", { endTimeMs: 1 })
     ).rejects.toThrow(/endTime requires an explicit startTime/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// userTrades input integrity
+// ---------------------------------------------------------------------------
+//
+// This endpoint is about to become the substrate for durable fill accounting,
+// where "the exchange returned fewer rows than we asked for" is the proof that
+// an interval of history has been seen in full. Two readings must therefore be
+// impossible to confuse with an answer: a body that is not a page at all, and
+// a position side nobody actually reported.
+
+describe("userTrades refuses a body that is not a page", () => {
+  const service = () => new BinanceReadOnlyService(client());
+
+  it("A. an empty list is a VALID page of zero rows", async () => {
+    // The distinction this whole block exists for: nothing traded in the
+    // window is an ANSWER, and must keep answering [].
+    mockFetchSequence(timeResponse(), response([]));
+
+    await expect(service().listRecentTrades("BTCUSDT")).resolves.toEqual([]);
+  });
+
+  const NOT_A_PAGE: Array<[string, unknown]> = [
+    ["B. an object", {}],
+    ["B. a Binance-shaped error body served with 200", { code: 0, msg: "ok" }],
+    ["C. null", null],
+    ["D. a string", "hello"],
+    ["D. an empty string", ""],
+    ["E. a number", 123],
+    ["E. zero", 0],
+    ["F. a boolean", true],
+    ["F. false", false],
+  ];
+
+  it.each(NOT_A_PAGE)("%s is MALFORMED_RESPONSE, never an empty page", async (_label, body) => {
+    mockFetchSequence(timeResponse(), response(body));
+
+    const error = await service()
+      .listRecentTrades("BTCUSDT")
+      .then(() => null)
+      .catch((thrown) => thrown);
+
+    expect(error).toBeInstanceOf(BinanceError);
+    expect(error.kind).toBe("MALFORMED_RESPONSE");
+    expect(error.endpoint).toBe("userTrades");
+  });
+
+  it("G. refusal REPLACES the page; there is no warning-only path", async () => {
+    // A rejected promise cannot also hand back rows, which is the property
+    // that matters: no caller can observe a normalized page for a body the
+    // wrapper considered malformed.
+    mockFetchSequence(timeResponse(), response({ code: 0 }));
+
+    await expect(service().listRecentTrades("BTCUSDT")).rejects.toThrow(/not a list/);
+  });
+
+  it("G. an ARRAY-LIKE object is refused too", async () => {
+    // Proves the guard is Array.isArray and not duck-typing. This body would
+    // otherwise look like one row and silently pass as a short page.
+    mockFetchSequence(timeResponse(), response({ 0: { id: 1, qty: "1" }, length: 1 }));
+
+    await expect(service().listRecentTrades("BTCUSDT")).rejects.toBeInstanceOf(BinanceError);
+  });
+
+  it("the refusal survives the shape checks that run before the request", async () => {
+    // The pre-request contract still fails first, so a malformed BODY can only
+    // ever be reported for a request this wrapper actually agreed to send.
+    const fetchMock = mockFetchSequence(timeResponse(), response({}));
+
+    await expect(
+      service().listRecentTrades("BTCUSDT", { orderId: "1", startTimeMs: 1 })
+    ).rejects.toThrow(/either an orderId or a time window/);
+    expect(
+      fetchMock.mock.calls.filter((call) => String(call[0]).includes("/fapi/v1/userTrades"))
+    ).toHaveLength(0);
+  });
+});
+
+describe("H. userTrades normalization preserves the exchange's row count exactly", () => {
+  // LOAD-BEARING. Saturation is measured against the number of rows the
+  // EXCHANGE returned. If normalization ever started filtering, a truncated
+  // page of mostly-unusable rows would look short, and the window that
+  // produced it would be marked exhaustively seen while holding a hole.
+
+  const usable = { id: 1, orderId: 2, symbol: "BTCUSDT", side: "BUY", positionSide: "LONG",
+                   qty: "1", price: "2", time: 3 };
+
+  const pathological: unknown[] = [
+    usable,
+    null,
+    42,
+    "garbage",
+    {},
+    { id: {}, orderId: [], symbol: 7, side: true, positionSide: { a: 1 },
+      qty: {}, price: null, time: "nope" },
+  ];
+
+  it("maps every element, including null, scalar, empty and garbage ones", () => {
+    expect(normalizeUserTrades(pathological)).toHaveLength(pathological.length);
+    expect(normalizeUserTrades(pathological)).toHaveLength(6);
+  });
+
+  it("unusable elements become placeholder rows rather than disappearing", () => {
+    const rows = normalizeUserTrades(pathological);
+
+    // Every element is PRESENT and positionally stable. Only the first carries
+    // a usable fill; the rest are placeholders the ledger will skip and count.
+    expect(rows[0].tradeId).toBe("1");
+    expect(rows[0].quantity).toBe("1");
+    // null, a number and a string all become {} and then an all-null row, and
+    // the garbage OBJECT keeps its slot too -- every field it carries is
+    // unreadable, so it is a placeholder rather than a row that vanished.
+    for (const index of [1, 2, 3, 4, 5]) {
+      expect(rows[index].tradeId).toBeNull();
+      expect(rows[index].orderId).toBeNull();
+      expect(rows[index].quantity).toBeNull();
+      expect(rows[index].price).toBeNull();
+      expect(rows[index].positionSide).toBeNull();
+    }
+  });
+
+  it("a page of unusable rows still counts as a FULL page", () => {
+    // The case that would silently end a window: 1000 rows returned, 999 of
+    // them unreadable. The count the planner sees must still be 1000.
+    const full = Array.from({ length: 1000 }, (_, index) => (index === 0 ? usable : null));
+
+    expect(normalizeUserTrades(full)).toHaveLength(1000);
+  });
+
+  it("an empty page is still zero rows", () => {
+    expect(normalizeUserTrades([])).toHaveLength(0);
+  });
+});
+
+describe("userTrades positionSide is read, never invented", () => {
+  const sideOf = (positionSide: unknown) =>
+    normalizeUserTrades([
+      { id: 1, orderId: 2, symbol: "BTCUSDT", side: "BUY", qty: "1", price: "2", time: 3, positionSide },
+    ])[0].positionSide;
+
+  it("I/J/K. the three exchange values survive exactly", () => {
+    expect(sideOf("BOTH")).toBe("BOTH");
+    expect(sideOf("LONG")).toBe("LONG");
+    expect(sideOf("SHORT")).toBe("SHORT");
+  });
+
+  it("I. a genuine BOTH is a real reading and is NOT rejected", () => {
+    // ONE-WAY mode reports BOTH, and that fill is as real as any other. The
+    // change here is about which values are RECOGNISED, never about refusing
+    // one the exchange legitimately sends.
+    expect(sideOf("BOTH")).toBe("BOTH");
+    expect(sideOf("both")).toBe("BOTH");
+    expect(sideOf(" Both ")).toBe("BOTH");
+  });
+
+  it("preserves the repo's existing case folding, and adds no new spelling rules", () => {
+    expect(sideOf("long")).toBe("LONG");
+    expect(sideOf(" Short ")).toBe("SHORT");
+  });
+
+  it("L. an unknown PRESENT value is null, not a fabricated BOTH", () => {
+    // The defect this closes: every one of these used to normalize to "BOTH",
+    // which the ledger accepts as a valid side and inserts. In HEDGE mode that
+    // is a side nobody reported, written into the accounting substrate.
+    for (const unknown of ["garbage", "INVALID", "NET", "LONG_SHORT", "BOT", "BOTHX", "0", "-", "null"]) {
+      expect(sideOf(unknown)).toBeNull();
+    }
+  });
+
+  it("M. a wrong-typed value is null", () => {
+    for (const wrong of [{}, [], ["LONG"], { positionSide: "LONG" }, true, false, 1, 0]) {
+      expect(sideOf(wrong)).toBeNull();
+    }
+  });
+
+  it("N. an absent value is null", () => {
+    expect(sideOf(undefined)).toBeNull();
+    expect(sideOf(null)).toBeNull();
+    expect(sideOf("")).toBeNull();
+    expect(sideOf("   ")).toBeNull();
+    // The key missing entirely, not merely undefined.
+    expect(
+      normalizeUserTrades([{ id: 1, orderId: 2, symbol: "X", side: "BUY", qty: "1", price: "2", time: 3 }])[0]
+        .positionSide
+    ).toBeNull();
+  });
+
+  it("the strict reader is the one wired in, and it recognises exactly three values", () => {
+    expect(strictPositionSide("LONG")).toBe("LONG");
+    expect(strictPositionSide("SHORT")).toBe("SHORT");
+    expect(strictPositionSide("BOTH")).toBe("BOTH");
+    expect(strictPositionSide("garbage")).toBeNull();
+    expect(strictPositionSide(undefined)).toBeNull();
+  });
+
+  it("the TOLERANT reader is untouched, because a position row cannot hold an absence", () => {
+    // normalizePositions' DTO field is non-nullable and ONE-WAY mode really
+    // does report BOTH. Only the FILL path is strict; changing this shared
+    // helper globally would alter unrelated endpoint behaviour.
+    expect(normalizePositionSide("garbage")).toBe("BOTH");
+    expect(normalizePositionSide(undefined)).toBe("BOTH");
+    expect(normalizePositionSide({})).toBe("BOTH");
+    expect(normalizePositionSide("LONG")).toBe("LONG");
+    expect(normalizePositionSide("SHORT")).toBe("SHORT");
+  });
+
+  it("a POSITION with an unreadable side still reads BOTH, exactly as before", () => {
+    const [position] = normalizePositions([
+      { symbol: "BTCUSDT", positionAmt: "1", positionSide: "garbage" },
+    ]);
+
+    expect(position.positionSide).toBe("BOTH");
+  });
+});
+
+describe("userTrades exchange identities are validated, never coerced", () => {
+  // A durable fill is keyed on (profile, symbol, exchangeTradeId). `String(x)`
+  // accepts everything, so an object used to arrive as "[object Object]", an
+  // array as "" or "7", a boolean as "true" -- every one of them a plausible
+  // identity that no exchange ever issued.
+
+  const idsOf = (raw: unknown) => {
+    const [row] = normalizeUserTrades([
+      { id: raw, orderId: raw, symbol: "BTCUSDT", side: "BUY", positionSide: "LONG",
+        qty: "1", price: "2", time: 3 },
+    ]);
+    return { tradeId: row.tradeId, orderId: row.orderId };
+  };
+
+  it("A. a digit string is accepted exactly as supplied", () => {
+    expect(idsOf("123")).toEqual({ tradeId: "123", orderId: "123" });
+    expect(idsOf("1")).toEqual({ tradeId: "1", orderId: "1" });
+  });
+
+  it("B. a 19-digit id keeps every digit and never touches a JS number", () => {
+    // LOAD-BEARING. Routing this through Number() returns ...992, which is a
+    // different trade. The string path must be byte-exact.
+    const huge = "9007199254740993";
+    expect(String(Number(huge))).not.toBe(huge);
+
+    expect(idsOf(huge)).toEqual({ tradeId: huge, orderId: huge });
+    expect(idsOf("18446744073709551615").tradeId).toBe("18446744073709551615");
+  });
+
+  it("C. leading zeros are preserved; this validates, it does not canonicalize", () => {
+    expect(idsOf("00123")).toEqual({ tradeId: "00123", orderId: "00123" });
+    expect(idsOf("0").tradeId).toBe("0");
+  });
+
+  it("D. a safe integer NUMBER renders exactly", () => {
+    expect(idsOf(123)).toEqual({ tradeId: "123", orderId: "123" });
+    expect(idsOf(698759).tradeId).toBe("698759");
+    expect(idsOf(0).tradeId).toBe("0");
+    expect(idsOf(Number.MAX_SAFE_INTEGER).tradeId).toBe("9007199254740991");
+  });
+
+  it("E/F/G. an object, an array or a boolean is NOT an identity", () => {
+    // The exact defect: every one of these used to become a non-null string.
+    for (const wrong of [{}, { id: 1 }, [], [7], ["123"], true, false]) {
+      expect(idsOf(wrong)).toEqual({ tradeId: null, orderId: null });
+    }
+  });
+
+  it("I. proof an object cannot become \"[object Object]\"", () => {
+    expect(String({})).toBe("[object Object]");
+    expect(idsOf({}).tradeId).toBeNull();
+    expect(idsOf({}).orderId).toBeNull();
+  });
+
+  it("H/I/J. a number JavaScript cannot represent exactly is refused", () => {
+    // JSON.parse already rounded this before the normalizer saw it, so the
+    // only honest answer is that we do not know the id.
+    expect(9007199254740993).toBe(9007199254740992);
+    expect(idsOf(9007199254740993).tradeId).toBeNull();
+
+    for (const wrong of [1.5, -1, -0.5, NaN, Infinity, -Infinity, 2 ** 53]) {
+      expect(idsOf(wrong)).toEqual({ tradeId: null, orderId: null });
+    }
+  });
+
+  it("K. non-digit text is refused, including blank and padded digits", () => {
+    for (const wrong of ["garbage", "", "   ", " 12 ", "12 ", "1e3", "0x1F", "12.0", "-1", "+1", "1,2"]) {
+      expect(idsOf(wrong)).toEqual({ tradeId: null, orderId: null });
+    }
+  });
+
+  it("L. an absent identity is null", () => {
+    expect(idsOf(undefined)).toEqual({ tradeId: null, orderId: null });
+    expect(idsOf(null)).toEqual({ tradeId: null, orderId: null });
+    expect(
+      normalizeUserTrades([{ symbol: "BTCUSDT", side: "BUY", qty: "1", price: "2", time: 3 }])[0]
+    ).toMatchObject({ tradeId: null, orderId: null });
+  });
+
+  it("the helper itself recognises exactly the same domain", () => {
+    expect(strictExchangeId("9007199254740993")).toBe("9007199254740993");
+    expect(strictExchangeId("00123")).toBe("00123");
+    expect(strictExchangeId(123)).toBe("123");
+    expect(strictExchangeId(0)).toBe("0");
+    expect(strictExchangeId(-1)).toBeNull();
+    expect(strictExchangeId(1.5)).toBeNull();
+    expect(strictExchangeId(9007199254740993)).toBeNull();
+    expect(strictExchangeId({})).toBeNull();
+    expect(strictExchangeId([])).toBeNull();
+    expect(strictExchangeId(true)).toBeNull();
+    expect(strictExchangeId("garbage")).toBeNull();
+    expect(strictExchangeId(undefined)).toBeNull();
+  });
+
+  it("the documented Binance row is unaffected", () => {
+    // Binance sends both ids as JSON numbers in its own example, and both are
+    // safe integers, so nothing about the normal path changes.
+    const [row] = normalizeUserTrades([
+      { id: 698759, orderId: 25851813, symbol: "BTCUSDT", side: "SELL",
+        positionSide: "SHORT", qty: "0.002", price: "7819.01", time: 1569514978020 },
+    ]);
+
+    expect(row.tradeId).toBe("698759");
+    expect(row.orderId).toBe("25851813");
+  });
+
+  it("an unusable identity still occupies its row in the page", () => {
+    // Cardinality is unchanged by the stricter reader: the row is a placeholder
+    // the ledger will skip and count, not a row that vanished.
+    const rows = normalizeUserTrades([{ id: {}, qty: "1" }, { id: 2, qty: "1" }]);
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0].tradeId).toBeNull();
+    expect(rows[1].tradeId).toBe("2");
+  });
+
+  it("ids on OTHER endpoints are untouched", () => {
+    // normalizeQueriedOrder / normalizeHistoricalOrders / normalizeAlgoOrder
+    // keep their tolerant conversion; only the fill path is strict.
+    expect(normalizeAlgoOrder({ algoId: 123, clientAlgoId: "tad-x" }).algoId).toBe("123");
   });
 });

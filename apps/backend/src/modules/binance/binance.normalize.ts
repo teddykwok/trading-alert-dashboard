@@ -127,9 +127,66 @@ function integer(value: unknown): number | null {
   return null;
 }
 
+/**
+ * TOLERANT position side, for rows whose DTO cannot hold an absence.
+ *
+ * Answers "BOTH" for anything it cannot read. That is correct for a POSITION,
+ * where the field describes the row's own identity and ONE-WAY mode really
+ * does report "BOTH" — but it is a fabricated answer, so it must never be used
+ * for an accounting fact. See `strictPositionSide`.
+ */
 export function normalizePositionSide(value: unknown): BinancePositionSide {
   const upper = text(value)?.toUpperCase();
   return upper === "LONG" || upper === "SHORT" ? upper : "BOTH";
+}
+
+/**
+ * STRICT position side, for economic facts that must not be invented.
+ *
+ * A FILL is an accounting row, not an identity: in HEDGE mode "BOTH" is not a
+ * reading at all, and defaulting to it would record a side nobody reported and
+ * make the row indistinguishable from a genuine ONE-WAY fill. An unreadable
+ * value therefore returns null, so the ledger refuses the row as incomplete
+ * instead of inserting a fabricated one.
+ *
+ * `text` already rejects every non-string, so an object, array, boolean or
+ * number is unreadable rather than stringified. Case folding matches
+ * `normalizePositionSide` exactly — this is stricter about WHICH values are
+ * recognised, never about how they are spelled.
+ */
+export function strictPositionSide(value: unknown): BinancePositionSide | null {
+  const upper = text(value)?.toUpperCase();
+  return upper === "LONG" || upper === "SHORT" || upper === "BOTH" ? upper : null;
+}
+
+/**
+ * STRICT exchange identity, for ids that become DURABLE keys.
+ *
+ * `String(value)` accepts everything, which is how `{}` becomes
+ * "[object Object]", `[7]` becomes "7", `true` becomes "true" and an array
+ * becomes "". Every one of those is a fabricated identity that looks entirely
+ * plausible in a database column, and a fill ledger keyed on it would treat two
+ * unrelated rows as the same trade or one trade as two.
+ *
+ * VALIDATION, NOT CANONICALIZATION. A digit string is returned byte-for-byte:
+ * "00123" stays "00123" and a 19-digit id keeps every digit, because the
+ * exchange's spelling of its own identity is the identity. Nothing here is
+ * parsed, re-rendered or compared numerically.
+ *
+ * A JSON NUMBER is accepted only when JavaScript can represent it exactly.
+ * `JSON.parse` has already rounded anything past 2^53 by the time this runs --
+ * 9007199254740993 arrives as 9007199254740992 -- so an unsafe integer is
+ * refused rather than stored as an authoritative id that is quietly off by one.
+ * The string form remains the lossless path.
+ */
+export function strictExchangeId(value: unknown): string | null {
+  // No trim: whitespace is not part of an id, and accepting " 12 " would force
+  // a canonicalization decision this deliberately does not make.
+  if (typeof value === "string") return /^\d+$/.test(value) ? value : null;
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
+  }
+  return null;
 }
 
 export function normalizeMarginType(value: unknown): BinanceMarginType | null {
@@ -379,17 +436,45 @@ export function normalizeHistoricalOrders(payload: unknown): BinanceHistoricalOr
   });
 }
 
-/** Normalizes GET /fapi/v1/userTrades. Same list discipline as above. */
+/**
+ * Normalizes GET /fapi/v1/userTrades. Same list discipline as above.
+ *
+ * CARDINALITY IS 1:1 AND LOAD-BEARING. `asRows` maps every element and never
+ * filters, and every field reader below is total, so a null, scalar or garbage
+ * element becomes a placeholder DTO rather than disappearing. Saturation is
+ * measured against the number of rows the EXCHANGE returned, so a normalizer
+ * that quietly dropped an unusable row would make a truncated page look short
+ * and end a window that was never exhausted. Do not add a filter here.
+ *
+ * A non-array payload still answers `[]`; the userTrades WRAPPER refuses that
+ * case before ever calling this, because "not a page" and "an empty page" are
+ * different claims and only one of them may be treated as an answer.
+ *
+ * Both exchange identities go through `strictExchangeId` and the position side
+ * through `strictPositionSide`: this endpoint feeds durable fill accounting, so
+ * an unreadable field must arrive as an absence the ledger can refuse, never as
+ * a plausible value it will store.
+ */
 export function normalizeUserTrades(payload: unknown): BinanceUserTradeDto[] {
   if (!Array.isArray(payload)) return [];
   return asRows(payload).map((row) => {
     const time = Number(row.time);
     return {
-      tradeId: row.id === undefined || row.id === null ? null : String(row.id),
-      orderId: row.orderId === undefined || row.orderId === null ? null : String(row.orderId),
+      // STRICT: the durable fill identity. An unreadable id is null, never a
+      // stringified object, boolean or rounded double -- the ledger refuses a
+      // fill with no identity, and a fabricated one would key a real economic
+      // row to a trade that does not exist.
+      tradeId: strictExchangeId(row.id),
+      // STRICT for the same reason, but NOT required: the ledger records an
+      // economic fill with no order id as UNATTRIBUTED, which is a legitimate
+      // reading. What it must never hold is an order id nobody issued.
+      orderId: strictExchangeId(row.orderId),
       symbol: text(row.symbol),
       side: text(row.side),
-      positionSide: row.positionSide === undefined ? null : normalizePositionSide(row.positionSide),
+      // STRICT: an absent OR unreadable side is null, never a fabricated
+      // "BOTH". The ledger skips such a row; recording it would put a side
+      // nobody reported into the accounting substrate.
+      positionSide: strictPositionSide(row.positionSide),
       quantity: decimalString(row.qty),
       price: decimalString(row.price),
       // Accounting fields, byte-exact. `decimalString` preserves the delivered

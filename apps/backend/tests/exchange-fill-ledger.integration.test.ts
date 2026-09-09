@@ -1373,3 +1373,174 @@ describe("A/P. the normalized user trade", () => {
     expect(normalizeUserTrades("not-a-list")).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// O. raw exchange row -> normalizer -> ledger, for the side that was never sent
+// ---------------------------------------------------------------------------
+
+describe("O. an unreadable positionSide never reaches the ledger as a fill", () => {
+  /** One documented row, with only its position side made unreadable. */
+  const rawWith = (positionSide: unknown) => ({
+    id: 990001,
+    orderId: 25851813,
+    symbol: SYMBOL,
+    side: "SELL",
+    positionSide,
+    qty: "0.002",
+    price: "7819.01",
+    quoteQty: "15.63802",
+    realizedPnl: "-0.91539999",
+    commission: "-0.07819010",
+    commissionAsset: "USDT",
+    maker: false,
+    time: 1_757_000_000_000,
+  });
+
+  maybe()("a garbage side normalizes to null and the ledger refuses the row", async () => {
+    // The defect this closes end to end: "garbage" used to become "BOTH",
+    // which is a value ExecutionPositionSide accepts, so the fill was INSERTED
+    // carrying a side the exchange never reported.
+    const id = await profile("unreadable-side");
+    const [normalized] = normalizeUserTrades([rawWith("garbage")]);
+
+    expect(normalized.positionSide).toBeNull();
+
+    const report = await ledger.ingestUserTrades(id, [normalized]);
+
+    expect(report.skipped).toBe(1);
+    expect(report.inserted).toBe(0);
+    expect(report.skippedReasons).toEqual([`trade 990001: missing positionSide`]);
+    // The load-bearing half: no durable row at all.
+    expect(await fillsFor(id)).toEqual([]);
+  });
+
+  maybe()("a wrong-typed side is refused the same way", async () => {
+    const id = await profile("wrong-typed-side");
+    const [normalized] = normalizeUserTrades([rawWith({ side: "LONG" })]);
+
+    expect(normalized.positionSide).toBeNull();
+    expect((await ledger.ingestUserTrades(id, [normalized])).inserted).toBe(0);
+    expect(await fillsFor(id)).toEqual([]);
+  });
+
+  maybe()("a GENUINE BOTH is still a real fill and is recorded", async () => {
+    // Proof the fix narrows which values are recognised, not which fills are
+    // accepted. ONE-WAY mode reports BOTH and that row must survive.
+    const id = await profile("genuine-both");
+    const [normalized] = normalizeUserTrades([rawWith("BOTH")]);
+
+    expect(normalized.positionSide).toBe("BOTH");
+
+    const report = await ledger.ingestUserTrades(id, [normalized]);
+
+    expect(report.inserted).toBe(1);
+    expect(report.skipped).toBe(0);
+    const [row] = await fillsFor(id);
+    expect(row.positionSide).toBe("BOTH");
+    expect(row.exchangeTradeId).toBe("990001");
+  });
+
+  maybe()("LONG and SHORT are unaffected", async () => {
+    const id = await profile("known-sides");
+    const rows = normalizeUserTrades([
+      { ...rawWith("LONG"), id: 990002 },
+      { ...rawWith("SHORT"), id: 990003 },
+    ]);
+
+    expect(rows.map((row) => row.positionSide)).toEqual(["LONG", "SHORT"]);
+    expect((await ledger.ingestUserTrades(id, rows)).inserted).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M/N. a fabricated exchange identity never reaches the ledger
+// ---------------------------------------------------------------------------
+
+describe("M/N. exchange identities are validated before the ledger sees them", () => {
+  /** One documented row; only its identities are varied. */
+  const rawIds = (id: unknown, orderId: unknown) => ({
+    id,
+    orderId,
+    symbol: SYMBOL,
+    side: "SELL",
+    positionSide: "SHORT",
+    qty: "0.002",
+    price: "7819.01",
+    quoteQty: "15.63802",
+    realizedPnl: "-0.91539999",
+    commission: "-0.07819010",
+    commissionAsset: "USDT",
+    maker: false,
+    time: 1_757_000_000_000,
+  });
+
+  maybe()("M. an object trade id normalizes to null and the fill is refused", async () => {
+    // `String({})` is "[object Object]" -- a perfectly storable string that
+    // would have become the unique key of a real economic row.
+    const id = await profile("object-trade-id");
+    const [normalized] = normalizeUserTrades([rawIds({}, 77001)]);
+
+    expect(normalized.tradeId).toBeNull();
+
+    const report = await ledger.ingestUserTrades(id, [normalized]);
+
+    expect(report.skipped).toBe(1);
+    expect(report.inserted).toBe(0);
+    expect(report.skippedReasons).toEqual(["missing tradeId"]);
+    expect(await fillsFor(id)).toEqual([]);
+  });
+
+  maybe()("M. an array, a boolean and an imprecise number are refused the same way", async () => {
+    const id = await profile("unusable-trade-ids");
+    const rows = normalizeUserTrades([
+      rawIds([], 1), rawIds([7], 1), rawIds(true, 1), rawIds(9007199254740993, 1), rawIds("garbage", 1),
+    ]);
+
+    expect(rows.map((row) => row.tradeId)).toEqual([null, null, null, null, null]);
+
+    const report = await ledger.ingestUserTrades(id, rows);
+
+    expect(report.skipped).toBe(5);
+    expect(report.inserted).toBe(0);
+    expect(await fillsFor(id)).toEqual([]);
+  });
+
+  maybe()("N. an unusable ORDER id does not make a real fill unrepresentable", async () => {
+    // The existing ledger doctrine: orderId is not required. A fill nobody can
+    // attribute is still a fill, and it stays recorded as UNATTRIBUTED.
+    const id = await profile("object-order-id");
+    const [normalized] = normalizeUserTrades([rawIds(990101, {})]);
+
+    expect(normalized.tradeId).toBe("990101");
+    expect(normalized.orderId).toBeNull();
+
+    const report = await ledger.ingestUserTrades(id, [normalized]);
+
+    expect(report.inserted).toBe(1);
+    expect(report.skipped).toBe(0);
+    expect(report.unattributed).toBe(1);
+
+    const [row] = await fillsFor(id);
+    expect(row.exchangeTradeId).toBe("990101");
+    // The load-bearing half: no fabricated order identity is stored.
+    expect(row.exchangeOrderId).toBeNull();
+    expect(row.attribution).toBe("UNATTRIBUTED");
+    expect(row.binanceOrderId).toBeNull();
+    // And the economics survived intact.
+    expect(row.quantity.toFixed(3)).toBe("0.002");
+    expect(row.price.toFixed(2)).toBe("7819.01");
+  });
+
+  maybe()("a 19-digit trade id is stored with every digit intact", async () => {
+    const id = await profile("huge-trade-id");
+    const huge = "9007199254740993";
+    const [normalized] = normalizeUserTrades([rawIds(huge, "25851813")]);
+
+    expect(normalized.tradeId).toBe(huge);
+
+    expect((await ledger.ingestUserTrades(id, [normalized])).inserted).toBe(1);
+    const [row] = await fillsFor(id);
+    expect(row.exchangeTradeId).toBe(huge);
+    expect(row.exchangeOrderId).toBe("25851813");
+  });
+});

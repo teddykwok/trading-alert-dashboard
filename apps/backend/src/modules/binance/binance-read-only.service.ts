@@ -468,6 +468,28 @@ export class BinanceReadOnlyService {
       endTime: options.endTimeMs === undefined ? undefined : String(options.endTimeMs),
       orderId: options.orderId,
     });
+
+    /**
+     * A PAGE IS A LIST. Anything else is not an empty page.
+     *
+     * `parseJson` only proves the body was valid JSON, and a non-2xx status is
+     * already an error, so what arrives here is any successfully parsed value:
+     * an object, a string, a number, a boolean, null. The normalizer answers
+     * `[]` for all of them, and `[]` is a legitimate reading -- a window in
+     * which nothing traded. Letting the two collapse is the worst outcome this
+     * endpoint has: a page that was never a page would be counted as zero rows,
+     * fall short of the requested limit, and durably mark an interval of fill
+     * history as exhaustively seen. Refused instead, so it retries as an
+     * ordinary transport failure rather than looking like an answer.
+     */
+    if (!Array.isArray(payload)) {
+      throw new BinanceError({
+        kind: "MALFORMED_RESPONSE",
+        message: "userTrades returned a body that is not a list",
+        endpoint: "userTrades",
+      });
+    }
+
     return normalizeUserTrades(payload);
   }
 
