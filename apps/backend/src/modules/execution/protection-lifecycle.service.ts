@@ -358,6 +358,24 @@ export interface OperatorRecoveryApproval {
   reasonCode: ProtectionReasonCode;
 }
 
+/**
+ * One standard protection order as the exchange currently reports it.
+ *
+ * Carries the average fill alongside the status because the two come from the
+ * same read and describe the same event; separating them is what let a closure
+ * be attributed without the price it happened at.
+ */
+interface StandardProtectionObservation {
+  status: NormalizedProtectionStatus;
+  /**
+   * The average fill the row holds AFTER synchronization, never the raw
+   * response: an observation whose quantity was rejected as stale must not be
+   * able to attribute a closure with the average belonging to that quantity.
+   * Null means genuinely unknown.
+   */
+  averageFillPrice: string | null;
+}
+
 export interface ProtectionRecoveryInput extends ProtectionLifecycleInput {
   operatorApproval?: OperatorRecoveryApproval;
 }
@@ -966,7 +984,22 @@ export class ProtectionLifecycleService {
 
     // Refresh every local protection order from the exchange.
     const orders = await this.loadProtectionOrders(execution.id);
-    const observed: Array<{ order: BinanceOrder; status: NormalizedProtectionStatus; dto: BinanceAlgoOrderDto | null }> = [];
+    /**
+     * What the exchange says about each owned protection order.
+     *
+     * `averageFillPrice` is deliberately modality-NEUTRAL: closure needs the
+     * price a fill happened at, and that is the same question whether the leg
+     * was conditional or a resting LIMIT. It used to be reached through an
+     * ALGO-shaped DTO that was structurally null for a standard row, so a
+     * standard take profit could close a trade and leave `actualExitPrice`
+     * empty. Exchange-specific detail stays on the modality that owns it.
+     */
+    const observed: Array<{
+      order: BinanceOrder;
+      status: NormalizedProtectionStatus;
+      /** Exactly as the exchange reported it; "0" means nothing filled. */
+      averageFillPrice: string | null;
+    }> = [];
     for (const order of orders) {
       /**
        * A standard protection row lives on a different endpoint under a
@@ -975,7 +1008,7 @@ export class ProtectionLifecycleService {
        * unreadable and leave cleanup permanently incomplete.
        */
       if (protectionModality(order.orderType) === "STANDARD") {
-        observed.push({ order, status: await this.observeStandardProtection(execution, order), dto: null });
+        observed.push({ order, ...(await this.observeStandardProtection(execution, order)) });
         continue;
       }
 
@@ -987,14 +1020,14 @@ export class ProtectionLifecycleService {
       if (query.outcome === "CONFIRMED_ACCEPTED" && query.order) {
         const status = normalizeAlgoStatus(query.order.algoStatus);
         await this.applyProtectionObservation(order, query.order, status, input.evaluatedAt);
-        observed.push({ order, status, dto: query.order });
+        observed.push({ order, status, averageFillPrice: query.order.averagePrice });
       } else if (query.outcome === "NOT_FOUND_CONFIRMED") {
         // Binance PROVED this exact id does not exist. There is nothing left
         // for this sibling to cancel, which is a resolved state â€” collapsing it
         // into UNKNOWN is what left the first real canary stuck forever.
-        observed.push({ order, status: "ABSENT", dto: null });
+        observed.push({ order, status: "ABSENT", averageFillPrice: null });
       } else {
-        observed.push({ order, status: "UNKNOWN", dto: null });
+        observed.push({ order, status: "UNKNOWN", averageFillPrice: null });
       }
     }
 
@@ -1314,13 +1347,22 @@ export class ProtectionLifecycleService {
     }
 
     const exitOrder = closure.reason === "TAKE_PROFIT" ? takeProfitFilled : closure.reason === "STOP_LOSS" ? stopFilled : null;
+    const exitAverage =
+      exitOrder?.averageFillPrice !== undefined &&
+      exitOrder?.averageFillPrice !== null &&
+      new D(exitOrder.averageFillPrice).greaterThan(0)
+        ? exitOrder.averageFillPrice
+        : null;
     const committed = await this.commitExecutionChange(execution, input.expectedVersion, {
       status: targetStatus,
       reasonCode: "PROTECTION_VERIFIED",
       message: `Position closed via ${closure.reason}; all sibling protection was cancelled.`,
       eventType: "PROTECTION_CLEANUP",
       actuals: {
-        actualExitPrice: exitOrder?.dto?.averagePrice ? new D(exitOrder.dto.averagePrice) : undefined,
+        // The price OUR OWN filled leg traded at, whichever modality it was.
+        // A zero is Binance saying nothing filled, not a fill at zero, so it
+        // leaves the value unknown rather than recording a free exit.
+        actualExitPrice: exitAverage === null ? undefined : new D(exitAverage),
         exitReason: closure.reason,
         closedAt: input.evaluatedAt,
         lastReconciledAt: input.evaluatedAt,
@@ -3015,13 +3057,43 @@ export class ProtectionLifecycleService {
    * measured from the authoritative query, so this changes no arithmetic — it
    * makes the stored history true.
    *
-   * Deliberately narrow. It writes only the status, only when the row does not
-   * already say that, and never for a status it does not understand: an
-   * unreadable order must not be given a terminal state it never reached.
-   * `originalQuantity` is intent history and is never overwritten by the
-   * exchange's `origQty`, and the deterministic identity is never touched.
+   * It also records WHAT THE ORDER ACTUALLY DID. The query already carries
+   * `executedQty` and `avgPrice`; they were being read and thrown away, so a
+   * standard take profit that closed a whole position left a durable row
+   * saying it had filled nothing at no price. ZROUSDT closed CLOSED_TP on
+   * 68.8 @ 1.0925 while its own row read `executedQuantity 0`,
+   * `averageFillPrice null` — and because the execution takes its exit price
+   * from this observation, `actualExitPrice` was null too. The conditional
+   * path has always persisted both; this is the same doctrine, not a new one.
+   *
+   * Still narrow in the ways that matter. A status it does not understand
+   * writes NOTHING, so an unreadable order is never given a terminal state it
+   * never reached. `originalQuantity` is intent history and is never
+   * overwritten by the exchange's `origQty`. The deterministic client identity
+   * is never touched.
+   *
+   * The write is a DIFF, not a refresh: only fields whose value actually
+   * changes are sent, and an observation that agrees with the row in every
+   * respect performs no write at all. That is what lets the same-status case
+   * be corrected — the old code returned early whenever the status matched,
+   * so a row already marked FILLED could never learn what it had filled, and
+   * stayed wrong permanently.
+   *
+   * RETURNS the average fill this order is now known to have, which is the
+   * value the row holds after synchronization — the observation's own average
+   * when it was accepted, and the previously stored one when it was not. The
+   * caller attributes a closure with it, and that is the whole point of
+   * returning it rather than letting the caller re-read the raw response: a
+   * quantity this method REJECTED as stale must not be able to send its
+   * average out through the closure instead. What we persist and what we
+   * attribute are then the same number by construction, not by two rules that
+   * happen to agree.
    */
-  private async syncStandardProtectionStatus(order: BinanceOrder, dto: BinanceQueriedOrderDto): Promise<void> {
+  private async applyStandardProtectionObservation(
+    order: BinanceOrder,
+    dto: BinanceQueriedOrderDto
+  ): Promise<string | null> {
+    const stored = order.averageFillPrice === null ? null : order.averageFillPrice.toString();
     const raw = typeof dto.status === "string" ? dto.status.trim().toUpperCase() : null;
     const mapped =
       raw === "NEW" || raw === "PARTIALLY_FILLED" || raw === "FILLED" || raw === "EXPIRED" || raw === "REJECTED"
@@ -3029,15 +3101,47 @@ export class ProtectionLifecycleService {
         : raw === "CANCELED" || raw === "CANCELLED"
           ? "CANCELED"
           : null;
-    if (mapped === null || mapped === order.status) return;
-    await this.prisma.binanceOrder.update({
-      where: { id: order.id },
-      data: {
-        status: mapped,
-        lastExchangeUpdateAt: new Date(),
-        ...(dto.orderId ? { exchangeOrderId: dto.orderId } : {}),
-      },
-    });
+    if (mapped === null) return stored;
+
+    /**
+     * Fills only ever move forward, exactly as on the conditional path: a
+     * stale read that reports less than we have already proven is not new
+     * information, it is an older view of the same order.
+     *
+     * The average price is accepted only ALONGSIDE a quantity we accept. It is
+     * the weighted average OF that executed quantity, so taking a price from a
+     * read whose quantity we rejected would pair a stale average with a fill it
+     * does not describe. Equal quantities still qualify: that is the ZRO
+     * repair, where the quantity is already right and only the price is
+     * missing.
+     */
+    const previousExecuted = new D(order.executedQuantity);
+    const observedExecuted = dto.executedQty === null ? previousExecuted : new D(dto.executedQty);
+    const current = observedExecuted.greaterThanOrEqualTo(previousExecuted);
+    const executed = current ? observedExecuted : previousExecuted;
+    // Binance reports "nothing has filled yet" as 0. That is an absence, never
+    // a price, and it must not be written over a null that already says so.
+    const average =
+      current && dto.averagePrice !== null && new D(dto.averagePrice).greaterThan(0)
+        ? new D(dto.averagePrice)
+        : null;
+
+    const data: Prisma.BinanceOrderUpdateInput = {};
+    if (mapped !== order.status) data.status = mapped;
+    if (!executed.equals(previousExecuted)) data.executedQuantity = executed;
+    if (average !== null && (order.averageFillPrice === null || !average.equals(new D(order.averageFillPrice)))) {
+      data.averageFillPrice = average;
+    }
+    if (dto.orderId !== null && dto.orderId !== order.exchangeOrderId) data.exchangeOrderId = dto.orderId;
+
+    const accepted = average === null ? stored : average.toString();
+
+    // Nothing the exchange said differs from what we already hold.
+    if (Object.keys(data).length === 0) return accepted;
+
+    data.lastExchangeUpdateAt = new Date();
+    await this.prisma.binanceOrder.update({ where: { id: order.id }, data });
+    return accepted;
   }
 
   /**
@@ -3146,7 +3250,7 @@ export class ProtectionLifecycleService {
       };
     }
 
-    await this.syncStandardProtectionStatus(order, existing.order);
+    await this.applyStandardProtectionObservation(order, existing.order);
 
     const reading = readStandardOrderCoverage({
       status: existing.order.status,
@@ -4440,29 +4544,35 @@ export class ProtectionLifecycleService {
   private async observeStandardProtection(
     execution: TradeExecution,
     order: BinanceOrder
-  ): Promise<NormalizedProtectionStatus> {
-    if (!order.clientOrderId) return "UNKNOWN";
+  ): Promise<StandardProtectionObservation> {
+    if (!order.clientOrderId) return { status: "UNKNOWN", averageFillPrice: null };
     const query = await this.queryStandardProtection(execution.symbol, order.clientOrderId);
-    if (query.outcome === "NOT_FOUND_CONFIRMED") return "ABSENT";
-    if (query.outcome !== "CONFIRMED_ACCEPTED" || !query.order) return "UNKNOWN";
+    if (query.outcome === "NOT_FOUND_CONFIRMED") return { status: "ABSENT", averageFillPrice: null };
+    if (query.outcome !== "CONFIRMED_ACCEPTED" || !query.order) {
+      return { status: "UNKNOWN", averageFillPrice: null };
+    }
 
-    await this.syncStandardProtectionStatus(order, query.order);
+    // The value that survived synchronization, NOT `query.order.averagePrice`.
+    // A stale read whose quantity was rejected carries an average describing a
+    // fill we have already superseded, and attributing a closure with it would
+    // record a price the row itself disagrees with.
+    const averageFillPrice = await this.applyStandardProtectionObservation(order, query.order);
     const reading = readStandardOrderCoverage({
       status: query.order.status,
       originalQuantity: query.order.origQty,
       executedQuantity: query.order.executedQty,
     });
-    if (reading.kind === "RESTING") return "ACTIVE";
-    if (reading.kind === "UNRESOLVED") return "UNKNOWN";
+    if (reading.kind === "RESTING") return { status: "ACTIVE", averageFillPrice };
+    if (reading.kind === "UNRESOLVED") return { status: "UNKNOWN", averageFillPrice };
     switch (reading.status) {
       case "FILLED":
-        return "FILLED";
+        return { status: "FILLED", averageFillPrice };
       case "EXPIRED":
-        return "EXPIRED";
+        return { status: "EXPIRED", averageFillPrice };
       case "REJECTED":
-        return "REJECTED";
+        return { status: "REJECTED", averageFillPrice };
       default:
-        return "CANCELED";
+        return { status: "CANCELED", averageFillPrice };
     }
   }
 
@@ -4575,7 +4685,7 @@ export class ProtectionLifecycleService {
     const order = await this.prisma.binanceOrder.findFirst({
       where: { tradeExecutionId: execution.id, clientOrderId: sibling.clientOrderId },
     });
-    if (order) await this.syncStandardProtectionStatus(order, after.order);
+    if (order) await this.applyStandardProtectionObservation(order, after.order);
 
     const reading = readStandardOrderCoverage({
       status: after.order.status,
@@ -5061,7 +5171,7 @@ export class ProtectionLifecycleService {
     if (query.outcome === "NOT_FOUND_CONFIRMED") return { kind: "TERMINAL", status: "ABSENT" };
     if (query.outcome !== "CONFIRMED_ACCEPTED" || !query.order) return { kind: "UNRESOLVED" };
 
-    await this.syncStandardProtectionStatus(order, query.order);
+    await this.applyStandardProtectionObservation(order, query.order);
     return readStandardOrderCoverage({
       status: query.order.status,
       originalQuantity: query.order.origQty,

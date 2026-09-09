@@ -9398,3 +9398,343 @@ describe("protection exit confirmation and sibling absence", () => {
     await clearAlerts(execution.id);
   });
 });
+
+// ===========================================================================
+// What a standard take profit ACTUALLY did
+// ===========================================================================
+//
+// ZROUSDT closed correctly as CLOSED_TP on 68.8 filled at 1.0925, and its own
+// durable row said `executedQuantity 0`, `averageFillPrice null`. The exchange
+// had already returned both on the same query the closure read; they were
+// parsed and discarded. `actualExitPrice` came from an ALGO-shaped field that
+// is structurally null for a standard order, so the execution recorded no exit
+// price either.
+//
+// The prices here run on the fixture's own scale rather than ZRO's, so the
+// plan stays internally coherent. The average fill is deliberately NOT the
+// take-profit target: that is what proves the value comes from the fill.
+
+describe("standard take-profit fill actuals", () => {
+  const TP_TARGET = "108";
+  const FILL_AVERAGE = "108.4";
+  const FILL_QUANTITY = "68.8";
+  const EXCHANGE_ORDER_ID = "S-ZRO-1";
+
+  const tpIdOf = (id: string) => buildClientOrderId(id, "TAKE_PROFIT", 1);
+  const stopIdOf = (id: string) => buildClientOrderId(id, "STOP_LOSS", 1);
+
+  const clearAlerts = async (id: string) =>
+    prisma!.criticalAlert.deleteMany({ where: { tradeExecutionId: id } });
+
+  const withStandardTakeProfit = async <T>(run: () => Promise<T>): Promise<T> => {
+    const key = "EXECUTION_STANDARD_LIMIT_TAKE_PROFIT_ENABLED" as const;
+    const previous = (runtimeEnv as Record<string, unknown>)[key];
+    (runtimeEnv as Record<string, unknown>)[key] = true;
+    try {
+      return await run();
+    } finally {
+      (runtimeEnv as Record<string, unknown>)[key] = previous;
+    }
+  };
+
+  const reconcile = async (id: string) =>
+    protectionService.reconcileProtectionAndClosure({
+      executionId: id,
+      expectedVersion: (await reload(id)).version,
+      evaluatedAt: at(),
+    });
+
+  const takeProfitRow = async (id: string) =>
+    (await ordersOf(id)).find((order) => order.role === "TAKE_PROFIT")!;
+
+  /** A LONG protected by an ALGO stop and a STANDARD resting LIMIT target. */
+  async function standardProtected() {
+    scenario.positionAmt = FILL_QUANTITY;
+    const execution = await filledExecution({ filled: FILL_QUANTITY });
+    await withStandardTakeProfit(() => protect(execution));
+    const takeProfit = await takeProfitRow(execution.id);
+    expect(takeProfit.orderType).toBe("LIMIT");
+    expect(takeProfit.price!.toString()).toBe(TP_TARGET);
+    expect(takeProfit.executedQuantity.toString()).toBe("0");
+    expect(takeProfit.averageFillPrice).toBeNull();
+    scenario.mutations = [];
+    scenario.submitted = [];
+    scenario.standardSubmitted = [];
+    return reload(execution.id);
+  }
+
+  /** The exchange now reports the target as fully filled. */
+  const fillOnExchange = (id: string, quantity = FILL_QUANTITY, average = FILL_AVERAGE) => {
+    const row = scenario.standardOrders.get(tpIdOf(id))!;
+    row.status = "FILLED";
+    row.executedQty = quantity;
+    row.avgPrice = average;
+    row.orderId = EXCHANGE_ORDER_ID;
+  };
+
+  // ------------------------------------------------------------ the ZRO case
+
+  maybe()("A/B/C/H. a filled standard target records what it filled, and at what price", async () => {
+    const execution = await standardProtected();
+    fillOnExchange(execution.id);
+    scenario.positionAmt = "0";
+
+    const outcome = await reconcile(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_TP");
+    expect(closed.exitReason).toBe("TAKE_PROFIT");
+    expect(closed.requiresManualIntervention).toBe(false);
+    // The execution's exit price is the FILL, not the target it was aiming at.
+    expect(closed.actualExitPrice!.toString()).toBe(FILL_AVERAGE);
+    expect(closed.actualExitPrice!.toString()).not.toBe(TP_TARGET);
+
+    const takeProfit = await takeProfitRow(execution.id);
+    expect(takeProfit.status).toBe("FILLED");
+    expect(takeProfit.executedQuantity.toString()).toBe(FILL_QUANTITY);
+    expect(takeProfit.averageFillPrice!.toString()).toBe(FILL_AVERAGE);
+    expect(takeProfit.exchangeOrderId).toBe(EXCHANGE_ORDER_ID);
+
+    // Nothing was submitted to fix it, and the stop was cancelled exactly once.
+    expect(scenario.standardSubmitted).toEqual([]);
+    expect(scenario.submitted).toEqual([]);
+    expect(scenario.mutations.filter((call) => call.startsWith("DELETE"))).toHaveLength(1);
+    expect(
+      await prisma!.binanceOrder.count({ where: { tradeExecutionId: execution.id, role: "EMERGENCY_CLOSE" } })
+    ).toBe(0);
+    expect((await protectionOf(execution.id)).state).toBe("CLOSED");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("D. a row ALREADY marked FILLED still learns what it filled", async () => {
+    // The exact production state, and the defect that made it permanent: the
+    // old code returned early whenever the mapped status equalled the stored
+    // one, so a row that reached FILLED before this fix could never be
+    // completed. No status transition is available to carry the repair.
+    const execution = await standardProtected();
+    fillOnExchange(execution.id);
+    await prisma!.binanceOrder.updateMany({
+      where: { tradeExecutionId: execution.id, role: "TAKE_PROFIT", generation: 1 },
+      data: { status: "FILLED", executedQuantity: "0", averageFillPrice: null, exchangeOrderId: null },
+    });
+    const stale = await takeProfitRow(execution.id);
+    expect(stale.status).toBe("FILLED");
+    expect(stale.executedQuantity.toString()).toBe("0");
+    expect(stale.averageFillPrice).toBeNull();
+    scenario.positionAmt = "0";
+
+    await reconcile(execution.id);
+
+    const healed = await takeProfitRow(execution.id);
+    expect(healed.status).toBe("FILLED");
+    expect(healed.executedQuantity.toString()).toBe(FILL_QUANTITY);
+    expect(healed.averageFillPrice!.toString()).toBe(FILL_AVERAGE);
+    expect(healed.exchangeOrderId).toBe(EXCHANGE_ORDER_ID);
+    expect((await reload(execution.id)).actualExitPrice!.toString()).toBe(FILL_AVERAGE);
+    await clearAlerts(execution.id);
+  });
+
+  // ------------------------------------------------------- partial and stale
+
+  maybe()("E. a partial fill is captured and advances on the next observation", async () => {
+    const execution = await standardProtected();
+    const row = scenario.standardOrders.get(tpIdOf(execution.id))!;
+    row.status = "PARTIALLY_FILLED";
+    row.executedQty = "20";
+    row.avgPrice = "108.1";
+    // Still open: a resting LIMIT with a live remnant is not a closure.
+    scenario.positionAmt = "48.8";
+
+    await reconcile(execution.id);
+
+    const first = await takeProfitRow(execution.id);
+    expect(first.status).toBe("PARTIALLY_FILLED");
+    expect(first.executedQuantity.toString()).toBe("20");
+    expect(first.averageFillPrice!.toString()).toBe("108.1");
+
+    row.executedQty = "45";
+    row.avgPrice = "108.25";
+    scenario.positionAmt = "23.8";
+
+    await reconcile(execution.id);
+
+    const second = await takeProfitRow(execution.id);
+    expect(second.executedQuantity.toString()).toBe("45");
+    // The aggregate average moves with the quantity it describes.
+    expect(second.averageFillPrice!.toString()).toBe("108.25");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("F. a stale observation can move neither the quantity nor the price", async () => {
+    const execution = await standardProtected();
+    const row = scenario.standardOrders.get(tpIdOf(execution.id))!;
+    row.status = "PARTIALLY_FILLED";
+    row.executedQty = "45";
+    row.avgPrice = "108.25";
+    scenario.positionAmt = "23.8";
+    await reconcile(execution.id);
+    expect((await takeProfitRow(execution.id)).executedQuantity.toString()).toBe("45");
+
+    // An older view of the same order. Its average belongs to a fill we have
+    // already superseded, so accepting it would pair a stale price with a
+    // quantity it does not describe.
+    row.executedQty = "20";
+    row.avgPrice = "108.1";
+
+    await reconcile(execution.id);
+
+    const held = await takeProfitRow(execution.id);
+    expect(held.executedQuantity.toString()).toBe("45");
+    expect(held.averageFillPrice!.toString()).toBe("108.25");
+    await clearAlerts(execution.id);
+  });
+
+
+  maybe()("a REJECTED stale quantity cannot send its average out through the closure", async () => {
+    // The two rules have to be one rule. Persistence rejects a stale read's
+    // average because it belongs to a fill we have already superseded; if
+    // closure then read the same raw response, the execution would record an
+    // exit price its own protection row disagrees with.
+    const execution = await standardProtected();
+    const row = scenario.standardOrders.get(tpIdOf(execution.id))!;
+    row.status = "PARTIALLY_FILLED";
+    row.executedQty = "45";
+    row.avgPrice = "108.25";
+    scenario.positionAmt = "23.8";
+    await reconcile(execution.id);
+    const accepted = await takeProfitRow(execution.id);
+    expect(accepted.executedQuantity.toString()).toBe("45");
+    expect(accepted.averageFillPrice!.toString()).toBe("108.25");
+
+    // An older view of the same order, now arriving as a terminal reading.
+    row.status = "FILLED";
+    row.executedQty = "20";
+    row.avgPrice = "108.1";
+    scenario.positionAmt = "0";
+
+    await reconcile(execution.id);
+
+    const held = await takeProfitRow(execution.id);
+    expect(held.executedQuantity.toString()).toBe("45");
+    expect(held.averageFillPrice!.toString()).toBe("108.25");
+
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_TP");
+    // The rejected average must not appear anywhere.
+    expect(closed.actualExitPrice!.toString()).not.toBe("108.1");
+    // What is attributed is exactly what the row holds.
+    expect(closed.actualExitPrice!.toString()).toBe(held.averageFillPrice!.toString());
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("a later read with no average keeps attributing the one already proven", async () => {
+    // The same rule from the other side: an authoritative average we already
+    // accepted is not discarded because a later response omits it.
+    const execution = await standardProtected();
+    fillOnExchange(execution.id);
+    scenario.positionAmt = FILL_QUANTITY;
+    await reconcile(execution.id);
+    expect((await takeProfitRow(execution.id)).averageFillPrice!.toString()).toBe(FILL_AVERAGE);
+
+    const row = scenario.standardOrders.get(tpIdOf(execution.id))!;
+    row.avgPrice = "0";
+    scenario.positionAmt = "0";
+
+    await reconcile(execution.id);
+
+    expect((await takeProfitRow(execution.id)).averageFillPrice!.toString()).toBe(FILL_AVERAGE);
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_TP");
+    expect(closed.actualExitPrice!.toString()).toBe(FILL_AVERAGE);
+    await clearAlerts(execution.id);
+  });
+
+  // ------------------------------------------------- absence is not a price
+
+  maybe()("G. an unfilled target keeps a null average, never its own limit price", async () => {
+    const execution = await standardProtected();
+    const row = scenario.standardOrders.get(tpIdOf(execution.id))!;
+    row.status = "NEW";
+    row.executedQty = "0";
+    // Binance reports "nothing filled yet" as a zero average.
+    row.avgPrice = "0";
+    scenario.positionAmt = FILL_QUANTITY;
+
+    await reconcile(execution.id);
+
+    const resting = await takeProfitRow(execution.id);
+    expect(resting.status).toBe("NEW");
+    expect(resting.executedQuantity.toString()).toBe("0");
+    // Not 0, and emphatically not the target it is resting at.
+    expect(resting.averageFillPrice).toBeNull();
+    expect((await reload(execution.id)).actualExitPrice).toBeNull();
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("a FILLED target with no usable average closes, but claims no exit price", async () => {
+    // Fail-open on the accounting, never on the closure: the position really is
+    // closed and the attribution really is ours, so the trade must not be
+    // parked. The price simply stays unknown rather than being invented.
+    const execution = await standardProtected();
+    fillOnExchange(execution.id, FILL_QUANTITY, "0");
+    scenario.positionAmt = "0";
+
+    const outcome = await reconcile(execution.id);
+
+    expect(outcome.ok).toBe(true);
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_TP");
+    expect(closed.actualExitPrice).toBeNull();
+    const takeProfit = await takeProfitRow(execution.id);
+    expect(takeProfit.executedQuantity.toString()).toBe(FILL_QUANTITY);
+    expect(takeProfit.averageFillPrice).toBeNull();
+    await clearAlerts(execution.id);
+  });
+
+  // ------------------------------------------------------------ ALGO is safe
+
+  maybe()("I. a conditional take profit still records its fill and exit price", async () => {
+    // The conditional path already did this correctly and must be untouched;
+    // only the field closure reads it through changed.
+    scenario.positionAmt = "68.8";
+    const execution = await filledExecution({ filled: "68.8" });
+    await protect(execution);
+    const takeProfitId = buildClientOrderId(execution.id, "TAKE_PROFIT", 1);
+    const algo = scenario.algoOrders.get(takeProfitId)!;
+    expect(algo.orderType).toBe("TAKE_PROFIT_MARKET");
+    algo.algoStatus = "FILLED";
+    algo.executedQty = "68.8";
+    algo.avgPrice = "108.4";
+    scenario.positionAmt = "0";
+
+    await reconcile(execution.id);
+
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_TP");
+    expect(closed.actualExitPrice!.toString()).toBe("108.4");
+    const takeProfit = await takeProfitRow(execution.id);
+    expect(takeProfit.executedQuantity.toString()).toBe("68.8");
+    expect(takeProfit.averageFillPrice!.toString()).toBe("108.4");
+    await clearAlerts(execution.id);
+  });
+
+  maybe()("I2. a conditional STOP still records its fill and exit price", async () => {
+    scenario.positionAmt = "68.8";
+    const execution = await filledExecution({ filled: "68.8" });
+    await protect(execution);
+    const stop = scenario.algoOrders.get(stopIdOf(execution.id))!;
+    stop.algoStatus = "FILLED";
+    stop.executedQty = "68.8";
+    stop.avgPrice = "95.8";
+    scenario.positionAmt = "0";
+
+    await reconcile(execution.id);
+
+    const closed = await reload(execution.id);
+    expect(closed.status).toBe("CLOSED_SL");
+    expect(closed.exitReason).toBe("STOP_LOSS");
+    expect(closed.actualExitPrice!.toString()).toBe("95.8");
+    await clearAlerts(execution.id);
+  });
+});
