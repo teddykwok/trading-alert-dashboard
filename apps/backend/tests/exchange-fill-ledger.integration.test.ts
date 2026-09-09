@@ -24,6 +24,7 @@ const {
   ExchangeFillLedgerService,
   FillLedgerConflictError,
   FillLedgerAttributionConflictError,
+  FillLedgerInsertRaceError,
   FillLedgerRaceUnresolvedError,
 } = await import(
   "../src/modules/execution/exchange-fill-ledger.service"
@@ -275,11 +276,13 @@ describe("a race on the unique key cannot smuggle a conflict through", () => {
         const real = Reflect.get(target, property, receiver) as Record<string, unknown>;
         return new Proxy(real, {
           get(inner, innerProperty, innerReceiver) {
-            if (innerProperty !== "findUnique") return Reflect.get(inner, innerProperty, innerReceiver);
+            // The batch PRE-READ is what decides known from new, so that is
+            // what has to be blinded now.
+            if (innerProperty !== "findMany") return Reflect.get(inner, innerProperty, innerReceiver);
             return async (...args: unknown[]) => {
               if (!blinded) {
                 blinded = true;
-                return null;
+                return [];
               }
               return (Reflect.get(inner, innerProperty, innerReceiver) as CallableFunction).apply(inner, args);
             };
@@ -290,41 +293,83 @@ describe("a race on the unique key cannot smuggle a conflict through", () => {
     return new ExchangeFillLedgerService(client);
   }
 
-  maybe()("A. an identical fill losing the race is a duplicate, and stays one row", async () => {
+  maybe()("A. an identical fill losing the insert race fails the WHOLE call", async () => {
+    // Doctrine change, deliberate. Recovering per row used to mean catching the
+    // violation and re-reading the winner -- which a caller inside a
+    // transaction cannot do, because the violation has already aborted it and
+    // the re-read would fail with 25P02. So the call claims nothing instead.
     const id = await profile("race-identical");
-    // The winner.
     await ledger.ingestUserTrades(id, [trade({ tradeId: "9001", orderId: "R1" })]);
     const [winner] = await fillsFor(id);
 
-    // The loser: reads nothing, tries to insert, is rejected by the constraint.
-    const report = await blindedService().ingestUserTrades(id, [trade({ tradeId: "9001", orderId: "R1" })]);
+    const raced = await blindedService()
+      .ingestUserTrades(id, [trade({ tradeId: "9001", orderId: "R1" })])
+      .then(() => null)
+      .catch((thrown) => thrown);
 
-    expect(report.inserted).toBe(0);
-    expect(report.duplicates).toBe(1);
+    expect(raced).toBeInstanceOf(FillLedgerInsertRaceError);
+    expect(raced.reasonCode).toBe("FILL_LEDGER_INSERT_RACE");
+    // Retryable: this is contention, not contradiction.
+    expect(raced.retryable).toBe(true);
+
+    // Nothing was written and the winner is untouched.
     const rows = await fillsFor(id);
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toBe(winner.id);
     expect(rows[0].ingestedAt.getTime()).toBe(winner.ingestedAt.getTime());
   });
 
-  maybe()("B. a CONFLICTING fill losing the race is surfaced, never absorbed", async () => {
-    // The whole point. Before the re-read, a unique violation was taken as
-    // proof of a duplicate, so contradictory economics arriving a millisecond
-    // late reported success and were silently dropped.
+  maybe()("A2. and the REPLAY converges on a duplicate", async () => {
+    // The other half of the doctrine: the retry's pre-read sees the winner and
+    // takes the ordinary path, where the economics ARE compared. Each replay
+    // finds strictly more rows already durable, so this terminates.
+    const id = await profile("race-identical-replay");
+    const fill = [trade({ tradeId: "9101", orderId: "R11" })];
+    await ledger.ingestUserTrades(id, fill);
+    const [winner] = await fillsFor(id);
+
+    await expect(blindedService().ingestUserTrades(id, fill)).rejects.toBeInstanceOf(
+      FillLedgerInsertRaceError
+    );
+
+    const replay = await ledger.ingestUserTrades(id, fill);
+
+    expect(replay.inserted).toBe(0);
+    expect(replay.duplicates).toBe(1);
+    const rows = await fillsFor(id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(winner.id);
+  });
+
+  maybe()("B. a CONFLICTING fill losing the race is never absorbed", async () => {
+    // The guarantee is unchanged: contradictory economics arriving a
+    // millisecond late are never reported as success. Only WHERE it surfaces
+    // moved -- the losing call refuses to claim anything, and the replay does
+    // the comparison it could not do inside an aborted transaction.
     const id = await profile("race-conflict");
     await ledger.ingestUserTrades(id, [
       trade({ tradeId: "9002", orderId: "R2", quantity: "1", price: "100", realizedPnl: "1" }),
     ]);
     const [winner] = await fillsFor(id);
+    const contradiction = [
+      trade({ tradeId: "9002", orderId: "R2", quantity: "1", price: "101", realizedPnl: "2" }),
+    ];
 
-    await expect(
-      blindedService().ingestUserTrades(id, [
-        trade({ tradeId: "9002", orderId: "R2", quantity: "1", price: "101", realizedPnl: "2" }),
-      ])
-    ).rejects.toBeInstanceOf(FillLedgerConflictError);
+    await expect(blindedService().ingestUserTrades(id, contradiction)).rejects.toBeInstanceOf(
+      FillLedgerInsertRaceError
+    );
 
-    // Exactly one row, and the winner is untouched.
-    const rows = await fillsFor(id);
+    // Nothing absorbed, nothing overwritten.
+    let rows = await fillsFor(id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].price.toString()).toBe("100");
+
+    // And the replay names it for what it is.
+    await expect(ledger.ingestUserTrades(id, contradiction)).rejects.toBeInstanceOf(
+      FillLedgerConflictError
+    );
+
+    rows = await fillsFor(id);
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toBe(winner.id);
     expect(rows[0].price.toString()).toBe("100");
@@ -332,8 +377,9 @@ describe("a race on the unique key cannot smuggle a conflict through", () => {
   });
 
   maybe()("genuinely parallel identical ingestion still leaves exactly one row", async () => {
-    // Real concurrency, non-deterministic by nature: whichever interleaving
-    // occurs, the outcome must be the same one row.
+    // Real concurrency, non-deterministic by nature. Whichever interleaving
+    // occurs: one insert, one row, and any loser fails RETRYABLY rather than
+    // claiming something it did not write.
     const id = await profile("race-parallel");
     const fill = [trade({ tradeId: "9003", orderId: "R3" })];
 
@@ -343,13 +389,22 @@ describe("a race on the unique key cannot smuggle a conflict through", () => {
       ledger.ingestUserTrades(id, fill),
     ]);
 
-    expect(results.every((result) => result.status === "fulfilled")).toBe(true);
     const inserted = results.reduce(
       (total, result) => total + (result.status === "fulfilled" ? result.value.inserted : 0),
       0
     );
     expect(inserted).toBe(1);
+    for (const result of results) {
+      if (result.status === "rejected") {
+        expect(result.reason).toBeInstanceOf(FillLedgerInsertRaceError);
+      }
+    }
     expect(await fillsFor(id)).toHaveLength(1);
+
+    // A replay after the dust settles reports the truth for every caller.
+    const replay = await ledger.ingestUserTrades(id, fill);
+    expect(replay.inserted).toBe(0);
+    expect(replay.duplicates).toBe(1);
   });
 });
 
@@ -1181,7 +1236,8 @@ describe("a race on attribution cannot move an owner", () => {
         return new Proxy(real, {
           get(inner, innerProperty, innerReceiver) {
             const original = Reflect.get(inner, innerProperty, innerReceiver) as CallableFunction;
-            if (innerProperty !== "findUnique") return original;
+            // The batch pre-read is the moment the row is seen unowned.
+            if (innerProperty !== "findMany") return original;
             return async (...args: unknown[]) => {
               const found = await original.apply(inner, args);
               if (!claimed) {
@@ -1542,5 +1598,630 @@ describe("M/N. exchange identities are validated before the ledger sees them", (
     const [row] = await fillsFor(id);
     expect(row.exchangeTradeId).toBe(huge);
     expect(row.exchangeOrderId).toBe("25851813");
+  });
+});
+
+// ===========================================================================
+// The batched, transaction-aware ingestion path
+// ===========================================================================
+//
+// One exchange page must be able to land in the SAME transaction as the durable
+// record that says the page was seen, and it must survive a page that repeats
+// or contradicts itself without either fabricating a winner or livelocking.
+
+/** A second symbol, so batch scoping can be proven rather than assumed. */
+const SECOND_SYMBOL = "LEDGERBTCUSDT";
+
+/** An owned execution + order on ANY profile and symbol. */
+async function orderOn(
+  executionProfileId: string,
+  symbol: string,
+  ids: { exchangeOrderId?: string; actualOrderId?: string }
+) {
+  sequence += 1;
+  const execution = await prisma!.tradeExecution.create({
+    data: {
+      executionProfileId, symbol, direction: "LONG", positionSide: "LONG",
+      selectedLookback: 200, plannedEntryPrice: "1.06", calculatedStopLoss: "1.01",
+      executableStopLoss: "1.01", takeProfit: "1.09", riskBudgetUsd: "3", quantityRaw: "68.8",
+      plannedQuantity: "68.8", quantityStepSize: "0.1", actualPlannedLoss: "3",
+      unusedRiskBudget: "0", positionNotional: "72.9", targetIsolatedMargin: "7.3",
+      maximumIsolatedMargin: "10", selectedLeverage: 10, estimatedInitialMargin: "7.3",
+      liquidationBufferRatio: "0.5", decisionReasonCode: "SYNTHETIC",
+    },
+  });
+  const order = await prisma!.binanceOrder.create({
+    data: {
+      tradeExecutionId: execution.id, role: "TAKE_PROFIT", generation: 1,
+      clientOrderId: `${TAG}-batch-${sequence}`, side: "SELL", positionSide: "LONG",
+      orderType: "LIMIT", originalQuantity: "68.8", status: "NEW",
+      exchangeOrderId: ids.exchangeOrderId ?? null,
+      actualOrderId: ids.actualOrderId ?? null,
+    },
+  });
+  return { execution, order };
+}
+
+/** One durable fill by its natural identity. */
+const rowFor = async (executionProfileId: string, exchangeTradeId: string) =>
+  prisma!.exchangeFillLedger.findFirstOrThrow({ where: { executionProfileId, exchangeTradeId } });
+
+// ---------------------------------------------------------------------------
+// The caller owns the transaction
+// ---------------------------------------------------------------------------
+
+describe("ingestion can be a statement in the caller's transaction", () => {
+  maybe()("commits with the caller", async () => {
+    const id = await profile("tx-commit");
+
+    const report = await prisma!.$transaction((tx) =>
+      ledger.ingestUserTradesInTransaction(tx, id, [trade({ tradeId: "TX-1" })])
+    );
+
+    expect(report.inserted).toBe(1);
+    expect(await fillsFor(id)).toHaveLength(1);
+  });
+
+  maybe()("rolls back with the caller, leaving no fill behind", async () => {
+    // The property the whole refactor exists for. If the work the caller does
+    // AFTER ingestion fails, the page must not stay recorded on its own -- an
+    // interval marked processed with none of its fills is a silent hole.
+    const id = await profile("tx-rollback");
+
+    await expect(
+      prisma!.$transaction(async (tx) => {
+        await ledger.ingestUserTradesInTransaction(tx, id, [
+          trade({ tradeId: "TX-2" }),
+          trade({ tradeId: "TX-3" }),
+        ]);
+        throw new Error("the caller's own work failed after ingestion");
+      })
+    ).rejects.toThrow(/the caller's own work failed/);
+
+    expect(await fillsFor(id)).toEqual([]);
+  });
+
+  maybe()("an enrichment inside the transaction rolls back too", async () => {
+    const id = await profile("tx-rollback-enrich");
+    const fill = trade({ tradeId: "TX-4", orderId: "TX-ORD" });
+    await ledger.ingestUserTrades(id, [fill]);
+    await orderOn(id, SYMBOL, { exchangeOrderId: "TX-ORD" });
+    expect((await rowFor(id, "TX-4")).attribution).toBe("UNATTRIBUTED");
+
+    await expect(
+      prisma!.$transaction(async (tx) => {
+        const report = await ledger.ingestUserTradesInTransaction(tx, id, [fill]);
+        expect(report.attributionEnriched).toBe(1);
+        throw new Error("rolled back after enriching");
+      })
+    ).rejects.toThrow(/rolled back after enriching/);
+
+    // The owner was learned and then un-learned, exactly as the caller decided.
+    expect((await rowFor(id, "TX-4")).attribution).toBe("UNATTRIBUTED");
+  });
+
+  maybe()("the pooled path is unchanged and commits on its own", async () => {
+    const id = await profile("tx-pooled");
+
+    const report = await ledger.ingestUserTrades(id, [trade({ tradeId: "TX-5" })]);
+
+    expect(report.inserted).toBe(1);
+    expect(await fillsFor(id)).toHaveLength(1);
+  });
+
+  maybe()("a conflict inside the transaction leaves the caller's other work rolled back", async () => {
+    const id = await profile("tx-conflict");
+    await ledger.ingestUserTrades(id, [trade({ tradeId: "TX-6", price: "100" })]);
+
+    await expect(
+      prisma!.$transaction(async (tx) => {
+        await tx.exchangeFillLedger.create({
+          data: {
+            executionProfileId: id, symbol: SYMBOL, exchangeTradeId: "TX-7",
+            side: "SELL", positionSide: "LONG", quantity: "1", price: "5",
+            tradeTime: new Date(1_757_000_000_000),
+          },
+        });
+        return ledger.ingestUserTradesInTransaction(tx, id, [trade({ tradeId: "TX-6", price: "101" })]);
+      })
+    ).rejects.toBeInstanceOf(FillLedgerConflictError);
+
+    // Neither the caller's row nor anything else survived.
+    const rows = await fillsFor(id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].exchangeTradeId).toBe("TX-6");
+    expect(rows[0].price.toString()).toBe("100");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One page that contradicts or repeats itself
+// ---------------------------------------------------------------------------
+
+describe("same-page natural identities are canonicalized before any insert", () => {
+  maybe()("the same fill twice in one page is one row and one duplicate", async () => {
+    // The livelock this closes: two rows with one natural key in a single
+    // insert hit the unique constraint with NO concurrent writer, and every
+    // replay reproduces the identical page, so the work would burn its whole
+    // attempt budget and be abandoned.
+    const id = await profile("same-page-identical");
+
+    const report = await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "SP-1", orderId: "SP-A" }),
+      trade({ tradeId: "SP-1", orderId: "SP-A" }),
+    ]);
+
+    expect(report.inserted).toBe(1);
+    expect(report.duplicates).toBe(1);
+    expect(report.skipped).toBe(0);
+    expect(await fillsFor(id)).toHaveLength(1);
+  });
+
+  maybe()("three occurrences are one row and two duplicates", async () => {
+    const id = await profile("same-page-three");
+
+    const report = await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "SP-2" }),
+      trade({ tradeId: "SP-2" }),
+      trade({ tradeId: "SP-2" }),
+    ]);
+
+    expect(report.inserted).toBe(1);
+    expect(report.duplicates).toBe(2);
+    expect(report.inserted + report.duplicates + report.skipped).toBe(3);
+    expect(await fillsFor(id)).toHaveLength(1);
+  });
+
+  maybe()("contradictory occurrences of one identity are a conflict, before anything is written", async () => {
+    const id = await profile("same-page-conflict");
+
+    await expect(
+      ledger.ingestUserTrades(id, [
+        trade({ tradeId: "SP-3", price: "100" }),
+        trade({ tradeId: "SP-4" }),
+        trade({ tradeId: "SP-3", price: "101" }),
+      ])
+    ).rejects.toBeInstanceOf(FillLedgerConflictError);
+
+    // Not even the unrelated, perfectly good fill in the same page.
+    expect(await fillsFor(id)).toEqual([]);
+  });
+
+  maybe()("a same-page conflict names the fields that disagree", async () => {
+    const id = await profile("same-page-conflict-fields");
+
+    const thrown = await ledger
+      .ingestUserTrades(id, [
+        trade({ tradeId: "SP-5", price: "100", realizedPnl: "1" }),
+        trade({ tradeId: "SP-5", price: "101", realizedPnl: "2" }),
+      ])
+      .then(() => null)
+      .catch((error) => error);
+
+    expect(thrown).toBeInstanceOf(FillLedgerConflictError);
+    expect(thrown.reasonCode).toBe("FILL_LEDGER_IDENTITY_CONFLICT");
+    expect(thrown.differing).toEqual(expect.arrayContaining(["price", "realizedPnl"]));
+  });
+
+  maybe()("the same decimal written differently is not a same-page conflict", async () => {
+    const id = await profile("same-page-decimal");
+
+    const report = await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "SP-6", quantity: "68.8", price: "1.0925" }),
+      trade({ tradeId: "SP-6", quantity: "68.80", price: "1.09250" }),
+    ]);
+
+    expect(report.inserted).toBe(1);
+    expect(report.duplicates).toBe(1);
+  });
+
+  maybe()("an unrepresentable occurrence is skipped, never grouped", async () => {
+    // A row with no trade id has no identity to group BY, so it is classified
+    // first and takes no part in canonicalization. Conservation still holds.
+    const id = await profile("same-page-skip");
+
+    const report = await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "SP-7" }),
+      trade({ tradeId: null }),
+      trade({ tradeId: "SP-7" }),
+      trade({ tradeId: "SP-8", quantity: null }),
+    ]);
+
+    expect(report.inserted).toBe(1);
+    expect(report.duplicates).toBe(1);
+    expect(report.skipped).toBe(2);
+    expect(report.inserted + report.duplicates + report.skipped).toBe(4);
+    expect(await fillsFor(id)).toHaveLength(1);
+  });
+
+  maybe()("the same trade id on DIFFERENT symbols is not a same-page duplicate", async () => {
+    // Identity is (account, symbol, trade id). Grouping on the trade id alone
+    // would collapse two genuinely different fills into one.
+    const id = await profile("same-page-symbols");
+
+    const report = await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "SP-9", symbol: SYMBOL }),
+      trade({ tradeId: "SP-9", symbol: SECOND_SYMBOL }),
+    ]);
+
+    expect(report.inserted).toBe(2);
+    expect(report.duplicates).toBe(0);
+    const rows = await fillsFor(id);
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.symbol).sort()).toEqual([SECOND_SYMBOL, SYMBOL].sort());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One page, many symbols
+// ---------------------------------------------------------------------------
+
+describe("mixed-symbol batches keep every boundary", () => {
+  maybe()("one call may carry several symbols, as it always could", async () => {
+    const id = await profile("mixed-symbols");
+
+    const report = await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "MS-1", symbol: SYMBOL }),
+      trade({ tradeId: "MS-2", symbol: SECOND_SYMBOL }),
+      trade({ tradeId: "MS-3", symbol: SYMBOL }),
+    ]);
+
+    expect(report.inserted).toBe(3);
+    expect(await fillsFor(id)).toHaveLength(3);
+  });
+
+  maybe()("the pre-read never matches a trade id across symbols", async () => {
+    // A global `exchangeTradeId IN (...)` would find the first symbol's row and
+    // route a genuinely NEW fill into the replay path -- where its economics
+    // would be compared against an unrelated trade and reported as a conflict.
+    const id = await profile("mixed-symbol-preread");
+    await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "MS-4", symbol: SYMBOL, price: "100", quantity: "1" }),
+    ]);
+
+    const report = await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "MS-4", symbol: SECOND_SYMBOL, price: "7", quantity: "3" }),
+    ]);
+
+    expect(report.inserted).toBe(1);
+    expect(report.duplicates).toBe(0);
+    const rows = await fillsFor(id);
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => `${row.symbol}:${row.price.toString()}`).sort()).toEqual(
+      [`${SYMBOL}:100`, `${SECOND_SYMBOL}:7`].sort()
+    );
+  });
+
+  maybe()("a replay of a mixed page is a duplicate on every symbol", async () => {
+    const id = await profile("mixed-symbol-replay");
+    const page = [
+      trade({ tradeId: "MS-5", symbol: SYMBOL }),
+      trade({ tradeId: "MS-5", symbol: SECOND_SYMBOL }),
+    ];
+    await ledger.ingestUserTrades(id, page);
+
+    const replay = await ledger.ingestUserTrades(id, page);
+
+    expect(replay.inserted).toBe(0);
+    expect(replay.duplicates).toBe(2);
+    expect(await fillsFor(id)).toHaveLength(2);
+  });
+
+  maybe()("every durable pre-read is scoped by account AND symbol, never a global id list", async () => {
+    // Structural, because the requirement is structural. Behaviourally the
+    // composite lookup key already carries the row's own symbol, so a global
+    // `exchangeTradeId IN (...)` would still produce the right answer -- while
+    // reading another symbol's rows to do it, and leaving the correctness of
+    // the whole pre-read resting on one downstream map key instead of on the
+    // query. The scope is asserted here so it cannot be dropped silently.
+    const id = await profile("preread-scope");
+    const seen: Array<Record<string, unknown>> = [];
+    const client = new Proxy(prisma as object, {
+      get(target, property, receiver) {
+        if (property !== "exchangeFillLedger") return Reflect.get(target, property, receiver);
+        const real = Reflect.get(target, property, receiver) as Record<string, unknown>;
+        return new Proxy(real, {
+          get(inner, innerProperty, innerReceiver) {
+            const original = Reflect.get(inner, innerProperty, innerReceiver) as CallableFunction;
+            if (innerProperty !== "findMany") return original;
+            return async (...args: unknown[]) => {
+              seen.push(((args[0] ?? {}) as { where?: Record<string, unknown> }).where ?? {});
+              return original.apply(inner, args);
+            };
+          },
+        });
+      },
+    }) as PrismaClient;
+
+    await new ExchangeFillLedgerService(client).ingestUserTrades(id, [
+      trade({ tradeId: "PS-1", symbol: SYMBOL }),
+      trade({ tradeId: "PS-2", symbol: SYMBOL }),
+      trade({ tradeId: "PS-3", symbol: SECOND_SYMBOL }),
+    ]);
+
+    // One query per symbol, each naming its own account and symbol.
+    expect(seen).toHaveLength(2);
+    const bySymbol = new Map(seen.map((where) => [where.symbol as string, where]));
+    expect([...bySymbol.keys()].sort()).toEqual([SECOND_SYMBOL, SYMBOL].sort());
+
+    for (const [symbol, where] of bySymbol) {
+      expect(where.executionProfileId).toBe(id);
+      expect(typeof where.symbol).toBe("string");
+      const ids = (where.exchangeTradeId as { in: string[] }).in;
+      // And the id list belongs to THAT symbol only.
+      expect(ids.sort()).toEqual(symbol === SYMBOL ? ["PS-1", "PS-2"] : ["PS-3"]);
+    }
+  });
+
+  maybe()("attribution still refuses to cross a symbol, in a batch", async () => {
+    const id = await profile("mixed-symbol-attribution");
+    const owner = await orderOn(id, SYMBOL, { exchangeOrderId: "MS-ORD" });
+
+    const report = await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "MS-6", symbol: SYMBOL, orderId: "MS-ORD" }),
+      trade({ tradeId: "MS-7", symbol: SECOND_SYMBOL, orderId: "MS-ORD" }),
+    ]);
+
+    expect(report.inserted).toBe(2);
+    expect(report.unattributed).toBe(1);
+    const rows = await fillsFor(id);
+    const owned = rows.find((row) => row.exchangeTradeId === "MS-6")!;
+    const other = rows.find((row) => row.exchangeTradeId === "MS-7")!;
+    // The owner's execution is on SYMBOL, so only that fill may claim it.
+    expect(owned.attribution).toBe("OWNED_ORDER");
+    expect(owned.binanceOrderId).toBe(owner.order.id);
+    expect(other.attribution).toBe("UNATTRIBUTED");
+    expect(other.binanceOrderId).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Attribution is resolved once for the batch
+// ---------------------------------------------------------------------------
+
+describe("batched attribution keeps the single-fill semantics exactly", () => {
+  /** Counts how many times the owned-order lookup is issued. */
+  function countingService() {
+    let lookups = 0;
+    const client = new Proxy(prisma as object, {
+      get(target, property, receiver) {
+        if (property !== "binanceOrder") return Reflect.get(target, property, receiver);
+        const real = Reflect.get(target, property, receiver) as Record<string, unknown>;
+        return new Proxy(real, {
+          get(inner, innerProperty, innerReceiver) {
+            const original = Reflect.get(inner, innerProperty, innerReceiver) as CallableFunction;
+            if (innerProperty !== "findMany") return original;
+            return async (...args: unknown[]) => {
+              lookups += 1;
+              return original.apply(inner, args);
+            };
+          },
+        });
+      },
+    }) as PrismaClient;
+    return { service: new ExchangeFillLedgerService(client), lookups: () => lookups };
+  }
+
+  maybe()("a page of many fills issues ONE lookup per symbol, not one per fill", async () => {
+    // A replayed window of a thousand known trades used to issue a thousand
+    // lookups. Inside a caller's transaction that is a thousand round trips
+    // holding it open.
+    const id = await profile("batch-attribution-count");
+    const { service, lookups } = countingService();
+    const page = Array.from({ length: 25 }, (_, index) =>
+      trade({ tradeId: `BA-${index}`, orderId: `BA-ORD-${index}`, symbol: SYMBOL })
+    );
+
+    const report = await service.ingestUserTrades(id, page);
+
+    expect(report.inserted).toBe(25);
+    expect(lookups()).toBe(1);
+  });
+
+  maybe()("two symbols in one page are two lookups, one per boundary", async () => {
+    const id = await profile("batch-attribution-symbols");
+    const { service, lookups } = countingService();
+
+    await service.ingestUserTrades(id, [
+      trade({ tradeId: "BA-S1", orderId: "BA-S", symbol: SYMBOL }),
+      trade({ tradeId: "BA-S2", orderId: "BA-S", symbol: SECOND_SYMBOL }),
+    ]);
+
+    expect(lookups()).toBe(2);
+  });
+
+  maybe()("fills with no order id issue no lookup at all", async () => {
+    const id = await profile("batch-attribution-none");
+    const { service, lookups } = countingService();
+
+    const report = await service.ingestUserTrades(id, [
+      trade({ tradeId: "BA-N1", orderId: null }),
+      trade({ tradeId: "BA-N2", orderId: "   " }),
+    ]);
+
+    expect(report.inserted).toBe(2);
+    expect(report.unattributed).toBe(2);
+    expect(lookups()).toBe(0);
+  });
+
+  maybe()("ambiguity is decided PER ORDER ID inside one batch", async () => {
+    // The property a naive batch lookup destroys: sharing one query across ids
+    // and asking "did we get more than one row?" would make an unambiguous
+    // fill ambiguous just because a different id in the same page was.
+    const id = await profile("batch-ambiguity");
+    await orderOn(id, SYMBOL, { exchangeOrderId: "BA-DUP" });
+    await orderOn(id, SYMBOL, { exchangeOrderId: "BA-DUP" });
+    const clean = await orderOn(id, SYMBOL, { exchangeOrderId: "BA-CLEAN" });
+
+    const report = await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "BA-A1", orderId: "BA-DUP" }),
+      trade({ tradeId: "BA-A2", orderId: "BA-CLEAN" }),
+      trade({ tradeId: "BA-A3", orderId: "BA-NOBODY" }),
+    ]);
+
+    expect(report.inserted).toBe(3);
+    expect(report.ambiguous).toBe(1);
+    expect(report.unattributed).toBe(1);
+
+    expect((await rowFor(id, "BA-A1")).attribution).toBe("AMBIGUOUS");
+    const owned = await rowFor(id, "BA-A2");
+    expect(owned.attribution).toBe("OWNED_ORDER");
+    expect(owned.binanceOrderId).toBe(clean.order.id);
+    expect((await rowFor(id, "BA-A3")).attribution).toBe("UNATTRIBUTED");
+  });
+
+  maybe()("one row carrying the id in BOTH columns is one candidate, not two", async () => {
+    // Rows are counted, not matched columns -- exactly as the single-id lookup
+    // counted them. Otherwise a triggered conditional order whose two identity
+    // columns agree would make its own fill look ambiguous.
+    const id = await profile("batch-both-columns");
+    const owner = await orderOn(id, SYMBOL, { exchangeOrderId: "BA-BOTH", actualOrderId: "BA-BOTH" });
+
+    const report = await ledger.ingestUserTrades(id, [trade({ tradeId: "BA-B1", orderId: "BA-BOTH" })]);
+
+    expect(report.ambiguous).toBe(0);
+    const row = await rowFor(id, "BA-B1");
+    expect(row.attribution).toBe("OWNED_ORDER");
+    expect(row.binanceOrderId).toBe(owner.order.id);
+  });
+
+  maybe()("a triggered conditional order still resolves through actualOrderId in a batch", async () => {
+    const id = await profile("batch-actual-order-id");
+    const owner = await orderOn(id, SYMBOL, { actualOrderId: "BA-TRIGGERED" });
+
+    await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "BA-T1", orderId: "BA-TRIGGERED" }),
+      trade({ tradeId: "BA-T2", orderId: "BA-UNKNOWN" }),
+    ]);
+
+    const row = await rowFor(id, "BA-T1");
+    expect(row.attribution).toBe("OWNED_ORDER");
+    expect(row.binanceOrderId).toBe(owner.order.id);
+    expect(row.tradeExecutionId).toBe(owner.execution.id);
+    expect((await rowFor(id, "BA-T2")).attribution).toBe("UNATTRIBUTED");
+  });
+
+  maybe()("a batch enriches known rows and inserts new ones in one pass", async () => {
+    const id = await profile("batch-mixed-pass");
+    const known = trade({ tradeId: "BM-1", orderId: "BM-ORD" });
+    await ledger.ingestUserTrades(id, [known]);
+    const owner = await orderOn(id, SYMBOL, { exchangeOrderId: "BM-ORD" });
+
+    const report = await ledger.ingestUserTrades(id, [known, trade({ tradeId: "BM-2", orderId: null })]);
+
+    expect(report.inserted).toBe(1);
+    expect(report.duplicates).toBe(1);
+    expect(report.attributionEnriched).toBe(1);
+    expect(report.attributionEnriched).toBeLessThanOrEqual(report.duplicates);
+    expect((await rowFor(id, "BM-1")).binanceOrderId).toBe(owner.order.id);
+    expect((await rowFor(id, "BM-2")).attribution).toBe("UNATTRIBUTED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What the report is allowed to say
+// ---------------------------------------------------------------------------
+
+describe("batch accounting conserves every input", () => {
+  maybe()("inserted + duplicates + skipped totals the input, across every path", async () => {
+    const id = await profile("conservation");
+    await ledger.ingestUserTrades(id, [trade({ tradeId: "CN-KNOWN" })]);
+
+    const page = [
+      trade({ tradeId: "CN-KNOWN" }),                    // durable duplicate
+      trade({ tradeId: "CN-NEW-1" }),                    // insert
+      trade({ tradeId: "CN-NEW-1" }),                    // same-page duplicate
+      trade({ tradeId: "CN-NEW-2", symbol: SECOND_SYMBOL }), // insert, other symbol
+      trade({ tradeId: null }),                          // skip
+      trade({ tradeId: "CN-BAD", price: null }),         // skip
+    ];
+
+    const report = await ledger.ingestUserTrades(id, page);
+
+    expect(report.inserted).toBe(2);
+    expect(report.duplicates).toBe(2);
+    expect(report.skipped).toBe(2);
+    expect(report.inserted + report.duplicates + report.skipped).toBe(page.length);
+    expect(report.skippedReasons).toHaveLength(2);
+    expect(report.attributionEnriched).toBeLessThanOrEqual(report.duplicates);
+    expect(await fillsFor(id)).toHaveLength(3);
+  });
+
+  maybe()("an empty page is a valid call that writes nothing", async () => {
+    const id = await profile("conservation-empty");
+
+    const report = await ledger.ingestUserTrades(id, []);
+
+    expect(report).toMatchObject({ inserted: 0, duplicates: 0, skipped: 0 });
+    expect(await fillsFor(id)).toEqual([]);
+  });
+
+  maybe()("a page of nothing but unusable rows writes nothing and skips everything", async () => {
+    const id = await profile("conservation-all-skipped");
+
+    const report = await ledger.ingestUserTrades(id, [trade({ tradeId: null }), trade({ tradeId: null })]);
+
+    expect(report.skipped).toBe(2);
+    expect(report.inserted + report.duplicates + report.skipped).toBe(2);
+    expect(await fillsFor(id)).toEqual([]);
+  });
+
+  maybe()("enrichment stays a SUBSET of duplicates, never a peer", async () => {
+    const id = await profile("conservation-enriched");
+    const fills = [trade({ tradeId: "CN-E1", orderId: "CN-E" }), trade({ tradeId: "CN-E2", orderId: null })];
+    await ledger.ingestUserTrades(id, fills);
+    await orderOn(id, SYMBOL, { exchangeOrderId: "CN-E" });
+
+    const report = await ledger.ingestUserTrades(id, fills);
+
+    expect(report.inserted).toBe(0);
+    expect(report.duplicates).toBe(2);
+    expect(report.attributionEnriched).toBe(1);
+    expect(report.inserted + report.duplicates + report.skipped).toBe(2);
+  });
+});
+
+describe("a contradiction anywhere in a page stops the whole page", () => {
+  maybe()("a conflict on the LAST trade leaves the earlier ones unwritten", async () => {
+    // Economics are compared for the whole batch before any write, so a page
+    // is applied entirely or not at all -- the earlier rows are no longer
+    // already committed by the time the contradiction is reached.
+    const id = await profile("batch-conflict-last");
+    await ledger.ingestUserTrades(id, [trade({ tradeId: "BC-KNOWN", price: "100" })]);
+    expect(await fillsFor(id)).toHaveLength(1);
+
+    await expect(
+      ledger.ingestUserTrades(id, [
+        trade({ tradeId: "BC-NEW-1" }),
+        trade({ tradeId: "BC-NEW-2" }),
+        trade({ tradeId: "BC-KNOWN", price: "101" }),
+      ])
+    ).rejects.toBeInstanceOf(FillLedgerConflictError);
+
+    const rows = await fillsFor(id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].exchangeTradeId).toBe("BC-KNOWN");
+    expect(rows[0].price.toString()).toBe("100");
+  });
+
+  maybe()("a conflict blocks enrichment in the same page", async () => {
+    // Conflict-first is unconditional: an owner becoming resolvable is never a
+    // way past a contradiction, even for a DIFFERENT fill in the batch.
+    const id = await profile("batch-conflict-blocks-enrichment");
+    await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "BE-1", orderId: "BE-ORD" }),
+      trade({ tradeId: "BE-2", price: "100" }),
+    ]);
+    await orderOn(id, SYMBOL, { exchangeOrderId: "BE-ORD" });
+
+    await expect(
+      ledger.ingestUserTrades(id, [
+        trade({ tradeId: "BE-1", orderId: "BE-ORD" }),
+        trade({ tradeId: "BE-2", price: "101" }),
+      ])
+    ).rejects.toBeInstanceOf(FillLedgerConflictError);
+
+    expect((await rowFor(id, "BE-1")).attribution).toBe("UNATTRIBUTED");
+    expect((await rowFor(id, "BE-2")).price.toString()).toBe("100");
   });
 });
