@@ -1056,3 +1056,260 @@ describe("endpoint definitions", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// userTrades query contract
+// ---------------------------------------------------------------------------
+//
+// Accounting needs two shapes from this endpoint: a TARGETED read that names
+// one exchange order, and a BOUNDED read that names a time window. Both are
+// still exactly one request -- deciding which windows to ask for belongs
+// elsewhere. These tests pin what actually goes on the wire, because a request
+// that succeeds while meaning something else is the failure mode that matters.
+
+describe("userTrades query construction", () => {
+  const service = () => new BinanceReadOnlyService(client());
+
+  /** The query the LAST call put on the wire. */
+  const sentParams = (fetchMock: ReturnType<typeof vi.fn>) =>
+    new URL(lastUrl(fetchMock)).searchParams;
+
+  it("A/J. with no options it sends symbol and the default limit, and nothing else", async () => {
+    const fetchMock = mockFetchSequence(timeResponse(), response([]));
+
+    await service().listRecentTrades("btcusdt");
+
+    const params = sentParams(fetchMock);
+    expect(params.get("symbol")).toBe("BTCUSDT");
+    expect(params.get("limit")).toBe("500");
+    // Absent options emit NO parameter, not an empty or literal one.
+    expect(params.has("startTime")).toBe(false);
+    expect(params.has("endTime")).toBe(false);
+    expect(params.has("orderId")).toBe(false);
+    expect(params.has("fromId")).toBe(false);
+  });
+
+  it("B/C. the pre-existing limit and startTime behaviour is unchanged", async () => {
+    const fetchMock = mockFetchSequence(timeResponse(), response([]));
+
+    await service().listRecentTrades("BTCUSDT", { limit: 250, startTimeMs: 1757000000000 });
+
+    const params = sentParams(fetchMock);
+    expect(params.get("limit")).toBe("250");
+    expect(params.get("startTime")).toBe("1757000000000");
+    expect(params.has("endTime")).toBe(false);
+  });
+
+  it("D/E/F. a bounded window sends startTime, endTime and the exact limit", async () => {
+    const fetchMock = mockFetchSequence(timeResponse(), response([]));
+
+    await service().listRecentTrades("BTCUSDT", {
+      startTimeMs: 1757000000000,
+      endTimeMs: 1757600000000,
+      limit: 1000,
+    });
+
+    const params = sentParams(fetchMock);
+    expect(params.get("startTime")).toBe("1757000000000");
+    expect(params.get("endTime")).toBe("1757600000000");
+    expect(params.get("limit")).toBe("1000");
+    expect(params.get("symbol")).toBe("BTCUSDT");
+  });
+
+  it("G/I. a targeted read sends the order id alongside the symbol", async () => {
+    const fetchMock = mockFetchSequence(timeResponse(), response([]));
+
+    await service().listRecentTrades("BTCUSDT", { orderId: "25851813", limit: 1000 });
+
+    const params = sentParams(fetchMock);
+    expect(params.get("orderId")).toBe("25851813");
+    // Binance documents that orderId must accompany symbol.
+    expect(params.get("symbol")).toBe("BTCUSDT");
+    expect(params.get("limit")).toBe("1000");
+    expect(params.has("startTime")).toBe(false);
+  });
+
+  it("H. a large order id survives with every digit intact", async () => {
+    // Beyond Number.MAX_SAFE_INTEGER. Anything routing this through a JS
+    // number would come back rounded, and would query a different order.
+    const huge = "9007199254740993";
+    expect(String(Number(huge))).not.toBe(huge);
+    const fetchMock = mockFetchSequence(timeResponse(), response([]));
+
+    await service().listRecentTrades("BTCUSDT", { orderId: huge });
+
+    expect(sentParams(fetchMock).get("orderId")).toBe(huge);
+  });
+
+  it("accepts zero as a genuine timestamp rather than treating it as absent", async () => {
+    const fetchMock = mockFetchSequence(timeResponse(), response([]));
+
+    await service().listRecentTrades("BTCUSDT", { startTimeMs: 0 });
+
+    expect(sentParams(fetchMock).get("startTime")).toBe("0");
+  });
+
+  it("K. the response is normalized exactly as before", async () => {
+    const raw = {
+      buyer: false, commission: "-0.07819010", commissionAsset: "USDT", id: 698759,
+      maker: false, orderId: 25851813, price: "7819.01", qty: "0.002",
+      quoteQty: "15.63802", realizedPnl: "-0.91539999", side: "SELL",
+      positionSide: "SHORT", symbol: "BTCUSDT", time: 1569514978020,
+    };
+    mockFetchSequence(timeResponse(), response([raw]));
+
+    const [trade] = await service().listRecentTrades("BTCUSDT", { orderId: "25851813" });
+
+    expect(trade.tradeId).toBe("698759");
+    expect(trade.orderId).toBe("25851813");
+    expect(trade.quantity).toBe("0.002");
+    expect(trade.price).toBe("7819.01");
+    expect(trade.quoteQuantity).toBe("15.63802");
+    expect(trade.realizedPnl).toBe("-0.91539999");
+    expect(trade.commission).toBe("-0.07819010");
+    expect(trade.commissionAsset).toBe("USDT");
+  });
+
+  it("N. one call issues exactly one userTrades request", async () => {
+    // No paging, no continuation, no second window.
+    const full = Array.from({ length: 1000 }, (_, index) => ({
+      id: index, orderId: 1, qty: "1", price: "1", time: 1, symbol: "BTCUSDT",
+    }));
+    const fetchMock = mockFetchSequence(timeResponse(), response(full));
+
+    const trades = await service().listRecentTrades("BTCUSDT", { limit: 1000 });
+
+    expect(trades).toHaveLength(1000);
+    const userTradesCalls = fetchMock.mock.calls.filter((call) =>
+      String(call[0]).includes("/fapi/v1/userTrades")
+    );
+    expect(userTradesCalls).toHaveLength(1);
+  });
+});
+
+describe("userTrades arguments are checked, never coerced", () => {
+  const service = () => new BinanceReadOnlyService(client());
+
+  it("refuses a limit the exchange would not honour, rather than clamping it", async () => {
+    // Silently answering a smaller question is how a gap becomes invisible: a
+    // caller comparing rows against its requested limit would read a truncated
+    // page as a complete one.
+    mockFetchSequence(timeResponse(), response([]));
+    for (const limit of [0, -1, 1001, 1.5, Number.NaN]) {
+      await expect(service().listRecentTrades("BTCUSDT", { limit })).rejects.toBeInstanceOf(BinanceError);
+    }
+  });
+
+  it("refuses a non-integer or negative time bound instead of sending literal NaN", async () => {
+    mockFetchSequence(timeResponse(), response([]));
+    for (const value of [Number.NaN, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      await expect(
+        service().listRecentTrades("BTCUSDT", { startTimeMs: value })
+      ).rejects.toBeInstanceOf(BinanceError);
+      // Paired with a valid start bound, so this fails on the BOUND rather
+      // than on the end-without-start contract rule.
+      await expect(
+        service().listRecentTrades("BTCUSDT", { startTimeMs: 1, endTimeMs: value })
+      ).rejects.toBeInstanceOf(BinanceError);
+    }
+  });
+
+  it("refuses a blank order id, which the query builder would otherwise drop", async () => {
+    // An empty value is removed from the canonical query, so a targeted read
+    // would silently become an unbounded one.
+    mockFetchSequence(timeResponse(), response([]));
+    for (const orderId of ["", "   "]) {
+      await expect(
+        service().listRecentTrades("BTCUSDT", { orderId })
+      ).rejects.toBeInstanceOf(BinanceError);
+    }
+  });
+
+  it("refuses a clientOrderId passed where the exchange order id belongs", async () => {
+    // A live hazard: `tad-ec-1-...` is the id an emergency close is RECOVERED
+    // by, and sending it here would query something else entirely.
+    mockFetchSequence(timeResponse(), response([]));
+    await expect(
+      service().listRecentTrades("BTCUSDT", { orderId: "tad-ec-1-9f2ab1c4d5e6" })
+    ).rejects.toBeInstanceOf(BinanceError);
+  });
+
+  it("a refused call never reaches the exchange", async () => {
+    const fetchMock = mockFetchSequence(timeResponse(), response([]));
+
+    await expect(service().listRecentTrades("BTCUSDT", { limit: 5000 })).rejects.toBeInstanceOf(
+      BinanceError
+    );
+
+    const userTradesCalls = fetchMock.mock.calls.filter((call) =>
+      String(call[0]).includes("/fapi/v1/userTrades")
+    );
+    expect(userTradesCalls).toHaveLength(0);
+  });
+
+  it("M. the endpoint weight is unchanged", () => {
+    expect(BINANCE_READ_ONLY_ENDPOINTS.userTrades.weight).toBe(5);
+    expect(BINANCE_READ_ONLY_ENDPOINTS.userTrades.path).toBe("/fapi/v1/userTrades");
+    expect(BINANCE_READ_ONLY_ENDPOINTS.userTrades.signed).toBe(true);
+  });
+});
+
+describe("userTrades supports exactly three question shapes", () => {
+  const service = () => new BinanceReadOnlyService(client());
+
+  /** Every combination the options type can spell, and its verdict. */
+  const SUPPORTED: ReadonlyArray<[string, Record<string, unknown>]> = [
+    ["A. no options", {}],
+    ["B. limit", { limit: 250 }],
+    ["C. startTime", { startTimeMs: 1757000000000 }],
+    ["D. startTime + limit", { startTimeMs: 1757000000000, limit: 250 }],
+    ["E. startTime + endTime", { startTimeMs: 1757000000000, endTimeMs: 1757600000000 }],
+    ["F. startTime + endTime + limit", { startTimeMs: 1757000000000, endTimeMs: 1757600000000, limit: 1000 }],
+    ["G. orderId", { orderId: "25851813" }],
+    ["H. orderId + limit", { orderId: "25851813", limit: 1000 }],
+  ];
+
+  const REJECTED: ReadonlyArray<[string, Record<string, unknown>]> = [
+    ["I. endTime alone", { endTimeMs: 1757600000000 }],
+    ["J. endTime + limit", { endTimeMs: 1757600000000, limit: 250 }],
+    ["K. orderId + startTime", { orderId: "25851813", startTimeMs: 1757000000000 }],
+    ["L. orderId + endTime", { orderId: "25851813", endTimeMs: 1757600000000 }],
+    [
+      "M. orderId + startTime + endTime",
+      { orderId: "25851813", startTimeMs: 1757000000000, endTimeMs: 1757600000000 },
+    ],
+  ];
+
+  it.each(SUPPORTED)("%s is accepted and reaches the exchange once", async (_label, options) => {
+    const fetchMock = mockFetchSequence(timeResponse(), response([]));
+
+    await service().listRecentTrades("BTCUSDT", options);
+
+    const calls = fetchMock.mock.calls.filter((call) => String(call[0]).includes("/fapi/v1/userTrades"));
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each(REJECTED)("%s is refused BEFORE any request", async (_label, options) => {
+    // The options type can spell these; the contract does not include them.
+    // Binance documents no interaction between orderId and a time range, and
+    // an end bound with no start names a window with no beginning -- neither
+    // is a question this wrapper knows how to answer, so neither is asked.
+    const fetchMock = mockFetchSequence(timeResponse(), response([]));
+
+    await expect(service().listRecentTrades("BTCUSDT", options)).rejects.toBeInstanceOf(BinanceError);
+
+    const calls = fetchMock.mock.calls.filter((call) => String(call[0]).includes("/fapi/v1/userTrades"));
+    expect(calls).toHaveLength(0);
+  });
+
+  it("says which rule was broken", async () => {
+    mockFetchSequence(timeResponse(), response([]));
+
+    await expect(
+      service().listRecentTrades("BTCUSDT", { orderId: "1", startTimeMs: 1 })
+    ).rejects.toThrow(/either an orderId or a time window/);
+    await expect(
+      service().listRecentTrades("BTCUSDT", { endTimeMs: 1 })
+    ).rejects.toThrow(/endTime requires an explicit startTime/);
+  });
+});

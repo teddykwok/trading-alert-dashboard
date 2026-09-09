@@ -48,6 +48,27 @@ export const ONE_WAY_MODE_WARNING = `WARNING: Expected ${EXPECTED_POSITION_MODE}
  * written to the database, and the alert pipeline is never touched. The
  * service exposes only reporting methods — there is no trading method to call.
  */
+/** Binance's documented maximum page size for GET /fapi/v1/userTrades. */
+const USER_TRADES_MAX_LIMIT = 1000;
+
+/**
+ * A millisecond timestamp, or nothing.
+ *
+ * Checked rather than coerced for the same reason the other guards are:
+ * `String(NaN)` is "NaN", which Binance would reject as a puzzling malformed
+ * request rather than as the caller bug it is.
+ */
+function assertTimestampMs(value: number | undefined, parameter: string): void {
+  if (value === undefined) return;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new BinanceError({
+      kind: "MALFORMED_RESPONSE",
+      message: `userTrades ${parameter} must be a non-negative integer of milliseconds`,
+      endpoint: "userTrades",
+    });
+  }
+}
+
 export class BinanceReadOnlyService {
   constructor(private readonly client: BinanceReadOnlyClient = new BinanceReadOnlyClient()) {}
 
@@ -336,15 +357,116 @@ export class BinanceReadOnlyService {
    * An order can be gone from the book and still have traded. Absence is not
    * provable without asking whether anything filled, so this is the second
    * half of the same question, never a convenience.
+   *
+   * Exactly three shapes are supported, and the method REFUSES anything else:
+   *
+   *   RECENT    symbol [+ limit]                       — the pre-existing form
+   *   BOUNDED   symbol + startTimeMs [+ endTimeMs] [+ limit]
+   *   TARGETED  symbol + orderId [+ limit]
+   *
+   * A targeted read asks what one order did; a bounded read asks what happened
+   * in one window. They are different questions, and the wrapper will not mix
+   * them. All three still issue exactly ONE request: paging a window is a
+   * decision about which windows to ask for, and it belongs to whatever owns
+   * that decision, not to a method whose job is to ask once and report the
+   * answer.
+   *
+   * `fromId` is deliberately absent. Binance documents that it cannot be
+   * combined with a time range, and documents neither its inclusivity nor any
+   * ordering guarantee — so it cannot carry a losslessness argument, and
+   * exposing it would invite one to be built on it.
+   *
+   * The arguments are checked rather than coerced. Every guard here exists
+   * because the alternative is a request that SUCCEEDS while meaning something
+   * else: a `NaN` bound serializes to the literal "NaN", a blank `orderId` is
+   * dropped by the canonical query builder and quietly becomes an unbounded
+   * sweep, and a `limit` the exchange will not honour breaks the only signal a
+   * caller has for whether it saw a whole page.
    */
   async listRecentTrades(
     symbol: string,
-    options: { limit?: number; startTimeMs?: number } = {}
+    options: {
+      limit?: number;
+      startTimeMs?: number;
+      endTimeMs?: number;
+      /**
+       * The EXCHANGE order id, as text. Kept as a string end to end: an int64
+       * id does not survive a JavaScript number, and this is an identity
+       * rather than a quantity.
+       */
+      orderId?: string;
+    } = {}
   ): Promise<BinanceUserTradeDto[]> {
+    const wanted = symbol.trim().toUpperCase();
+    const limit = options.limit ?? 500;
+
+    // Binance caps this at 1000. Refused rather than clamped: a caller that
+    // asked for more than the exchange will return needs to know its page was
+    // never whole, and silently answering a smaller question is how a gap
+    // becomes invisible.
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > USER_TRADES_MAX_LIMIT) {
+      throw new BinanceError({
+        kind: "MALFORMED_RESPONSE",
+        message: `userTrades limit must be an integer between 1 and ${USER_TRADES_MAX_LIMIT}`,
+        endpoint: "userTrades",
+      });
+    }
+    assertTimestampMs(options.startTimeMs, "startTime");
+    assertTimestampMs(options.endTimeMs, "endTime");
+    if (options.orderId !== undefined && !/^\d+$/.test(options.orderId)) {
+      // Also catches a clientOrderId passed by mistake, which is a live
+      // hazard: `tad-ec-1-…` is the id an emergency close is RECOVERED by, and
+      // sending it here would query the wrong thing entirely.
+      throw new BinanceError({
+        kind: "MALFORMED_RESPONSE",
+        message: "userTrades orderId must be the exchange order id, as digits",
+        endpoint: "userTrades",
+      });
+    }
+
+    /**
+     * EXACTLY ONE QUESTION PER CALL.
+     *
+     * The options type can spell combinations this wrapper does not support,
+     * and TypeScript cannot express "these fields are mutually exclusive"
+     * without a union that every existing caller would have to be rewritten
+     * for. So the contract is enforced here instead of merely described.
+     *
+     * A targeted read asks what ONE order did; a bounded read asks what
+     * happened in ONE window. Mixing them is not a richer question — Binance
+     * documents no interaction between `orderId` and a time range, so the
+     * result would rest on behaviour nobody has specified, and the ingestion
+     * built on top would inherit that. An end bound with no start is the same
+     * problem in miniature: it names a window with no beginning, and the
+     * repair architecture only ever asks for explicit ones.
+     *
+     * Refused locally rather than sent and interpreted: an unsupported request
+     * that happens to return plausible rows is the worst outcome, because it
+     * looks like an answer.
+     */
+    if (options.orderId !== undefined && (options.startTimeMs !== undefined || options.endTimeMs !== undefined)) {
+      throw new BinanceError({
+        kind: "MALFORMED_RESPONSE",
+        message: "userTrades takes either an orderId or a time window, never both",
+        endpoint: "userTrades",
+      });
+    }
+    if (options.endTimeMs !== undefined && options.startTimeMs === undefined) {
+      throw new BinanceError({
+        kind: "MALFORMED_RESPONSE",
+        message: "userTrades endTime requires an explicit startTime",
+        endpoint: "userTrades",
+      });
+    }
+
+    // `undefined` is dropped by `buildCanonicalQuery`, so an absent option
+    // emits no parameter at all rather than an empty or literal one.
     const payload = await this.client.request<unknown>("userTrades", {
-      symbol: symbol.trim().toUpperCase(),
-      limit: String(options.limit ?? 500),
-      ...(options.startTimeMs === undefined ? {} : { startTime: String(options.startTimeMs) }),
+      symbol: wanted,
+      limit: String(limit),
+      startTime: options.startTimeMs === undefined ? undefined : String(options.startTimeMs),
+      endTime: options.endTimeMs === undefined ? undefined : String(options.endTimeMs),
+      orderId: options.orderId,
     });
     return normalizeUserTrades(payload);
   }
