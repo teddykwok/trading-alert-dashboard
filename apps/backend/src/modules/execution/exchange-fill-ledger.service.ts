@@ -1,5 +1,10 @@
 import { Prisma } from "@prisma/client";
-import type { PrismaClient } from "@prisma/client";
+import type {
+  ExchangeFillLedger,
+  ExecutionOrderSide,
+  ExecutionPositionSide,
+  PrismaClient,
+} from "@prisma/client";
 import type { BinanceUserTradeDto } from "../binance/binance.types";
 
 /**
@@ -23,6 +28,12 @@ export type FillIngestOutcome =
   | "INSERTED"
   /** Already recorded, identical in every economic fact. Nothing was written. */
   | "DUPLICATE"
+  /**
+   * Already recorded and still economically identical, but its owning order
+   * has since become resolvable, so its attribution — and ONLY its
+   * attribution — was filled in.
+   */
+  | "ENRICHED"
   /** Unusable: an identity or a fact the ledger requires was missing. */
   | "SKIPPED_INCOMPLETE";
 
@@ -34,6 +45,15 @@ export interface FillIngestReport {
   unattributed: number;
   /** Fills whose exchange order matched more than one owned row. */
   ambiguous: number;
+  /**
+   * Replays that gained an owner they did not previously have.
+   *
+   * A SUBSET of `duplicates`, not a peer of it: the economic fill really was
+   * already recorded, so it is still counted there and
+   * `inserted + duplicates + skipped` still totals the trades handed in. This
+   * says how many of those replays were more than a no-op.
+   */
+  attributionEnriched: number;
   /** Why each skipped trade was unusable, for the caller to surface. */
   skippedReasons: string[];
 }
@@ -65,6 +85,34 @@ export class FillLedgerConflictError extends Error {
 }
 
 /**
+ * A stored fill already has an owner, and a replay resolved a DIFFERENT one.
+ *
+ * Attribution may become KNOWN later; it may not silently change hands. Two
+ * owned orders claiming one fill means our local identities are wrong, and
+ * quietly moving the fill would relocate that trade's economics onto another
+ * execution — the exact failure the ambiguity rule exists to prevent, arriving
+ * one replay late instead of at insert.
+ */
+export class FillLedgerAttributionConflictError extends Error {
+  readonly reasonCode = "FILL_LEDGER_ATTRIBUTION_CONFLICT";
+
+  constructor(
+    readonly executionProfileId: string,
+    readonly symbol: string,
+    readonly exchangeTradeId: string,
+    readonly storedBinanceOrderId: string | null,
+    readonly resolvedBinanceOrderId: string | null
+  ) {
+    super(
+      `Fill ${symbol}#${exchangeTradeId} is already attributed to order ` +
+        `${storedBinanceOrderId ?? "(none)"}, but this replay resolved ` +
+        `${resolvedBinanceOrderId ?? "(none)"}; ownership was left as it was.`
+    );
+    this.name = "FillLedgerAttributionConflictError";
+  }
+}
+
+/**
  * The unique constraint rejected an insert, and the row it collided with then
  * could not be read back.
  *
@@ -79,14 +127,43 @@ export class FillLedgerRaceUnresolvedError extends Error {
   constructor(
     readonly executionProfileId: string,
     readonly symbol: string,
-    readonly exchangeTradeId: string
+    readonly exchangeTradeId: string,
+    readonly detail = "collided with an existing row that could not then be read back"
   ) {
     super(
-      `Fill ${symbol}#${exchangeTradeId} collided with an existing row that could ` +
-        `not then be read back; nothing was written and nothing is claimed about it.`
+      `Fill ${symbol}#${exchangeTradeId} ${detail}; nothing was written and ` +
+        `nothing is claimed about it.`
     );
     this.name = "FillLedgerRaceUnresolvedError";
   }
+}
+
+/**
+ * The immutable economic content of one fill.
+ *
+ * Named once and shared by everything that compares or writes it, so the
+ * conflict check and the insert can never come to describe different sets.
+ */
+interface FillFacts {
+  exchangeOrderId: string | null;
+  side: ExecutionOrderSide;
+  positionSide: ExecutionPositionSide;
+  quantity: Prisma.Decimal;
+  price: Prisma.Decimal;
+  quoteQuantity: Prisma.Decimal | null;
+  realizedPnl: Prisma.Decimal | null;
+  commission: Prisma.Decimal | null;
+  commissionAsset: string | null;
+  maker: boolean | null;
+}
+
+/** The natural identity of one fill, already validated. */
+interface FillKey {
+  executionProfileId: string;
+  symbol: string;
+  exchangeTradeId: string;
+  /** The exchange order this fill named, if any. */
+  orderId: string | null;
 }
 
 /** Exact decimal, or null when the exchange reported nothing. */
@@ -126,14 +203,20 @@ export class ExchangeFillLedgerService {
       skipped: 0,
       unattributed: 0,
       ambiguous: 0,
+      attributionEnriched: 0,
       skippedReasons: [],
     };
 
     for (const trade of trades) {
       const outcome = await this.ingestOne(executionProfileId, trade, report);
       if (outcome === "INSERTED") report.inserted += 1;
-      else if (outcome === "DUPLICATE") report.duplicates += 1;
-      else report.skipped += 1;
+      else if (outcome === "SKIPPED_INCOMPLETE") report.skipped += 1;
+      else {
+        // Both DUPLICATE and ENRICHED describe an economic fill we already
+        // hold; enrichment is additionally counted, never instead.
+        report.duplicates += 1;
+        if (outcome === "ENRICHED") report.attributionEnriched += 1;
+      }
     }
 
     return report;
@@ -168,7 +251,14 @@ export class ExchangeFillLedgerService {
     if (quantity === null) return skip(`trade ${trade.tradeId}: missing quantity`);
     if (price === null) return skip(`trade ${trade.tradeId}: missing price`);
 
-    const facts = {
+    const key: FillKey = {
+      executionProfileId,
+      symbol: trade.symbol,
+      exchangeTradeId: trade.tradeId,
+      orderId: trade.orderId,
+    };
+
+    const facts: FillFacts = {
       exchangeOrderId: trade.orderId,
       side,
       positionSide,
@@ -181,21 +271,16 @@ export class ExchangeFillLedgerService {
       commission: decimal(trade.commission),
       commissionAsset: trade.commissionAsset,
       maker: trade.maker,
-      tradeTime: new Date(trade.timeMs),
-    } as const;
+    };
+    const tradeTime = new Date(trade.timeMs);
 
-    const existing = await this.findFill(executionProfileId, trade.symbol, trade.tradeId);
+    const existing = await this.findFill(executionProfileId, key.symbol, key.exchangeTradeId);
 
     if (existing) {
-      const differing = this.differences(existing, facts);
-      if (differing.length > 0) {
-        throw new FillLedgerConflictError(executionProfileId, trade.symbol, trade.tradeId, differing);
-      }
-      // Same fill, same facts. Nothing to write — this is the replay path.
-      return "DUPLICATE";
+      return this.resolveExistingFill(existing, key, facts, report);
     }
 
-    const attribution = await this.attribute(executionProfileId, trade.symbol, trade.orderId);
+    const attribution = await this.attribute(executionProfileId, key.symbol, key.orderId);
     if (attribution.attribution === "UNATTRIBUTED") report.unattributed += 1;
     if (attribution.attribution === "AMBIGUOUS") report.ambiguous += 1;
 
@@ -203,9 +288,10 @@ export class ExchangeFillLedgerService {
       await this.prisma.exchangeFillLedger.create({
         data: {
           executionProfileId,
-          symbol: trade.symbol,
-          exchangeTradeId: trade.tradeId,
+          symbol: key.symbol,
+          exchangeTradeId: key.exchangeTradeId,
           ...facts,
+          tradeTime,
           ...attribution,
         },
       });
@@ -229,20 +315,134 @@ export class ExchangeFillLedgerService {
         if (attribution.attribution === "UNATTRIBUTED") report.unattributed -= 1;
         if (attribution.attribution === "AMBIGUOUS") report.ambiguous -= 1;
 
-        const winner = await this.findFill(executionProfileId, trade.symbol, trade.tradeId);
+        const winner = await this.findFill(executionProfileId, key.symbol, key.exchangeTradeId);
         if (winner === null) {
-          throw new FillLedgerRaceUnresolvedError(executionProfileId, trade.symbol, trade.tradeId);
+          throw new FillLedgerRaceUnresolvedError(executionProfileId, key.symbol, key.exchangeTradeId);
         }
-        const differing = this.differences(winner, facts);
-        if (differing.length > 0) {
-          throw new FillLedgerConflictError(executionProfileId, trade.symbol, trade.tradeId, differing);
-        }
-        return "DUPLICATE";
+        // The same resolver the ordinary replay uses, so a fill that loses the
+        // insert race is still able to contribute what it knows about ownership.
+        return this.resolveExistingFill(winner, key, facts, report);
       }
       throw error;
     }
 
     return "INSERTED";
+  }
+
+  /**
+   * What to do about a fill we already hold.
+   *
+   * The economic comparison comes FIRST and is unconditional: contradictory
+   * facts under one exchange identity are a conflict whether or not ownership
+   * could now be resolved, and enrichment must never become a way to slip past
+   * it.
+   *
+   * Only then, and only for a row that has no owner yet, is ownership
+   * reconsidered. That is the asymmetry this whole feature rests on: what a
+   * fill WAS is fixed the moment the exchange reports it, but WHOSE it is, is
+   * something we can learn later. A fill can legitimately be read before its
+   * owning order's exchange identity has been recorded locally — an ambiguous
+   * submission is reconciled after the fact — and without this the row would
+   * stay unowned forever, because attribution was only ever computed on insert.
+   */
+  private async resolveExistingFill(
+    existing: ExchangeFillLedger,
+    key: FillKey,
+    facts: FillFacts,
+    report: FillIngestReport
+  ): Promise<FillIngestOutcome> {
+    const { executionProfileId, symbol, exchangeTradeId } = key;
+    const differing = this.differences(existing, facts);
+    if (differing.length > 0) {
+      throw new FillLedgerConflictError(executionProfileId, symbol, exchangeTradeId, differing);
+    }
+
+    /**
+     * ALREADY OWNED IS STICKY, in every direction.
+     *
+     * Not re-resolved, not re-checked, not moved. A later lookup that finds
+     * nothing, finds something else, or has become ambiguous describes our
+     * LOCAL state, which can be wrong or mid-repair; it is not new information
+     * about which order the exchange filled. The one case where a later lookup
+     * genuinely contradicts a stored owner is caught below, where a
+     * concurrent enrichment could otherwise overwrite a winner.
+     *
+     * AMBIGUOUS is left alone too. Deciding whether an ambiguous row should
+     * ever be re-resolved is a separate question from filling in an absent
+     * owner, and answering it here would smuggle a state machine into a
+     * one-way enrichment.
+     */
+    if (existing.attribution !== "UNATTRIBUTED") return "DUPLICATE";
+
+    const resolved = await this.attribute(executionProfileId, symbol, key.orderId);
+    if (resolved.attribution !== "OWNED_ORDER" || resolved.binanceOrderId === null) {
+      // Nothing to learn: still no owner, or now several. Several is reported
+      // so the caller can see it, but the stored row stays UNATTRIBUTED —
+      // guessing one late is no better than guessing one early.
+      if (resolved.attribution === "AMBIGUOUS") report.ambiguous += 1;
+      return "DUPLICATE";
+    }
+
+    /**
+     * Compare-and-set, so two callers who both resolved an owner cannot both
+     * write one. The WHERE carries the full prior state, which means the
+     * update applies only to a row still genuinely unowned — a read followed
+     * by a blind write would let the loser overwrite the winner with an
+     * equally-plausible answer.
+     *
+     * Nothing economic appears in `data`. That is the enforcement, not a
+     * convention: this is the only statement in the service that updates a
+     * ledger row, and it can reach exactly three columns.
+     */
+    const applied = await this.prisma.exchangeFillLedger.updateMany({
+      where: {
+        id: existing.id,
+        attribution: "UNATTRIBUTED",
+        binanceOrderId: null,
+        tradeExecutionId: null,
+      },
+      data: {
+        attribution: "OWNED_ORDER",
+        binanceOrderId: resolved.binanceOrderId,
+        tradeExecutionId: resolved.tradeExecutionId,
+      },
+    });
+
+    if (applied.count === 1) return "ENRICHED";
+
+    /**
+     * We lost. One authoritative re-read decides what actually happened; no
+     * retry, because the answer cannot change again in our favour.
+     */
+    const after = await this.findFill(executionProfileId, symbol, exchangeTradeId);
+    if (after === null) {
+      throw new FillLedgerRaceUnresolvedError(
+        executionProfileId,
+        symbol,
+        exchangeTradeId,
+        "disappeared while its attribution was being settled"
+      );
+    }
+    if (after.attribution === "OWNED_ORDER") {
+      // The winner reached the same conclusion we did: nothing left to do.
+      if (after.binanceOrderId === resolved.binanceOrderId) return "DUPLICATE";
+      throw new FillLedgerAttributionConflictError(
+        executionProfileId,
+        symbol,
+        exchangeTradeId,
+        after.binanceOrderId,
+        resolved.binanceOrderId
+      );
+    }
+    // Not owned, yet the conditional update matched nothing. The row is in a
+    // state this code cannot account for, so it says so rather than reporting
+    // an enrichment that never happened.
+    throw new FillLedgerRaceUnresolvedError(
+      executionProfileId,
+      symbol,
+      exchangeTradeId,
+      `could not be attributed and is not owned (attribution ${after.attribution})`
+    );
   }
 
   /** One fill by its natural identity, or null. */
@@ -327,30 +527,7 @@ export class ExchangeFillLedgerService {
   }
 
   /** Which immutable facts a re-read disagrees with. Empty means identical. */
-  private differences(
-    stored: {
-      exchangeOrderId: string | null;
-      side: string;
-      positionSide: string;
-      quantity: Prisma.Decimal;
-      price: Prisma.Decimal;
-      quoteQuantity: Prisma.Decimal | null;
-      realizedPnl: Prisma.Decimal | null;
-      commission: Prisma.Decimal | null;
-      commissionAsset: string | null;
-    },
-    incoming: {
-      exchangeOrderId: string | null;
-      side: string;
-      positionSide: string;
-      quantity: Prisma.Decimal;
-      price: Prisma.Decimal;
-      quoteQuantity: Prisma.Decimal | null;
-      realizedPnl: Prisma.Decimal | null;
-      commission: Prisma.Decimal | null;
-      commissionAsset: string | null;
-    }
-  ): string[] {
+  private differences(stored: FillFacts, incoming: FillFacts): string[] {
     const differing: string[] = [];
     // `maker` is excluded on purpose: it describes how the fill matched, not
     // what it was worth, and it is the one field Binance may omit on a

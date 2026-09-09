@@ -20,7 +20,12 @@ const prisma: PrismaClient | null = testDatabase;
 
 const { normalizeUserTrades } = await import("../src/modules/binance/binance.normalize");
 
-const { ExchangeFillLedgerService, FillLedgerConflictError } = await import(
+const {
+  ExchangeFillLedgerService,
+  FillLedgerConflictError,
+  FillLedgerAttributionConflictError,
+  FillLedgerRaceUnresolvedError,
+} = await import(
   "../src/modules/execution/exchange-fill-ledger.service"
 );
 
@@ -735,6 +740,484 @@ describe("attribution never crosses a symbol boundary", () => {
     expect(report.unattributed).toBe(1);
     expect(report.ambiguous).toBe(0);
     expect((await fillOn(accountA, BTC, "SYM-6")).attribution).toBe("UNATTRIBUTED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Attribution can be learned later; economics cannot
+// ---------------------------------------------------------------------------
+//
+// A fill can legitimately be read before the order that produced it has had its
+// exchange identity recorded locally — an ambiguous submission is reconciled
+// after the fact. Attribution was previously computed only on insert, so such a
+// fill stayed unowned permanently. Learning WHOSE a fill is later is not the
+// same as changing WHAT it was.
+
+describe("attribution enrichment on replay", () => {
+  async function orderIn(
+    executionProfileId: string,
+    symbol: string,
+    options: { exchangeOrderId?: string; actualOrderId?: string; role?: string }
+  ) {
+    sequence += 1;
+    const execution = await prisma!.tradeExecution.create({
+      data: {
+        executionProfileId,
+        symbol,
+        direction: "LONG",
+        positionSide: "LONG",
+        selectedLookback: 200,
+        plannedEntryPrice: "1.06", calculatedStopLoss: "1.01", executableStopLoss: "1.01",
+        takeProfit: "1.09", riskBudgetUsd: "3", quantityRaw: "68.8", plannedQuantity: "68.8",
+        quantityStepSize: "0.1", actualPlannedLoss: "3", unusedRiskBudget: "0",
+        positionNotional: "72.9", targetIsolatedMargin: "7.3", maximumIsolatedMargin: "10",
+        selectedLeverage: 10, estimatedInitialMargin: "7.3", liquidationBufferRatio: "0.5",
+        decisionReasonCode: "SYNTHETIC",
+      },
+    });
+    const order = await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: execution.id,
+        role: (options.role ?? "TAKE_PROFIT") as "TAKE_PROFIT",
+        generation: 1,
+        clientOrderId: `${TAG}-enr-${sequence}`,
+        side: "SELL",
+        positionSide: "LONG",
+        orderType: "LIMIT",
+        originalQuantity: "68.8",
+        status: "NEW",
+        exchangeOrderId: options.exchangeOrderId ?? null,
+        actualOrderId: options.actualOrderId ?? null,
+      },
+    });
+    return { execution, order };
+  }
+
+  const fillRow = async (executionProfileId: string, symbol: string, exchangeTradeId: string) =>
+    prisma!.exchangeFillLedger.findFirstOrThrow({
+      where: { executionProfileId, symbol, exchangeTradeId },
+    });
+
+  const countFor = async (executionProfileId: string, exchangeTradeId: string) =>
+    prisma!.exchangeFillLedger.count({ where: { executionProfileId, exchangeTradeId } });
+
+  maybe()("A/C/D/E. an ordinary order recorded later claims its fill, and nothing else moves", async () => {
+    const id = await profile("enrich-standard");
+    const fill = trade({ tradeId: "E-1", orderId: "LATE-ORD-1", symbol: SYMBOL });
+
+    // 1. The fill arrives first. Nothing owns it yet.
+    await ledger.ingestUserTrades(id, [fill]);
+    const before = await fillRow(id, SYMBOL, "E-1");
+    expect(before.attribution).toBe("UNATTRIBUTED");
+    expect(before.binanceOrderId).toBeNull();
+
+    // 2. Reconciliation later captures the order's exchange identity.
+    const owner = await orderIn(id, SYMBOL, { exchangeOrderId: "LATE-ORD-1", role: "ENTRY" });
+
+    // 3. The very same fill is replayed.
+    const report = await ledger.ingestUserTrades(id, [fill]);
+
+    expect(report.attributionEnriched).toBe(1);
+    // Still a duplicate economic fill: enrichment is counted as well, not instead.
+    expect(report.duplicates).toBe(1);
+    expect(report.inserted).toBe(0);
+
+    const after = await fillRow(id, SYMBOL, "E-1");
+    expect(after.attribution).toBe("OWNED_ORDER");
+    expect(after.binanceOrderId).toBe(owner.order.id);
+    expect(after.tradeExecutionId).toBe(owner.execution.id);
+
+    // C/D: the same row, not a replacement.
+    expect(after.id).toBe(before.id);
+    expect(after.ingestedAt.getTime()).toBe(before.ingestedAt.getTime());
+    expect(await countFor(id, "E-1")).toBe(1);
+
+    // E: every economic fact exactly as it was.
+    expect(after.exchangeOrderId).toBe(before.exchangeOrderId);
+    expect(after.side).toBe(before.side);
+    expect(after.positionSide).toBe(before.positionSide);
+    expect(after.quantity.toFixed()).toBe(before.quantity.toFixed());
+    expect(after.price.toFixed()).toBe(before.price.toFixed());
+    expect(after.quoteQuantity!.toFixed()).toBe(before.quoteQuantity!.toFixed());
+    expect(after.realizedPnl!.toFixed()).toBe(before.realizedPnl!.toFixed());
+    expect(after.commission!.toFixed()).toBe(before.commission!.toFixed());
+    expect(after.commissionAsset).toBe(before.commissionAsset);
+    expect(after.maker).toBe(before.maker);
+    expect(after.tradeTime.getTime()).toBe(before.tradeTime.getTime());
+    expect(after.symbol).toBe(before.symbol);
+    expect(after.exchangeTradeId).toBe(before.exchangeTradeId);
+    expect(after.executionProfileId).toBe(before.executionProfileId);
+  });
+
+  maybe()("B. a triggered conditional order recorded later claims its fill too", async () => {
+    // The realistic case: a conditional order has no exchange order id until it
+    // fires, so the fill can easily be seen before the id it references exists.
+    const id = await profile("enrich-algo");
+    const fill = trade({ tradeId: "E-2", orderId: "LATE-ALGO-1", symbol: SYMBOL });
+
+    await ledger.ingestUserTrades(id, [fill]);
+    expect((await fillRow(id, SYMBOL, "E-2")).attribution).toBe("UNATTRIBUTED");
+
+    const owner = await orderIn(id, SYMBOL, { actualOrderId: "LATE-ALGO-1", role: "STOP_LOSS" });
+
+    const report = await ledger.ingestUserTrades(id, [fill]);
+
+    expect(report.attributionEnriched).toBe(1);
+    const after = await fillRow(id, SYMBOL, "E-2");
+    expect(after.attribution).toBe("OWNED_ORDER");
+    expect(after.binanceOrderId).toBe(owner.order.id);
+    expect(after.tradeExecutionId).toBe(owner.execution.id);
+  });
+
+  maybe()("F. replaying with still no owner changes nothing at all", async () => {
+    const id = await profile("enrich-none");
+    const fill = trade({ tradeId: "E-3", orderId: "NEVER-OWNED", symbol: SYMBOL });
+
+    await ledger.ingestUserTrades(id, [fill]);
+    const before = await fillRow(id, SYMBOL, "E-3");
+
+    const report = await ledger.ingestUserTrades(id, [fill]);
+
+    expect(report.attributionEnriched).toBe(0);
+    expect(report.duplicates).toBe(1);
+    const after = await fillRow(id, SYMBOL, "E-3");
+    expect(after.attribution).toBe("UNATTRIBUTED");
+    expect(after.binanceOrderId).toBeNull();
+    expect(after.id).toBe(before.id);
+    expect(await countFor(id, "E-3")).toBe(1);
+  });
+
+  maybe()("G. two late candidates are not guessed between", async () => {
+    // Guessing one late is no better than guessing one early. The row keeps
+    // saying it has no owner, and the caller is told why.
+    const id = await profile("enrich-ambiguous");
+    const fill = trade({ tradeId: "E-4", orderId: "LATE-DUP", symbol: SYMBOL });
+
+    await ledger.ingestUserTrades(id, [fill]);
+    await orderIn(id, SYMBOL, { exchangeOrderId: "LATE-DUP" });
+    await orderIn(id, SYMBOL, { actualOrderId: "LATE-DUP" });
+
+    const report = await ledger.ingestUserTrades(id, [fill]);
+
+    expect(report.attributionEnriched).toBe(0);
+    expect(report.ambiguous).toBe(1);
+    const after = await fillRow(id, SYMBOL, "E-4");
+    // Deliberately NOT transitioned to AMBIGUOUS: this fills in an absent
+    // owner, it does not run a state machine over attribution.
+    expect(after.attribution).toBe("UNATTRIBUTED");
+    expect(after.binanceOrderId).toBeNull();
+  });
+
+  maybe()("H. an economic conflict blocks enrichment, even when an owner now exists", async () => {
+    // Priority matters: enrichment must never become a way past the conflict
+    // check. Contradictory economics are a conflict whether or not ownership
+    // could now be settled.
+    const id = await profile("enrich-conflict");
+    await ledger.ingestUserTrades(id, [
+      trade({ tradeId: "E-5", orderId: "CONFLICT-ORD", symbol: SYMBOL, price: "100" }),
+    ]);
+    await orderIn(id, SYMBOL, { exchangeOrderId: "CONFLICT-ORD" });
+
+    await expect(
+      ledger.ingestUserTrades(id, [
+        trade({ tradeId: "E-5", orderId: "CONFLICT-ORD", symbol: SYMBOL, price: "101" }),
+      ])
+    ).rejects.toBeInstanceOf(FillLedgerConflictError);
+
+    const after = await fillRow(id, SYMBOL, "E-5");
+    expect(after.price.toFixed()).toBe("100");
+    // No attribution mutation happened on the way to the error.
+    expect(after.attribution).toBe("UNATTRIBUTED");
+    expect(after.binanceOrderId).toBeNull();
+  });
+
+  maybe()("I. an owner already recorded never moves, even with a competitor present", async () => {
+    const id = await profile("enrich-sticky");
+    const fill = trade({ tradeId: "E-6", orderId: "STICKY-ORD", symbol: SYMBOL });
+    const first = await orderIn(id, SYMBOL, { exchangeOrderId: "STICKY-ORD" });
+
+    await ledger.ingestUserTrades(id, [fill]);
+    const owned = await fillRow(id, SYMBOL, "E-6");
+    expect(owned.attribution).toBe("OWNED_ORDER");
+    expect(owned.binanceOrderId).toBe(first.order.id);
+
+    // A competing local row appears afterwards, which would make a fresh
+    // lookup ambiguous. The stored answer is not re-litigated.
+    await orderIn(id, SYMBOL, { actualOrderId: "STICKY-ORD" });
+
+    const report = await ledger.ingestUserTrades(id, [fill]);
+
+    expect(report.attributionEnriched).toBe(0);
+    // Not re-resolved at all, so not reported as ambiguous either.
+    expect(report.ambiguous).toBe(0);
+    const after = await fillRow(id, SYMBOL, "E-6");
+    expect(after.attribution).toBe("OWNED_ORDER");
+    expect(after.binanceOrderId).toBe(first.order.id);
+    expect(after.tradeExecutionId).toBe(first.execution.id);
+  });
+
+  maybe()("J. a late order in ANOTHER account cannot claim this fill", async () => {
+    const id = await profile("enrich-cross-account");
+    const fill = trade({ tradeId: "E-7", orderId: "CROSS-ACCT", symbol: SYMBOL });
+
+    await ledger.ingestUserTrades(id, [fill]);
+    // The order appears — but under a different account.
+    const theirs = await orderIn(accountB, SYMBOL, { exchangeOrderId: "CROSS-ACCT" });
+
+    const report = await ledger.ingestUserTrades(id, [fill]);
+
+    expect(report.attributionEnriched).toBe(0);
+    const after = await fillRow(id, SYMBOL, "E-7");
+    expect(after.attribution).toBe("UNATTRIBUTED");
+    expect(after.tradeExecutionId).toBeNull();
+    expect(
+      await prisma!.exchangeFillLedger.count({ where: { tradeExecutionId: theirs.execution.id } })
+    ).toBe(0);
+  });
+
+  maybe()("K. a late order on ANOTHER symbol cannot claim this fill", async () => {
+    const id = await profile("enrich-cross-symbol");
+    const fill = trade({ tradeId: "E-8", orderId: "CROSS-SYM", symbol: SYMBOL });
+
+    await ledger.ingestUserTrades(id, [fill]);
+    await orderIn(id, "LEDGERALTUSDT", { exchangeOrderId: "CROSS-SYM" });
+
+    const report = await ledger.ingestUserTrades(id, [fill]);
+
+    expect(report.attributionEnriched).toBe(0);
+    expect((await fillRow(id, SYMBOL, "E-8")).attribution).toBe("UNATTRIBUTED");
+  });
+
+  maybe()("J/K. only the correct account AND symbol may enrich, among decoys", async () => {
+    const id = await profile("enrich-decoys");
+    const fill = trade({ tradeId: "E-9", orderId: "DECOY-1", symbol: SYMBOL });
+    await ledger.ingestUserTrades(id, [fill]);
+
+    // Wrong account, right symbol. Right account, wrong symbol. Then the
+    // genuine one.
+    await orderIn(accountB, SYMBOL, { exchangeOrderId: "DECOY-1" });
+    await orderIn(id, "LEDGERALTUSDT", { exchangeOrderId: "DECOY-1" });
+    const correct = await orderIn(id, SYMBOL, { exchangeOrderId: "DECOY-1" });
+
+    const report = await ledger.ingestUserTrades(id, [fill]);
+
+    expect(report.attributionEnriched).toBe(1);
+    // Exactly one candidate survived the boundary, so this is not ambiguous.
+    expect(report.ambiguous).toBe(0);
+    const after = await fillRow(id, SYMBOL, "E-9");
+    expect(after.binanceOrderId).toBe(correct.order.id);
+    expect(after.tradeExecutionId).toBe(correct.execution.id);
+  });
+});
+
+describe("a race on attribution cannot move an owner", () => {
+  /**
+   * A service whose enrichment compare-and-set always reports "matched
+   * nothing", as it would for a caller that lost the race.
+   *
+   * The database is real and so is everything else; only the loser's view of
+   * its own update is forced, because whether a genuine parallel run takes the
+   * losing branch is a coin toss and the branch has to be proven on every run.
+   */
+  function losingService(whileUpdating: () => Promise<void> = async () => {}) {
+    const client = new Proxy(prisma as object, {
+      get(target, property, receiver) {
+        if (property !== "exchangeFillLedger") return Reflect.get(target, property, receiver);
+        const real = Reflect.get(target, property, receiver) as Record<string, unknown>;
+        return new Proxy(real, {
+          get(inner, innerProperty, innerReceiver) {
+            if (innerProperty !== "updateMany") return Reflect.get(inner, innerProperty, innerReceiver);
+            return async () => {
+              // The rival commits DURING our update, which is the only window
+              // in which our compare-and-set can match nothing: the row was
+              // genuinely unowned when we read it.
+              await whileUpdating();
+              return { count: 0 };
+            };
+          },
+        });
+      },
+    }) as PrismaClient;
+    return new ExchangeFillLedgerService(client);
+  }
+
+  /** What a rival caller would have written, applied directly. */
+  const claimedBy = async (rowId: string, order: { id: string; tradeExecutionId: string }) => {
+    await prisma!.exchangeFillLedger.update({
+      where: { id: rowId },
+      data: {
+        attribution: "OWNED_ORDER",
+        binanceOrderId: order.id,
+        tradeExecutionId: order.tradeExecutionId,
+      },
+    });
+  };
+
+  const rowOf = async (executionProfileId: string, exchangeTradeId: string) =>
+    prisma!.exchangeFillLedger.findFirstOrThrow({ where: { executionProfileId, exchangeTradeId } });
+
+  async function orderFor(executionProfileId: string, exchangeOrderId: string) {
+    sequence += 1;
+    const execution = await prisma!.tradeExecution.create({
+      data: {
+        executionProfileId, symbol: SYMBOL, direction: "LONG", positionSide: "LONG",
+        selectedLookback: 200, plannedEntryPrice: "1.06", calculatedStopLoss: "1.01",
+        executableStopLoss: "1.01", takeProfit: "1.09", riskBudgetUsd: "3", quantityRaw: "68.8",
+        plannedQuantity: "68.8", quantityStepSize: "0.1", actualPlannedLoss: "3",
+        unusedRiskBudget: "0", positionNotional: "72.9", targetIsolatedMargin: "7.3",
+        maximumIsolatedMargin: "10", selectedLeverage: 10, estimatedInitialMargin: "7.3",
+        liquidationBufferRatio: "0.5", decisionReasonCode: "SYNTHETIC",
+      },
+    });
+    const order = await prisma!.binanceOrder.create({
+      data: {
+        tradeExecutionId: execution.id, role: "TAKE_PROFIT", generation: 1,
+        clientOrderId: `${TAG}-race-${sequence}`, side: "SELL", positionSide: "LONG",
+        orderType: "LIMIT", originalQuantity: "68.8", status: "NEW", exchangeOrderId,
+      },
+    });
+    return { execution, order };
+  }
+
+  maybe()("L. two callers enriching to the SAME owner is idempotent", async () => {
+    const id = await profile("race-enrich-same");
+    const fill = trade({ tradeId: "R-1", orderId: "RACE-SAME", symbol: SYMBOL });
+    await ledger.ingestUserTrades(id, [fill]);
+    const owner = await orderFor(id, "RACE-SAME");
+    const before = await rowOf(id, "R-1");
+
+    const results = await Promise.allSettled([
+      ledger.ingestUserTrades(id, [fill]),
+      ledger.ingestUserTrades(id, [fill]),
+      ledger.ingestUserTrades(id, [fill]),
+    ]);
+
+    // Nobody fails, and nobody is told a false conflict.
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+    const after = await rowOf(id, "R-1");
+    expect(after.id).toBe(before.id);
+    expect(after.attribution).toBe("OWNED_ORDER");
+    expect(after.binanceOrderId).toBe(owner.order.id);
+    expect(after.price.toFixed()).toBe(before.price.toFixed());
+    expect(
+      await prisma!.exchangeFillLedger.count({ where: { executionProfileId: id, exchangeTradeId: "R-1" } })
+    ).toBe(1);
+  });
+
+  maybe()("L2. a loser that resolved the SAME owner accepts the winner's answer", async () => {
+    // Deterministically the losing branch, with the row genuinely unowned when
+    // it is read — which is the only way the branch is reachable, because an
+    // already-owned row is settled by stickiness long before the update.
+    const id = await profile("race-enrich-loser-same");
+    const fill = trade({ tradeId: "R-2", orderId: "RACE-LOSER", symbol: SYMBOL });
+    await ledger.ingestUserTrades(id, [fill]);
+    const owner = await orderFor(id, "RACE-LOSER");
+    const row = await rowOf(id, "R-2");
+    expect(row.attribution).toBe("UNATTRIBUTED");
+
+    // A rival commits the SAME owner while we update: our compare-and-set
+    // matches nothing, and the re-read shows our own conclusion already made.
+    const report = await losingService(async () => {
+      await claimedBy(row.id, { id: owner.order.id, tradeExecutionId: owner.execution.id });
+    }).ingestUserTrades(id, [fill]);
+
+    expect(report.duplicates).toBe(1);
+    // No enrichment claimed: this caller did not perform one.
+    expect(report.attributionEnriched).toBe(0);
+    const after = await rowOf(id, "R-2");
+    expect(after.attribution).toBe("OWNED_ORDER");
+    expect(after.binanceOrderId).toBe(owner.order.id);
+  });
+
+  maybe()("M. a loser that resolved a DIFFERENT owner cannot overwrite the winner", async () => {
+    // The row is unowned when we read it and we resolve one candidate; a rival
+    // commits a different one mid-update.
+    const id = await profile("race-enrich-loser-diff");
+    const fill = trade({ tradeId: "R-3", orderId: "RACE-DIFF", symbol: SYMBOL });
+    await ledger.ingestUserTrades(id, [fill]);
+    const resolvedByUs = await orderFor(id, "RACE-DIFF");
+    const rival = await orderFor(id, "RACE-DIFF-RIVAL");
+    const row = await rowOf(id, "R-3");
+    expect(row.attribution).toBe("UNATTRIBUTED");
+
+    // We resolve our own candidate; the rival commits a DIFFERENT one while we
+    // update. Ownership must not change hands.
+    await expect(
+      losingService(async () => {
+        await claimedBy(row.id, { id: rival.order.id, tradeExecutionId: rival.execution.id });
+      }).ingestUserTrades(id, [fill])
+    ).rejects.toBeInstanceOf(FillLedgerAttributionConflictError);
+
+    // The rival's answer stands; ours was refused, not applied.
+    const after = await rowOf(id, "R-3");
+    expect(after.attribution).toBe("OWNED_ORDER");
+    expect(after.binanceOrderId).toBe(rival.order.id);
+    expect(after.binanceOrderId).not.toBe(resolvedByUs.order.id);
+    expect(after.price.toFixed()).toBe(row.price.toFixed());
+    expect(after.id).toBe(row.id);
+  });
+
+  maybe()("the compare-and-set itself refuses a row claimed since it was read", async () => {
+    // The real guard, not a simulated one. `updateMany` here is the actual
+    // Prisma call: a rival commits between our read and our write, and the
+    // WHERE clause carrying the full prior state is the only thing that stops
+    // us overwriting them. Without it this update matches by id and silently
+    // moves the fill to our candidate.
+    const id = await profile("race-enrich-cas");
+    const fill = trade({ tradeId: "R-5", orderId: "CAS-ORD", symbol: SYMBOL });
+    await ledger.ingestUserTrades(id, [fill]);
+    const ours = await orderFor(id, "CAS-ORD");
+    const rival = await orderFor(id, "CAS-RIVAL");
+    const row = await rowOf(id, "R-5");
+    expect(row.attribution).toBe("UNATTRIBUTED");
+
+    // Hands back the genuinely unowned row, then lets the rival commit — so
+    // the service proceeds to a real update against a row that has changed.
+    let claimed = false;
+    const client = new Proxy(prisma as object, {
+      get(target, property, receiver) {
+        if (property !== "exchangeFillLedger") return Reflect.get(target, property, receiver);
+        const real = Reflect.get(target, property, receiver) as Record<string, unknown>;
+        return new Proxy(real, {
+          get(inner, innerProperty, innerReceiver) {
+            const original = Reflect.get(inner, innerProperty, innerReceiver) as CallableFunction;
+            if (innerProperty !== "findUnique") return original;
+            return async (...args: unknown[]) => {
+              const found = await original.apply(inner, args);
+              if (!claimed) {
+                claimed = true;
+                await claimedBy(row.id, { id: rival.order.id, tradeExecutionId: rival.execution.id });
+              }
+              return found;
+            };
+          },
+        });
+      },
+    }) as PrismaClient;
+
+    await expect(
+      new ExchangeFillLedgerService(client).ingestUserTrades(id, [fill])
+    ).rejects.toBeInstanceOf(FillLedgerAttributionConflictError);
+
+    const after = await rowOf(id, "R-5");
+    expect(after.attribution).toBe("OWNED_ORDER");
+    expect(after.binanceOrderId).toBe(rival.order.id);
+    expect(after.binanceOrderId).not.toBe(ours.order.id);
+  });
+
+  maybe()("a compare-and-set that matches nothing while still unowned fails explicitly", async () => {
+    // Not reachable in ordinary operation, so it must say so rather than
+    // reporting an enrichment that never happened.
+    const id = await profile("race-enrich-impossible");
+    const fill = trade({ tradeId: "R-4", orderId: "RACE-IMPOSSIBLE", symbol: SYMBOL });
+    await ledger.ingestUserTrades(id, [fill]);
+    await orderFor(id, "RACE-IMPOSSIBLE");
+
+    await expect(losingService().ingestUserTrades(id, [fill])).rejects.toBeInstanceOf(
+      FillLedgerRaceUnresolvedError
+    );
+
+    expect((await rowOf(id, "R-4")).attribution).toBe("UNATTRIBUTED");
   });
 });
 
