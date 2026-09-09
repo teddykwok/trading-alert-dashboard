@@ -18,6 +18,23 @@ import {
 
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_ATTEMPTS = 3; // 1 initial + 2 bounded retries
+
+/**
+ * How many times ONE request may reach the network.
+ *
+ * A named mode rather than a `maxAttempts: number`, deliberately: the choice is
+ * between two doctrines, not a dial. Transport retry belongs to whoever owns
+ * the retry BUDGET, and a caller that keeps its own durable one must be able to
+ * say so in a way a reader cannot misread as tuning.
+ *
+ *  - BOUNDED_RETRY  the default everything has always had: up to MAX_ATTEMPTS
+ *                   dispatches for a retryable failure, plus one clock re-sync
+ *                   for a single timestamp rejection.
+ *  - SINGLE_DISPATCH  exactly one dispatch of THIS endpoint, whatever comes
+ *                   back. Every failure, retryable or not, is classified and
+ *                   handed to the caller.
+ */
+export type BinanceDispatchMode = "BOUNDED_RETRY" | "SINGLE_DISPATCH";
 const BASE_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 4_000;
 /** Re-sync the clock at most this often; also re-synced once after a -1021. */
@@ -204,16 +221,31 @@ export class BinanceReadOnlyClient {
    * Retries are bounded and only apply to retryable kinds (429/5xx/network);
    * auth, permission and validation failures fail fast. A single -1021 gets
    * one clock re-sync and one retry.
+   *
+   * Under SINGLE_DISPATCH none of that applies: this endpoint is dispatched
+   * EXACTLY ONCE and every failure is classified and thrown, including the
+   * timestamp rejection that would otherwise buy a re-sync and a second
+   * dispatch. A caller that owns a durable retry budget uses that mode so its
+   * budget means what it says.
+   *
+   * NOTE: a signed request may still refresh the clock BEFORE the loop, which
+   * dispatches GET /fapi/v1/time. That is a different endpoint and happens at
+   * most once; SINGLE_DISPATCH bounds dispatches of THIS endpoint.
    */
-  async request<T>(name: BinanceEndpointName, params: QueryParams = {}): Promise<T> {
+  async request<T>(
+    name: BinanceEndpointName,
+    params: QueryParams = {},
+    dispatchMode: BinanceDispatchMode = "BOUNDED_RETRY"
+  ): Promise<T> {
     const endpoint = BINANCE_READ_ONLY_ENDPOINTS[name];
     this.assertUsable(endpoint.signed);
 
     if (endpoint.signed) await this.ensureFreshTimeSync();
 
     let resyncedOnce = false;
+    const maxAttempts = dispatchMode === "SINGLE_DISPATCH" ? 1 : MAX_ATTEMPTS;
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       let query = buildCanonicalQuery(params);
       const headers: Record<string, string> = {};
 
@@ -250,14 +282,34 @@ export class BinanceReadOnlyClient {
       } catch (error) {
         const binanceError = this.asBinanceError(error, name);
 
-        // A timestamp rejection is worth exactly one clock re-sync + retry.
+        /**
+         * A timestamp rejection is worth exactly one clock re-sync.
+         *
+         * BOTH modes take the re-sync, because the cached offset is what
+         * produced the rejected timestamp and it is now known to be wrong --
+         * leaving it in place would hand the same bad offset to whatever asks
+         * next. The modes differ only in what they do with the correction:
+         *
+         *  - BOUNDED_RETRY spends it immediately on a second dispatch;
+         *  - SINGLE_DISPATCH keeps it and throws, because that second dispatch
+         *    is exactly what the mode exists to prevent. The caller's NEXT
+         *    durable attempt starts from the corrected clock instead.
+         *
+         * The refresh is BEST EFFORT under SINGLE_DISPATCH: if /fapi/v1/time
+         * is also failing, that must not replace the timestamp rejection the
+         * caller needs in order to classify this attempt.
+         */
         if (binanceError.kind === "TIMESTAMP" && !resyncedOnce) {
           resyncedOnce = true;
-          await this.syncTime();
-          continue;
+          if (dispatchMode === "BOUNDED_RETRY") {
+            await this.syncTime();
+            continue;
+          }
+          await this.syncTime().catch(() => undefined);
+          throw binanceError;
         }
 
-        const isLastAttempt = attempt === MAX_ATTEMPTS;
+        const isLastAttempt = attempt === maxAttempts;
         if (!binanceError.retryable || isLastAttempt) throw binanceError;
 
         const delay = backoffDelayMs(attempt, binanceError.retryAfterMs);

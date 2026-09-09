@@ -1655,3 +1655,357 @@ describe("userTrades exchange identities are validated, never coerced", () => {
     expect(normalizeAlgoOrder({ algoId: 123, clientAlgoId: "tad-x" }).algoId).toBe("123");
   });
 });
+
+// ---------------------------------------------------------------------------
+// SINGLE_DISPATCH: one durable attempt, one network dispatch
+// ---------------------------------------------------------------------------
+//
+// A caller whose retry budget lives in the database cannot also let the
+// transport retry inside one attempt: "five attempts" would silently mean up to
+// fifteen requests, and the weight a cycle spends would stop being knowable
+// from the number of windows it worked.
+
+describe("listRecentTradesOnce dispatches userTrades exactly once", () => {
+  const service = () => new BinanceReadOnlyService(client());
+
+  /** Counts userTrades dispatches; the time sync is a different endpoint. */
+  function countingFetch(userTradesResponder: () => unknown) {
+    let userTrades = 0;
+    const fn = vi.fn(async (url: unknown) => {
+      if (String(url).includes("/fapi/v1/userTrades")) {
+        userTrades += 1;
+        const answer = userTradesResponder();
+        if (answer instanceof Error) throw answer;
+        return answer;
+      }
+      return timeResponse();
+    });
+    global.fetch = fn as unknown as typeof fetch;
+    return { count: () => userTrades };
+  }
+
+  /** Retries are instant, so a mode that DOES retry cannot pass by timing out. */
+  const instantBackoff = () =>
+    vi.spyOn(global, "setTimeout").mockImplementation(((fn: () => void) => {
+      fn();
+      return 0 as unknown as NodeJS.Timeout;
+    }) as never);
+
+  it("J. a successful short page is one dispatch", async () => {
+    const counter = countingFetch(() => response([]));
+
+    const trades = await service().listRecentTradesOnce("BTCUSDT", {
+      startTimeMs: 0, endTimeMs: 1000, limit: 1000,
+    });
+
+    expect(trades).toEqual([]);
+    expect(counter.count()).toBe(1);
+  });
+
+  it("K. a successful FULL page is one dispatch, with no continuation", async () => {
+    const full = Array.from({ length: 1000 }, (_, index) => ({
+      id: index, orderId: 1, qty: "1", price: "2", time: 1,
+      symbol: "BTCUSDT", side: "BUY", positionSide: "LONG",
+    }));
+    const counter = countingFetch(() => response(full));
+
+    const trades = await service().listRecentTradesOnce("BTCUSDT", {
+      startTimeMs: 0, endTimeMs: 1000, limit: 1000,
+    });
+
+    expect(trades).toHaveLength(1000);
+    expect(counter.count()).toBe(1);
+  });
+
+  const failures: Array<[string, () => unknown, string]> = [
+    ["L. SERVER", () => response({ code: -1001, msg: "Internal error" }, { status: 503 }), "SERVER"],
+    ["M. NETWORK", () => new Error("socket hang up"), "NETWORK"],
+    ["N. TIMEOUT", () => Object.assign(new Error("aborted"), { name: "AbortError" }), "TIMEOUT"],
+    ["O. RATE_LIMIT", () => response({ code: -1003, msg: "Too many requests" }, { status: 429 }), "RATE_LIMIT"],
+    ["Q. AUTH", () => response({ code: -2015, msg: "Invalid API-key" }, { status: 401 }), "AUTH"],
+  ];
+
+  it.each(failures)("%s fails after exactly one dispatch", async (_label, responder, kind) => {
+    instantBackoff();
+    const counter = countingFetch(responder);
+
+    const thrown = await service()
+      .listRecentTradesOnce("BTCUSDT", { startTimeMs: 0, endTimeMs: 1000, limit: 1000 })
+      .then(() => null)
+      .catch((error) => error);
+
+    expect(thrown).toBeInstanceOf(BinanceError);
+    expect(thrown.kind).toBe(kind);
+    expect(thrown.endpoint).toBe("userTrades");
+    expect(counter.count()).toBe(1);
+  });
+
+  it("P. a TIMESTAMP rejection does NOT buy a second userTrades dispatch", async () => {
+    // The subtle one. In BOUNDED_RETRY a -1021 is worth a clock re-sync and a
+    // retry -- and that retry IS a second dispatch of this endpoint. Here the
+    // classified failure goes to the caller, whose own next attempt re-syncs.
+    instantBackoff();
+    const counter = countingFetch(() =>
+      response({ code: -1021, msg: "Timestamp outside of the recvWindow." }, { status: 400 })
+    );
+
+    const thrown = await service()
+      .listRecentTradesOnce("BTCUSDT", { startTimeMs: 0, endTimeMs: 1000, limit: 1000 })
+      .then(() => null)
+      .catch((error) => error);
+
+    expect(thrown).toBeInstanceOf(BinanceError);
+    expect(thrown.kind).toBe("TIMESTAMP");
+    expect(counter.count()).toBe(1);
+  });
+
+  it("a non-array body is still refused, after one dispatch", async () => {
+    const counter = countingFetch(() => response({ code: 0, msg: "ok" }));
+
+    const thrown = await service()
+      .listRecentTradesOnce("BTCUSDT", { startTimeMs: 0, endTimeMs: 1000, limit: 1000 })
+      .then(() => null)
+      .catch((error) => error);
+
+    expect(thrown.kind).toBe("MALFORMED_RESPONSE");
+    expect(counter.count()).toBe(1);
+  });
+
+  it("the pre-request query contract is unchanged", async () => {
+    const fetchMock = mockFetchSequence(timeResponse(), response([]));
+
+    await service().listRecentTradesOnce("btcusdt", {
+      startTimeMs: 1757000000000, endTimeMs: 1757600000000, limit: 1000,
+    });
+
+    const params = new URL(lastUrl(fetchMock)).searchParams;
+    expect(params.get("symbol")).toBe("BTCUSDT");
+    expect(params.get("startTime")).toBe("1757000000000");
+    expect(params.get("endTime")).toBe("1757600000000");
+    expect(params.get("limit")).toBe("1000");
+
+    // And the unsupported combinations are refused here too, before any request.
+    await expect(
+      service().listRecentTradesOnce("BTCUSDT", { orderId: "1", startTimeMs: 1 })
+    ).rejects.toBeInstanceOf(BinanceError);
+    await expect(
+      service().listRecentTradesOnce("BTCUSDT", { limit: 5000 })
+    ).rejects.toBeInstanceOf(BinanceError);
+  });
+
+  it("S. success normalization is identical to the retrying entry point", async () => {
+    const raw = {
+      buyer: false, commission: "-0.07819010", commissionAsset: "USDT", id: 698759,
+      maker: false, orderId: 25851813, price: "7819.01", qty: "0.002",
+      quoteQty: "15.63802", realizedPnl: "-0.91539999", side: "SELL",
+      positionSide: "SHORT", symbol: "BTCUSDT", time: 1569514978020,
+    };
+    const page = [raw, null, "garbage", { id: {} }];
+
+    mockFetchSequence(timeResponse(), response(page));
+    const once = await service().listRecentTradesOnce("BTCUSDT", { startTimeMs: 0, endTimeMs: 1 });
+
+    mockFetchSequence(timeResponse(), response(page));
+    const retrying = await service().listRecentTrades("BTCUSDT", { startTimeMs: 0, endTimeMs: 1 });
+
+    expect(once).toEqual(retrying);
+    // Cardinality is preserved on this path too.
+    expect(once).toHaveLength(4);
+    expect(once[0].tradeId).toBe("698759");
+    expect(once[0].commission).toBe("-0.07819010");
+    expect(once[1].tradeId).toBeNull();
+    expect(once[3].tradeId).toBeNull();
+  });
+});
+
+describe("R. the default entry point keeps its transport retry", () => {
+  const service = () => new BinanceReadOnlyService(client());
+
+  it("a retryable failure is still redispatched up to the bounded maximum", async () => {
+    vi.spyOn(global, "setTimeout").mockImplementation(((fn: () => void) => {
+      fn();
+      return 0 as unknown as NodeJS.Timeout;
+    }) as never);
+    let userTrades = 0;
+    global.fetch = vi.fn(async (url: unknown) => {
+      if (!String(url).includes("/fapi/v1/userTrades")) return timeResponse();
+      userTrades += 1;
+      return response({ code: -1001, msg: "Internal error" }, { status: 503 });
+    }) as unknown as typeof fetch;
+
+    await expect(
+      service().listRecentTrades("BTCUSDT", { startTimeMs: 0, endTimeMs: 1000, limit: 1000 })
+    ).rejects.toMatchObject({ kind: "SERVER" });
+
+    // Unchanged from before this seam existed: 1 initial + 2 bounded retries.
+    expect(userTrades).toBe(3);
+  });
+
+  it("a timestamp rejection still buys one re-sync and one retry", async () => {
+    const fetchMock = mockFetchSequence(
+      timeResponse(),
+      response({ code: -1021, msg: "Timestamp outside of the recvWindow." }, { status: 400 }),
+      timeResponse(),
+      response([])
+    );
+
+    await expect(
+      service().listRecentTrades("BTCUSDT", { startTimeMs: 0, endTimeMs: 1000 })
+    ).resolves.toEqual([]);
+    // time, failed call, re-sync, successful retry
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("a successful page is one dispatch on the default path too", async () => {
+    let userTrades = 0;
+    global.fetch = vi.fn(async (url: unknown) => {
+      if (!String(url).includes("/fapi/v1/userTrades")) return timeResponse();
+      userTrades += 1;
+      return response([]);
+    }) as unknown as typeof fetch;
+
+    await service().listRecentTrades("BTCUSDT", { startTimeMs: 0, endTimeMs: 1000 });
+
+    expect(userTrades).toBe(1);
+  });
+});
+
+describe("SINGLE_DISPATCH corrects the clock without spending a second dispatch", () => {
+  const STALE_AHEAD_MS = 3_600_000; // the server appears an hour ahead
+
+  /**
+   * A clock that is wrong until the exchange rejects a timestamp, then right.
+   *
+   * The offsets differ by an hour, so which one a later request used is
+   * unambiguous rather than a timing judgement.
+   */
+  function driftingClock() {
+    let serverAheadMs = STALE_AHEAD_MS;
+    let userTrades = 0;
+    let timeSyncs = 0;
+    const userTradeUrls: string[] = [];
+
+    global.fetch = vi.fn(async (url: unknown) => {
+      const target = String(url);
+      if (target.includes("/fapi/v1/time")) {
+        timeSyncs += 1;
+        return response({ serverTime: Date.now() + serverAheadMs });
+      }
+      userTrades += 1;
+      userTradeUrls.push(target);
+      if (userTrades === 1) {
+        // The exchange refuses the timestamp our stale offset produced. By the
+        // time we ask again, the true offset is zero.
+        serverAheadMs = 0;
+        return response(
+          { code: -1021, msg: "Timestamp for this request is outside of the recvWindow." },
+          { status: 400 }
+        );
+      }
+      return response([]);
+    }) as unknown as typeof fetch;
+
+    return {
+      userTrades: () => userTrades,
+      timeSyncs: () => timeSyncs,
+      timestampOf: (index: number) =>
+        Number(new URL(userTradeUrls[index]).searchParams.get("timestamp")),
+    };
+  }
+
+  it("F. refreshes the offset and still throws, after ONE userTrades dispatch", async () => {
+    const clock = driftingClock();
+    const connector = client();
+
+    const thrown = await new BinanceReadOnlyService(connector)
+      .listRecentTradesOnce("BTCUSDT", { startTimeMs: 0, endTimeMs: 1000, limit: 1000 })
+      .then(() => null)
+      .catch((error) => error);
+
+    // E: the attempt still failed, and it failed for the reason it failed for.
+    expect(thrown).toBeInstanceOf(BinanceError);
+    expect(thrown.kind).toBe("TIMESTAMP");
+    // F: no second dispatch of the signed endpoint.
+    expect(clock.userTrades()).toBe(1);
+    // D: the initial freshness sync plus the corrective one. Neither is a
+    // userTrades dispatch.
+    expect(clock.timeSyncs()).toBe(2);
+    // The correction was KEPT: the cached offset is no longer the stale hour.
+    expect(Math.abs(connector.clockOffsetMs)).toBeLessThan(5_000);
+  });
+
+  it("G. the NEXT durable attempt starts from the corrected clock", async () => {
+    // The load-bearing case. Surfacing TIMESTAMP without refreshing would hand
+    // the same bad offset to the next attempt, and the window would fail its
+    // way to ABANDONED against a clock nobody ever fixed.
+    const clock = driftingClock();
+    const connector = client();
+    const service = new BinanceReadOnlyService(connector);
+    const query = { startTimeMs: 0, endTimeMs: 1000, limit: 1000 };
+
+    await expect(service.listRecentTradesOnce("BTCUSDT", query)).rejects.toMatchObject({
+      kind: "TIMESTAMP",
+    });
+    expect(clock.userTrades()).toBe(1);
+    const firstTimestamp = clock.timestampOf(0);
+    // The first attempt really did send the stale hour-ahead timestamp.
+    expect(firstTimestamp - Date.now()).toBeGreaterThan(STALE_AHEAD_MS - 60_000);
+
+    // A SEPARATE invocation, as the durable executor's next attempt would be.
+    await expect(service.listRecentTradesOnce("BTCUSDT", query)).resolves.toEqual([]);
+
+    expect(clock.userTrades()).toBe(2);
+    const secondTimestamp = clock.timestampOf(1);
+    // It used the CORRECTED offset...
+    expect(Math.abs(secondTimestamp - Date.now())).toBeLessThan(5_000);
+    // ...and not the stale one it would have inherited without the refresh.
+    expect(Math.abs(secondTimestamp - firstTimestamp)).toBeGreaterThan(STALE_AHEAD_MS - 60_000);
+    // The cache was still fresh, so no third /time call was needed.
+    expect(clock.timeSyncs()).toBe(2);
+  });
+
+  it("a failing clock refresh does not replace the timestamp rejection", async () => {
+    // Best effort: if /fapi/v1/time is down too, the caller still needs to know
+    // this attempt failed on a timestamp, not on whatever the sync hit.
+    let userTrades = 0;
+    let syncs = 0;
+    global.fetch = vi.fn(async (url: unknown) => {
+      if (String(url).includes("/fapi/v1/time")) {
+        syncs += 1;
+        // The first sync succeeds so the request can be signed; the corrective
+        // one fails.
+        return syncs === 1
+          ? response({ serverTime: Date.now() })
+          : response({ code: -1001, msg: "Internal error" }, { status: 503 });
+      }
+      userTrades += 1;
+      return response(
+        { code: -1021, msg: "Timestamp for this request is outside of the recvWindow." },
+        { status: 400 }
+      );
+    }) as unknown as typeof fetch;
+
+    const thrown = await new BinanceReadOnlyService(client())
+      .listRecentTradesOnce("BTCUSDT", { startTimeMs: 0, endTimeMs: 1000 })
+      .then(() => null)
+      .catch((error) => error);
+
+    expect(thrown).toBeInstanceOf(BinanceError);
+    expect(thrown.kind).toBe("TIMESTAMP");
+    expect(userTrades).toBe(1);
+  });
+
+  it("BOUNDED_RETRY still spends the re-sync on a second dispatch", async () => {
+    // The default path is unchanged: same primitive, different control flow.
+    const clock = driftingClock();
+
+    await expect(
+      new BinanceReadOnlyService(client()).listRecentTrades("BTCUSDT", {
+        startTimeMs: 0, endTimeMs: 1000, limit: 1000,
+      })
+    ).resolves.toEqual([]);
+
+    expect(clock.userTrades()).toBe(2);
+    expect(clock.timeSyncs()).toBe(2);
+  });
+});

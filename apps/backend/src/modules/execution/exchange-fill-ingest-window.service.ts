@@ -437,12 +437,44 @@ export class ExchangeFillIngestWindowService {
     });
   }
 
+  /**
+   * PURE CAS. Terminal: this attempt learned something a retry cannot repair.
+   *
+   * The other terminals each describe a specific finding about the interval.
+   * This one describes a finding about the EVIDENCE: the exchange contradicted
+   * its own contract, the account cannot be read at all, or the economics that
+   * came back disagree with economics already recorded under the same immutable
+   * identity. Re-asking reproduces it exactly, so spending the rest of the
+   * attempt budget to arrive at the same answer only delays the moment an
+   * operator can see it.
+   *
+   * Fenced like every other transition, which is what stops a worker whose
+   * lease expired mid-request from abandoning a window another attempt now
+   * owns. `attempts` and `lastAttemptAt` are deliberately RETAINED: the
+   * abandonment happened on a specific attempt, and erasing how many were spent
+   * would hide whether this was a first-look refusal or a worn-out window.
+   *
+   * ABANDONED is the one terminal an operator is expected to re-open by hand,
+   * so the reason is recorded rather than merely the status.
+   */
+  async markAbandoned(
+    client: Prisma.TransactionClient,
+    claim: FillIngestWindowClaim,
+    reason: { reasonCode: string; sanitizedError?: string | null }
+  ): Promise<void> {
+    await this.terminate(client, claim, {
+      status: "ABANDONED",
+      lastErrorCode: reason.reasonCode,
+      sanitizedLastError: reason.sanitizedError ?? null,
+    });
+  }
+
   /** The shared terminal write: fenced, lease cleared, backoff cleared. */
   private async terminate(
     client: Prisma.TransactionClient,
     claim: FillIngestWindowClaim,
     outcome: {
-      status: "COMPLETE" | "INCOMPLETE_SKIPPED_ROWS" | "SATURATED_SINGLE_MILLISECOND";
+      status: "COMPLETE" | "INCOMPLETE_SKIPPED_ROWS" | "SATURATED_SINGLE_MILLISECOND" | "ABANDONED";
       lastErrorCode: string | null;
       sanitizedLastError: string | null;
     }

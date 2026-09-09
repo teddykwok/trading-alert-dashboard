@@ -1370,3 +1370,251 @@ describe("H. the service's canonical split is the planner's canonical split", ()
     expect(decision.kind).toBe("SATURATED_SINGLE_MILLISECOND");
   });
 });
+
+// ---------------------------------------------------------------------------
+// ABANDONED as a deliberate finding, not an exhausted budget
+// ---------------------------------------------------------------------------
+
+describe("markAbandoned terminalizes a live claimed attempt", () => {
+  maybe()("A/B/C/I. the active claimant abandons, and the row is left settled", async () => {
+    const id = await profile("abandon-active");
+    const claim = await seededClaim(id, "worker-a");
+    // A previous attempt's transient failure and backoff are on the row.
+    await prisma!.exchangeFillIngestWindow.update({
+      where: { id: claim.windowId },
+      data: {
+        lastErrorCode: "HTTP_5XX",
+        sanitizedLastError: "earlier blip",
+        nextEligibleAt: new Date(Date.now() + 60_000),
+      },
+    });
+    const before = await rowOf(claim.windowId);
+
+    await work.markAbandoned(prisma!, claim, {
+      reasonCode: "FILL_LEDGER_IDENTITY_CONFLICT",
+      sanitizedError: "stored and incoming disagree on price",
+    });
+
+    const row = await rowOf(claim.windowId);
+    expect(row.status).toBe("ABANDONED");
+    // B: the lease and the backoff are gone.
+    expect(row.claimedAt).toBeNull();
+    expect(row.claimOwner).toBeNull();
+    expect(row.nextEligibleAt).toBeNull();
+    // C: the terminal reason REPLACES the transient one.
+    expect(row.lastErrorCode).toBe("FILL_LEDGER_IDENTITY_CONFLICT");
+    expect(row.sanitizedLastError).toBe("stored and incoming disagree on price");
+    // I: how many attempts were spent, and when, is retained -- a first-look
+    // refusal and a worn-out window are different things.
+    expect(row.attempts).toBe(claim.attempt);
+    expect(row.lastAttemptAt!.getTime()).toBe(before.lastAttemptAt!.getTime());
+  });
+
+  maybe()("abandons on the FIRST attempt, without spending the budget", async () => {
+    // The whole point of the primitive: retrying this evidence cannot repair
+    // it, so waiting for the attempt budget only delays the operator seeing it.
+    const id = await profile("abandon-first-attempt");
+    const claim = await seededClaim(id, "worker-a");
+    expect(claim.attempt).toBe(1);
+
+    await work.markAbandoned(prisma!, claim, { reasonCode: "REQUEST_INVALID" });
+
+    const row = await rowOf(claim.windowId);
+    expect(row.status).toBe("ABANDONED");
+    expect(row.attempts).toBe(1);
+    expect(row.attempts).toBeLessThan(MAX_INGEST_ATTEMPTS);
+  });
+
+  maybe()("D. an omitted detail is null, never an invented message", async () => {
+    const id = await profile("abandon-no-detail");
+    const claim = await seededClaim(id, "worker-a");
+
+    await work.markAbandoned(prisma!, claim, { reasonCode: "UNSUPPORTED_SYMBOL" });
+
+    const row = await rowOf(claim.windowId);
+    expect(row.lastErrorCode).toBe("UNSUPPORTED_SYMBOL");
+    expect(row.sanitizedLastError).toBeNull();
+  });
+
+  maybe()("D. only what the caller sanitized is stored", async () => {
+    // The service persists the phrase it is handed and adds nothing: no URL, no
+    // query string, no header. Sanitizing is the caller's job and this pins
+    // that the column is not enriched behind its back.
+    const id = await profile("abandon-sanitized");
+    const claim = await seededClaim(id, "worker-a");
+
+    await work.markAbandoned(prisma!, claim, {
+      reasonCode: "AUTH",
+      sanitizedError: "Binance rejected the credentials",
+    });
+
+    const row = await rowOf(claim.windowId);
+    expect(row.sanitizedLastError).toBe("Binance rejected the credentials");
+    for (const secret of ["signature=", "X-MBX-APIKEY", "apiKey", "secret", "https://"]) {
+      expect(row.sanitizedLastError).not.toContain(secret);
+      expect(row.lastErrorCode).not.toContain(secret);
+    }
+  });
+
+  maybe()("an abandoned window is never claimed again", async () => {
+    const id = await profile("abandon-not-claimable");
+    const claim = await seededClaim(id, "worker-a");
+    await work.markAbandoned(prisma!, claim, { reasonCode: "REQUEST_INVALID" });
+
+    expect(await work.claimNextWindow(prisma!, { executionProfileId: id, workerId: "w" })).toBeNull();
+  });
+});
+
+describe("markAbandoned is fenced like every other transition", () => {
+  maybe()("E. a stale attempt cannot abandon the newer one", async () => {
+    // The load-bearing case. A worker whose lease expired mid-request comes
+    // back holding a permanent-looking failure about a window somebody else now
+    // owns; abandoning it would destroy live work from stale evidence.
+    const id = await profile("abandon-stale");
+    const workerA = await seededClaim(id, "worker-a");
+    await expireLease(workerA.windowId);
+    const workerB = await work.claimNextWindow(prisma!, {
+      executionProfileId: id,
+      workerId: "worker-b",
+    });
+    const before = await rowOf(workerA.windowId);
+
+    await expect(
+      work.markAbandoned(prisma!, workerA, { reasonCode: "AUTH" })
+    ).rejects.toBeInstanceOf(StaleFillIngestClaimError);
+
+    // Worker B's row is byte-equivalent to what it was.
+    const after = await rowOf(workerA.windowId);
+    expect(after.status).toBe("PENDING");
+    expect(after.attempts).toBe(2);
+    expect(after.attempts).toBe(before.attempts);
+    expect(after.claimOwner).toBe(workerB!.claimOwner);
+    expect(after.claimedAt!.getTime()).toBe(before.claimedAt!.getTime());
+    expect(after.nextEligibleAt).toBe(before.nextEligibleAt);
+    expect(after.lastErrorCode).toBe(before.lastErrorCode);
+    expect(after.sanitizedLastError).toBe(before.sanitizedLastError);
+  });
+
+  maybe()("F. the SAME worker id on a newer attempt still fences the old one", async () => {
+    // Isolates the token: a stable worker identity across a restart makes the
+    // owner column useless, and only the generation can refuse.
+    const id = await profile("abandon-same-owner");
+    const first = await seededClaim(id, "worker-a");
+    await expireLease(first.windowId);
+    const second = await work.claimNextWindow(prisma!, {
+      executionProfileId: id,
+      workerId: "worker-a",
+    });
+    expect(second!.claimOwner).toBe(first.claimOwner);
+    expect(second!.attempt).toBe(first.attempt + 1);
+
+    await expect(
+      work.markAbandoned(prisma!, first, { reasonCode: "AUTH" })
+    ).rejects.toBeInstanceOf(StaleFillIngestClaimError);
+    expect((await rowOf(first.windowId)).status).toBe("PENDING");
+
+    // And the live generation may abandon.
+    await work.markAbandoned(prisma!, second!, { reasonCode: "AUTH" });
+    expect((await rowOf(first.windowId)).status).toBe("ABANDONED");
+  });
+
+  maybe()("a forged attempt or owner is refused", async () => {
+    const id = await profile("abandon-forged");
+    const claim = await seededClaim(id, "worker-a");
+
+    for (const forged of [
+      { ...claim, attempt: 0 },
+      { ...claim, attempt: 99 },
+      { ...claim, claimOwner: "somebody-else" },
+    ]) {
+      await expect(
+        work.markAbandoned(prisma!, forged, { reasonCode: "AUTH" })
+      ).rejects.toBeInstanceOf(StaleFillIngestClaimError);
+    }
+    expect((await rowOf(claim.windowId)).status).toBe("PENDING");
+  });
+
+  maybe()("G. no terminal row can be abandoned or regressed", async () => {
+    const terminals = [
+      { status: "COMPLETE", reach: (c: any) => work.markComplete(prisma!, c) },
+      { status: "INCOMPLETE_SKIPPED_ROWS", reach: (c: any) => work.markIncompleteSkippedRows(prisma!, c) },
+      { status: "SATURATED_SINGLE_MILLISECOND", reach: (c: any) => work.markSaturatedSingleMillisecond(prisma!, c) },
+      { status: "ABANDONED", reach: (c: any) => work.markAbandoned(prisma!, c, { reasonCode: "AUTH" }) },
+    ];
+
+    for (const terminal of terminals) {
+      const id = await profile(`abandon-immutable-${terminal.status}`);
+      const claim = await seededClaim(id, "worker-a");
+      await terminal.reach(claim);
+
+      await expect(
+        work.markAbandoned(prisma!, claim, { reasonCode: "REQUEST_INVALID" })
+      ).rejects.toBeInstanceOf(StaleFillIngestClaimError);
+      await expect(work.markComplete(prisma!, claim)).rejects.toBeInstanceOf(StaleFillIngestClaimError);
+
+      expect((await rowOf(claim.windowId)).status).toBe(terminal.status);
+    }
+  });
+
+  maybe()("G. a SPLIT parent cannot be abandoned", async () => {
+    const id = await profile("abandon-split-parent");
+    const claim = await seededClaim(id, "worker-a");
+    await work.splitWindow(claim, canonicalHalves(claim));
+
+    await expect(
+      work.markAbandoned(prisma!, claim, { reasonCode: "AUTH" })
+    ).rejects.toBeInstanceOf(StaleFillIngestClaimError);
+
+    expect((await rowOf(claim.windowId)).status).toBe("SPLIT");
+  });
+
+  maybe()("G. a terminal row is refused even while carrying a matching claim", async () => {
+    // Isolates the STATUS guard, since a terminal transition normally clears
+    // the owner and that alone would refuse.
+    const id = await profile("abandon-status-guard");
+    const claim = await seededClaim(id, "worker-a");
+    await work.markComplete(prisma!, claim);
+    await prisma!.exchangeFillIngestWindow.update({
+      where: { id: claim.windowId },
+      data: { claimedAt: new Date(), claimOwner: claim.claimOwner },
+    });
+
+    await expect(
+      work.markAbandoned(prisma!, claim, { reasonCode: "AUTH" })
+    ).rejects.toBeInstanceOf(StaleFillIngestClaimError);
+    expect((await rowOf(claim.windowId)).status).toBe("COMPLETE");
+  });
+
+  maybe()("H. it rolls back with the caller's transaction", async () => {
+    // So a future executor may terminalize inside the same atomic unit as
+    // whatever else it decided.
+    const id = await profile("abandon-rollback");
+    const claim = await seededClaim(id, "worker-a");
+    const before = await rowOf(claim.windowId);
+
+    await expect(
+      prisma!.$transaction(async (tx) => {
+        await work.markAbandoned(tx, claim, { reasonCode: "AUTH" });
+        throw new Error("the caller's own work failed after the transition");
+      })
+    ).rejects.toThrow(/the caller's own work failed/);
+
+    const after = await rowOf(claim.windowId);
+    expect(after.status).toBe("PENDING");
+    expect(after.claimOwner).toBe("worker-a");
+    expect(after.attempts).toBe(before.attempts);
+    expect(after.claimedAt!.getTime()).toBe(before.claimedAt!.getTime());
+    expect(after.lastErrorCode).toBeNull();
+  });
+
+  maybe()("and commits with it when the caller succeeds", async () => {
+    const id = await profile("abandon-commit");
+    const claim = await seededClaim(id, "worker-a");
+
+    await prisma!.$transaction(async (tx) => {
+      await work.markAbandoned(tx, claim, { reasonCode: "REQUEST_INVALID" });
+    });
+
+    expect((await rowOf(claim.windowId)).status).toBe("ABANDONED");
+  });
+});

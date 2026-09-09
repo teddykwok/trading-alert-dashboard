@@ -1,5 +1,6 @@
 import { BinanceReadOnlyClient } from "./binance.client";
 import { BinanceError } from "./binance.errors";
+import type { BinanceDispatchMode } from "./binance.client";
 import {
   asRow,
   asRows,
@@ -67,6 +68,25 @@ function assertTimestampMs(value: number | undefined, parameter: string): void {
       endpoint: "userTrades",
     });
   }
+}
+
+/**
+ * The bounded userTrades query contract.
+ *
+ * Exactly three shapes are supported -- a plain page, a time window, and a
+ * targeted order -- and the wrapper enforces which combinations are legal
+ * rather than merely describing them.
+ */
+export interface UserTradesQuery {
+  limit?: number;
+  startTimeMs?: number;
+  endTimeMs?: number;
+  /**
+   * The EXCHANGE order id, as text. Kept as a string end to end: an int64 id
+   * does not survive a JavaScript number, and this is an identity rather than
+   * a quantity.
+   */
+  orderId?: string;
 }
 
 export class BinanceReadOnlyService {
@@ -383,19 +403,38 @@ export class BinanceReadOnlyService {
    * sweep, and a `limit` the exchange will not honour breaks the only signal a
    * caller has for whether it saw a whole page.
    */
-  async listRecentTrades(
+  /**
+   * One bounded page of this account's fills, with the client's ordinary
+   * transport retry. Unchanged, and what every existing caller gets.
+   */
+  async listRecentTrades(symbol: string, options: UserTradesQuery = {}): Promise<BinanceUserTradeDto[]> {
+    return this.userTradesPage(symbol, options, "BOUNDED_RETRY");
+  }
+
+  /**
+   * The same page, dispatched to the network EXACTLY ONCE.
+   *
+   * For a caller that owns a DURABLE retry budget -- one where an attempt is
+   * counted in the database, backed off in the database and eventually
+   * abandoned in the database. Transport retry inside such an attempt makes
+   * that budget a lie: "five attempts" would silently mean up to fifteen
+   * requests, and the weight a cycle spends would stop being knowable from the
+   * number of windows it worked.
+   *
+   * Every failure is classified and thrown, including the timestamp rejection
+   * that would otherwise buy a re-sync and a second dispatch. Success
+   * normalization, the query contract and the non-array refusal are identical
+   * to `listRecentTrades` -- this controls transport redispatch and nothing
+   * else.
+   */
+  async listRecentTradesOnce(symbol: string, options: UserTradesQuery = {}): Promise<BinanceUserTradeDto[]> {
+    return this.userTradesPage(symbol, options, "SINGLE_DISPATCH");
+  }
+
+  private async userTradesPage(
     symbol: string,
-    options: {
-      limit?: number;
-      startTimeMs?: number;
-      endTimeMs?: number;
-      /**
-       * The EXCHANGE order id, as text. Kept as a string end to end: an int64
-       * id does not survive a JavaScript number, and this is an identity
-       * rather than a quantity.
-       */
-      orderId?: string;
-    } = {}
+    options: UserTradesQuery,
+    dispatchMode: BinanceDispatchMode
   ): Promise<BinanceUserTradeDto[]> {
     const wanted = symbol.trim().toUpperCase();
     const limit = options.limit ?? 500;
@@ -461,13 +500,17 @@ export class BinanceReadOnlyService {
 
     // `undefined` is dropped by `buildCanonicalQuery`, so an absent option
     // emits no parameter at all rather than an empty or literal one.
-    const payload = await this.client.request<unknown>("userTrades", {
-      symbol: wanted,
-      limit: String(limit),
-      startTime: options.startTimeMs === undefined ? undefined : String(options.startTimeMs),
-      endTime: options.endTimeMs === undefined ? undefined : String(options.endTimeMs),
-      orderId: options.orderId,
-    });
+    const payload = await this.client.request<unknown>(
+      "userTrades",
+      {
+        symbol: wanted,
+        limit: String(limit),
+        startTime: options.startTimeMs === undefined ? undefined : String(options.startTimeMs),
+        endTime: options.endTimeMs === undefined ? undefined : String(options.endTimeMs),
+        orderId: options.orderId,
+      },
+      dispatchMode
+    );
 
     /**
      * A PAGE IS A LIST. Anything else is not an empty page.
