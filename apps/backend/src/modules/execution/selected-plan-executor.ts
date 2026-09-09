@@ -1,6 +1,6 @@
 import { Prisma } from "@prisma/client";
 import type { PrismaClient } from "@prisma/client";
-import type { ExtremeRRPlanDto } from "@trading-alert-dashboard/shared";
+import type { ExtremeRRPlanDto, ExtremeRRTemplateSnapshot } from "@trading-alert-dashboard/shared";
 import { logger } from "../../config/logger";
 import type { BinanceMarginPlanService } from "../binance/binance-margin-plan.service";
 import { isExactAuthorization } from "./canary-authorization.service";
@@ -61,6 +61,39 @@ export interface SelectedPlanExecutorDependencies {
   executions: ExecutionService;
   orchestrator: ExecutionOrchestrator;
   profileIdentity?: ProfileIdentity;
+}
+
+/**
+ * The risk configuration THIS plan was sized with, copied for the execution to
+ * keep permanently.
+ *
+ * Source is `plan.template`, which is the plan's OWN frozen snapshot, taken
+ * from whichever template was active when the plan was generated. It is NOT
+ * the currently active RiskTemplate: that table is mutable and may already
+ * hold different values by the time a selected plan is admitted, so reading it
+ * here would record a configuration this trade was never planned with. The
+ * plan is the only thing that knows what it used.
+ *
+ * The execution already freezes the DERIVED numbers — `riskBudgetUsd`,
+ * `actualPlannedLoss`, `estimatedRewardRatio` — but not the policy that
+ * produced them. Without this, "1% of 300" and "3% of 100" are indistinguishable
+ * afterwards, and the answer lived only on `ExtremeRRPlan`, one alert deletion
+ * away. 2711 of 9372 historical executions have already lost it that way.
+ *
+ * Copied field by field rather than spread: this object is written to a
+ * durable column, and a field later added to the DTO must not silently join
+ * the permanent record without someone deciding it should.
+ */
+function frozenRiskTemplateSnapshot(template: ExtremeRRTemplateSnapshot) {
+  return {
+    riskTemplateId: template.riskTemplateId,
+    name: template.name,
+    referenceCapital: template.referenceCapital,
+    riskPercent: template.riskPercent,
+    rewardRatio: template.rewardRatio,
+    riskAmount: template.riskAmount,
+    targetAmount: template.targetAmount,
+  };
 }
 
 export class SelectedPlanExecutor {
@@ -255,7 +288,14 @@ export class SelectedPlanExecutor {
         // an authorized window; planning ahead of that is safe because the
         // KILL SWITCH and the live gates still block every mutation.
         allowDisabledProfile: true,
-        snapshots: { extremeRRCandidate: candidate, marginPlan, exchangeFilters },
+        // `plan.template` is non-null here: the guard above refuses a plan
+        // without one, so a created execution always carries its provenance.
+        snapshots: {
+          extremeRRCandidate: candidate,
+          marginPlan,
+          exchangeFilters,
+          riskTemplate: frozenRiskTemplateSnapshot(plan.template),
+        },
       });
       executionId = execution.id;
       created = true;

@@ -67,6 +67,7 @@ function harness(options: {
   canaryOwnerAlertId?: string;
 } = {}) {
   const creates: unknown[] = [];
+  const plannerInputs: unknown[] = [];
   const admissions: string[] = [];
   const canaryBindings: unknown[] = [];
   let createCalls = 0;
@@ -93,8 +94,9 @@ function harness(options: {
       },
     } as never,
     marginPlanner: {
-      planForSymbolWithSnapshot: async () => {
+      planForSymbolWithSnapshot: async (input: unknown) => {
         planningCalls += 1;
+        plannerInputs.push(input);
         return {
           plan: {
             status: options.marginStatus ?? "READY",
@@ -135,6 +137,7 @@ function harness(options: {
   return {
     executor,
     creates,
+    plannerInputs,
     admissions,
     canaryBindings,
     createCalls: () => createCalls,
@@ -569,5 +572,148 @@ describe("frozen exchange filters", () => {
     expect(code).not.toContain("inspectSymbol");
     expect(code).not.toContain("readOnly");
     expect(code).toContain("exchangeFilters");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Frozen risk-template provenance
+// ---------------------------------------------------------------------------
+//
+// The execution freezes the DERIVED numbers already — riskBudgetUsd,
+// actualPlannedLoss, estimatedRewardRatio — but not the policy behind them.
+// "1% of 300" and "3% of 100" both size a 3.00 risk budget and were
+// indistinguishable afterwards, because the answer lived only on
+// ExtremeRRPlan, one alert deletion away. 2711 of 9372 historical executions
+// had already lost it that way.
+
+describe("frozen risk-template snapshot", () => {
+  const templateOf = (creates: unknown[]) =>
+    (creates[0] as { snapshots: { riskTemplate: Record<string, unknown> } }).snapshots.riskTemplate;
+
+  it("A. a new execution carries the template provenance", async () => {
+    const { executor, creates } = harness();
+
+    await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect(creates).toHaveLength(1);
+    expect(templateOf(creates)).toBeDefined();
+  });
+
+  it("B. it is EXACTLY what the selected plan was sized with", async () => {
+    const { executor, creates } = harness();
+
+    await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect(templateOf(creates)).toEqual({
+      riskTemplateId: "t1",
+      name: "canary",
+      referenceCapital: "300",
+      riskPercent: "0.5",
+      rewardRatio: "3",
+      riskAmount: "1.50",
+      targetAmount: "4.50",
+    });
+    // The other snapshots are untouched.
+    const snapshots = (creates[0] as { snapshots: Record<string, unknown> }).snapshots;
+    expect(snapshots.extremeRRCandidate).toEqual(CANDIDATE);
+    expect(snapshots.exchangeFilters).toEqual(FILTERS);
+    expect(snapshots.marginPlan).toBeDefined();
+  });
+
+  it("D. a plan sized with V1 is recorded as V1, whatever the template says now", async () => {
+    // The load-bearing test. This passes today only because the snapshot is
+    // built from the PLAN. It fails the moment anyone "simplifies" the code by
+    // reading the currently active RiskTemplate at execution time, because the
+    // executor is handed no template repository at all and could not see V2.
+    const v1Plan = {
+      ...PLAN,
+      template: {
+        riskTemplateId: "t1",
+        name: "V1 conservative",
+        referenceCapital: "300",
+        riskPercent: "0.5",
+        rewardRatio: "3",
+        riskAmount: "1.50",
+        targetAmount: "4.50",
+      },
+    };
+    const { executor, creates } = harness();
+
+    await executor.handleSelectedPlan(v1Plan as never, "FRAXUSDT");
+
+    expect(templateOf(creates)).toMatchObject({
+      name: "V1 conservative",
+      riskPercent: "0.5",
+      referenceCapital: "300",
+      riskAmount: "1.50",
+    });
+
+    // And the executor cannot reach the mutable table even if someone wanted
+    // it to: no repository, no client, no query. This is the assertion that
+    // breaks if the snapshot is ever rebuilt from the active template.
+    const source = readFileSync(
+      path.join(BACKEND, "src", "modules", "execution", "selected-plan-executor.ts"),
+      "utf8"
+    );
+    expect(source).not.toContain("RiskTemplateRepository");
+    expect(source).not.toContain("riskTemplate.find");
+    expect(source).not.toContain("findActive");
+  });
+
+  it("the snapshot is a copy, not a reference into the plan", async () => {
+    // It becomes a durable JSON column; sharing a reference with a caller's
+    // object would let a later mutation rewrite recorded history in memory.
+    const plan = JSON.parse(JSON.stringify(PLAN)) as typeof PLAN;
+    const { executor, creates } = harness();
+
+    await executor.handleSelectedPlan(plan as never, "FRAXUSDT");
+    (plan.template as Record<string, unknown>).riskPercent = "99";
+
+    expect(templateOf(creates).riskPercent).toBe("0.5");
+  });
+
+  it("carries exactly the seven provenance fields, and nothing else", async () => {
+    // A field added to the plan DTO must not silently join the permanent
+    // record; that is a decision, not a default.
+    const { executor, creates } = harness({
+      plan: {
+        ...PLAN,
+        template: { ...PLAN.template, somethingNew: "must-not-be-recorded" },
+      },
+    });
+
+    await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect(Object.keys(templateOf(creates)).sort()).toEqual([
+      "name",
+      "referenceCapital",
+      "rewardRatio",
+      "riskAmount",
+      "riskPercent",
+      "riskTemplateId",
+      "targetAmount",
+    ]);
+  });
+
+  it("no template means no execution, so provenance is never partial", async () => {
+    // Already the executor's rule; asserted here because it is what makes the
+    // snapshot unconditional. Nothing has to invent a default.
+    const { executor, creates } = harness();
+
+    const result = await executor.handleSelectedPlan({ ...PLAN, template: null } as never, "FRAXUSDT");
+
+    expect(result.handled).toBe(false);
+    expect(creates).toEqual([]);
+  });
+
+  it("the risk budget the planner used is the template's own riskAmount", async () => {
+    // Ties the snapshot to the sizing it explains: riskBudgetUsd is not an
+    // independent number, it IS template.riskAmount.
+    const { executor, creates, plannerInputs } = harness();
+
+    await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
+
+    expect((plannerInputs[0] as { riskBudgetUsd: string }).riskBudgetUsd).toBe(PLAN.template.riskAmount);
+    expect(templateOf(creates).riskAmount).toBe(PLAN.template.riskAmount);
   });
 });

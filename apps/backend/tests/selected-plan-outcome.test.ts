@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -426,18 +425,31 @@ describe("I/J. repeated and concurrent recording stay deterministic", () => {
 // ===========================================================================
 
 describe("K/P/Q/R. observability cannot alter a trading decision", () => {
-  it("the executor file is byte-identical to the one on main", () => {
-    // The strongest guarantee available, and the reason this design was chosen:
-    // the outcome is already RETURNED to the caller, so the evidence can be
-    // written at the call site and the decision-making file never has to be
-    // opened. Compared against git rather than asserted in prose.
-    const relative = "apps/backend/src/modules/execution/selected-plan-executor.ts";
-    const onMain = execFileSync("git", ["show", `main:${relative}`], {
-      cwd: path.resolve(BACKEND, "../.."),
-      encoding: "utf8",
-      maxBuffer: 10 * 1024 * 1024,
-    });
-    expect(EXECUTOR_SOURCE.replace(/\r\n/g, "\n")).toBe(onMain.replace(/\r\n/g, "\n"));
+  it("the executor has no route to the persistence path at all", () => {
+    // This was once asserted by diffing the executor against `main`. That
+    // proved the ORIGINAL change did not touch the file, but it was a claim
+    // about branch ancestry rather than about the code: it passed again the
+    // moment that branch merged, and it failed for any later, unrelated,
+    // entirely legitimate edit to the executor. The durable claim is the one
+    // the design actually rests on -- the outcome is RETURNED to the caller,
+    // so the decision-making file needs no access to the writer and is given
+    // none. That stays true however the executor evolves.
+    const code = codeOf(EXECUTOR_SOURCE);
+    // No import of the outcome module, under any specifier form.
+    expect(code).not.toMatch(/from\s+["'][^"']*selected-plan-outcome[^"']*["']/);
+    expect(code).not.toMatch(/require\(\s*["'][^"']*selected-plan-outcome[^"']*["']\s*\)/);
+    // And no reference to the model, by any route.
+    expect(code).not.toContain("selectedPlanOutcome");
+  });
+
+  it("the decision leaves the executor by RETURN, which is what lets it stay ignorant", () => {
+    // The other half of the same argument, and the reason the check above is
+    // sufficient: `handleSelectedPlan` hands its verdict back to the caller, so
+    // the evidence is always available without the executor storing anything.
+    // No future feature has a reason to reach for persistence here.
+    const code = codeOf(EXECUTOR_SOURCE);
+    expect(code).toContain("async handleSelectedPlan(");
+    expect(code).toContain("Promise<SelectedPlanOutcome>");
   });
 
   maybe()("the executor never persists an outcome itself", () => {
