@@ -445,6 +445,7 @@ model ExecutionProfile {
 
   executions    TradeExecution[]
   exchangeFills ExchangeFillLedger[]
+  fillIngestWindows ExchangeFillIngestWindow[]
   safetyPolicy  ExecutionSafetyPolicy?
   canaryAuthorizations ExecutionCanaryAuthorization[]
 
@@ -1509,4 +1510,115 @@ model ExchangeFillLedger {
   @@index([binanceOrderId])
   @@index([executionProfileId, symbol, tradeTime])
   @@index([attribution])
+}
+
+// ===========================================================================
+// Bounded userTrades ingestion — durable work state
+// ===========================================================================
+
+enum FillIngestWindowStatus {
+  /// Not yet in a terminal proof state. A PENDING row may be unclaimed,
+  /// currently leased, or waiting out a retry backoff — the claim fields say
+  /// which. Deliberately NOT split into a CLAIMED state: a crash between
+  /// "claimed" and "wrote the status" would leave the two disagreeing, and the
+  /// consumer would have to accept both anyway.
+  PENDING
+  /// Proven exhaustive: a short page whose every representable economic row was
+  /// durably recorded in the SAME transaction that wrote this status.
+  COMPLETE
+  /// Saturated and bisected. Terminal for this node — its two children carry
+  /// the truth — and retained forever as the lineage explaining why they exist.
+  SPLIT
+  /// The page was short enough to prove exhaustion, but at least one returned
+  /// row could not be represented. A KNOWN coverage gap: the good rows are
+  /// recorded, the interval is not claimed as whole.
+  INCOMPLETE_SKIPPED_ROWS
+  /// A full page inside a single millisecond. There is no smaller window to
+  /// ask for, so time-windowing cannot prove exhaustion at all. Known gap.
+  SATURATED_SINGLE_MILLISECOND
+  /// The attempt budget ran out without a trustworthy answer. Known gap, and
+  /// the only terminal state an operator is expected to re-open by hand.
+  ABANDONED
+}
+
+/// One authoritative bounded SWEEP interval of one symbol's fill history in one
+/// account, and whether that interval has been PROVEN exhausted.
+///
+/// This is the durable proof state for a time interval. It is not an order, not
+/// a targeted-order request, not a global cursor and not a general job queue.
+///
+/// ONE AUTHORITATIVE TREE per (profile, symbol). Roots are deterministic
+/// intervals; children are the planner's exact bisection of a saturated parent,
+/// so the non-SPLIT rows tile their roots with no gap and no overlap. That is
+/// what lets contiguous completeness be DERIVED from these rows instead of
+/// cached in a second, disagreeable place — there is deliberately no high-water
+/// checkpoint anywhere.
+///
+/// Targeted reads (an execution needs its fills now) write economic facts to
+/// ExchangeFillLedger and never create a row here: they make no exhaustiveness
+/// claim, so they earn no coverage credit.
+model ExchangeFillIngestWindow {
+  id String @id @default(cuid())
+
+  /// The account this interval belongs to. Restrict, like every other durable
+  /// account-scoped record: a profile with ingestion history cannot be removed
+  /// out from under the proof it produced.
+  executionProfileId String
+  executionProfile   ExecutionProfile @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)
+  /// userTrades makes `symbol` mandatory, so a window can never mean "all
+  /// symbols", and an exchange trade id is unique per ACCOUNT only — the same
+  /// interval on two symbols is two independent questions.
+  symbol             String
+
+  /// INCLUSIVE integer-millisecond bounds, exactly as the pure planner works in.
+  /// BigInt rather than DateTime because the split tree's identity IS integer
+  /// arithmetic — `mid` and `mid + 1` — and a value that has been through a
+  /// timezone-bearing type is no longer the same identity it was written as.
+  startTimeMs BigInt
+  endTimeMs   BigInt
+
+  status FillIngestWindowStatus @default(PENDING)
+
+  /// The saturated window this one was bisected out of. NULL means a root.
+  /// Restrict: a parent is audit lineage and is never removed under its
+  /// children.
+  parentId String?
+  parent   ExchangeFillIngestWindow?  @relation("FillIngestWindowSplit", fields: [parentId], references: [id], onDelete: Restrict)
+  children ExchangeFillIngestWindow[] @relation("FillIngestWindowSplit")
+
+  /// Incremented when a claim is ACQUIRED, not when one fails. A crash
+  /// therefore burns an attempt, so a window that reliably kills its worker
+  /// cannot loop forever — and the value doubles as the claim's fencing token,
+  /// which is why every later mutation must present the exact number it was
+  /// handed.
+  attempts   Int       @default(0)
+  /// Lease — see CriticalAlert.claimedAt. Both claim columns are set and
+  /// cleared together; the database enforces that they agree.
+  claimedAt  DateTime?
+  /// Operational identity of the worker holding the lease. Never a credential,
+  /// a host secret or an environment blob.
+  claimOwner String?
+
+  /// Persisted backoff, not an in-process timer: an in-memory delay dies with
+  /// the process, and a restart after a rate limit would re-request everything
+  /// at once — which is how a 429 becomes an IP ban.
+  nextEligibleAt     DateTime?
+  lastAttemptAt      DateTime?
+  /// Bounded accounting only — a stable code and a sanitized phrase, never a
+  /// raw Binance payload.
+  lastErrorCode      String?
+  sanitizedLastError String?
+
+  createdAt DateTime @default(now())
+  /// Doubles as the terminal timestamp: terminal statuses are immutable, so
+  /// nothing writes to a row after it leaves PENDING.
+  updatedAt DateTime @updatedAt
+
+  /// The natural identity of one interval, and the whole idempotency mechanism
+  /// for seeding and for re-deriving split children after a rolled-back
+  /// transaction. Carries the account and the symbol because two accounts may
+  /// legitimately sweep the same symbol over the same range independently.
+  @@unique([executionProfileId, symbol, startTimeMs, endTimeMs])
+  @@index([executionProfileId, status, nextEligibleAt, claimedAt])
+  @@index([parentId])
 }
