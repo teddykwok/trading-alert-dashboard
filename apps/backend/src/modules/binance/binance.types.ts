@@ -198,16 +198,38 @@ export interface BinanceHistoricalOrderDto {
 }
 
 /**
- * One row of GET /fapi/v1/userTrades — a FILL. Its presence is disqualifying
- * evidence for any release, so only what identifies it is carried.
+ * One row of GET /fapi/v1/userTrades — a FILL.
+ *
+ * Originally reduced to identity alone, because its only consumer asked one
+ * question: did anything trade? It now also carries what the fill COST and
+ * EARNED, because this is the one endpoint that reports either. An order query
+ * gives an aggregate average and no fees at all; a position read gives neither.
+ * A fill is where accounting actually happens, and Binance was already
+ * returning all of it on the same response.
+ *
+ * Every added field is nullable and every one is preserved as an exact string.
+ * A field the exchange did not send reads as null — UNKNOWN — and is never a
+ * fabricated zero, which for a commission or a realized result would be a
+ * completely different claim.
  */
 export interface BinanceUserTradeDto {
   tradeId: string | null;
   orderId: string | null;
+  /** Carried so a fill can be keyed without trusting the caller's argument. */
+  symbol: string | null;
   side: string | null;
   positionSide: BinancePositionSide | null;
   quantity: string | null;
   price: string | null;
+  /** Binance "quoteQty": the quote-asset value of this fill. */
+  quoteQuantity: string | null;
+  /** Per-fill realized result. Legitimately NEGATIVE. */
+  realizedPnl: string | null;
+  /** Per-fill fee, in `commissionAsset` — NOT necessarily USDT. */
+  commission: string | null;
+  commissionAsset: string | null;
+  /** Whether this fill was the maker side, when reported. */
+  maker: boolean | null;
   timeMs: number | null;
 }
 

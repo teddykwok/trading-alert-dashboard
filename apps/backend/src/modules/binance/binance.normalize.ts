@@ -387,10 +387,19 @@ export function normalizeUserTrades(payload: unknown): BinanceUserTradeDto[] {
     return {
       tradeId: row.id === undefined || row.id === null ? null : String(row.id),
       orderId: row.orderId === undefined || row.orderId === null ? null : String(row.orderId),
+      symbol: text(row.symbol),
       side: text(row.side),
       positionSide: row.positionSide === undefined ? null : normalizePositionSide(row.positionSide),
       quantity: decimalString(row.qty),
       price: decimalString(row.price),
+      // Accounting fields, byte-exact. `decimalString` preserves the delivered
+      // text, so a negative realized result and a long commission expansion
+      // both survive; an absent field stays null rather than becoming 0.
+      quoteQuantity: decimalString(row.quoteQty),
+      realizedPnl: decimalString(row.realizedPnl),
+      commission: decimalString(row.commission),
+      commissionAsset: text(row.commissionAsset),
+      maker: bool(row.maker),
       timeMs: Number.isFinite(time) ? time : null,
     };
   });

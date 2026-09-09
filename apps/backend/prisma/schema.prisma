@@ -443,8 +443,9 @@ model ExecutionProfile {
   createdAt            DateTime              @default(now())
   updatedAt            DateTime              @updatedAt
 
-  executions   TradeExecution[]
-  safetyPolicy ExecutionSafetyPolicy?
+  executions    TradeExecution[]
+  exchangeFills ExchangeFillLedger[]
+  safetyPolicy  ExecutionSafetyPolicy?
   canaryAuthorizations ExecutionCanaryAuthorization[]
 
   @@unique([exchange, environment, accountIdentifier])
@@ -673,6 +674,7 @@ model TradeExecution {
   criticalAlerts    CriticalAlert[]
   notifications     ExecutionNotification[]
   protectionVerifications ExecutionProtectionVerification[]
+  exchangeFills           ExchangeFillLedger[]
 
   @@unique([alertId, executionProfileId])
   @@index([status])
@@ -743,6 +745,8 @@ model BinanceOrder {
   workingType          String?
   priceProtect         Boolean?
   triggeredAt          DateTime?
+
+  exchangeFills    ExchangeFillLedger[]
 
   createdAt        DateTime             @default(now())
   updatedAt        DateTime             @updatedAt
@@ -1418,4 +1422,91 @@ model SelectedPlanOutcome {
 
   @@index([reasonCode])
   @@index([evaluatedAt])
+}
+
+// ===========================================================================
+// Exchange fill ledger — the accounting substrate.
+//
+// One row is ONE FILL as Binance reported it, and nothing else. No win/loss,
+// no net PnL, no R multiple, no bucket, no running total: those are readings
+// OF these facts and belong to whatever asks the question, not to the record.
+// Storing a derived figure here would freeze today's definition of it into
+// rows nobody can revisit.
+//
+// APPEND-ONLY. A fill happened; it does not later un-happen or change value.
+// Ingestion inserts, and a replay of the same trade is a no-op enforced by the
+// database rather than by whoever remembered to check. Nothing accumulates in
+// place — there is no `total += observed` anywhere, which is the failure mode
+// that makes a restart silently double a position's result.
+// ===========================================================================
+
+/// How confidently this fill is tied to one of OUR orders.
+enum FillAttribution {
+  /// Exactly one owned order carries the exchange order id on this fill.
+  OWNED_ORDER
+  /// No owned order carries it. The fill is real and stays recorded; it is
+  /// simply not ours to explain — another client, a manual trade, a
+  /// liquidation.
+  UNATTRIBUTED
+  /// More than one owned row claims the same exchange order id. Recorded and
+  /// flagged rather than assigned to whichever matched first.
+  AMBIGUOUS
+}
+
+model ExchangeFillLedger {
+  id String @id @default(cuid())
+
+  /// The account this fill belongs to. Not derived by joining through the
+  /// attributed execution: an UNATTRIBUTED fill has no execution, and a fill
+  /// must still know whose account it happened in.
+  executionProfileId String
+  executionProfile   ExecutionProfile @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)
+
+  symbol String
+  /// Binance's own trade id. Unique per account, NOT globally, which is why
+  /// the natural key carries the profile.
+  exchangeTradeId String
+  /// The exchange order this fill came from, as reported on the fill.
+  exchangeOrderId String?
+
+  // --- Attribution, by ORDER IDENTITY only ---------------------------------
+  /// Resolved from `exchangeOrderId` against an owned order's own identity.
+  /// Never from symbol and time, and never from positionSide: those coincide
+  /// for unrelated trades and would attribute someone else's fill to us.
+  attribution      FillAttribution @default(UNATTRIBUTED)
+  binanceOrderId   String?
+  binanceOrder     BinanceOrder?   @relation(fields: [binanceOrderId], references: [id], onDelete: Restrict)
+  tradeExecutionId String?
+  tradeExecution   TradeExecution? @relation(fields: [tradeExecutionId], references: [id], onDelete: Restrict)
+
+  // --- What the exchange said happened -------------------------------------
+  side         ExecutionOrderSide
+  positionSide ExecutionPositionSide
+
+  quantity      Decimal  @db.Decimal(40, 18)
+  price         Decimal  @db.Decimal(30, 12)
+  quoteQuantity Decimal? @db.Decimal(30, 12)
+  /// Per-fill realized result. Legitimately negative; null means the exchange
+  /// did not report one, never that it was zero.
+  realizedPnl   Decimal? @db.Decimal(30, 12)
+  /// Fee amount in `commissionAsset`, which is NOT necessarily USDT. The pair
+  /// is stored as delivered and never converted here — a USD figure derived
+  /// from an unrecorded rate would be a guess wearing an exact number.
+  commission      Decimal? @db.Decimal(30, 12)
+  commissionAsset String?
+  maker           Boolean?
+
+  /// The exchange's own timestamp for the fill, never our observation time.
+  tradeTime  DateTime
+  /// When we first recorded it. The two differ after any outage.
+  ingestedAt DateTime @default(now())
+
+  /// The natural identity of one fill. Account-scoped because a trade id is
+  /// unique per account only, so Account A and Account B may legitimately
+  /// both hold trade 1001 — and TESTNET must never merge with MAINNET.
+  @@unique([executionProfileId, symbol, exchangeTradeId])
+  @@index([tradeExecutionId])
+  @@index([binanceOrderId])
+  @@index([executionProfileId, symbol, tradeTime])
+  @@index([attribution])
 }
