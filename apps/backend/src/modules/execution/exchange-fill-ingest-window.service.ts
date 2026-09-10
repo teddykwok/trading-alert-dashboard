@@ -165,7 +165,7 @@ export type RetryableFailureOutcome = "PENDING" | "ABANDONED";
  * exactly has already lost the identity it is supposed to carry, so widening it
  * would only make the wrong number durable.
  */
-function assertBounds(startTimeMs: number, endTimeMs: number): void {
+export function assertBounds(startTimeMs: number, endTimeMs: number): void {
   const refuse = (detail: string): never => {
     throw new FillIngestWindowRefusedError(detail, startTimeMs, endTimeMs);
   };
@@ -180,7 +180,7 @@ function assertBounds(startTimeMs: number, endTimeMs: number): void {
 }
 
 /** BigInt back to the exact number the planner works in, or a refusal. */
-function toMs(value: bigint): number {
+export function toMs(value: bigint): number {
   const asNumber = Number(value);
   if (!Number.isSafeInteger(asNumber)) {
     throw new FillIngestWindowRefusedError("stored bound is not a safe integer", value, value);
