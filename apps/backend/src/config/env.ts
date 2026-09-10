@@ -8,6 +8,13 @@ import {
   DEFAULT_TAKE_PROFIT_WORKING_TYPE,
   PROTECTION_WORKING_TYPES,
 } from "../modules/execution/protection-policy";
+// Also dependency-free at runtime: its only import is a TYPE import, which is
+// erased, so naming it here adds no module cycle. Imported rather than
+// re-typed so the schema and `canonicalUtcDayRoots` cannot drift apart.
+import {
+  MAX_INGEST_HORIZON_DAYS,
+  MIN_INGEST_HORIZON_DAYS,
+} from "../modules/execution/exchange-fill-day-roots";
 
 /**
  * Decimal-string config values. Validated as plain decimal literals and kept
@@ -43,6 +50,22 @@ export function compareDecimalStrings(a: string, b: string): number {
   if (left === right) return 0;
   return left < right ? -1 : 1;
 }
+
+/**
+ * Whole-number config values that must mean EXACTLY what was written.
+ *
+ * `z.coerce.number()` is right for an ordinary limit, and wrong here: it reads
+ * "30days" as 30, "2.5" as 2.5 and "2.0" as 2, so a typo becomes a silently
+ * different policy. A horizon is a count of days an operator chose, and a value
+ * that had to be reinterpreted to become a number is a mistake rather than a
+ * setting -- so the text is validated first and converted second. Trimmed,
+ * matching the decimal-string validators above.
+ */
+const wholeNumberString = z
+  .string()
+  .trim()
+  .regex(/^\d+$/, "must be a whole number, e.g. \"30\"")
+  .transform((value) => Number(value));
 
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
@@ -266,6 +289,19 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .default(DEFAULT_PROTECTION_PRICE_PROTECT ? "true" : "false")
     .transform((value) => value === "true"),
+  // --- Phase 6 historical fill ingestion -------------------------------------
+  // How many COMPLETED UTC days of exchange fill history one root bootstrap
+  // covers. The bounds are the domain's own constants, not a second copy, and
+  // an out-of-range or malformed value fails STARTUP -- there is deliberately no
+  // clamp, because silently ingesting 60 days when 61 was asked for is a
+  // different account history than the operator requested.
+  //
+  // Availability only. Nothing invokes the bootstrap automatically; when and how
+  // often it runs is not decided here.
+  EXECUTION_FILL_INGEST_HORIZON_DAYS: wholeNumberString
+    .pipe(z.number().int().min(MIN_INGEST_HORIZON_DAYS).max(MAX_INGEST_HORIZON_DAYS))
+    .default("30"),
+
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value
   // fall back to mock candles, same as STOCK alerts.
