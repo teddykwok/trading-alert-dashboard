@@ -270,10 +270,28 @@ export class ExchangeFillIngestWindowService {
           { OR: [{ claimedAt: null }, { claimedAt: { lt: staleBefore } }] },
         ],
       },
-      // Newest first: the most recently settled interval is the one anything
-      // downstream is waiting on, and a split child is newer-or-equal to the
-      // rest of its region, so a tree is finished before older backlog starts.
-      orderBy: [{ startTimeMs: "desc" }, { id: "asc" }],
+      // OLDEST DURABLE ROW FIRST. Fairness here means nothing that has been
+      // waiting can be starved by work created after it: a split child is
+      // created later than the roots it shares a horizon with, so it queues
+      // BEHIND them instead of finishing its own tree first. That deliberately
+      // reverses the earlier newest-first rule, under which a steadily
+      // splitting region could keep overtaking an older backlog forever.
+      //
+      // A retry keeps its row, so it keeps its place in line -- `createdAt` is
+      // untouched by failure, and `nextEligibleAt` above is what holds it back
+      // while it waits rather than any change of position.
+      //
+      // Total and deterministic to the last key. `createdAt` ties whenever
+      // rows are inserted by one statement, so the interval, the symbol and
+      // finally `id` settle what is left: two workers scanning the same
+      // instant must see the same queue, in the same order, every time.
+      orderBy: [
+        { createdAt: "asc" },
+        { startTimeMs: "asc" },
+        { symbol: "asc" },
+        { endTimeMs: "asc" },
+        { id: "asc" },
+      ],
       take: CLAIM_CANDIDATE_SCAN,
       select: {
         id: true, symbol: true, startTimeMs: true, endTimeMs: true,
