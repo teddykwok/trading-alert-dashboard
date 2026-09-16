@@ -25,6 +25,7 @@ import type {
   AllowlistValidationResult,
 } from "../modules/operator/allowlist.service";
 import { CANARY_AUTHORIZATION_MODES, type CanaryAuthorizationMode } from "../modules/execution/canary-readiness";
+import { interpretHistoricalFillOperationalSnapshot } from "../modules/execution/historical-fill-operational-interpretation";
 import {
   HistoricalFillOperationalSnapshotService,
   type HistoricalFillOperationalSnapshot,
@@ -100,11 +101,26 @@ const isoOrNull = (value: Date | null): string | null =>
  * strings; a null instant stays null.
  */
 function serializeHistoricalFillSnapshot(snapshot: HistoricalFillOperationalSnapshot) {
+  /**
+   * The operational judgement, derived from the snapshot already in hand.
+   *
+   * No second query, no second profile lookup and no clock: the classifier is
+   * pure, so this costs nothing beyond the facts already read. Its fields are
+   * copied out one at a time like every other value here -- a classifier that
+   * later grows a debugging field must be let through deliberately.
+   */
+  const interpretation = interpretHistoricalFillOperationalSnapshot(snapshot);
+  const interpreted = {
+    state: interpretation.state,
+    issues: interpretation.issues.map((issue) => ({ code: issue.code, count: issue.count })),
+  };
+
   if (snapshot.outcome === "PROFILE_UNAVAILABLE") {
     return {
       outcome: snapshot.outcome,
       capturedAt: snapshot.capturedAt.toISOString(),
       reasonCode: snapshot.reasonCode,
+      interpretation: interpreted,
     };
   }
 
@@ -142,6 +158,7 @@ function serializeHistoricalFillSnapshot(snapshot: HistoricalFillOperationalSnap
       totalFills: ledger.totalFills,
       unattributedFills: ledger.unattributedFills,
     },
+    interpretation: interpreted,
   };
 }
 

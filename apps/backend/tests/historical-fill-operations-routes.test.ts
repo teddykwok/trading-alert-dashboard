@@ -273,6 +273,16 @@ describe("the wire contract", () => {
         nextBackoffEligibleAt: null, // J. a null instant stays null
       },
       ledger: { totalFills: 12, unattributedFills: 4 },
+      // Additive only: every factual field above is untouched. This
+      // long-standing fixture carries ABANDONED 1 and INCOMPLETE_SKIPPED_ROWS
+      // 1, so the honest answer for it is NEEDS_ATTENTION.
+      interpretation: {
+        state: "NEEDS_ATTENTION",
+        issues: [
+          { code: "ABANDONED_WINDOWS_PRESENT", count: 1 },
+          { code: "INCOMPLETE_SKIPPED_ROWS_PRESENT", count: 1 },
+        ],
+      },
     });
 
     // K. Counts are numbers on the wire, never stringified.
@@ -298,9 +308,13 @@ describe("the wire contract", () => {
       outcome: "PROFILE_UNAVAILABLE",
       capturedAt: "2026-08-12T09:15:00.000Z",
       reasonCode: "PROFILE_POLICY_MISSING",
+      // C. A workset that could not be evaluated is UNAVAILABLE, never a
+      // condition -- and the binder's reason is still carried beside it.
+      interpretation: { state: "UNAVAILABLE", issues: [] },
     });
     expect(Object.keys(response.json()).sort()).toEqual([
       "capturedAt",
+      "interpretation",
       "outcome",
       "reasonCode",
     ]);
@@ -358,6 +372,7 @@ describe("the wire contract", () => {
     expect(Object.keys(response.json()).sort()).toEqual([
       "capturedAt",
       "executionProfileId",
+      "interpretation",
       "ledger",
       "outcome",
       "pending",
@@ -511,5 +526,127 @@ describe("the route reaches the real read model", () => {
       where: { executionProfileId: { in: [mine.id, theirs.id] } },
     });
     await prisma.executionProfile.deleteMany({ where: { id: { in: [mine.id, theirs.id] } } });
+  });
+});
+
+/**
+ * The operational interpretation, on the wire.
+ *
+ * The classifier itself is proven exhaustively in its own pure suite; these
+ * assert the ROUTE carries its answer faithfully and adds nothing else.
+ */
+describe("the interpretation field", () => {
+  /** The fixture with every trigger cleared, for the untroubled cases. */
+  const UNTROUBLED = {
+    ...READY_SNAPSHOT,
+    windows: {
+      ...READY_SNAPSHOT.windows,
+      byStatus: { ...READY_SNAPSHOT.windows.byStatus, ABANDONED: 0, INCOMPLETE_SKIPPED_ROWS: 0 },
+    },
+  };
+
+  const withCounts = (overrides: {
+    pending?: Record<string, number>;
+    windows?: Record<string, number>;
+    ledger?: Record<string, number>;
+  }) => ({
+    ...UNTROUBLED,
+    windows: {
+      ...UNTROUBLED.windows,
+      byStatus: { ...UNTROUBLED.windows.byStatus, ...overrides.windows },
+    },
+    pending: { ...UNTROUBLED.pending, ...overrides.pending },
+    ledger: { ...UNTROUBLED.ledger, ...overrides.ledger },
+  });
+
+  it("A. serializes NORMAL when nothing needs a human", async () => {
+    const { app } = await buildAppWith(() => UNTROUBLED);
+
+    const response = await authorized(app);
+
+    expect(response.json().interpretation).toEqual({ state: "NORMAL", issues: [] });
+    await app.close();
+  });
+
+  it("B+D. serializes NEEDS_ATTENTION with every condition, in order", async () => {
+    const { app } = await buildAppWith(() =>
+      withCounts({
+        pending: { staleLease: 2, attemptExhausted: 1 },
+        windows: { ABANDONED: 3, INCOMPLETE_SKIPPED_ROWS: 4, SATURATED_SINGLE_MILLISECOND: 5 },
+      })
+    );
+
+    const response = await authorized(app);
+
+    expect(response.json().interpretation).toEqual({
+      state: "NEEDS_ATTENTION",
+      issues: [
+        { code: "STALE_LEASES_PRESENT", count: 2 },
+        { code: "ATTEMPT_EXHAUSTED_PRESENT", count: 1 },
+        { code: "ABANDONED_WINDOWS_PRESENT", count: 3 },
+        { code: "INCOMPLETE_SKIPPED_ROWS_PRESENT", count: 4 },
+        { code: "SATURATED_SINGLE_MILLISECOND_PRESENT", count: 5 },
+      ],
+    });
+    await app.close();
+  });
+
+  it("an unattributed fill alone is not a condition on the wire either", async () => {
+    const { app } = await buildAppWith(() => ({
+      ...UNTROUBLED,
+      ledger: { totalFills: 40, unattributedFills: 40 },
+    }));
+
+    const response = await authorized(app);
+
+    expect(response.json().interpretation).toEqual({ state: "NORMAL", issues: [] });
+    // ...and the fact itself is still reported.
+    expect(response.json().ledger.unattributedFills).toBe(40);
+    await app.close();
+  });
+
+  it("E+F. allowlists the interpretation, dropping anything else on it", async () => {
+    const { app } = await buildAppWith(() => ({
+      ...withCounts({ pending: { staleLease: 1 } }),
+      interpretation: { state: "CRITICAL", debugRule: "leak", issues: [{ code: "X", secret: "s" }] },
+    }));
+
+    const response = await authorized(app);
+    const raw = response.body;
+
+    // The route recomputes from the snapshot rather than forwarding whatever
+    // arrived, so a foreign interpretation cannot ride through.
+    expect(response.json().interpretation).toEqual({
+      state: "NEEDS_ATTENTION",
+      issues: [{ code: "STALE_LEASES_PRESENT", count: 1 }],
+    });
+    for (const forbidden of ["CRITICAL", "debugRule", "leak", "secret"]) {
+      expect(raw).not.toContain(forbidden);
+    }
+    // Each issue carries exactly a code and a count.
+    for (const issue of response.json().interpretation.issues) {
+      expect(Object.keys(issue).sort()).toEqual(["code", "count"]);
+    }
+    await app.close();
+  });
+
+  it("G+H+I. adds no read, no caller control and no weakening of the guard", async () => {
+    const { app, calls } = await buildAppWith(() => withCounts({ pending: { staleLease: 1 } }));
+
+    // Unauthenticated still reads nothing at all.
+    expect((await get(app)).statusCode).toBe(401);
+    expect(calls).toHaveLength(0);
+
+    // Authorized: still exactly ONE capture, still with no arguments, even
+    // though an interpretation is now produced.
+    const response = await authorized(
+      app,
+      `${URL}?executionProfileId=other&now=1999-01-01T00:00:00.000Z`
+    );
+    expect(response.statusCode).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual([]);
+    expect(response.json().interpretation.state).toBe("NEEDS_ATTENTION");
+    await app.close();
   });
 });

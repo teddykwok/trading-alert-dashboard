@@ -1,4 +1,7 @@
 import type {
+  HistoricalFillInterpretationDto,
+  HistoricalFillOperationalIssueCode,
+  HistoricalFillOperationalState,
   HistoricalFillOperationsDto,
   HistoricalFillProfileReason,
 } from "../../api/operator";
@@ -12,13 +15,17 @@ import { formatDateTime } from "../../utils/formatDate";
  * directly rather than inferred from JSX -- which matters more than usual here,
  * because this repository has no DOM test environment.
  *
- * ## No verdicts
+ * ## Renders verdicts, never reaches them
  *
- * Nothing in this file decides whether a number is good. There is no tone, no
- * severity, no threshold and no recommendation, and that is deliberate: a
- * stale lease or an abandoned window is a fact an operator reads, and deciding
- * what it MEANS is a later slice's job. Introducing a colour here would quietly
- * make this file the owner of a policy it has not been given.
+ * This file now carries wording and a tone for an operational state -- but it
+ * does not DECIDE that state. The server classifies, and everything here is a
+ * lookup keyed by what the server said. There is no threshold, no comparison
+ * and no arithmetic over the counts anywhere in this module, which is what
+ * keeps the panel incapable of disagreeing with the API about what an operator
+ * is looking at.
+ *
+ * The individual metrics stay exactly as factual as they were: no figure is
+ * coloured or ranked by its own value.
  */
 
 /** What a durable instant that does not exist renders as. */
@@ -139,4 +146,72 @@ export function presentHistoricalFillOperations(
       ],
     },
   ];
+}
+
+/**
+ * What each server-assigned state is called in front of an operator.
+ *
+ * Every sentence is scoped to historical fills. None of them makes a claim
+ * about the account, the exchange connection, or whether trading is safe --
+ * this panel has never read anything that would justify one.
+ */
+export const HISTORICAL_FILL_STATE_WORDING: Record<HistoricalFillOperationalState, string> = {
+  NORMAL: "No historical fill conditions currently require operator attention.",
+  NEEDS_ATTENTION: "Historical fill ingestion has conditions that require operator review.",
+  UNAVAILABLE: "Historical fill operational state is unavailable.",
+};
+
+export function describeOperationalState(state: HistoricalFillOperationalState): string {
+  return HISTORICAL_FILL_STATE_WORDING[state];
+}
+
+/** The tones this panel may use. `red` is deliberately not among them. */
+export type InterpretationTone = "green" | "yellow" | "gray";
+
+/**
+ * Tone per state, deliberately understated.
+ *
+ * Attention is amber, never red: NEEDS_ATTENTION means a durable condition is
+ * worth an operator's review, not that anything is failing right now, and a
+ * critical colour would overstate every one of the five triggers.
+ */
+export const HISTORICAL_FILL_STATE_TONE: Record<HistoricalFillOperationalState, InterpretationTone> =
+  {
+    NORMAL: "green",
+    NEEDS_ATTENTION: "yellow",
+    UNAVAILABLE: "gray",
+  };
+
+export function toneForOperationalState(state: HistoricalFillOperationalState): InterpretationTone {
+  return HISTORICAL_FILL_STATE_TONE[state];
+}
+
+/**
+ * Issue labels: nouns naming what was counted.
+ *
+ * No verbs, because a label here is not an instruction. What an operator should
+ * DO about a stale lease is the runbook slice's subject, and wording it now
+ * would commit this panel to advice nobody has reviewed.
+ */
+export const HISTORICAL_FILL_ISSUE_WORDING: Record<HistoricalFillOperationalIssueCode, string> = {
+  STALE_LEASES_PRESENT: "Stale leases",
+  ATTEMPT_EXHAUSTED_PRESENT: "Pending windows at the attempt limit",
+  ABANDONED_WINDOWS_PRESENT: "Abandoned windows",
+  INCOMPLETE_SKIPPED_ROWS_PRESENT: "Windows completed with skipped rows",
+  SATURATED_SINGLE_MILLISECOND_PRESENT: "Windows saturated at single-millisecond granularity",
+};
+
+/**
+ * The issue rows, in the order the server sent them.
+ *
+ * Every issue is rendered. None is dropped, merged, re-ordered or promoted,
+ * so a second condition can never be hidden behind the first.
+ */
+export function presentInterpretationIssues(
+  interpretation: HistoricalFillInterpretationDto
+): MetricRow[] {
+  return interpretation.issues.map((issue) => ({
+    label: HISTORICAL_FILL_ISSUE_WORDING[issue.code],
+    value: count(issue.count),
+  }));
 }

@@ -392,8 +392,10 @@ export function postSafeOff(): Promise<TradingControlActionResult> {
  * Durable historical-fill ingestion state, exactly as
  * GET /api/operator/historical-fills/operations returns it.
  *
- * FACTS ONLY. The server deliberately reports no health, severity or
- * recommendation, and neither does anything that consumes this type.
+ * The metrics are FACTS: no figure carries a health, severity or
+ * recommendation of its own, and nothing that consumes this type gives one.
+ * The single judgement on the wire is `interpretation`, which the SERVER
+ * computes; consumers render it and never derive their own.
  */
 export type HistoricalFillProfileReason =
   | "PROFILE_NOT_CONFIGURED"
@@ -429,8 +431,39 @@ export interface HistoricalFillPendingCountsDto {
   nextBackoffEligibleAt: string | null;
 }
 
+/**
+ * The server's operational judgement about historical fill ingestion.
+ *
+ * The BACKEND owns this policy. The panel renders what it is told and never
+ * recomputes a state from the counts, so the two can never drift into
+ * disagreeing about what an operator is looking at.
+ */
+export type HistoricalFillOperationalState = "NORMAL" | "NEEDS_ATTENTION" | "UNAVAILABLE";
+
+export type HistoricalFillOperationalIssueCode =
+  | "STALE_LEASES_PRESENT"
+  | "ATTEMPT_EXHAUSTED_PRESENT"
+  | "ABANDONED_WINDOWS_PRESENT"
+  | "INCOMPLETE_SKIPPED_ROWS_PRESENT"
+  | "SATURATED_SINGLE_MILLISECOND_PRESENT";
+
+export interface HistoricalFillOperationalIssueDto {
+  code: HistoricalFillOperationalIssueCode;
+  count: number;
+}
+
+export interface HistoricalFillInterpretationDto {
+  state: HistoricalFillOperationalState;
+  issues: HistoricalFillOperationalIssueDto[];
+}
+
 export type HistoricalFillOperationsDto =
-  | { outcome: "PROFILE_UNAVAILABLE"; capturedAt: string; reasonCode: HistoricalFillProfileReason }
+  | {
+      outcome: "PROFILE_UNAVAILABLE";
+      capturedAt: string;
+      reasonCode: HistoricalFillProfileReason;
+      interpretation: HistoricalFillInterpretationDto;
+    }
   | {
       outcome: "READY";
       capturedAt: string;
@@ -438,6 +471,7 @@ export type HistoricalFillOperationsDto =
       windows: HistoricalFillWindowCountsDto;
       pending: HistoricalFillPendingCountsDto;
       ledger: { totalFills: number; unattributedFills: number };
+      interpretation: HistoricalFillInterpretationDto;
     };
 
 /** The route the panel reads, and the only one it may. */
