@@ -301,6 +301,28 @@ const envSchema = z.object({
   EXECUTION_FILL_INGEST_HORIZON_DAYS: wholeNumberString
     .pipe(z.number().int().min(MIN_INGEST_HORIZON_DAYS).max(MAX_INGEST_HORIZON_DAYS))
     .default("30"),
+  // How many one-window executor invocations a SINGLE bounded batch may spend.
+  // Not a domain constant and not imported from one: the driver independently
+  // refuses anything that is not a safe integer >= 1, and this ceiling is the
+  // separate operational question of how much one pass may do. Both checks
+  // stand -- config is defence in depth, never a replacement.
+  //
+  // Deliberately NOT an exchange-request budget. Request weight is Slice 4's
+  // problem and may restrict effective work further; a window bound is not a
+  // rate limit and must not be read as one.
+  EXECUTION_FILL_BATCH_MAX_WINDOWS: wholeNumberString
+    .pipe(z.number().int().min(1).max(100))
+    .default("5"),
+  // How long a FUTURE scheduler should leave between batch opportunities.
+  // Seconds, matching every other cadence value in this schema.
+  //
+  // Nothing reads this yet, and declaring it starts nothing: there is no timer,
+  // no cron and no startup hook in this phase. It exists so the cadence
+  // decision is written down once, in the same place as the bound it pairs
+  // with, before anything is wired to obey it.
+  EXECUTION_FILL_BATCH_INTERVAL_SECONDS: wholeNumberString
+    .pipe(z.number().int().min(10).max(3600))
+    .default("60"),
 
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value
