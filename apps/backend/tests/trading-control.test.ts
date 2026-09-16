@@ -806,11 +806,17 @@ describe("trading control: structural guarantees", () => {
     // Eighteen now: pause and resume add two guarded POSTs. They change the
     // session's admission state and nothing else — no route reads or writes a
     // count, a budget or an expiry.
-    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:18 guards:18`);
+    // Nineteen now: the historical-fill operations snapshot adds one guarded
+    // GET. It reads durable ingest-window and fill-ledger counts and writes
+    // nothing -- the READ surface grew, the guarded-ness did not change.
+    expect(`routes:${routes.length} guards:${guards.length}`).toBe(`routes:19 guards:19`);
     // Seven GETs and eleven POSTs, and still no PUT/PATCH/DELETE anywhere. The
     // READ surface stays read-only: pause and resume are POSTs, so the GET
     // count is unchanged by this feature.
-    expect((code.match(/app\.get\(/g) ?? []).length).toBe(7);
+    // Eight GETs now: the historical-fill operations snapshot is the added
+    // one. The POST count is untouched, and there is still no PUT, PATCH or
+    // DELETE anywhere on the operator surface.
+    expect((code.match(/app\.get\(/g) ?? []).length).toBe(8);
     expect((code.match(/app\.post\(/g) ?? []).length).toBe(11);
     expect(code.match(/app\.(put|patch|delete)\(/g)).toBeNull();
   });

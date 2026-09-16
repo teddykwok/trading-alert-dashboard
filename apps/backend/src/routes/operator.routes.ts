@@ -25,6 +25,10 @@ import type {
   AllowlistValidationResult,
 } from "../modules/operator/allowlist.service";
 import { CANARY_AUTHORIZATION_MODES, type CanaryAuthorizationMode } from "../modules/execution/canary-readiness";
+import {
+  HistoricalFillOperationalSnapshotService,
+  type HistoricalFillOperationalSnapshot,
+} from "../modules/execution/historical-fill-operational-snapshot.service";
 import { ValidationError } from "../utils/errors";
 
 /**
@@ -72,6 +76,73 @@ export interface OperatorRoutesOptions {
   tradingControlActionsFactory?: (prisma: PrismaClient) => TradingControlActor;
   /** Injected in tests so allowlist validation never reaches the exchange. */
   allowlistFactory?: (prisma: PrismaClient) => AllowlistManager;
+  /** Injected in tests so a snapshot can be scripted without seeding a queue. */
+  historicalFillSnapshotFactory?: (prisma: PrismaClient) => HistoricalFillReader;
+}
+
+/** The one method the historical-fill route needs, so a test can supply it. */
+export interface HistoricalFillReader {
+  capture(options?: { now?: Date }): Promise<HistoricalFillOperationalSnapshot>;
+}
+
+/** A durable instant on the wire, or null. Never a Date, never a number. */
+const isoOrNull = (value: Date | null): string | null =>
+  value === null ? null : value.toISOString();
+
+/**
+ * The wire contract, written out field by field.
+ *
+ * This IS the allowlist. No route in this project declares a Fastify response
+ * schema, so rather than introduce a serializer stack for one endpoint, the
+ * body is CONSTRUCTED rather than forwarded: a property the snapshot grows
+ * later cannot reach an operator's browser until someone adds it here on
+ * purpose. Counts stay numbers; the four durable instants become ISO-8601
+ * strings; a null instant stays null.
+ */
+function serializeHistoricalFillSnapshot(snapshot: HistoricalFillOperationalSnapshot) {
+  if (snapshot.outcome === "PROFILE_UNAVAILABLE") {
+    return {
+      outcome: snapshot.outcome,
+      capturedAt: snapshot.capturedAt.toISOString(),
+      reasonCode: snapshot.reasonCode,
+    };
+  }
+
+  const { windows, pending, ledger } = snapshot;
+  return {
+    outcome: snapshot.outcome,
+    capturedAt: snapshot.capturedAt.toISOString(),
+    executionProfileId: snapshot.executionProfileId,
+    windows: {
+      total: windows.total,
+      roots: windows.roots,
+      children: windows.children,
+      distinctSymbolCount: windows.distinctSymbolCount,
+      byStatus: {
+        PENDING: windows.byStatus.PENDING,
+        COMPLETE: windows.byStatus.COMPLETE,
+        SPLIT: windows.byStatus.SPLIT,
+        INCOMPLETE_SKIPPED_ROWS: windows.byStatus.INCOMPLETE_SKIPPED_ROWS,
+        SATURATED_SINGLE_MILLISECOND: windows.byStatus.SATURATED_SINGLE_MILLISECOND,
+        ABANDONED: windows.byStatus.ABANDONED,
+      },
+    },
+    pending: {
+      total: pending.total,
+      claimableNow: pending.claimableNow,
+      activeLease: pending.activeLease,
+      staleLease: pending.staleLease,
+      inBackoff: pending.inBackoff,
+      attemptExhausted: pending.attemptExhausted,
+      oldestPendingCreatedAt: isoOrNull(pending.oldestPendingCreatedAt),
+      oldestClaimableCreatedAt: isoOrNull(pending.oldestClaimableCreatedAt),
+      nextBackoffEligibleAt: isoOrNull(pending.nextBackoffEligibleAt),
+    },
+    ledger: {
+      totalFills: ledger.totalFills,
+      unattributedFills: ledger.unattributedFills,
+    },
+  };
 }
 
 /** The mutation surface. Three actions, and deliberately nothing else. */
@@ -111,6 +182,9 @@ export async function operatorRoutes(
     ((prisma: PrismaClient) => new TradingControlActionsService(prisma));
   const buildAllowlist =
     options.allowlistFactory ?? ((prisma: PrismaClient) => new AllowlistService(prisma));
+  const buildHistoricalFillSnapshot =
+    options.historicalFillSnapshotFactory ??
+    ((prisma: PrismaClient) => new HistoricalFillOperationalSnapshotService({ prisma }));
 
   /**
    * Every mutation answers the same way: the action's own sanitized result, and
@@ -153,6 +227,36 @@ export async function operatorRoutes(
   app.get("/api/operator/auth-check", { preHandler: requireOperatorAuth }, async () => ({
     authenticated: true,
   }));
+
+  /**
+   * Durable historical-fill ingestion state, as FACTS.
+   *
+   * Reads only: counts, minimums and the configured profile's identity. It
+   * claims nothing, seeds nothing, starts no batch and reaches no exchange.
+   *
+   * No request input of any kind is consulted -- no path parameter, no body and
+   * notably no query. The account is whatever the process is bound to, and the
+   * instant is the server's own: a caller who could pass `executionProfileId`
+   * would have a profile enumeration API, and a caller who could pass `now`
+   * could backdate a lease into looking expired. Neither is reachable because
+   * neither is read.
+   *
+   * `PROFILE_UNAVAILABLE` is 200, not 401 or 503. It is a true statement about
+   * configuration that the operator panel needs to render; authentication
+   * already succeeded, and the server is working exactly as intended.
+   *
+   * `no-store` because this is live operational state: a cached copy would show
+   * an operator a queue that has since moved.
+   */
+  app.get(
+    "/api/operator/historical-fills/operations",
+    { preHandler: requireOperatorAuth },
+    async (request, reply) => {
+      const snapshot = await buildHistoricalFillSnapshot(request.server.prisma).capture();
+      reply.header("Cache-Control", "no-store");
+      return serializeHistoricalFillSnapshot(snapshot);
+    }
+  );
 
   // The panel's polled feed, safe to call every few seconds: it resolves the
   // profile, counts capacity through the shared status groups and reads
