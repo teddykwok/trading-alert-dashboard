@@ -1,4 +1,8 @@
-import type { ExchangeFillOneWindowExecutor } from "./exchange-fill-one-window-executor.service";
+import { BINANCE_READ_ONLY_ENDPOINTS } from "../binance/binance.endpoints";
+import type {
+  ExchangeFillOneWindowExecutor,
+  FillIngestExecutionOutcome,
+} from "./exchange-fill-one-window-executor.service";
 import type { ExchangeFillRootBootstrap, FillRootBootstrapResult } from "./exchange-fill-root-bootstrap.service";
 
 /**
@@ -25,6 +29,15 @@ import type { ExchangeFillRootBootstrap, FillRootBootstrapResult } from "./excha
  * days are complete is a question about a fixed moment, and freezing it is what
  * makes a pass reproducible.
  *
+ * ## The weight budget is about ONE endpoint
+ *
+ * A pass also carries a ceiling on the Binance REQUEST_WEIGHT it may spend on
+ * `GET /fapi/v1/userTrades`, and on nothing else. It is NOT an account or IP
+ * rate limiter: server-time syncs, orders, account reads, market data, other
+ * workers and anything a human does by hand are all outside it. The names here
+ * say `userTrades` everywhere precisely so this cannot be mistaken for a global
+ * limiter it is not.
+ *
  * Execution time is NOT that instant, and must not be. `claimNextWindow` writes
  * `claimedAt` and `scheduleRetry` writes `nextEligibleAt`, and both are later
  * compared against REAL time -- by this process and, more importantly, by other
@@ -41,8 +54,59 @@ import type { ExchangeFillRootBootstrap, FillRootBootstrapResult } from "./excha
  * forwarding a timestamp that is no longer true by the time it is used.
  */
 
+/**
+ * What ONE `/fapi/v1/userTrades` dispatch costs, taken from the endpoint
+ * registry rather than restated. The registry is the repository's documented
+ * weight table and is already pinned by its own test, so a change there moves
+ * this budget with it instead of leaving two numbers to drift apart.
+ */
+export const USER_TRADES_REQUEST_WEIGHT = BINANCE_READ_ONLY_ENDPOINTS.userTrades.weight;
+
+/**
+ * Whether an outcome proves a userTrades request was ATTEMPTED.
+ *
+ * Traced from the executor, not assumed. `PROFILE_UNAVAILABLE` returns at the
+ * binding check and `NO_WORK` returns when no claim exists -- both strictly
+ * before the single `listRecentTradesOnce` call. Every other outcome is only
+ * reachable after that call has been made, including the failures: a request
+ * that came back 429 or 5xx still spent its weight at the exchange.
+ *
+ * Exhaustive by type. A new executor outcome fails this object to compile,
+ * which is the point -- a future union member must be classified deliberately
+ * rather than silently defaulting to "free".
+ */
+const USER_TRADES_DISPATCH_ATTEMPTED: Record<FillIngestExecutionOutcome, boolean> = {
+  PROFILE_UNAVAILABLE: false,
+  NO_WORK: false,
+  COMPLETE: true,
+  INCOMPLETE_SKIPPED_ROWS: true,
+  SPLIT: true,
+  SATURATED_SINGLE_MILLISECOND: true,
+  RETRY_SCHEDULED: true,
+  ABANDONED: true,
+  STALE_CLAIM: true,
+};
+
 /** Why the pass stopped. Exactly one of these ends every invocation. */
-export type FillBatchStopReason = "NO_WORK" | "PROFILE_UNAVAILABLE" | "MAX_WINDOWS_REACHED";
+export type FillBatchStopReason =
+  | "NO_WORK"
+  | "PROFILE_UNAVAILABLE"
+  | "MAX_WINDOWS_REACHED"
+  | "USER_TRADES_WEIGHT_BUDGET_EXHAUSTED";
+
+/**
+ * What the pass spent on userTrades, and what it had.
+ *
+ * `used` counts reservations that were KEPT. A speculative reservation refunded
+ * because the invocation turned out to dispatch nothing never appears here, so
+ * `used` stays an honest multiple of one dispatch.
+ */
+export interface UserTradesWeightAccounting {
+  userTradesRequestWeightPerDispatch: number;
+  userTradesWeightBudget: number;
+  userTradesWeightUsed: number;
+  userTradesWeightRemaining: number;
+}
 
 /**
  * How many invocations ended in each durable outcome.
@@ -65,7 +129,7 @@ export interface FillBatchOutcomeCounts {
 export type FillRootBootstrapSummary = Extract<FillRootBootstrapResult, { outcome: "BOOTSTRAPPED" }>;
 
 export type HistoricalFillBatchResult =
-  | {
+  | ({
       outcome: "PROFILE_UNAVAILABLE";
       /** Which half of the pass could not name the account. */
       stage: "BOOTSTRAP" | "EXECUTION";
@@ -75,13 +139,13 @@ export type HistoricalFillBatchResult =
       bootstrap: FillRootBootstrapSummary | null;
       executionInvocations: number;
       outcomes: FillBatchOutcomeCounts;
-    }
-  | {
-      outcome: "NO_WORK" | "MAX_WINDOWS_REACHED";
+    } & UserTradesWeightAccounting)
+  | ({
+      outcome: "NO_WORK" | "MAX_WINDOWS_REACHED" | "USER_TRADES_WEIGHT_BUDGET_EXHAUSTED";
       bootstrap: FillRootBootstrapSummary;
       executionInvocations: number;
       outcomes: FillBatchOutcomeCounts;
-    };
+    } & UserTradesWeightAccounting);
 
 /** The bound is not configuration here; a caller must state it. */
 export class FillBatchRefusedError extends Error {
@@ -119,6 +183,14 @@ const emptyCounts = (): FillBatchOutcomeCounts => ({
 const sum = (counts: FillBatchOutcomeCounts): number =>
   Object.values(counts).reduce((total, value) => total + value, 0);
 
+/** The weight half of every result, derived in one place so it cannot disagree. */
+const weighed = (budget: number, used: number): UserTradesWeightAccounting => ({
+  userTradesRequestWeightPerDispatch: USER_TRADES_REQUEST_WEIGHT,
+  userTradesWeightBudget: budget,
+  userTradesWeightUsed: used,
+  userTradesWeightRemaining: budget - used,
+});
+
 export class HistoricalFillBatchDriver {
   constructor(private readonly deps: HistoricalFillBatchDependencies) {}
 
@@ -135,12 +207,16 @@ export class HistoricalFillBatchDriver {
     now: Date;
     horizonDays: number;
     maxWindows: number;
+    maxUserTradesWeight: number;
   }): Promise<HistoricalFillBatchResult> {
     // Refused BEFORE the bootstrap: an unusable bound is not a reason to create
     // roots, and it is certainly not a reason to spend an exchange request.
     assertMaxWindows(options.maxWindows);
+    assertUserTradesWeightBudget(options.maxUserTradesWeight);
 
     const outcomes = emptyCounts();
+    const budget = options.maxUserTradesWeight;
+    let used = 0;
 
     // Exactly once per pass. Roots are canonical and idempotent, so repeating
     // this per window would add a full horizon scan per iteration and answer
@@ -160,20 +236,56 @@ export class HistoricalFillBatchDriver {
         bootstrap: null,
         executionInvocations: 0,
         outcomes,
+        ...weighed(budget, used),
       };
     }
 
     let executionInvocations = 0;
 
     for (let attempt = 0; attempt < options.maxWindows; attempt += 1) {
+      // The invocation bound is checked FIRST, by the loop itself. Reaching it
+      // is MAX_WINDOWS_REACHED even when the last invocation also happened to
+      // spend the last of the weight: the caller's requested number of
+      // invocations is what ran out.
+      //
+      // Then the budget, BEFORE the call rather than after it. `executeOne`
+      // may claim a window and dispatch immediately, so starting one without
+      // enough weight reserved for a dispatch is how a ceiling gets exceeded.
+      // There is no "try and see".
+      if (budget - used < USER_TRADES_REQUEST_WEIGHT) {
+        return this.settled(
+          {
+            outcome: "USER_TRADES_WEIGHT_BUDGET_EXHAUSTED",
+            bootstrap,
+            executionInvocations,
+            outcomes,
+            ...weighed(budget, used),
+          },
+          0
+        );
+      }
+
+      // Reserved conservatively: assume the dispatch happens, and give the
+      // weight back only once the outcome PROVES it did not.
+      used += USER_TRADES_REQUEST_WEIGHT;
+
       // No `now`. The executor resolves a fresh instant per invocation, which
       // is the only value a lease or a backoff may honestly be stamped with.
       const result = await this.deps.executor.executeOne({ workerId: options.workerId });
       executionInvocations += 1;
 
+      if (!USER_TRADES_DISPATCH_ATTEMPTED[result.outcome]) {
+        // Proven zero-dispatch. A failed REQUEST is never refunded here -- it
+        // reached the exchange and spent its weight there.
+        used -= USER_TRADES_REQUEST_WEIGHT;
+      }
+
       // Nothing was eligible, so asking again can only produce the same answer.
       if (result.outcome === "NO_WORK") {
-        return this.settled({ outcome: "NO_WORK", bootstrap, executionInvocations, outcomes }, 1);
+        return this.settled(
+          { outcome: "NO_WORK", bootstrap, executionInvocations, outcomes, ...weighed(budget, used) },
+          1
+        );
       }
 
       // The executor binds the profile independently of the bootstrap, so this
@@ -192,6 +304,7 @@ export class HistoricalFillBatchDriver {
             bootstrap,
             executionInvocations,
             outcomes,
+            ...weighed(budget, used),
           },
           1
         );
@@ -207,7 +320,13 @@ export class HistoricalFillBatchDriver {
     }
 
     return this.settled(
-      { outcome: "MAX_WINDOWS_REACHED", bootstrap, executionInvocations, outcomes },
+      {
+        outcome: "MAX_WINDOWS_REACHED",
+        bootstrap,
+        executionInvocations,
+        outcomes,
+        ...weighed(budget, used),
+      },
       0
     );
   }
@@ -227,6 +346,22 @@ export class HistoricalFillBatchDriver {
         `${result.executionInvocations} executor invocation(s) but ${accounted} accounted for`
       );
     }
+
+    const { userTradesWeightBudget: budget, userTradesWeightUsed: weightUsed } = result;
+    if (weightUsed < 0 || weightUsed > budget) {
+      throw new FillBatchInvariantError(`userTrades weight ${weightUsed} is outside 0..${budget}`);
+    }
+    if (weightUsed % USER_TRADES_REQUEST_WEIGHT !== 0) {
+      throw new FillBatchInvariantError(
+        `userTrades weight ${weightUsed} is not a multiple of ${USER_TRADES_REQUEST_WEIGHT}`
+      );
+    }
+    if (result.userTradesWeightRemaining !== budget - weightUsed) {
+      throw new FillBatchInvariantError(
+        `userTrades weight ${weightUsed} of ${budget} leaves ${budget - weightUsed}, not ` +
+          `${result.userTradesWeightRemaining}`
+      );
+    }
     return result;
   }
 }
@@ -239,6 +374,28 @@ export class HistoricalFillBatchDriver {
  * issue exchange requests, and how big a pass may be is a decision that has not
  * been made yet.
  */
+/**
+ * The userTrades ceiling, checked like the window bound.
+ *
+ * A pass that cannot afford a single dispatch is a misconfiguration rather than
+ * an outcome, so it is refused here instead of returning "exhausted" having
+ * done nothing. Configuration validates this range too; neither check is
+ * load-bearing alone.
+ */
+function assertUserTradesWeightBudget(maxUserTradesWeight: number): void {
+  if (!Number.isSafeInteger(maxUserTradesWeight)) {
+    throw new FillBatchRefusedError(
+      `maxUserTradesWeight must be a safe integer, received ${String(maxUserTradesWeight)}`
+    );
+  }
+  if (maxUserTradesWeight < USER_TRADES_REQUEST_WEIGHT) {
+    throw new FillBatchRefusedError(
+      `maxUserTradesWeight must be at least one dispatch (${USER_TRADES_REQUEST_WEIGHT}), ` +
+        `received ${maxUserTradesWeight}`
+    );
+  }
+}
+
 function assertMaxWindows(maxWindows: number): void {
   if (!Number.isSafeInteger(maxWindows)) {
     throw new FillBatchRefusedError(

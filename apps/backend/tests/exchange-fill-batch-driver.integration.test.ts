@@ -126,6 +126,7 @@ describe("the bound is the whole point", () => {
       now: NOW,
       horizonDays: 2,
       maxWindows: 1,
+      maxUserTradesWeight: 500,
     });
 
     expect(executor.calls).toHaveLength(1);
@@ -134,6 +135,10 @@ describe("the bound is the whole point", () => {
       bootstrap: bootstrapped,
       executionInvocations: 1,
       outcomes: counts({ COMPLETE: 1 }),
+      userTradesRequestWeightPerDispatch: 5,
+      userTradesWeightBudget: 500,
+      userTradesWeightUsed: 5,
+      userTradesWeightRemaining: 495,
     });
   });
 
@@ -150,6 +155,7 @@ describe("the bound is the whole point", () => {
       now: NOW,
       horizonDays: 2,
       maxWindows: 3,
+      maxUserTradesWeight: 500,
     });
 
     expect(executor.calls).toHaveLength(3);
@@ -171,6 +177,7 @@ describe("the bound is the whole point", () => {
       now: NOW,
       horizonDays: 2,
       maxWindows: 4,
+      maxUserTradesWeight: 500,
     });
 
     expect(executor.calls).toHaveLength(4);
@@ -179,6 +186,10 @@ describe("the bound is the whole point", () => {
       bootstrap: bootstrapped,
       executionInvocations: 4,
       outcomes: counts({ COMPLETE: 4 }),
+      userTradesRequestWeightPerDispatch: 5,
+      userTradesWeightBudget: 500,
+      userTradesWeightUsed: 20,
+      userTradesWeightRemaining: 480,
     });
   });
 
@@ -193,6 +204,7 @@ describe("the bound is the whole point", () => {
           now: NOW,
           horizonDays: 2,
           maxWindows,
+          maxUserTradesWeight: 500,
         })
       ).rejects.toBeInstanceOf(FillBatchRefusedError);
 
@@ -218,6 +230,7 @@ describe("stopping", () => {
       now: NOW,
       horizonDays: 2,
       maxWindows: 10,
+      maxUserTradesWeight: 500,
     });
 
     // Three invocations out of a budget of ten: no spin on an empty queue.
@@ -227,6 +240,10 @@ describe("stopping", () => {
       bootstrap: bootstrapped,
       executionInvocations: 3,
       outcomes: counts({ COMPLETE: 2 }),
+      userTradesRequestWeightPerDispatch: 5,
+      userTradesWeightBudget: 500,
+      userTradesWeightUsed: 10,
+      userTradesWeightRemaining: 490,
     });
   });
 
@@ -242,6 +259,7 @@ describe("stopping", () => {
       now: NOW,
       horizonDays: 2,
       maxWindows: 5,
+      maxUserTradesWeight: 500,
     });
 
     expect(executor.calls).toHaveLength(0);
@@ -253,6 +271,10 @@ describe("stopping", () => {
       bootstrap: null,
       executionInvocations: 0,
       outcomes: counts(),
+      userTradesRequestWeightPerDispatch: 5,
+      userTradesWeightBudget: 500,
+      userTradesWeightUsed: 0,
+      userTradesWeightRemaining: 500,
     });
   });
 
@@ -268,6 +290,7 @@ describe("stopping", () => {
       now: NOW,
       horizonDays: 2,
       maxWindows: 9,
+      maxUserTradesWeight: 500,
     });
 
     // Two of nine spent, and the third never happened.
@@ -279,6 +302,10 @@ describe("stopping", () => {
       bootstrap: bootstrapped,
       executionInvocations: 2,
       outcomes: counts({ COMPLETE: 1 }),
+      userTradesRequestWeightPerDispatch: 5,
+      userTradesWeightBudget: 500,
+      userTradesWeightUsed: 5,
+      userTradesWeightRemaining: 495,
     });
   });
 });
@@ -298,6 +325,7 @@ describe("durable outcomes do not end the pass", () => {
       now: NOW,
       horizonDays: 2,
       maxWindows: 6,
+      maxUserTradesWeight: 500,
     });
 
     expect(executor.calls).toHaveLength(3);
@@ -331,6 +359,7 @@ describe("durable outcomes do not end the pass", () => {
       now: NOW,
       horizonDays: 2,
       maxWindows: 20,
+      maxUserTradesWeight: 500,
     });
 
     expect(executor.calls).toHaveLength(8);
@@ -347,6 +376,10 @@ describe("durable outcomes do not end the pass", () => {
         ABANDONED: 1,
         RETRY_SCHEDULED: 1,
       }),
+      userTradesRequestWeightPerDispatch: 5,
+      userTradesWeightBudget: 500,
+      userTradesWeightUsed: 35,
+      userTradesWeightRemaining: 465,
     });
     // Conservation: seven counted windows plus the one call that said NO_WORK.
     const counted = Object.values(result.outcomes).reduce((a, b) => a + b, 0);
@@ -364,6 +397,7 @@ describe("the batch clock and the execution clock are different clocks", () => {
       now: NOW,
       horizonDays: 4,
       maxWindows: 9,
+      maxUserTradesWeight: 500,
     });
 
     // Which UTC days are complete is a question about a fixed moment.
@@ -384,6 +418,7 @@ describe("the batch clock and the execution clock are different clocks", () => {
       now: NOW,
       horizonDays: 2,
       maxWindows: 9,
+      maxUserTradesWeight: 500,
     });
 
     expect(executor.calls).toHaveLength(4);
@@ -414,6 +449,7 @@ describe("the bootstrap runs once per pass", () => {
       now: NOW,
       horizonDays: 7,
       maxWindows: 20,
+      maxUserTradesWeight: 500,
     });
 
     expect(executor.calls).toHaveLength(6);
@@ -440,6 +476,7 @@ describe("errors are not outcomes", () => {
         now: NOW,
         horizonDays: 2,
         maxWindows: 5,
+        maxUserTradesWeight: 500,
       })
     ).rejects.toBe(failure);
 
@@ -466,6 +503,7 @@ describe("errors are not outcomes", () => {
         now: NOW,
         horizonDays: 2,
         maxWindows: 5,
+        maxUserTradesWeight: 500,
       })
     ).rejects.toBe(failure);
 
@@ -596,7 +634,7 @@ describe("real bootstrap and real executor, bounded", () => {
     } as never);
 
     const result = await new HistoricalFillBatchDriver({ bootstrap, executor }).runHistoricalFillBatch(
-      { workerId: WORKER, now: NOW, horizonDays: 2, maxWindows: 5 }
+      { workerId: WORKER, now: NOW, horizonDays: 2, maxWindows: 5, maxUserTradesWeight: 500 }
     );
 
     // Two canonical roots existed because the bootstrap made them, and the
@@ -651,7 +689,7 @@ describe("real bootstrap and real executor, bounded", () => {
 
     // Five days of roots, but only two slots to spend on them.
     const result = await new HistoricalFillBatchDriver({ bootstrap, executor }).runHistoricalFillBatch(
-      { workerId: WORKER, now: NOW, horizonDays: 5, maxWindows: 2 }
+      { workerId: WORKER, now: NOW, horizonDays: 5, maxWindows: 2, maxUserTradesWeight: 500 }
     );
 
     expect(result.outcome).toBe("MAX_WINDOWS_REACHED");
@@ -693,7 +731,7 @@ describe("durable timestamps come from the execution clock", () => {
       executor: new ExchangeFillOneWindowExecutor({
         prisma: prisma!, reader, ledger, work, bindProfile: boundTo(executionProfileId),
       } as never),
-    }).runHistoricalFillBatch({ workerId: WORKER, now: NOW, horizonDays: 2, maxWindows: 5 });
+    }).runHistoricalFillBatch({ workerId: WORKER, now: NOW, horizonDays: 2, maxWindows: 5, maxUserTradesWeight: 500 });
     const after = Date.now();
 
     const rows = await prisma!.exchangeFillIngestWindow.findMany({ where: { executionProfileId } });
@@ -731,7 +769,7 @@ describe("durable timestamps come from the execution clock", () => {
       executor: new ExchangeFillOneWindowExecutor({
         prisma: prisma!, reader, ledger, work, bindProfile: boundTo(executionProfileId),
       } as never),
-    }).runHistoricalFillBatch({ workerId: WORKER, now: NOW, horizonDays: 2, maxWindows: 5 });
+    }).runHistoricalFillBatch({ workerId: WORKER, now: NOW, horizonDays: 2, maxWindows: 5, maxUserTradesWeight: 500 });
     const after = Date.now();
 
     expect(result.outcomes).toEqual(counts({ RETRY_SCHEDULED: 2 }));

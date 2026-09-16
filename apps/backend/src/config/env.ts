@@ -323,6 +323,23 @@ const envSchema = z.object({
   EXECUTION_FILL_BATCH_INTERVAL_SECONDS: wholeNumberString
     .pipe(z.number().int().min(10).max(3600))
     .default("60"),
+  // The Binance REQUEST_WEIGHT one bounded batch may spend on
+  // GET /fapi/v1/userTrades, and on NOTHING else. It is not an account or IP
+  // rate limiter: server-time syncs, orders, account reads, market data and
+  // any other process are all outside it.
+  //
+  // One userTrades dispatch costs 5 (the documented weight pinned in
+  // modules/binance/binance.endpoints.ts, which a test here holds this range
+  // against). So the floor of 5 buys exactly one dispatch, the default of 25
+  // matches the default 5-window batch, and the ceiling of 500 matches the
+  // 100-window configuration ceiling -- the default therefore takes nothing
+  // away from the batch size already configured above.
+  //
+  // Independent of MAX_WINDOWS by design, and never derived from it at
+  // runtime: one bounds invocations, the other bounds exchange weight.
+  EXECUTION_FILL_BATCH_MAX_USER_TRADES_WEIGHT: wholeNumberString
+    .pipe(z.number().int().min(5).max(500))
+    .default("25"),
 
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value

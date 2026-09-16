@@ -162,6 +162,7 @@ describe("the configured bound drives one bounded batch", () => {
       now,
       horizonDays: 2,
       maxWindows,
+      maxUserTradesWeight: 500,
     });
 
     expect(maxWindows).toBe(3);
@@ -212,6 +213,7 @@ describe("the configured bound drives one bounded batch", () => {
         now: new Date("2026-08-12T09:15:00.000Z"),
         horizonDays: 2,
         maxWindows: 0,
+        maxUserTradesWeight: 500,
       })
     ).rejects.toMatchObject({ reasonCode: "FILL_BATCH_REFUSED" });
   });
