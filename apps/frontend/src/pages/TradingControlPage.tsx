@@ -1,3 +1,4 @@
+import { HistoricalFillOperationsCard } from "../components/operator/HistoricalFillOperationsCard";
 import { TradingControlCard } from "../components/operator/TradingControlCard";
 
 /**
@@ -23,6 +24,10 @@ export function TradingControlPage() {
       </header>
 
       <TradingControlCard />
+
+      {/* Read-only durable fill-ingestion state. It sits below the controls
+          because it reports what HAS happened rather than offering an action. */}
+      <HistoricalFillOperationsCard />
     </div>
   );
 }

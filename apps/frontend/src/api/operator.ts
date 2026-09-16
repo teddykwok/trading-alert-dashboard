@@ -388,6 +388,73 @@ export function postSafeOff(): Promise<TradingControlActionResult> {
   return operatorApiClient.post("/api/operator/trading-control/safe-off");
 }
 
+/**
+ * Durable historical-fill ingestion state, exactly as
+ * GET /api/operator/historical-fills/operations returns it.
+ *
+ * FACTS ONLY. The server deliberately reports no health, severity or
+ * recommendation, and neither does anything that consumes this type.
+ */
+export type HistoricalFillProfileReason =
+  | "PROFILE_NOT_CONFIGURED"
+  | "PROFILE_NOT_FOUND"
+  | "PROFILE_AMBIGUOUS"
+  | "PROFILE_POLICY_MISSING"
+  | "PROFILE_ENVIRONMENT_MISMATCH";
+
+export interface HistoricalFillWindowCountsDto {
+  total: number;
+  roots: number;
+  children: number;
+  distinctSymbolCount: number;
+  byStatus: {
+    PENDING: number;
+    COMPLETE: number;
+    SPLIT: number;
+    INCOMPLETE_SKIPPED_ROWS: number;
+    SATURATED_SINGLE_MILLISECOND: number;
+    ABANDONED: number;
+  };
+}
+
+export interface HistoricalFillPendingCountsDto {
+  total: number;
+  claimableNow: number;
+  activeLease: number;
+  staleLease: number;
+  inBackoff: number;
+  attemptExhausted: number;
+  oldestPendingCreatedAt: string | null;
+  oldestClaimableCreatedAt: string | null;
+  nextBackoffEligibleAt: string | null;
+}
+
+export type HistoricalFillOperationsDto =
+  | { outcome: "PROFILE_UNAVAILABLE"; capturedAt: string; reasonCode: HistoricalFillProfileReason }
+  | {
+      outcome: "READY";
+      capturedAt: string;
+      executionProfileId: string;
+      windows: HistoricalFillWindowCountsDto;
+      pending: HistoricalFillPendingCountsDto;
+      ledger: { totalFills: number; unattributedFills: number };
+    };
+
+/** The route the panel reads, and the only one it may. */
+export const HISTORICAL_FILL_OPERATIONS_PATH = "/api/operator/historical-fills/operations";
+
+/**
+ * Reads the snapshot. GET only, no parameters of any kind.
+ *
+ * There is deliberately no `executionProfileId` and no `now` argument: the
+ * server binds the account from its own configuration and stamps its own
+ * instant, and offering either here would hand a browser control over which
+ * account it reads or how a lease is classified.
+ */
+export function fetchHistoricalFillOperations(): Promise<HistoricalFillOperationsDto> {
+  return operatorApiClient.get<HistoricalFillOperationsDto>(HISTORICAL_FILL_OPERATIONS_PATH);
+}
+
 // ---------------------------------------------------------------------------
 // Execution policy LIMITS
 // ---------------------------------------------------------------------------
