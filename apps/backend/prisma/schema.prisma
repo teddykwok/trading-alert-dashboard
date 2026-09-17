@@ -446,6 +446,7 @@ model ExecutionProfile {
   executions    TradeExecution[]
   exchangeFills ExchangeFillLedger[]
   fillIngestWindows ExchangeFillIngestWindow[]
+  fillWeightBuckets HistoricalFillWeightBucket[]
   safetyPolicy  ExecutionSafetyPolicy?
   canaryAuthorizations ExecutionCanaryAuthorization[]
 
@@ -1621,4 +1622,85 @@ model ExchangeFillIngestWindow {
   @@unique([executionProfileId, symbol, startTimeMs, endTimeMs])
   @@index([executionProfileId, status, nextEligibleAt, claimedAt])
   @@index([parentId])
+}
+
+/// CROSS-PROCESS accounting for historical-fill userTrades request weight.
+///
+/// One row per (account, UTC minute). Every historical batch reserves against
+/// the row for the minute it is in BEFORE it may invoke the one-window
+/// executor, so N worker processes share one ceiling instead of each spending
+/// their own per-batch budget in full.
+///
+/// WHAT THIS IS NOT. It counts historical `/fapi/v1/userTrades` and nothing
+/// else -- market data, order entry, account reads and every CLI are outside
+/// it. It is not an IP limiter, not account-wide budgeting, and its fixed
+/// minute is not Binance's rolling window. It bounds what THIS subsystem
+/// produces, which is the only thing it can honestly promise.
+///
+/// WHY THE CAP IS STORED. Two processes could start with different configured
+/// caps. The cap in force is therefore a durable fact of the bucket, and a
+/// process whose configuration disagrees is refused rather than allowed to
+/// raise a ceiling somebody else is already counting against.
+model HistoricalFillWeightBucket {
+  id String @id @default(cuid())
+
+  /// The account whose exchange allowance is being spent. Restrict, like every
+  /// other durable account-scoped record.
+  executionProfileId String
+  executionProfile   ExecutionProfile @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)
+
+  /// Start of the accounting minute, truncated from the DATABASE clock so that
+  /// every contender resolves the same bucket regardless of host clock skew.
+  bucketStart DateTime
+
+  /// The cap in force for this bucket, frozen by whoever created it.
+  weightCap  Int
+  /// Granted weight. Only ever moved by a conditional update that proves the
+  /// cap still holds, so it can never exceed `weightCap`.
+  weightUsed Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  reservations HistoricalFillWeightReservation[]
+
+  /// The natural identity, and the whole race-safety mechanism: two processes
+  /// entering the same minute converge on one row instead of creating two.
+  @@unique([executionProfileId, bucketStart])
+  @@index([bucketStart])
+}
+
+/// One granted reservation of one dispatch's worth of weight.
+///
+/// WHY THE COUNTER IS NOT ENOUGH. `weightUsed` is an aggregate: it knows five
+/// weight is spent, not WHOSE. Releasing against the counter alone therefore
+/// cannot tell a first release of R1 from a second one, and a duplicate would
+/// hand away weight still owed to R2 -- which is an UNDERCOUNT, the one error
+/// direction that lets the account's allowance be spent twice.
+///
+/// So each grant gets a row, and `releasedAt` is the durable proof of whether
+/// it has already been given back. Release is a compare-and-set on THAT row:
+/// at most one release per reservation, whatever any caller does and however
+/// many processes try at once. Same shape as TradingSessionSlot, for the same
+/// reason -- the database owns the idempotency, not the caller.
+model HistoricalFillWeightReservation {
+  id String @id @default(cuid())
+
+  /// The bucket this weight was taken from. Release decrements THIS bucket,
+  /// never whichever minute it happens to be when the release arrives.
+  bucketId String
+  bucket   HistoricalFillWeightBucket @relation(fields: [bucketId], references: [id], onDelete: Restrict)
+
+  /// Exactly what was taken, so a release can never give back a different
+  /// amount than was granted.
+  weight Int
+
+  /// NULL means outstanding: this reservation may still dispatch, so its
+  /// weight must stay counted. Set once, and only by the update that also
+  /// decrements the bucket.
+  releasedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([bucketId, releasedAt])
 }

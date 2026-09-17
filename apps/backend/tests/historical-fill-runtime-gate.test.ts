@@ -14,7 +14,16 @@ const GATE = "EXECUTION_FILL_RUNTIME_ENABLED";
 const KILL = "EXECUTION_GLOBAL_KILL_SWITCH";
 const LIVE = "EXECUTION_LIVE_ENTRY_ENABLED";
 const PROTECTION = "EXECUTION_PROTECTION_READY";
-const KEYS = [GATE, KILL, LIVE, PROTECTION];
+/**
+ * The shared cross-process ceiling.
+ *
+ * Enabling the runtime now REQUIRES it: a worker that discovered mid-sweep it
+ * had no shared ceiling would already have spent weight nobody budgeted. Every
+ * case below that turns the gate on therefore supplies one, which is the
+ * contract rather than a convenience.
+ */
+const GLOBAL_CAP = "EXECUTION_FILL_GLOBAL_USER_TRADES_WEIGHT_PER_MINUTE";
+const KEYS = [GATE, KILL, LIVE, PROTECTION, GLOBAL_CAP];
 
 const ORIGINAL = Object.fromEntries(KEYS.map((key) => [key, process.env[key]]));
 
@@ -52,7 +61,7 @@ describe("the historical-fill runtime gate", () => {
   });
 
   it("C. parses an explicit \"true\" as true", async () => {
-    const env = await loadEnv({ [GATE]: "true" });
+    const env = await loadEnv({ [GATE]: "true", [GLOBAL_CAP]: "25" });
 
     expect(env[GATE]).toBe(true);
   });
@@ -90,6 +99,7 @@ describe("the gate is nobody else's flag", () => {
     // trading gates being shut is not a reason it cannot run.
     const env = await loadEnv({
       [GATE]: "true",
+      [GLOBAL_CAP]: "25",
       [KILL]: "true",
       [LIVE]: "false",
       [PROTECTION]: "false",
@@ -102,7 +112,13 @@ describe("the gate is nobody else's flag", () => {
   });
 
   it("E+F+G. the gate is a distinct key, not an alias", async () => {
-    const env = await loadEnv({ [GATE]: "true", [KILL]: "true", [LIVE]: "false", [PROTECTION]: "false" });
+    const env = await loadEnv({
+      [GATE]: "true",
+      [GLOBAL_CAP]: "25",
+      [KILL]: "true",
+      [LIVE]: "false",
+      [PROTECTION]: "false",
+    });
 
     // Four independent keys: no two of them move together.
     expect(env[GATE]).not.toBe(env[LIVE]);

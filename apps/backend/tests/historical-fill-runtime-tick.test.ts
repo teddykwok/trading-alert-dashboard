@@ -418,7 +418,9 @@ describe("the gate the runner actually reads", () => {
   const KILL = "EXECUTION_GLOBAL_KILL_SWITCH";
   const LIVE = "EXECUTION_LIVE_ENTRY_ENABLED";
   const PROTECTION = "EXECUTION_PROTECTION_READY";
-  const KEYS = [GATE, KILL, LIVE, PROTECTION];
+  // Enabling the runtime now also requires the shared cross-process ceiling.
+  const GLOBAL_CAP = "EXECUTION_FILL_GLOBAL_USER_TRADES_WEIGHT_PER_MINUTE";
+  const KEYS = [GATE, KILL, LIVE, PROTECTION, GLOBAL_CAP];
   const ORIGINAL = Object.fromEntries(KEYS.map((key) => [key, process.env[key]]));
 
   afterEach(() => {
@@ -463,6 +465,7 @@ describe("the gate the runner actually reads", () => {
     // kill switch is not a reason it cannot run.
     const runtime = await loadRuntime({
       [GATE]: "true",
+      [GLOBAL_CAP]: "25",
       [KILL]: "true",
       [LIVE]: "false",
       [PROTECTION]: "false",

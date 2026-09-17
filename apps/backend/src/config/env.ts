@@ -363,6 +363,25 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((value) => value === "true"),
+  // The CROSS-PROCESS ceiling on historical `/fapi/v1/userTrades` weight, per
+  // accounting minute, shared by every worker sweeping the same account.
+  //
+  // Deliberately NOT the same value as EXECUTION_FILL_BATCH_MAX_USER_TRADES_WEIGHT
+  // above, which bounds ONE batch inside ONE process and multiplies by the
+  // number of processes. This one is the ceiling those processes share.
+  //
+  // NO DEFAULT, on purpose. A default would let somebody enable the runtime
+  // without ever deciding what share of the account's exchange allowance this
+  // subsystem may take -- and that share cannot be derived from source, because
+  // nothing here measures what the rest of Teddy already spends. It is optional
+  // only while the runtime is off; the refinement below requires it the moment
+  // EXECUTION_FILL_RUNTIME_ENABLED is true.
+  //
+  // A multiple of one dispatch (5): a ceiling of 27 would buy exactly the same
+  // five requests as 25 while reading as though it bought more.
+  EXECUTION_FILL_GLOBAL_USER_TRADES_WEIGHT_PER_MINUTE: wholeNumberString
+    .pipe(z.number().int().min(5).multipleOf(5))
+    .optional(),
 
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value
@@ -472,6 +491,24 @@ const envSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ["OPERATOR_API_TOKEN"],
       message: "OPERATOR_API_TOKEN must be at least 32 characters when set",
+    });
+  }
+
+  // The shared historical ceiling is required exactly when the historical
+  // runtime may run, and irrelevant otherwise -- the same shape the read-only
+  // connector already uses for its credentials below. Fails at STARTUP rather
+  // than at the first batch: a worker that discovered mid-sweep that it had no
+  // shared ceiling would already have spent weight nobody budgeted.
+  if (
+    value.EXECUTION_FILL_RUNTIME_ENABLED &&
+    value.EXECUTION_FILL_GLOBAL_USER_TRADES_WEIGHT_PER_MINUTE === undefined
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["EXECUTION_FILL_GLOBAL_USER_TRADES_WEIGHT_PER_MINUTE"],
+      message:
+        "EXECUTION_FILL_GLOBAL_USER_TRADES_WEIGHT_PER_MINUTE is required when " +
+        "EXECUTION_FILL_RUNTIME_ENABLED=true",
     });
   }
 

@@ -4,6 +4,10 @@ import type {
   FillIngestExecutionOutcome,
 } from "./exchange-fill-one-window-executor.service";
 import type { ExchangeFillRootBootstrap, FillRootBootstrapResult } from "./exchange-fill-root-bootstrap.service";
+import type {
+  HistoricalFillWeightReservation,
+  HistoricalFillWeightReservationResult,
+} from "./historical-fill-weight-budget.service";
 
 /**
  * ONE bounded pass of historical fill ingestion: make the work exist, then
@@ -92,7 +96,19 @@ export type FillBatchStopReason =
   | "NO_WORK"
   | "PROFILE_UNAVAILABLE"
   | "MAX_WINDOWS_REACHED"
-  | "USER_TRADES_WEIGHT_BUDGET_EXHAUSTED";
+  | "USER_TRADES_WEIGHT_BUDGET_EXHAUSTED"
+  /**
+   * The CROSS-PROCESS ceiling is full for this accounting minute.
+   *
+   * Deliberately distinct from `USER_TRADES_WEIGHT_BUDGET_EXHAUSTED`, which
+   * means THIS pass spent its own local budget. The two need different
+   * operator responses -- one says the batch did its configured work, the
+   * other says other processes are already using the account's share -- so
+   * collapsing them would destroy the only signal that distinguishes them.
+   */
+  | "GLOBAL_USER_TRADES_WEIGHT_BUDGET_EXHAUSTED"
+  /** A configured ceiling disagrees with the one already in force. */
+  | "GLOBAL_USER_TRADES_WEIGHT_CAP_MISMATCH";
 
 /**
  * What the pass spent on userTrades, and what it had.
@@ -141,7 +157,12 @@ export type HistoricalFillBatchResult =
       outcomes: FillBatchOutcomeCounts;
     } & UserTradesWeightAccounting)
   | ({
-      outcome: "NO_WORK" | "MAX_WINDOWS_REACHED" | "USER_TRADES_WEIGHT_BUDGET_EXHAUSTED";
+      outcome:
+        | "NO_WORK"
+        | "MAX_WINDOWS_REACHED"
+        | "USER_TRADES_WEIGHT_BUDGET_EXHAUSTED"
+        | "GLOBAL_USER_TRADES_WEIGHT_BUDGET_EXHAUSTED"
+        | "GLOBAL_USER_TRADES_WEIGHT_CAP_MISMATCH";
       bootstrap: FillRootBootstrapSummary;
       executionInvocations: number;
       outcomes: FillBatchOutcomeCounts;
@@ -168,6 +189,23 @@ export class FillBatchInvariantError extends Error {
 export interface HistoricalFillBatchDependencies {
   bootstrap: ExchangeFillRootBootstrap;
   executor: ExchangeFillOneWindowExecutor;
+  /**
+   * The shared ceiling, when one is configured.
+   *
+   * Optional so the driver keeps working exactly as before for every caller
+   * that has none -- but when it IS present, no executor invocation happens
+   * without a grant. Reserving HERE rather than inside the executor is what
+   * keeps a denial free of consequence: `executeOne` claims the window, so a
+   * denial that arrived any later would have burned an ingest attempt for a
+   * reason that has nothing to do with the window.
+   */
+  weightBudget?: {
+    reserve: (options: {
+      executionProfileId: string;
+      weightCap: number;
+    }) => Promise<HistoricalFillWeightReservationResult>;
+    releaseCertainNonDispatch: (reservation: HistoricalFillWeightReservation) => Promise<void>;
+  };
 }
 
 const emptyCounts = (): FillBatchOutcomeCounts => ({
@@ -208,11 +246,20 @@ export class HistoricalFillBatchDriver {
     horizonDays: number;
     maxWindows: number;
     maxUserTradesWeight: number;
+    /**
+     * The SHARED per-minute ceiling. Required exactly when a `weightBudget`
+     * dependency is present, and meaningless without one.
+     */
+    globalUserTradesWeightPerMinute?: number;
   }): Promise<HistoricalFillBatchResult> {
     // Refused BEFORE the bootstrap: an unusable bound is not a reason to create
     // roots, and it is certainly not a reason to spend an exchange request.
     assertMaxWindows(options.maxWindows);
     assertUserTradesWeightBudget(options.maxUserTradesWeight);
+    assertGlobalUserTradesWeightCap(
+      this.deps.weightBudget !== undefined,
+      options.globalUserTradesWeightPerMinute
+    );
 
     const outcomes = emptyCounts();
     const budget = options.maxUserTradesWeight;
@@ -265,6 +312,51 @@ export class HistoricalFillBatchDriver {
         );
       }
 
+      // The SHARED ceiling, when one is configured. Ordered after the local
+      // check deliberately: a pass that cannot afford a dispatch locally has no
+      // business touching a row other processes are contending for, and
+      // ordering it this way keeps `USER_TRADES_WEIGHT_BUDGET_EXHAUSTED`
+      // meaning exactly what it meant before this existed.
+      //
+      // A denial here costs nothing: `executeOne` is what claims a window, and
+      // it has not been called yet, so no ingest attempt is burned and no
+      // window is touched.
+      let reservation: HistoricalFillWeightReservation | null = null;
+      if (this.deps.weightBudget !== undefined) {
+        const shared = await this.deps.weightBudget.reserve({
+          executionProfileId: bootstrap.executionProfileId,
+          // Non-null by `assertGlobalUserTradesWeightCap` above, which refused
+          // the pass before the bootstrap if a budget was wired without a cap.
+          weightCap: options.globalUserTradesWeightPerMinute as number,
+        });
+
+        if (shared.outcome === "EXHAUSTED") {
+          return this.settled(
+            {
+              outcome: "GLOBAL_USER_TRADES_WEIGHT_BUDGET_EXHAUSTED",
+              bootstrap,
+              executionInvocations,
+              outcomes,
+              ...weighed(budget, used),
+            },
+            0
+          );
+        }
+        if (shared.outcome === "CAP_MISMATCH") {
+          return this.settled(
+            {
+              outcome: "GLOBAL_USER_TRADES_WEIGHT_CAP_MISMATCH",
+              bootstrap,
+              executionInvocations,
+              outcomes,
+              ...weighed(budget, used),
+            },
+            0
+          );
+        }
+        reservation = shared.reservation;
+      }
+
       // Reserved conservatively: assume the dispatch happens, and give the
       // weight back only once the outcome PROVES it did not.
       used += USER_TRADES_REQUEST_WEIGHT;
@@ -278,6 +370,14 @@ export class HistoricalFillBatchDriver {
         // Proven zero-dispatch. A failed REQUEST is never refunded here -- it
         // reached the exchange and spent its weight there.
         used -= USER_TRADES_REQUEST_WEIGHT;
+        // The shared ceiling is given back under the SAME predicate, so the
+        // two budgets can never disagree about whether a request happened. An
+        // executor THROW deliberately does not reach here: an invocation that
+        // ended in an exception may or may not have dispatched, and uncertain
+        // dispatch is always counted as spent.
+        if (reservation !== null) {
+          await this.deps.weightBudget?.releaseCertainNonDispatch(reservation);
+        }
       }
 
       // Nothing was eligible, so asking again can only produce the same answer.
@@ -392,6 +492,43 @@ function assertUserTradesWeightBudget(maxUserTradesWeight: number): void {
     throw new FillBatchRefusedError(
       `maxUserTradesWeight must be at least one dispatch (${USER_TRADES_REQUEST_WEIGHT}), ` +
         `received ${maxUserTradesWeight}`
+    );
+  }
+}
+
+/**
+ * The shared ceiling, refused as strictly as the local one.
+ *
+ * A wired budget with no cap is a misconfiguration, not an outcome: it would
+ * mean a process contending for a shared row without knowing what it is
+ * allowed. Refused before the bootstrap, like every other unusable bound.
+ */
+function assertGlobalUserTradesWeightCap(
+  budgetWired: boolean,
+  cap: number | undefined
+): void {
+  if (!budgetWired) {
+    if (cap !== undefined) {
+      throw new FillBatchRefusedError(
+        "globalUserTradesWeightPerMinute was given without a shared weight budget to enforce it"
+      );
+    }
+    return;
+  }
+  if (cap === undefined) {
+    throw new FillBatchRefusedError(
+      "a shared weight budget was wired without globalUserTradesWeightPerMinute"
+    );
+  }
+  if (!Number.isSafeInteger(cap)) {
+    throw new FillBatchRefusedError(
+      `globalUserTradesWeightPerMinute must be a safe integer, received ${String(cap)}`
+    );
+  }
+  if (cap < USER_TRADES_REQUEST_WEIGHT) {
+    throw new FillBatchRefusedError(
+      `globalUserTradesWeightPerMinute must be at least one dispatch ` +
+        `(${USER_TRADES_REQUEST_WEIGHT}), received ${cap}`
     );
   }
 }
