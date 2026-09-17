@@ -24,6 +24,15 @@ import {
   presentInterpretationIssues,
   toneForOperationalState,
 } from "../src/features/operator/historicalFillOperationsPresentation";
+import {
+  HISTORICAL_FILL_ESCALATION,
+  HISTORICAL_FILL_EVIDENCE_NOTE,
+  HISTORICAL_FILL_ISSUE_RUNBOOK,
+  HISTORICAL_FILL_NORMAL_GUIDANCE,
+  HISTORICAL_FILL_PROFILE_RUNBOOK,
+  presentIssueRunbook,
+  profileReasonCheck,
+} from "../src/features/operator/historicalFillRunbook";
 
 /**
  * The historical-fill operator panel.
@@ -65,6 +74,16 @@ const PRESENTATION = src("features/operator/historicalFillOperationsPresentation
 const HOOK_CODE = codeOf("hooks/useHistoricalFillOperations.ts");
 const CARD_CODE = codeOf("components/operator/HistoricalFillOperationsCard.tsx");
 const PRESENTATION_CODE = codeOf("features/operator/historicalFillOperationsPresentation.ts");
+const RUNBOOK = src("features/operator/historicalFillRunbook.ts");
+const RUNBOOK_CODE = codeOf("features/operator/historicalFillRunbook.ts");
+
+/** The repository runbook document, read as text. */
+const RUNBOOK_DOC = readFileSync(
+  path.join(process.cwd(), "..", "..", "docs", "historical-fill-operations-runbook.md"),
+  "utf8"
+);
+/** Whitespace-normalised, so the doc assertions survive reflowing. */
+const RUNBOOK_DOC_FLAT = RUNBOOK_DOC.replace(/\s+/g, " ");
 
 const READY: Extract<HistoricalFillOperationsDto, { outcome: "READY" }> = {
   outcome: "READY",
@@ -127,6 +146,26 @@ const ISSUE_CODES: HistoricalFillOperationalIssueCode[] = [
 ];
 
 const STATES: HistoricalFillOperationalState[] = ["NORMAL", "NEEDS_ATTENTION", "UNAVAILABLE"];
+
+const PROFILE_REASONS: HistoricalFillProfileReason[] = [
+  "PROFILE_NOT_CONFIGURED",
+  "PROFILE_NOT_FOUND",
+  "PROFILE_AMBIGUOUS",
+  "PROFILE_POLICY_MISSING",
+  "PROFILE_ENVIRONMENT_MISMATCH",
+];
+
+/** Every sentence the runbook can put in front of an operator. */
+const RUNBOOK_PROSE = [
+  ...Object.values(HISTORICAL_FILL_ISSUE_RUNBOOK).flatMap((entry) => [
+    entry.meaning,
+    entry.operatorCheck,
+  ]),
+  ...Object.values(HISTORICAL_FILL_PROFILE_RUNBOOK).map((entry) => entry.operatorCheck),
+  HISTORICAL_FILL_NORMAL_GUIDANCE,
+  HISTORICAL_FILL_ESCALATION,
+  HISTORICAL_FILL_EVIDENCE_NOTE,
+];
 
 /** Every sentence this panel can put in front of an operator. */
 const VOCABULARY = [
@@ -714,5 +753,348 @@ describe("historical fill operations: the panel never reaches its own verdict", 
     // The poll interval is the only number the panel owns, and it is a
     // cadence, not a threshold.
     expect(HISTORICAL_FILL_OPERATIONS_POLL_MS).toBe(15_000);
+  });
+});
+
+describe("historical fill operations: the operator runbook", () => {
+  it("A. every issue code has exactly one runbook entry", () => {
+    expect(Object.keys(HISTORICAL_FILL_ISSUE_RUNBOOK).sort()).toEqual([...ISSUE_CODES].sort());
+    for (const code of ISSUE_CODES) {
+      const entry = HISTORICAL_FILL_ISSUE_RUNBOOK[code];
+      expect(entry.meaning.length).toBeGreaterThan(0);
+      expect(entry.operatorCheck.length).toBeGreaterThan(0);
+    }
+    // Guidance is distinct per code: no entry is a copy of another.
+    const checks = ISSUE_CODES.map((code) => HISTORICAL_FILL_ISSUE_RUNBOOK[code].operatorCheck);
+    expect(new Set(checks).size).toBe(ISSUE_CODES.length);
+    const meanings = ISSUE_CODES.map((code) => HISTORICAL_FILL_ISSUE_RUNBOOK[code].meaning);
+    expect(new Set(meanings).size).toBe(ISSUE_CODES.length);
+  });
+
+  it("B. every PROFILE_UNAVAILABLE reason has exactly one runbook entry", () => {
+    expect(Object.keys(HISTORICAL_FILL_PROFILE_RUNBOOK).sort()).toEqual([...PROFILE_REASONS].sort());
+    const checks = PROFILE_REASONS.map(profileReasonCheck);
+    expect(new Set(checks).size).toBe(PROFILE_REASONS.length);
+    for (const check of checks) expect(check.length).toBeGreaterThan(0);
+  });
+
+  it("C. STALE_LEASES_PRESENT guidance renders its own meaning and check", () => {
+    const [item] = presentIssueRunbook(
+      interpretationOf("NEEDS_ATTENTION", [{ code: "STALE_LEASES_PRESENT", count: 2 }])
+    );
+    expect(item.code).toBe("STALE_LEASES_PRESENT");
+    expect(item.meaning).toContain("lease");
+    expect(item.operatorCheck).toContain("Review");
+  });
+
+  it("D. ATTEMPT_EXHAUSTED_PRESENT guidance renders", () => {
+    const [item] = presentIssueRunbook(
+      interpretationOf("NEEDS_ATTENTION", [{ code: "ATTEMPT_EXHAUSTED_PRESENT", count: 1 }])
+    );
+    expect(item.code).toBe("ATTEMPT_EXHAUSTED_PRESENT");
+    expect(item.meaning).toContain("attempt limit");
+    expect(item.operatorCheck).toContain("attempt budget");
+  });
+
+  it("E. ABANDONED_WINDOWS_PRESENT guidance renders", () => {
+    const [item] = presentIssueRunbook(
+      interpretationOf("NEEDS_ATTENTION", [{ code: "ABANDONED_WINDOWS_PRESENT", count: 3 }])
+    );
+    expect(item.code).toBe("ABANDONED_WINDOWS_PRESENT");
+    expect(item.meaning).toContain("coverage gap");
+    expect(item.operatorCheck).toContain("failure history");
+  });
+
+  it("F. INCOMPLETE_SKIPPED_ROWS_PRESENT guidance renders", () => {
+    const [item] = presentIssueRunbook(
+      interpretationOf("NEEDS_ATTENTION", [{ code: "INCOMPLETE_SKIPPED_ROWS_PRESENT", count: 1 }])
+    );
+    expect(item.code).toBe("INCOMPLETE_SKIPPED_ROWS_PRESENT");
+    expect(item.meaning).toContain("coverage gap");
+    expect(item.operatorCheck).toContain("skipped");
+    // Never suggests rewriting or discarding data.
+    for (const forbidden of ["rewrite", "drop", "discard", "accept anyway"]) {
+      expect(item.operatorCheck.toLowerCase()).not.toContain(forbidden);
+    }
+  });
+
+  it("G. SATURATED_SINGLE_MILLISECOND_PRESENT guidance renders", () => {
+    const [item] = presentIssueRunbook(
+      interpretationOf("NEEDS_ATTENTION", [
+        { code: "SATURATED_SINGLE_MILLISECOND_PRESENT", count: 1 },
+      ])
+    );
+    expect(item.code).toBe("SATURATED_SINGLE_MILLISECOND_PRESENT");
+    expect(item.meaning).toContain("millisecond");
+    expect(item.operatorCheck).toContain("millisecond");
+    // Never suggests widening the interval or retrying forever.
+    for (const forbidden of ["widen", "retry", "forever"]) {
+      expect(item.operatorCheck.toLowerCase()).not.toContain(forbidden);
+    }
+  });
+
+  it("H. multiple server issues render all matching guidance, and nothing else", () => {
+    // READY carries four live conditions.
+    const items = presentIssueRunbook(READY.interpretation);
+    expect(items).toHaveLength(4);
+    expect(items.map((item) => item.code)).toEqual([
+      "STALE_LEASES_PRESENT",
+      "ATTEMPT_EXHAUSTED_PRESENT",
+      "ABANDONED_WINDOWS_PRESENT",
+      "INCOMPLETE_SKIPPED_ROWS_PRESENT",
+    ]);
+    // The fifth condition was not reported, so its guidance is not shown.
+    expect(items.map((item) => item.code)).not.toContain("SATURATED_SINGLE_MILLISECOND_PRESENT");
+  });
+
+  it("I. issue guidance follows the server's order, never a count ranking", () => {
+    // Descending counts deliberately fight the contract order.
+    const server = interpretationOf("NEEDS_ATTENTION", [
+      { code: "SATURATED_SINGLE_MILLISECOND_PRESENT", count: 99 },
+      { code: "STALE_LEASES_PRESENT", count: 1 },
+      { code: "ABANDONED_WINDOWS_PRESENT", count: 50 },
+    ]);
+    expect(presentIssueRunbook(server).map((item) => item.code)).toEqual([
+      "SATURATED_SINGLE_MILLISECOND_PRESENT",
+      "STALE_LEASES_PRESENT",
+      "ABANDONED_WINDOWS_PRESENT",
+    ]);
+    // No sort, and no count ever reaches the guidance logic: the module maps
+    // codes to prose and never reads the number beside them.
+    expect(RUNBOOK_CODE).not.toContain(".sort(");
+    expect(RUNBOOK_CODE).not.toContain("issue.count");
+    expect(RUNBOOK_CODE).not.toMatch(/[><]=?\s*\d/);
+  });
+
+  it("J. NORMAL shows no issue guidance at all", () => {
+    expect(presentIssueRunbook(interpretationOf("NORMAL"))).toEqual([]);
+    // The card falls back to the scoped no-action sentence.
+    expect(CARD_CODE).toContain("HISTORICAL_FILL_NORMAL_GUIDANCE");
+  });
+
+  it("K. NORMAL guidance stays scoped to historical fills", () => {
+    expect(HISTORICAL_FILL_NORMAL_GUIDANCE).toBe(
+      "No historical-fill runbook action is indicated by the current snapshot."
+    );
+    expect(HISTORICAL_FILL_NORMAL_GUIDANCE.toLowerCase()).toContain("historical-fill");
+  });
+});
+
+describe("historical fill operations: the runbook is guidance, never a control", () => {
+  it("L. UNAVAILABLE shows only the reported reason's check", () => {
+    expect(profileReasonCheck("PROFILE_AMBIGUOUS")).toBe(
+      "Verify that the current environment resolves to exactly one execution profile."
+    );
+    // One reason in, one check out -- the card never renders all five.
+    expect(CARD_CODE).toContain("profileReasonCheck(reason)");
+    expect(CARD_CODE).not.toContain("HISTORICAL_FILL_PROFILE_RUNBOOK");
+    expect(CARD_CODE).not.toContain("Object.values");
+    expect(CARD_CODE).not.toContain("Object.entries");
+  });
+
+  it("M. the factual reason sentence stays visible alongside the check", () => {
+    // Slice 3's wording is not collapsed into the runbook.
+    expect(CARD_CODE).toContain("describeProfileReason(snapshot.reasonCode)");
+    expect(CARD_CODE).toContain("<ProfileRunbook reason={snapshot.reasonCode} />");
+    expect(describeProfileReason("PROFILE_AMBIGUOUS")).toBe(
+      "More than one execution profile matches the configured environment."
+    );
+  });
+
+  it("N+O. the runbook adds no button; the card still has exactly one, Refresh", () => {
+    expect(CARD.match(/<Button/g)).toHaveLength(1);
+    expect(CARD).toContain('{refreshing ? "Refreshing…" : "Refresh"}');
+    // The guidance is a native <details>: no handler, no state, nothing to click
+    // but the disclosure triangle itself.
+    expect(CARD_CODE).toContain("<details");
+    expect(CARD_CODE.match(/onClick/g)).toHaveLength(1);
+    expect(CARD_CODE).not.toContain("useState");
+    const block = CARD_CODE.slice(
+      CARD_CODE.indexOf("function OperatorChecks"),
+      CARD_CODE.indexOf("function Section(")
+    );
+    for (const control of ["<Button", "onClick", "<form", "<input", "<select"]) {
+      expect(block).not.toContain(control);
+    }
+  });
+
+  it("P. no remediation control appears anywhere on the panel", () => {
+    for (const control of [
+      "Retry", "Resume", "Repair", "Requeue", "Reset", "Run now",
+      "Process", "Bootstrap", "Claim", "Abandon", "Delete", "Clear", "Force", "Override",
+    ]) {
+      expect(CARD).not.toContain(`>${control}`);
+      expect(CARD).not.toContain(`${control}<`);
+    }
+    // Nor does the guidance prose issue a mutation instruction.
+    for (const sentence of RUNBOOK_PROSE) {
+      for (const verb of [
+        "Retry ", "Requeue", "Reset the", "Delete the", "Force ", "Override",
+        "edit ", "rewrite", "DROP ", "UPDATE ", "INSERT ",
+      ]) {
+        expect(sentence).not.toContain(verb);
+      }
+    }
+  });
+
+  it("Q. the runbook module holds no interpretation logic at all", () => {
+    // Keyed by code, never by magnitude: no comparison, no arithmetic, no
+    // conditional state.
+    expect(RUNBOOK_CODE).not.toMatch(/[><]=?\s*\d/);
+    expect(RUNBOOK_CODE).not.toMatch(/\bMath\./);
+    for (const derived of [
+      "staleLease", "attemptExhausted", "unattributedFills", "byStatus",
+      "NEEDS_ATTENTION", "NORMAL:", "UNAVAILABLE:", "pending.",
+    ]) {
+      expect(RUNBOOK_CODE).not.toContain(derived);
+    }
+  });
+
+  it("R. guidance is derived from the state, and never the other way round", () => {
+    // Same interpretation in, same interpretation out: looking up guidance
+    // cannot alter what the server said.
+    const server = interpretationOf("NEEDS_ATTENTION", [
+      { code: "ABANDONED_WINDOWS_PRESENT", count: 3 },
+    ]);
+    const before = JSON.stringify(server);
+    presentIssueRunbook(server);
+    expect(JSON.stringify(server)).toBe(before);
+    expect(server.state).toBe("NEEDS_ATTENTION");
+    // The state sentence still comes from the presentation module, not here.
+    expect(RUNBOOK_CODE).not.toContain("describeOperationalState");
+    expect(RUNBOOK_CODE).not.toContain("toneForOperationalState");
+  });
+
+  it("S. a later snapshot replaces the earlier state and its guidance", () => {
+    expect(HOOK_CODE).toContain("setSnapshot(next)");
+    const first = READY.interpretation;
+    expect(presentIssueRunbook(first)).toHaveLength(4);
+    const later = interpretationOf("NORMAL");
+    expect(presentIssueRunbook(later)).toEqual([]);
+    // Nothing accumulated onto the earlier one.
+    expect(presentIssueRunbook(first)).toHaveLength(4);
+    // No client-side latch of any kind.
+    for (const sticky of ["acknowledge", "dismiss", "sticky", "latch", "everSeen"]) {
+      expect(CARD_CODE).not.toContain(sticky);
+    }
+  });
+
+  it("T. the runbook claims nothing about trading or overall safety", () => {
+    const prose = RUNBOOK_PROSE.join(" ").toLowerCase();
+    for (const claim of [
+      "safe to trade", "trading unsafe", "trading healthy", "system healthy",
+      "account unsafe", "execution safe", "all clear", "no risk",
+    ]) {
+      expect(prose).not.toContain(claim);
+    }
+  });
+
+  it("U. the runbook contains no time or SLA threshold", () => {
+    // No digit reaches operator-facing guidance at all, so there is no
+    // "after 15 minutes" to disagree with a policy nobody has reviewed.
+    for (const sentence of RUNBOOK_PROSE) {
+      expect(sentence).not.toMatch(/\d/);
+    }
+    // Checking whether something clears on a refresh is allowed; turning that
+    // into a counted threshold is not.
+    expect(HISTORICAL_FILL_ISSUE_RUNBOOK.STALE_LEASES_PRESENT.operatorCheck).toContain(
+      "later refresh"
+    );
+    const prose = RUNBOOK_PROSE.join(" ").toLowerCase();
+    for (const threshold of ["minutes", "hours", "sla", "deadline", "within "]) {
+      expect(prose).not.toContain(threshold);
+    }
+  });
+
+  it("V. no secret or environment value is named or rendered", () => {
+    for (const source of [RUNBOOK_CODE, CARD_CODE]) {
+      for (const secret of [
+        "process.env", "import.meta.env", "apiKey", "apiSecret",
+        "secretKey", "credential", "password", "Bearer ",
+      ]) {
+        expect(source).not.toContain(secret);
+      }
+    }
+  });
+
+  it("W+X. the runbook reaches no network, and the feature still only reads", () => {
+    for (const call of ["fetch(", "axios", "binance", "operatorApiClient", "XMLHttpRequest"]) {
+      expect(RUNBOOK_CODE).not.toContain(call);
+    }
+    // The panel's whole network surface is still the one authenticated GET.
+    expect(CLIENT).toContain(
+      "operatorApiClient.get<HistoricalFillOperationsDto>(HISTORICAL_FILL_OPERATIONS_PATH)"
+    );
+    for (const source of [RUNBOOK_CODE, CARD_CODE, HOOK_CODE]) {
+      for (const verb of [".post(", ".put(", ".patch(", ".delete("]) {
+        expect(source).not.toContain(verb);
+      }
+    }
+  });
+});
+
+describe("historical fill operations: the repository runbook document", () => {
+  it("covers every issue code and every unavailable reason", () => {
+    for (const code of ISSUE_CODES) expect(RUNBOOK_DOC).toContain(code);
+    for (const reason of PROFILE_REASONS) expect(RUNBOOK_DOC).toContain(reason);
+  });
+
+  it("describes the scope of all three states", () => {
+    for (const state of STATES) expect(RUNBOOK_DOC).toContain(state);
+    // Scoped to this subsystem, and says so.
+    expect(RUNBOOK_DOC_FLAT.toLowerCase()).toContain("historical-fill ingestion subsystem");
+    expect(RUNBOOK_DOC_FLAT).toContain("does not mean the system as a whole is healthy");
+  });
+
+  it("forbids direct durable-state mutation from the dashboard", () => {
+    const flat = RUNBOOK_DOC_FLAT.toLowerCase();
+    expect(flat).toContain("do not do these from this dashboard");
+    for (const forbidden of [
+      "run direct sql against the production database",
+      "run prisma console mutations against production",
+      "mutate redis keys",
+    ]) {
+      expect(flat).toContain(forbidden);
+    }
+    // And it offers no procedure for doing any of it.
+    for (const procedure of ["UPDATE ", "DELETE FROM", "INSERT INTO", "prisma.$executeRaw"]) {
+      expect(RUNBOOK_DOC).not.toContain(procedure);
+    }
+  });
+
+  it("does not claim the historical-fill runtime is enabled", () => {
+    expect(RUNBOOK_DOC_FLAT).toContain("historical-fill ingestion does not run by itself");
+    expect(RUNBOOK_DOC_FLAT.toLowerCase()).toContain("no production caller invokes it");
+  });
+
+  it("states the evidence limits instead of inventing observability", () => {
+    const flat = RUNBOOK_DOC_FLAT.toLowerCase();
+    expect(flat).toContain("emit **no runtime logs**".toLowerCase());
+    expect(flat).toContain("not exposed anywhere an operator can read");
+    expect(flat).toContain("do not go looking for one");
+  });
+
+  it("carries the escalation boundary and invents no SLA", () => {
+    expect(RUNBOOK_DOC_FLAT).toContain(HISTORICAL_FILL_ESCALATION);
+    expect(RUNBOOK_DOC_FLAT.toLowerCase()).toContain("no operational sla has been reviewed");
+    // No escalation threshold of any shape.
+    for (const pattern of [
+      /after \d+ (second|minute|hour|day)/i,
+      /older than \d+/i,
+      /within \d+ (second|minute|hour)/i,
+      /\d+ refreshe?s/i,
+      /\d+ polling cycles/i,
+    ]) {
+      expect(RUNBOOK_DOC).not.toMatch(pattern);
+    }
+  });
+
+  it("agrees with the typed guidance the panel renders, so the two cannot drift", () => {
+    for (const code of ISSUE_CODES) {
+      expect(RUNBOOK_DOC_FLAT).toContain(HISTORICAL_FILL_ISSUE_RUNBOOK[code].operatorCheck);
+    }
+    for (const reason of PROFILE_REASONS) {
+      expect(RUNBOOK_DOC_FLAT).toContain(profileReasonCheck(reason));
+    }
   });
 });

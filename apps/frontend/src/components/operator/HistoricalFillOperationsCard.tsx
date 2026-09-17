@@ -1,4 +1,9 @@
-import type { HistoricalFillInterpretationDto } from "../../api/operator";
+import type { PropsWithChildren } from "react";
+
+import type {
+  HistoricalFillInterpretationDto,
+  HistoricalFillProfileReason,
+} from "../../api/operator";
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { Card } from "../ui/Card";
@@ -11,6 +16,13 @@ import {
   toneForOperationalState,
   type MetricSection,
 } from "../../features/operator/historicalFillOperationsPresentation";
+import {
+  HISTORICAL_FILL_ESCALATION,
+  HISTORICAL_FILL_EVIDENCE_NOTE,
+  HISTORICAL_FILL_NORMAL_GUIDANCE,
+  presentIssueRunbook,
+  profileReasonCheck,
+} from "../../features/operator/historicalFillRunbook";
 import { useHistoricalFillOperations } from "../../hooks/useHistoricalFillOperations";
 
 /**
@@ -24,8 +36,11 @@ import { useHistoricalFillOperations } from "../../hooks/useHistoricalFillOperat
  * Nothing here compares a count against anything: the block below renders
  * `snapshot.interpretation` verbatim, so the panel and the API can never tell
  * an operator two different stories. NEEDS_ATTENTION still produces no button
- * -- it is a reason to look, not a control, and what to do about it is the
- * runbook slice's subject.
+ * -- it is a reason to look, not a control. The runbook block below explains
+ * the conditions and names read-only checks, and it is deliberately a native
+ * `<details>` (the pattern the sibling trading-control card already uses on
+ * this page) so that guidance costs the panel no button, no handler and no
+ * state.
  *
  * The individual figures remain neutral. No metric is coloured or ranked by its
  * own value; the only tone on this surface belongs to the state the server set.
@@ -54,6 +69,57 @@ function InterpretationBlock({
         </dl>
       )}
     </div>
+  );
+}
+
+/**
+ * Manual guidance, collapsed by default.
+ *
+ * `<details>` and nothing else: no button, no onClick, no state. Whatever it
+ * contains, an operator can only read it.
+ */
+function OperatorChecks({ children }: PropsWithChildren) {
+  return (
+    <details className="rounded-lg border border-surface-border p-2">
+      <summary className="cursor-pointer text-xs uppercase tracking-wide text-slate-400">
+        Operator checks
+      </summary>
+      <div className="mt-2 space-y-2">
+        {children}
+        <p className="text-xs text-slate-500">{HISTORICAL_FILL_EVIDENCE_NOTE}</p>
+        <p className="text-xs text-slate-500">{HISTORICAL_FILL_ESCALATION}</p>
+      </div>
+    </details>
+  );
+}
+
+/** Guidance for exactly the issues the server reported, in its order. */
+function IssueRunbook({ interpretation }: { interpretation: HistoricalFillInterpretationDto }) {
+  const items = presentIssueRunbook(interpretation);
+  return (
+    <OperatorChecks>
+      {items.length === 0 ? (
+        <p className="text-xs text-slate-400">{HISTORICAL_FILL_NORMAL_GUIDANCE}</p>
+      ) : (
+        <ul className="space-y-2">
+          {items.map((item) => (
+            <li key={item.code} className="text-xs text-slate-400">
+              <span className="block font-semibold text-slate-300">{item.meaning}</span>
+              {item.operatorCheck}
+            </li>
+          ))}
+        </ul>
+      )}
+    </OperatorChecks>
+  );
+}
+
+/** The check for the reason the server actually reported -- never all five. */
+function ProfileRunbook({ reason }: { reason: HistoricalFillProfileReason }) {
+  return (
+    <OperatorChecks>
+      <p className="text-xs text-slate-400">{profileReasonCheck(reason)}</p>
+    </OperatorChecks>
   );
 }
 
@@ -116,6 +182,7 @@ export function HistoricalFillOperationsCard() {
           <p className="text-xs text-slate-500">
             Captured {formatOptionalInstant(snapshot.capturedAt)}
           </p>
+          <ProfileRunbook reason={snapshot.reasonCode} />
         </div>
       ) : (
         <div className="space-y-3">
@@ -127,6 +194,7 @@ export function HistoricalFillOperationsCard() {
             <span className="font-mono">Profile {snapshot.executionProfileId}</span>
           </div>
           <InterpretationBlock interpretation={snapshot.interpretation} />
+          <IssueRunbook interpretation={snapshot.interpretation} />
           {presentHistoricalFillOperations(snapshot).map((section) => (
             <Section key={section.title} section={section} />
           ))}
