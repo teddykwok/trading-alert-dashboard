@@ -361,12 +361,25 @@ describe("the frozen surfaces stayed frozen, and nothing runs by default", () =>
     expect(scheduler).not.toContain("exchange-fill-batch-driver");
   });
 
-  it("no production module starts the scheduler, so nothing reaches any of this", async () => {
-    for (const file of [
-      "src/modules/jobs/vision-analysis.worker.ts",
-      "src/server.ts",
-      "src/app.ts",
+  it("only the worker reaches this, and only through the composition seam", async () => {
+    // Phase 9 Slice 3C made the worker the ONE production start call-site, so
+    // it is no longer unaware of historical fill. What still holds -- and what
+    // this guards -- is that it starts the composed runtime and nothing deeper:
+    // no driver, no budget service, no executor, no exchange call.
+    const worker = await read("src/modules/jobs/vision-analysis.worker.ts");
+    expect(worker).toContain("startHistoricalFillWorkerRuntime()");
+    for (const deeper of [
+      "HistoricalFillWeightBudget",
+      "HistoricalFillBatchDriver",
+      "runHistoricalFillBatch",
+      "createHistoricalFillScheduler",
+      "executeOne",
     ]) {
+      expect(worker).not.toContain(deeper);
+    }
+
+    // The HTTP entry points remain entirely unaware of the feature.
+    for (const file of ["src/server.ts", "src/app.ts"]) {
       const source = await read(file);
       expect(source).not.toContain("historical-fill");
       expect(source).not.toContain("HistoricalFillWeightBudget");

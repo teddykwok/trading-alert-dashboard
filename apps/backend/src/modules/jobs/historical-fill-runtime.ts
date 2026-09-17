@@ -147,6 +147,7 @@ export interface HistoricalFillRuntimeTickOptions {
       horizonDays: number;
       maxWindows: number;
       maxUserTradesWeight: number;
+      globalUserTradesWeightPerMinute?: number;
     }) => Promise<HistoricalFillBatchResult>;
   };
   /**
@@ -164,6 +165,15 @@ export interface HistoricalFillRuntimeTickOptions {
   horizonDays: number;
   maxWindows: number;
   maxUserTradesWeight: number;
+  /**
+   * The SHARED cross-process ceiling, forwarded unchanged to the driver.
+   *
+   * Required by the driver whenever a weight budget is wired, and meaningless
+   * without one -- so it travels with the rest of the bounds rather than being
+   * resolved here. A tick that dropped it would make the driver refuse the
+   * pass, which is the correct failure but the wrong place to discover it.
+   */
+  globalUserTradesWeightPerMinute?: number;
   /** Defaults to the configured gate; injectable so a test need not reload env. */
   enabled?: boolean;
 }
@@ -195,6 +205,7 @@ export async function runHistoricalFillRuntimeTick(
       horizonDays: options.horizonDays,
       maxWindows: options.maxWindows,
       maxUserTradesWeight: options.maxUserTradesWeight,
+      globalUserTradesWeightPerMinute: options.globalUserTradesWeightPerMinute,
     });
   } catch (error) {
     // Reported, then re-thrown unchanged. A failure that became a result would

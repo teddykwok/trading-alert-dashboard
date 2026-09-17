@@ -52,12 +52,31 @@ export type HistoricalFillSchedulerHandle =
       timer: NodeJS.Timeout;
       /** Idempotent: clears the interval once and refuses every later tick. */
       stop: () => void;
+      /**
+       * Stop, then wait for a tick that is ALREADY running to settle.
+       *
+       * Shutdown needs this because `stop()` only closes the door: a tick that
+       * was already inside `executeOne` still holds the shared Prisma client,
+       * and the worker disconnects that client moments later. Awaiting the
+       * in-flight pass is what keeps a claim and its transaction from being
+       * torn out from underneath -- there is no abort here, and there should
+       * not be.
+       *
+       * Resolves immediately when nothing is running, and never rejects: a
+       * failed tick is already the runner's own recorded incident, and it must
+       * not turn shutdown into a failure.
+       */
+      stopAndDrain: () => Promise<void>;
     };
 
 export interface HistoricalFillSchedulerOptions
   extends Pick<
     HistoricalFillRuntimeTickOptions,
-    "createDriver" | "horizonDays" | "maxWindows" | "maxUserTradesWeight"
+    | "createDriver"
+    | "horizonDays"
+    | "maxWindows"
+    | "maxUserTradesWeight"
+    | "globalUserTradesWeightPerMinute"
   > {
   /**
    * Passed through to every tick, exactly as given.
@@ -115,6 +134,8 @@ export function createHistoricalFillScheduler(
   let started: HistoricalFillSchedulerHandle | null = null;
   let tickInFlight = false;
   let stopped = false;
+  /** The pass currently running, so shutdown can await exactly that one. */
+  let inFlightTick: Promise<void> | null = null;
 
   /**
    * ONE pass, under the single-flight guard.
@@ -137,6 +158,8 @@ export function createHistoricalFillScheduler(
 
     tickInFlight = true;
     try {
+      // Nothing else is allowed to await this; `run()` below records the
+      // promise so a drain can wait for THIS pass and no other.
       await runTick({
         createDriver: options.createDriver,
         workerId: options.workerId,
@@ -144,6 +167,7 @@ export function createHistoricalFillScheduler(
         horizonDays: options.horizonDays,
         maxWindows: options.maxWindows,
         maxUserTradesWeight: options.maxUserTradesWeight,
+        globalUserTradesWeightPerMinute: options.globalUserTradesWeightPerMinute,
       });
     } catch {
       // Deliberately empty. See above: the runner owns the failure record, and
@@ -151,6 +175,19 @@ export function createHistoricalFillScheduler(
     } finally {
       tickInFlight = false;
     }
+  }
+
+  /**
+   * Runs one pass and remembers it while it is in flight.
+   *
+   * `tickOnce` already swallows failures, so this promise settles rather than
+   * rejects, which is what makes `stopAndDrain` safe to await unguarded.
+   */
+  function run(): void {
+    const pass = tickOnce().finally(() => {
+      inFlightTick = null;
+    });
+    inFlightTick = pass;
   }
 
   return {
@@ -170,7 +207,7 @@ export function createHistoricalFillScheduler(
       }
 
       const timer = setInterval(() => {
-        void tickOnce();
+        void run();
       }, intervalMs);
       timer.unref?.();
 
@@ -183,9 +220,17 @@ export function createHistoricalFillScheduler(
         logger.info("Historical fill scheduler stopped");
       };
 
+      // Close the door first, then wait for whoever is already inside. The
+      // order matters: draining before stopping would let the interval start
+      // another pass while we waited for the previous one.
+      const stopAndDrain = async () => {
+        stop();
+        await inFlightTick;
+      };
+
       logger.info({ intervalMs }, "Historical fill scheduler started");
 
-      started = { status: "RUNNING", timer, stop };
+      started = { status: "RUNNING", timer, stop, stopAndDrain };
       return started;
     },
   };

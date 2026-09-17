@@ -27,6 +27,7 @@ import {
 } from "../runtime/attestation-redis";
 import { startExecutionNotificationScheduler } from "./execution-notification.scheduler";
 import { startAlertQueueRecoveryScheduler } from "./alert-queue-recovery.scheduler";
+import { startHistoricalFillWorkerRuntime } from "./historical-fill-worker-runtime";
 import {
   createExecutionOrchestrator,
   isReconciliationHealthy,
@@ -290,6 +291,18 @@ const alertRecoveryTimer = startAlertQueueRecoveryScheduler();
 // gates closed this registers work that dispatches nothing.
 const orchestrationTimer = startExecutionOrchestrationScheduler();
 
+// Phase 9: the ONLY production start call-site for historical fill ingestion.
+// Dormant unless EXECUTION_FILL_RUNTIME_ENABLED=true, and dormant means it
+// builds nothing at all -- no timer, no Prisma-backed service, no Binance
+// client -- so this worker is unaffected by it and never touches the
+// historical tables while the gate is closed.
+//
+// Several worker processes may each run one of these. There is deliberately no
+// leader election: window correctness comes from the claim CAS and its attempts
+// fencing token, and exchange request production is bounded across processes by
+// the shared Postgres weight budget.
+const historicalFillRuntime = startHistoricalFillWorkerRuntime();
+
 // Daily bounded-data-retention cleanup (03:00 Asia/Singapore by default).
 // Failure to schedule must never take down the vision worker.
 let retentionWorker: Awaited<ReturnType<typeof setupRetentionSchedule>> = null;
@@ -348,6 +361,10 @@ process.on("SIGTERM", async () => {
   clearInterval(notificationTimer);
   clearInterval(orchestrationTimer);
   clearInterval(alertRecoveryTimer);
+  // Before the shared Prisma client goes away below: this stops future
+  // historical ticks and then waits for one already running, so a claim and its
+  // transaction are never torn out mid-flight. Nothing is aborted.
+  await historicalFillRuntime.stop();
   await worker.close();
   await extremeRRWorker.close();
   await retentionWorker?.close();
