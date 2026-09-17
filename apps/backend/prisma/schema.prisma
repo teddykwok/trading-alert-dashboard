@@ -447,6 +447,7 @@ model ExecutionProfile {
   exchangeFills ExchangeFillLedger[]
   fillIngestWindows ExchangeFillIngestWindow[]
   fillWeightBuckets HistoricalFillWeightBucket[]
+  fillCampaigns     HistoricalFillCampaign[]
   safetyPolicy  ExecutionSafetyPolicy?
   canaryAuthorizations ExecutionCanaryAuthorization[]
 
@@ -1700,7 +1701,96 @@ model HistoricalFillWeightReservation {
   /// decrements the bucket.
   releasedAt DateTime?
 
+  /// The campaign this admission was charged to, when one governed it.
+  ///
+  /// NULLABLE on purpose, and permanently so: reservations written before
+  /// campaigns existed carry NULL and are still perfectly valid records of
+  /// weight that was spent. A release only touches campaign accounting when
+  /// this is set.
+  ///
+  /// The profile is deliberately NOT duplicated here. It is reachable through
+  /// this campaign (and through the bucket), and a third copy would create an
+  /// invariant -- reservation.profile == campaign.profile == bucket.profile --
+  /// that nothing would enforce.
+  campaignId String?
+  campaign   HistoricalFillCampaign? @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+
   createdAt DateTime @default(now())
 
   @@index([bucketId, releasedAt])
+  @@index([campaignId])
+}
+
+/// How many historical dispatches one deliberate backfill may still spend.
+///
+/// ## Why a campaign exists at all
+///
+/// Every other bound in this subsystem is per-request, per-batch or
+/// per-minute. None of them stops a runtime that is simply left enabled: the
+/// scheduler wakes again next interval and the queue drains until it is empty.
+/// A campaign is the only bound that spans ticks, workers, crashes and
+/// restarts, so it is the only thing that can answer "how much will this
+/// backfill do in total".
+///
+/// ## The unit is an ADMITTED DISPATCH
+///
+/// Not an executor invocation. `NO_WORK` and `PROFILE_UNAVAILABLE` provably
+/// issue no exchange request and give their slot back; everything else --
+/// including an invocation that threw -- keeps it, because an uncertain
+/// dispatch must be counted as spent.
+///
+/// ## Status is written, never defaulted
+///
+/// There is deliberately no `@default`. A campaign that came into existence
+/// because somebody omitted a field would be an implicit licence to spend the
+/// account's exchange allowance, which is the exact opposite of the point.
+model HistoricalFillCampaign {
+  id String @id @default(cuid())
+
+  /// The account whose allowance this campaign may spend. Restrict, like every
+  /// other durable account-scoped record.
+  executionProfileId String
+  executionProfile   ExecutionProfile @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)
+
+  /// No default. See above.
+  status HistoricalFillCampaignStatus
+
+  /// The ceiling, frozen at creation and never editable afterwards: raising it
+  /// later would retroactively change what an operator authorised.
+  maxDispatches Int
+  /// Admissions granted. Only ever moved by a conditional update that re-proves
+  /// the ceiling, so it can never exceed `maxDispatches`.
+  dispatchesUsed Int @default(0)
+
+  /// Free operator text explaining why this campaign exists. Never a credential.
+  note String?
+
+  startedAt       DateTime  @default(now())
+  /// When a slot was last granted. Diagnostics only.
+  lastAdmissionAt DateTime?
+  /// Set when the campaign stops, and cleared again ONLY by the one guarded
+  /// reactivation that reopens a campaign whose final slot was refunded.
+  endedAt   DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  reservations HistoricalFillWeightReservation[]
+
+  @@index([executionProfileId, status])
+}
+
+/// ACTIVE and PAUSED are the LIVE states -- at most one of them may exist per
+/// profile, enforced by a partial unique index that Prisma cannot express and
+/// the migration therefore writes by hand.
+///
+/// EXHAUSTED is the one soft terminal: a campaign whose final slot is refunded
+/// because the dispatch provably never happened may return to ACTIVE. COMPLETED
+/// and ABORTED are hard -- an operator who aborted a campaign must never find it
+/// running again.
+enum HistoricalFillCampaignStatus {
+  ACTIVE
+  PAUSED
+  EXHAUSTED
+  COMPLETED
+  ABORTED
 }
