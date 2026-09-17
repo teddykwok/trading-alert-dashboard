@@ -340,6 +340,29 @@ const envSchema = z.object({
   EXECUTION_FILL_BATCH_MAX_USER_TRADES_WEIGHT: wholeNumberString
     .pipe(z.number().int().min(5).max(500))
     .default("25"),
+  // Whether a historical-fill runtime tick may run a batch at all.
+  //
+  // DEFAULT FALSE, and dormant even when true: turning this on does not create
+  // a timer, a cron, a startup hook or any caller. NOTHING in production
+  // invokes the tick runner in this phase -- the flag only decides what that
+  // runner would do if something one day called it.
+  //
+  // Strict enum for the same reason the Phase 10 maintenance gates use one: a
+  // typo like "TRUE" or "1" fails startup instead of silently reading as one
+  // value or the other. This switch authorizes real signed GET
+  // /fapi/v1/userTrades requests against a real account, so it must never be
+  // decided by a near-miss spelling.
+  //
+  // Deliberately its OWN gate. EXECUTION_GLOBAL_KILL_SWITCH,
+  // EXECUTION_LIVE_ENTRY_ENABLED and EXECUTION_PROTECTION_READY govern placing
+  // and protecting orders; historical fill ingestion places nothing and is
+  // read-only, so reusing a trading gate would either block a safe read or,
+  // far worse, let opening the trading gates start an exchange sweep nobody
+  // asked for.
+  EXECUTION_FILL_RUNTIME_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
 
   // Reserved for future non-Binance crypto providers; today only "binance" is
   // wired up (see market-data.service.ts). CRYPTO alerts on any other value
