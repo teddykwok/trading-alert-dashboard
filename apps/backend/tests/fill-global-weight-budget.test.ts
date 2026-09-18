@@ -7,9 +7,10 @@ import {
   type FillIngestExecutionOutcome,
 } from "../src/modules/execution/exchange-fill-batch-driver.service";
 import type {
+  HistoricalFillCampaignAdmissionResult,
   HistoricalFillWeightReservation,
-  HistoricalFillWeightReservationResult,
 } from "../src/modules/execution/historical-fill-weight-budget.service";
+import type { HistoricalFillCampaignGateResult } from "../src/modules/execution/historical-fill-campaign-gate.service";
 
 /**
  * The SHARED ceiling, at the driver seam.
@@ -39,10 +40,24 @@ const bootstrapped = {
   raceReconciledCount: 0,
 };
 
+/** An ample ACTIVE campaign, so these tests measure the WEIGHT seam and nothing else. */
+const activeGate: HistoricalFillCampaignGateResult = {
+  outcome: "ACTIVE",
+  executionProfileId: PROFILE_ID,
+  campaign: {
+    id: "campaign-abc",
+    status: "ACTIVE",
+    dispatchesUsed: 0,
+    maxDispatches: 100,
+    dispatchesRemaining: 100,
+  },
+};
+
 function scripted(options: {
   outcomes?: FillIngestExecutionOutcome[];
   throwOn?: number;
-  reserve?: () => Promise<HistoricalFillWeightReservationResult>;
+  admit?: () => Promise<HistoricalFillCampaignAdmissionResult>;
+  gate?: () => Promise<HistoricalFillCampaignGateResult>;
   bootstrap?: unknown;
 }) {
   const queue = [...(options.outcomes ?? [])];
@@ -56,22 +71,39 @@ function scripted(options: {
       : { outcome };
   });
 
-  const granted: HistoricalFillWeightReservationResult = {
-    outcome: "GRANTED",
+  const admitted: HistoricalFillCampaignAdmissionResult = {
+    outcome: "ADMITTED",
     reservation: { executionProfileId: PROFILE_ID, bucketStart: BUCKET, weight: 5 },
-  };
-  const reserve = vi.fn(options.reserve ?? (async () => granted));
+    campaignId: "campaign-abc",
+    dispatchesUsed: 1,
+    maxDispatches: 100,
+    campaignStatus: "ACTIVE",
+  } as never;
+  const admitCampaignDispatch = vi.fn(options.admit ?? (async () => admitted));
   const releaseCertainNonDispatch = vi.fn(async (_r: HistoricalFillWeightReservation) => undefined);
 
   const bootstrapHistoricalRoots = vi.fn(async () => options.bootstrap ?? bootstrapped);
+  const resolveForBatch = vi.fn(options.gate ?? (async () => activeGate));
+  const describeCampaign = vi.fn(async () => activeGate.outcome === "ACTIVE" ? activeGate.campaign : null);
+  const completeIfDrained = vi.fn(async () => "ACTIVE" as const);
 
   const driver = new HistoricalFillBatchDriver({
     bootstrap: { bootstrapHistoricalRoots } as never,
     executor: { executeOne } as never,
-    weightBudget: { reserve, releaseCertainNonDispatch },
+    weightBudget: { admitCampaignDispatch, releaseCertainNonDispatch },
+    campaigns: { resolveForBatch, describeCampaign, completeIfDrained },
   });
 
-  return { driver, executeOne, reserve, releaseCertainNonDispatch, bootstrapHistoricalRoots };
+  return {
+    driver,
+    executeOne,
+    reserve: admitCampaignDispatch,
+    admitCampaignDispatch,
+    releaseCertainNonDispatch,
+    bootstrapHistoricalRoots,
+    resolveForBatch,
+    completeIfDrained,
+  };
 }
 
 const run = (driver: HistoricalFillBatchDriver, overrides: Record<string, unknown> = {}) =>
@@ -88,8 +120,8 @@ const run = (driver: HistoricalFillBatchDriver, overrides: Record<string, unknow
 describe("the shared ceiling gates every executor invocation", () => {
   it("C. a denial returns the global outcome and never calls the executor", async () => {
     const { driver, executeOne, reserve, releaseCertainNonDispatch } = scripted({
-      reserve: async () => ({
-        outcome: "EXHAUSTED",
+      admit: async () => ({
+        outcome: "GLOBAL_USER_TRADES_WEIGHT_EXHAUSTED",
         bucketStart: BUCKET,
         weightCap: 25,
         weightUsed: 25,
@@ -111,7 +143,7 @@ describe("the shared ceiling gates every executor invocation", () => {
 
   it("J. a cap mismatch is distinguishable from an exhausted ceiling", async () => {
     const { driver, executeOne } = scripted({
-      reserve: async () => ({
+      admit: async () => ({
         outcome: "CAP_MISMATCH",
         bucketStart: BUCKET,
         storedCap: 25,

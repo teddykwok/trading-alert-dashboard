@@ -4,10 +4,18 @@ import type {
   FillIngestExecutionOutcome,
 } from "./exchange-fill-one-window-executor.service";
 import type { ExchangeFillRootBootstrap, FillRootBootstrapResult } from "./exchange-fill-root-bootstrap.service";
+// TYPE-ONLY, and load-bearing that it stays so: the weight budget imports
+// `USER_TRADES_REQUEST_WEIGHT` from this file as a value, so a value import
+// back would be a runtime cycle. Type imports are erased.
 import type {
+  HistoricalFillCampaignAdmissionResult,
   HistoricalFillWeightReservation,
-  HistoricalFillWeightReservationResult,
 } from "./historical-fill-weight-budget.service";
+import type {
+  HistoricalFillBatchCampaign,
+  HistoricalFillCampaignGateResult,
+} from "./historical-fill-campaign-gate.service";
+import type { HistoricalFillCampaignStatus } from "@prisma/client";
 
 /**
  * ONE bounded pass of historical fill ingestion: make the work exist, then
@@ -108,7 +116,70 @@ export type FillBatchStopReason =
    */
   | "GLOBAL_USER_TRADES_WEIGHT_BUDGET_EXHAUSTED"
   /** A configured ceiling disagrees with the one already in force. */
-  | "GLOBAL_USER_TRADES_WEIGHT_CAP_MISMATCH";
+  | "GLOBAL_USER_TRADES_WEIGHT_CAP_MISMATCH"
+  /**
+   * No ACTIVE campaign authorises this account to spend anything.
+   *
+   * The ORDINARY way a bounded backfill stops. When a campaign takes its final
+   * slot it becomes EXHAUSTED inside that same transaction, so the very next
+   * pass finds no ACTIVE campaign and lands here -- not on
+   * `CAMPAIGN_DISPATCH_BUDGET_EXHAUSTED`. It is equally what a paused, aborted,
+   * completed or never-started profile produces, which is why the campaign
+   * fields on the result carry the status: five stop reasons would say nothing
+   * the metadata does not, and each would have to be kept in step forever.
+   */
+  | "NO_ACTIVE_FILL_CAMPAIGN"
+  /**
+   * An ACTIVE campaign with no slots left.
+   *
+   * Unreachable in ordinary flow, by construction -- the transaction that takes
+   * the last slot marks the campaign EXHAUSTED -- so this is the fail-closed
+   * path for a hand-edited or corrupted row. Kept distinct from the two weight
+   * ceilings: "your budget is spent" and "this minute is busy" demand
+   * completely different operator responses.
+   */
+  | "CAMPAIGN_DISPATCH_BUDGET_EXHAUSTED";
+
+/**
+ * The campaign this pass ran under, as it stood when the pass ended.
+ *
+ * Every field is null when no campaign exists for the account at all. After an
+ * ordinary exhaustion or completion these still describe the campaign that just
+ * finished, which is the whole point: an operator reading a summary after the
+ * fact needs to see what happened, not an empty space where a live campaign
+ * used to be.
+ *
+ * No `note`: it is free operator text, and a summary that is logged does not
+ * carry arbitrary strings.
+ */
+export interface HistoricalFillCampaignAccounting {
+  campaignId: string | null;
+  campaignStatus: HistoricalFillCampaignStatus | null;
+  campaignDispatchesUsed: number | null;
+  campaignMaxDispatches: number | null;
+  campaignDispatchesRemaining: number | null;
+}
+
+const NO_CAMPAIGN_ACCOUNTING: HistoricalFillCampaignAccounting = {
+  campaignId: null,
+  campaignStatus: null,
+  campaignDispatchesUsed: null,
+  campaignMaxDispatches: null,
+  campaignDispatchesRemaining: null,
+};
+
+function campaignAccounting(
+  campaign: HistoricalFillBatchCampaign | null
+): HistoricalFillCampaignAccounting {
+  if (campaign === null) return NO_CAMPAIGN_ACCOUNTING;
+  return {
+    campaignId: campaign.id,
+    campaignStatus: campaign.status,
+    campaignDispatchesUsed: campaign.dispatchesUsed,
+    campaignMaxDispatches: campaign.maxDispatches,
+    campaignDispatchesRemaining: campaign.dispatchesRemaining,
+  };
+}
 
 /**
  * What the pass spent on userTrades, and what it had.
@@ -147,15 +218,35 @@ export type FillRootBootstrapSummary = Extract<FillRootBootstrapResult, { outcom
 export type HistoricalFillBatchResult =
   | ({
       outcome: "PROFILE_UNAVAILABLE";
-      /** Which half of the pass could not name the account. */
-      stage: "BOOTSTRAP" | "EXECUTION";
+      /**
+       * Which layer could not name the account.
+       *
+       * `CAMPAIGN` is the earliest: the campaign gate binds before the
+       * bootstrap, so a profile that cannot be resolved is now caught before a
+       * single root is written rather than after.
+       */
+      stage: "CAMPAIGN" | "BOOTSTRAP" | "EXECUTION";
       /** The binder's own code, carried through both layers unflattened. */
       reasonCode: string;
       /** Null when the bootstrap itself could not bind. */
       bootstrap: FillRootBootstrapSummary | null;
       executionInvocations: number;
       outcomes: FillBatchOutcomeCounts;
-    } & UserTradesWeightAccounting)
+    } & UserTradesWeightAccounting &
+      HistoricalFillCampaignAccounting)
+  | ({
+      /**
+       * Stopped before the bootstrap because nothing authorises this account.
+       *
+       * `bootstrap` is null and not a summary: the pass did not run one. That is
+       * the load-bearing part of this arm -- no roots, no claims, no requests.
+       */
+      outcome: "NO_ACTIVE_FILL_CAMPAIGN" | "CAMPAIGN_DISPATCH_BUDGET_EXHAUSTED";
+      bootstrap: null;
+      executionInvocations: number;
+      outcomes: FillBatchOutcomeCounts;
+    } & UserTradesWeightAccounting &
+      HistoricalFillCampaignAccounting)
   | ({
       outcome:
         | "NO_WORK"
@@ -166,7 +257,8 @@ export type HistoricalFillBatchResult =
       bootstrap: FillRootBootstrapSummary;
       executionInvocations: number;
       outcomes: FillBatchOutcomeCounts;
-    } & UserTradesWeightAccounting);
+    } & UserTradesWeightAccounting &
+      HistoricalFillCampaignAccounting);
 
 /** The bound is not configuration here; a caller must state it. */
 export class FillBatchRefusedError extends Error {
@@ -200,11 +292,28 @@ export interface HistoricalFillBatchDependencies {
    * reason that has nothing to do with the window.
    */
   weightBudget?: {
-    reserve: (options: {
+    admitCampaignDispatch: (options: {
       executionProfileId: string;
       weightCap: number;
-    }) => Promise<HistoricalFillWeightReservationResult>;
+    }) => Promise<HistoricalFillCampaignAdmissionResult>;
     releaseCertainNonDispatch: (reservation: HistoricalFillWeightReservation) => Promise<void>;
+  };
+  /**
+   * The campaign gate, required whenever a weight budget is wired.
+   *
+   * It answers "may this account spend anything at all" BEFORE the bootstrap,
+   * which is the only place that question can be asked without already having
+   * written something. Wiring a budget without it is refused outright rather
+   * than silently degraded, because a driver that admitted dispatches with no
+   * campaign to count them is precisely the bypass this slice closes.
+   */
+  campaigns?: {
+    resolveForBatch: () => Promise<HistoricalFillCampaignGateResult>;
+    describeCampaign: (campaignId: string) => Promise<HistoricalFillBatchCampaign | null>;
+    completeIfDrained: (
+      executionProfileId: string,
+      campaignId: string
+    ) => Promise<HistoricalFillCampaignStatus>;
   };
 }
 
@@ -260,10 +369,55 @@ export class HistoricalFillBatchDriver {
       this.deps.weightBudget !== undefined,
       options.globalUserTradesWeightPerMinute
     );
+    assertCampaignGate(this.deps.weightBudget !== undefined, this.deps.campaigns !== undefined);
 
     const outcomes = emptyCounts();
     const budget = options.maxUserTradesWeight;
     let used = 0;
+
+    // THE CAMPAIGN GATE, BEFORE THE BOOTSTRAP.
+    //
+    // Everything past this point writes something: the bootstrap creates roots,
+    // `executeOne` claims a window and burns an ingest attempt. An account that
+    // nothing authorises must leave no trace at all, so the question is asked
+    // here, where the only thing that has happened is two reads.
+    let campaign: HistoricalFillBatchCampaign | null = null;
+    let campaignProfileId: string | null = null;
+    if (this.deps.campaigns !== undefined) {
+      const gate = await this.deps.campaigns.resolveForBatch();
+
+      if (gate.outcome === "PROFILE_UNAVAILABLE") {
+        return {
+          outcome: "PROFILE_UNAVAILABLE",
+          stage: "CAMPAIGN",
+          reasonCode: gate.reasonCode,
+          bootstrap: null,
+          executionInvocations: 0,
+          outcomes,
+          ...weighed(budget, used),
+          ...NO_CAMPAIGN_ACCOUNTING,
+        };
+      }
+
+      if (gate.outcome === "NO_ACTIVE_CAMPAIGN") {
+        // Zero roots, zero claims, zero reservations, zero requests. The
+        // campaign metadata still says WHICH of the five situations this is.
+        return this.settled(
+          {
+            outcome: "NO_ACTIVE_FILL_CAMPAIGN",
+            bootstrap: null,
+            executionInvocations: 0,
+            outcomes,
+            ...weighed(budget, used),
+            ...campaignAccounting(gate.campaign),
+          },
+          0
+        );
+      }
+
+      campaign = gate.campaign;
+      campaignProfileId = gate.executionProfileId;
+    }
 
     // Exactly once per pass. Roots are canonical and idempotent, so repeating
     // this per window would add a full horizon scan per iteration and answer
@@ -284,7 +438,24 @@ export class HistoricalFillBatchDriver {
         executionInvocations: 0,
         outcomes,
         ...weighed(budget, used),
+        ...campaignAccounting(campaign),
       };
+    }
+
+    // THE ACCOUNT MUST BE THE SAME ACCOUNT.
+    //
+    // The gate and the bootstrap bind independently -- deliberately, because
+    // neither may trust a profile handed down by the other. That independence
+    // is only safe if they agree, and if configuration changed between the two
+    // binds they might not. A campaign belonging to one account must never
+    // authorise dispatches charged to another, so a disagreement stops the pass
+    // here: after the bootstrap's idempotent root writes, but BEFORE any
+    // admission, any claim and any request.
+    if (campaignProfileId !== null && campaignProfileId !== bootstrap.executionProfileId) {
+      throw new FillBatchInvariantError(
+        `the campaign gate bound execution profile ${campaignProfileId} but the bootstrap bound ` +
+          `${bootstrap.executionProfileId}; refusing to spend one account's campaign on another`
+      );
     }
 
     let executionInvocations = 0;
@@ -307,6 +478,7 @@ export class HistoricalFillBatchDriver {
             executionInvocations,
             outcomes,
             ...weighed(budget, used),
+            ...campaignAccounting(campaign),
           },
           0
         );
@@ -323,14 +495,70 @@ export class HistoricalFillBatchDriver {
       // window is touched.
       let reservation: HistoricalFillWeightReservation | null = null;
       if (this.deps.weightBudget !== undefined) {
-        const shared = await this.deps.weightBudget.reserve({
+        // ONE admission, taking the campaign slot and the minute's weight
+        // together or neither. There is no path here that spends one without
+        // the other, and no path that reaches the exchange without both.
+        const admission = await this.deps.weightBudget.admitCampaignDispatch({
           executionProfileId: bootstrap.executionProfileId,
           // Non-null by `assertGlobalUserTradesWeightCap` above, which refused
           // the pass before the bootstrap if a budget was wired without a cap.
           weightCap: options.globalUserTradesWeightPerMinute as number,
         });
 
-        if (shared.outcome === "EXHAUSTED") {
+        if (admission.outcome === "NO_ACTIVE_FILL_CAMPAIGN") {
+          // The campaign ended UNDER us -- an operator paused or aborted it, or
+          // another worker took its last slot -- between the pre-bootstrap gate
+          // and this locked admission.
+          //
+          // The gate's snapshot is therefore STALE by definition here, and the
+          // admission result carries only an id and a status. Reporting the
+          // stale counts, or inventing zeros to fill the gap, would put numbers
+          // in an operator's summary that were never true of any moment. So the
+          // campaign is re-read, and if it cannot be read the counts are null --
+          // "not known" -- which is the one honest answer available.
+          const settledCampaign =
+            admission.campaignId === null
+              ? null
+              : ((await this.deps.campaigns?.describeCampaign(admission.campaignId)) ?? null);
+          return this.settled(
+            {
+              outcome: "NO_ACTIVE_FILL_CAMPAIGN",
+              bootstrap: null,
+              executionInvocations,
+              outcomes,
+              ...weighed(budget, used),
+              ...campaignAccounting(settledCampaign),
+            },
+            0
+          );
+        }
+        if (admission.outcome === "CAMPAIGN_DISPATCH_BUDGET_EXHAUSTED") {
+          return this.settled(
+            {
+              outcome: "CAMPAIGN_DISPATCH_BUDGET_EXHAUSTED",
+              bootstrap: null,
+              executionInvocations,
+              outcomes,
+              ...weighed(budget, used),
+              // These counts ARE authoritative: the budget service read them
+              // from the row under its own lock and returned them unchanged.
+              ...campaignAccounting({
+                id: admission.campaignId,
+                status: "ACTIVE",
+                dispatchesUsed: admission.dispatchesUsed,
+                maxDispatches: admission.maxDispatches,
+                dispatchesRemaining: Math.max(
+                  0,
+                  admission.maxDispatches - admission.dispatchesUsed
+                ),
+              }),
+            },
+            0
+          );
+        }
+        if (admission.outcome === "GLOBAL_USER_TRADES_WEIGHT_EXHAUSTED") {
+          // 2B.2 unwound the campaign increment, so nothing was spent. The
+          // campaign accounting below is the one the gate read, unchanged.
           return this.settled(
             {
               outcome: "GLOBAL_USER_TRADES_WEIGHT_BUDGET_EXHAUSTED",
@@ -338,11 +566,12 @@ export class HistoricalFillBatchDriver {
               executionInvocations,
               outcomes,
               ...weighed(budget, used),
+              ...campaignAccounting(campaign),
             },
             0
           );
         }
-        if (shared.outcome === "CAP_MISMATCH") {
+        if (admission.outcome === "CAP_MISMATCH") {
           return this.settled(
             {
               outcome: "GLOBAL_USER_TRADES_WEIGHT_CAP_MISMATCH",
@@ -350,11 +579,22 @@ export class HistoricalFillBatchDriver {
               executionInvocations,
               outcomes,
               ...weighed(budget, used),
+              ...campaignAccounting(campaign),
             },
             0
           );
         }
-        reservation = shared.reservation;
+
+        reservation = admission.reservation;
+        // What the campaign looks like AFTER this admission, including the
+        // EXHAUSTED it may have just entered by taking its final slot.
+        campaign = {
+          id: admission.campaignId,
+          status: admission.campaignStatus,
+          dispatchesUsed: admission.dispatchesUsed,
+          maxDispatches: admission.maxDispatches,
+          dispatchesRemaining: Math.max(0, admission.maxDispatches - admission.dispatchesUsed),
+        };
       }
 
       // Reserved conservatively: assume the dispatch happens, and give the
@@ -376,14 +616,40 @@ export class HistoricalFillBatchDriver {
         // ended in an exception may or may not have dispatched, and uncertain
         // dispatch is always counted as spent.
         if (reservation !== null) {
+          // REFUND FIRST, ALWAYS BEFORE COMPLETION. Marking a campaign COMPLETED
+          // while one of its reservations is still outstanding would make the
+          // refund that follows hit 2B.2's deliberately fail-closed COMPLETED
+          // branch, which throws and rolls the release back -- stranding the
+          // weight and the slot for good. The ordering is the whole reason that
+          // situation is unreachable in ordinary operation.
           await this.deps.weightBudget?.releaseCertainNonDispatch(reservation);
+          // A refund gives a slot back and may reopen a campaign that this very
+          // pass exhausted, so the snapshot is now stale.
+          if (campaign !== null && this.deps.campaigns !== undefined) {
+            campaign = (await this.deps.campaigns.describeCampaign(campaign.id)) ?? campaign;
+          }
         }
       }
 
       // Nothing was eligible, so asking again can only produce the same answer.
       if (result.outcome === "NO_WORK") {
+        // The queue is empty from this worker's point of view, which is the one
+        // moment worth asking whether the CAMPAIGN is finished. Only an ACTIVE
+        // campaign with zero PENDING rows may complete; the gate owns that rule,
+        // and returns what is actually true afterwards.
+        if (campaign !== null && campaignProfileId !== null && this.deps.campaigns !== undefined) {
+          const status = await this.deps.campaigns.completeIfDrained(campaignProfileId, campaign.id);
+          campaign = { ...campaign, status };
+        }
         return this.settled(
-          { outcome: "NO_WORK", bootstrap, executionInvocations, outcomes, ...weighed(budget, used) },
+          {
+            outcome: "NO_WORK",
+            bootstrap,
+            executionInvocations,
+            outcomes,
+            ...weighed(budget, used),
+            ...campaignAccounting(campaign),
+          },
           1
         );
       }
@@ -405,6 +671,7 @@ export class HistoricalFillBatchDriver {
             executionInvocations,
             outcomes,
             ...weighed(budget, used),
+            ...campaignAccounting(campaign),
           },
           1
         );
@@ -426,6 +693,7 @@ export class HistoricalFillBatchDriver {
         executionInvocations,
         outcomes,
         ...weighed(budget, used),
+        ...campaignAccounting(campaign),
       },
       0
     );
@@ -529,6 +797,26 @@ function assertGlobalUserTradesWeightCap(
     throw new FillBatchRefusedError(
       `globalUserTradesWeightPerMinute must be at least one dispatch ` +
         `(${USER_TRADES_REQUEST_WEIGHT}), received ${cap}`
+    );
+  }
+}
+
+/**
+ * A wired weight budget without a campaign gate is refused outright.
+ *
+ * Not degraded, not defaulted. A budget with no gate would admit dispatches
+ * that no campaign counts -- the exact bypass this slice exists to close -- and
+ * the cheapest place to make that impossible is before the pass does anything.
+ */
+function assertCampaignGate(budgetWired: boolean, gateWired: boolean): void {
+  if (budgetWired && !gateWired) {
+    throw new FillBatchRefusedError(
+      "a shared weight budget was wired without a campaign gate to authorise its dispatches"
+    );
+  }
+  if (!budgetWired && gateWired) {
+    throw new FillBatchRefusedError(
+      "a campaign gate was wired without a shared weight budget to admit through"
     );
   }
 }

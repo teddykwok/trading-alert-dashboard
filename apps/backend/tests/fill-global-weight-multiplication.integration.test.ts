@@ -7,6 +7,8 @@ import {
   type FillIngestExecutionOutcome,
 } from "../src/modules/execution/exchange-fill-batch-driver.service";
 import { HistoricalFillWeightBudgetService } from "../src/modules/execution/historical-fill-weight-budget.service";
+import { HistoricalFillCampaignGate } from "../src/modules/execution/historical-fill-campaign-gate.service";
+import { HistoricalFillCampaignService } from "../src/modules/execution/historical-fill-campaign.service";
 
 /**
  * THE load-bearing proof: N worker processes do not multiply historical
@@ -19,6 +21,13 @@ import { HistoricalFillWeightBudgetService } from "../src/modules/execution/hist
  * Executors are scripted, so no Binance client exists anywhere in this file or
  * in the code under test. What is measured is how much weight the drivers
  * COLLECTIVELY retain, which is precisely what would have been sent.
+ *
+ * Every dispatch now also passes the campaign gate, because the driver admits
+ * through it. The campaign is deliberately sized far beyond anything these
+ * tests can spend (100 slots against at most 30 possible dispatches), so the
+ * SHARED MINUTE CEILING remains the only thing bounding the totals below —
+ * which is the invariant this file exists to prove, and it is proven through
+ * the campaign-aware path rather than around it.
  */
 
 const TAG = "fill-weight-multiplication-synthetic";
@@ -30,7 +39,12 @@ const maybe = () => (available ? it : it.skip);
 const clients: PrismaClient[] = [];
 let profileId = "";
 
-/** One simulated worker process: own connection, own budget, own driver. */
+/**
+ * One simulated worker process: own connection, own budget, own GATE, own driver.
+ *
+ * The database stays the only shared coordination point. A shared client, or a
+ * shared gate, would prove only that one process agrees with itself.
+ */
 function workerProcess(outcome: FillIngestExecutionOutcome = "COMPLETE") {
   const client = new PrismaClient({ datasources: { db: { url: resolveTestDatabase().url } } });
   clients.push(client);
@@ -52,6 +66,13 @@ function workerProcess(outcome: FillIngestExecutionOutcome = "COMPLETE") {
     // — the worst case for aggregate production.
     executor: { executeOne: async () => ({ outcome }) } as never,
     weightBudget: new HistoricalFillWeightBudgetService(client),
+    // The binder is injected because the real one reads process configuration,
+    // which cannot name a synthetic profile. Everything below it is real: the
+    // gate reads and writes the same campaign row every other worker sees.
+    campaigns: new HistoricalFillCampaignGate({
+      prisma: client,
+      bindProfile: async () => ({ ok: true, context: { executionProfileId: profileId } }) as never,
+    }),
   });
 }
 
@@ -80,6 +101,12 @@ beforeAll(async () => {
     select: { id: true },
   });
   profileId = profile.id;
+  // Ample on purpose: 100 slots against at most 30 possible dispatches, so the
+  // campaign can never be the bound these tests measure.
+  await new HistoricalFillCampaignService(prisma).createCampaign({
+    executionProfileId: profileId,
+    maxDispatches: 100,
+  });
 });
 
 afterAll(async () => {
@@ -88,6 +115,11 @@ afterAll(async () => {
       where: { bucket: { executionProfile: { name: { startsWith: TAG } } } },
     });
     await prisma.historicalFillWeightBucket.deleteMany({
+      where: { executionProfile: { name: { startsWith: TAG } } },
+    });
+    // Campaigns are referenced by reservations with onDelete: Restrict, so they
+    // go after those and before the profiles that own them.
+    await prisma.historicalFillCampaign.deleteMany({
       where: { executionProfile: { name: { startsWith: TAG } } },
     });
     await prisma.executionProfile.deleteMany({ where: { name: { startsWith: TAG } } });

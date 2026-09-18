@@ -303,15 +303,20 @@ describe("the production chain stays singular", () => {
   it("the driver is composed WITH the shared weight budget, never without it", async () => {
     const composition = await read("src/modules/jobs/historical-fill-worker-runtime.ts");
 
-    // §15's structural guarantee: the only driver this worker builds carries
-    // the shared reservation authority, so production wiring cannot reach
-    // executeOne or Binance on an unbudgeted path.
+    // The structural guarantee, now widened by the campaign gate: the only
+    // driver this worker builds carries BOTH the shared reservation authority
+    // and the campaign that authorises spending it, so production wiring
+    // cannot reach executeOne or Binance on an unbudgeted or uncounted path.
     expect(composition).toContain(
-      "new HistoricalFillBatchDriver({ bootstrap, executor, weightBudget })"
+      "new HistoricalFillBatchDriver({ bootstrap, executor, weightBudget, campaigns })"
     );
     expect(composition).toContain("new HistoricalFillWeightBudgetService(prisma)");
-    // And the budget is built from the SHARED client, not a second pool.
+    // Both on the SHARED client, never a second pool.
+    expect(composition).toContain("new HistoricalFillCampaignGate({ prisma })");
     expect(composition).not.toContain("new HistoricalFillBatchDriver({ bootstrap, executor })");
+    expect(composition).not.toContain(
+      "new HistoricalFillBatchDriver({ bootstrap, executor, weightBudget })"
+    );
   });
 
   it("no other production entry point starts it", async () => {

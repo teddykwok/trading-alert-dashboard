@@ -213,8 +213,9 @@ describe("the completion summary is an allowlist", () => {
     const summary = summarizeHistoricalFillBatch(WORKER_ID, RESULT);
 
     expect(Object.keys(summary).sort()).toEqual([
-      "bootstrap", "event", "executionInvocations", "outcome", "outcomes",
-      "userTradesRequests", "userTradesWeightBudget", "userTradesWeightRemaining",
+      "bootstrap", "campaignDispatchesRemaining", "campaignDispatchesUsed", "campaignId",
+      "campaignMaxDispatches", "campaignStatus", "event", "executionInvocations", "outcome",
+      "outcomes", "userTradesRequests", "userTradesWeightBudget", "userTradesWeightRemaining",
       "userTradesWeightUsed", "workerId",
     ]);
     // A field added to the driver result later cannot appear here by accident.

@@ -1,3 +1,5 @@
+import type { HistoricalFillCampaignStatus } from "@prisma/client";
+
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import type {
@@ -71,7 +73,7 @@ export interface HistoricalFillBatchSummary {
   workerId: string;
   outcome: FillBatchStopReason;
   /** Present only when the pass could not name the account. */
-  profileUnavailableStage?: "BOOTSTRAP" | "EXECUTION";
+  profileUnavailableStage?: "CAMPAIGN" | "BOOTSTRAP" | "EXECUTION";
   profileUnavailableReasonCode?: string;
   executionInvocations: number;
   /**
@@ -84,6 +86,21 @@ export interface HistoricalFillBatchSummary {
   userTradesWeightBudget: number;
   userTradesWeightRemaining: number;
   outcomes: FillBatchOutcomeCounts;
+  /**
+   * The campaign that bounded this pass, or nulls when none exists.
+   *
+   * Null is a real answer, not missing data: it means nothing authorises this
+   * account to spend, which is exactly what an operator needs to see. After an
+   * ordinary exhaustion or completion these describe the campaign that just
+   * ended, so the log still explains why the pass did nothing.
+   *
+   * Deliberately no `note`: it is free operator text and this goes to a log.
+   */
+  campaignId: string | null;
+  campaignStatus: HistoricalFillCampaignStatus | null;
+  campaignDispatchesUsed: number | null;
+  campaignMaxDispatches: number | null;
+  campaignDispatchesRemaining: number | null;
   /** Null when the bootstrap itself could not bind the profile. */
   bootstrap: HistoricalFillBootstrapSummary | null;
 }
@@ -107,6 +124,13 @@ export function summarizeHistoricalFillBatch(
     userTradesWeightBudget: result.userTradesWeightBudget,
     userTradesWeightRemaining: result.userTradesWeightRemaining,
     outcomes: { ...result.outcomes },
+    // Named one by one, like everything else here. A spread would leak whatever
+    // field the driver's campaign accounting grows next.
+    campaignId: result.campaignId,
+    campaignStatus: result.campaignStatus,
+    campaignDispatchesUsed: result.campaignDispatchesUsed,
+    campaignMaxDispatches: result.campaignMaxDispatches,
+    campaignDispatchesRemaining: result.campaignDispatchesRemaining,
     bootstrap:
       result.bootstrap === null
         ? null

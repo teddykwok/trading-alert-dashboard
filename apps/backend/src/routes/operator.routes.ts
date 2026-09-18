@@ -124,11 +124,32 @@ function serializeHistoricalFillSnapshot(snapshot: HistoricalFillOperationalSnap
     };
   }
 
-  const { windows, pending, ledger } = snapshot;
+  const { windows, pending, ledger, campaign } = snapshot;
   return {
     outcome: snapshot.outcome,
     capturedAt: snapshot.capturedAt.toISOString(),
     executionProfileId: snapshot.executionProfileId,
+    /**
+     * The live campaign, or the most recent one once none is live.
+     *
+     * Field by field, like everything else in this serializer: the campaign row
+     * carries a free-text `note`, and a spread would put an operator's typed
+     * string into an HTTP response the first time somebody widened the select.
+     * Null means this profile has never run a backfill.
+     */
+    campaign:
+      campaign === null
+        ? null
+        : {
+            id: campaign.id,
+            status: campaign.status,
+            maxDispatches: campaign.maxDispatches,
+            dispatchesUsed: campaign.dispatchesUsed,
+            dispatchesRemaining: campaign.dispatchesRemaining,
+            startedAt: campaign.startedAt.toISOString(),
+            lastAdmissionAt: campaign.lastAdmissionAt?.toISOString() ?? null,
+            endedAt: campaign.endedAt?.toISOString() ?? null,
+          },
     windows: {
       total: windows.total,
       roots: windows.roots,

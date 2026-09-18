@@ -10,6 +10,7 @@ import { ExchangeFillIngestWindowService } from "../execution/exchange-fill-inge
 import { ExchangeFillOneWindowExecutor } from "../execution/exchange-fill-one-window-executor.service";
 import { ExchangeFillRootBootstrap } from "../execution/exchange-fill-root-bootstrap.service";
 import { HistoricalFillWeightBudgetService } from "../execution/historical-fill-weight-budget.service";
+import { HistoricalFillCampaignGate } from "../execution/historical-fill-campaign-gate.service";
 import {
   createHistoricalFillScheduler,
   historicalFillIntervalMs,
@@ -110,7 +111,13 @@ export function startHistoricalFillWorkerRuntime(
   const executor = new ExchangeFillOneWindowExecutor({ prisma, reader, ledger, work });
   const bootstrap = new ExchangeFillRootBootstrap({ prisma, work });
   const weightBudget = new HistoricalFillWeightBudgetService(prisma);
-  const driver = new HistoricalFillBatchDriver({ bootstrap, executor, weightBudget });
+  // The campaign gate, on the SAME Prisma singleton -- no second pool, no
+  // scheduler of its own, and no worker-side control mutation: it reads the
+  // campaign before the bootstrap and may only move an ACTIVE campaign to
+  // COMPLETED once the queue is drained. Starting, pausing, resuming and
+  // aborting stay entirely with the operator CLI.
+  const campaigns = new HistoricalFillCampaignGate({ prisma });
+  const driver = new HistoricalFillBatchDriver({ bootstrap, executor, weightBudget, campaigns });
 
   const scheduler = (options.createScheduler ?? createHistoricalFillScheduler)({
     // The runner owns the call; this only supplies what it may build.

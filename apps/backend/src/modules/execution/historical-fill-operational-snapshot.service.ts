@@ -1,5 +1,5 @@
 import { Prisma, type PrismaClient } from "@prisma/client";
-import type { FillIngestWindowStatus } from "@prisma/client";
+import type { FillIngestWindowStatus, HistoricalFillCampaignStatus } from "@prisma/client";
 
 import {
   bindConfiguredExecutionProfileEnvironment,
@@ -83,6 +83,38 @@ export interface HistoricalFillLedgerCounts {
   unattributedFills: number;
 }
 
+/**
+ * The backfill campaign an operator is most likely asking about.
+ *
+ * ## Which campaign this is
+ *
+ * The LIVE one (ACTIVE or PAUSED) when the profile has one -- at most one can
+ * exist, enforced by a partial unique index. Otherwise the most recently
+ * STARTED campaign, whatever became of it. That second half is the point: the
+ * moment a campaign spends its final slot it becomes EXHAUSTED and stops being
+ * live, and an operator opening the panel right then needs to see the campaign
+ * that just ended rather than an empty space where it used to be. The same
+ * holds for COMPLETED and ABORTED.
+ *
+ * Null only when the profile has never had a campaign at all.
+ *
+ * ## What it deliberately omits
+ *
+ * `note` is free operator text. This snapshot is served over HTTP and rendered,
+ * so it carries counts, states and timestamps -- never an arbitrary string
+ * somebody typed at a CLI.
+ */
+export interface HistoricalFillCampaignSnapshot {
+  id: string;
+  status: HistoricalFillCampaignStatus;
+  maxDispatches: number;
+  dispatchesUsed: number;
+  dispatchesRemaining: number;
+  startedAt: Date;
+  lastAdmissionAt: Date | null;
+  endedAt: Date | null;
+}
+
 export type HistoricalFillOperationalSnapshot =
   | {
       outcome: "PROFILE_UNAVAILABLE";
@@ -97,7 +129,44 @@ export type HistoricalFillOperationalSnapshot =
       windows: HistoricalFillWindowCounts;
       pending: HistoricalFillPendingCounts;
       ledger: HistoricalFillLedgerCounts;
+      /** Null only when this profile has never had a campaign. */
+      campaign: HistoricalFillCampaignSnapshot | null;
     };
+
+const CAMPAIGN_SNAPSHOT_FIELDS = {
+  id: true,
+  status: true,
+  maxDispatches: true,
+  dispatchesUsed: true,
+  startedAt: true,
+  lastAdmissionAt: true,
+  endedAt: true,
+} as const;
+
+/** Never a spread: `note` must not reach an HTTP response by accident. */
+function describeCampaignSnapshot(
+  campaign: {
+    id: string;
+    status: HistoricalFillCampaignStatus;
+    maxDispatches: number;
+    dispatchesUsed: number;
+    startedAt: Date;
+    lastAdmissionAt: Date | null;
+    endedAt: Date | null;
+  } | null
+): HistoricalFillCampaignSnapshot | null {
+  if (campaign === null) return null;
+  return {
+    id: campaign.id,
+    status: campaign.status,
+    maxDispatches: campaign.maxDispatches,
+    dispatchesUsed: campaign.dispatchesUsed,
+    dispatchesRemaining: Math.max(0, campaign.maxDispatches - campaign.dispatchesUsed),
+    startedAt: campaign.startedAt,
+    lastAdmissionAt: campaign.lastAdmissionAt,
+    endedAt: campaign.endedAt,
+  };
+}
 
 /** A counting bug in this file, surfaced rather than reported as fact. */
 export class HistoricalFillSnapshotInvariantError extends Error {
@@ -195,6 +264,8 @@ export class HistoricalFillOperationalSnapshotService {
       nextBackoff,
       totalFills,
       unattributedFills,
+      liveCampaign,
+      latestCampaign,
     ] = await this.deps.prisma.$transaction(
       async (tx) =>
         Promise.all([
@@ -236,6 +307,19 @@ export class HistoricalFillOperationalSnapshotService {
           tx.exchangeFillLedger.count({
             where: { executionProfileId, attribution: "UNATTRIBUTED" },
           }),
+          // Inside the SAME snapshot as the counts, so the campaign an operator
+          // reads cannot belong to a different instant than the queue beside it.
+          // Live first; the ordering makes ACTIVE and PAUSED sort ahead of every
+          // terminal state, and the newest start wins among equals.
+          tx.historicalFillCampaign.findFirst({
+            where: { executionProfileId, status: { in: ["ACTIVE", "PAUSED"] } },
+            select: CAMPAIGN_SNAPSHOT_FIELDS,
+          }),
+          tx.historicalFillCampaign.findFirst({
+            where: { executionProfileId },
+            orderBy: { startedAt: "desc" },
+            select: CAMPAIGN_SNAPSHOT_FIELDS,
+          }),
         ]),
       { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead }
     );
@@ -254,6 +338,7 @@ export class HistoricalFillOperationalSnapshotService {
       outcome: "READY",
       capturedAt,
       executionProfileId,
+      campaign: describeCampaignSnapshot(liveCampaign ?? latestCampaign),
       windows: { total, roots, children, distinctSymbolCount: symbolGroups.length, byStatus },
       pending: {
         total: byStatus.PENDING,

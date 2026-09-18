@@ -2,6 +2,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { PrismaClient } from "@prisma/client";
 
 import { connectTestDatabase } from "./helpers/test-database";
+import { HistoricalFillCampaignService } from "../src/modules/execution/historical-fill-campaign.service";
+import { interpretHistoricalFillOperationalSnapshot } from "../src/modules/execution/historical-fill-operational-interpretation";
 
 /**
  * The historical-fill operational snapshot, against a REAL Postgres.
@@ -127,6 +129,14 @@ afterAll(async () => {
     await prisma.exchangeFillIngestWindow.deleteMany({
       where: { executionProfileId: { in: profiles } },
     });
+    // Campaigns are referenced by reservations with onDelete: Restrict, and
+    // reference profiles the same way, so they go before the profiles below.
+    await prisma.historicalFillWeightReservation.deleteMany({
+      where: { campaign: { executionProfileId: { in: profiles } } },
+    });
+    await prisma.historicalFillCampaign.deleteMany({
+      where: { executionProfileId: { in: profiles } },
+    });
     await prisma.executionSafetyPolicy.deleteMany({
       where: { executionProfileId: { in: profiles } },
     });
@@ -208,6 +218,9 @@ describe("the profile gates everything", () => {
       outcome: "READY",
       capturedAt: NOW,
       executionProfileId: id,
+      // A profile with no backfill history reports campaign: null — a real
+      // answer meaning "nothing authorises spending here", not missing data.
+      campaign: null,
       windows: {
         total: 0,
         roots: 0,
@@ -507,4 +520,116 @@ describe("the snapshot only looks", () => {
       await prisma!.exchangeFillLedger.findMany({ where: { executionProfileId: id } })
     ).toEqual(fillsBefore);
   });
+});
+
+describe("the campaign an operator is most likely asking about", () => {
+  const campaignsFor = () => new HistoricalFillCampaignService(prisma!);
+
+  async function forceStatus(campaignId: string, status: string): Promise<void> {
+    await prisma!.$executeRawUnsafe(
+      `UPDATE "HistoricalFillCampaign" SET "status" = $1::"HistoricalFillCampaignStatus" WHERE "id" = $2`,
+      status,
+      campaignId
+    );
+  }
+
+  maybe()("is null for a profile that has never run a backfill", async () => {
+    const id = await profile("campaign-none");
+    const snapshot = await snapshotFor(id).capture({ now: NOW });
+    if (snapshot.outcome !== "READY") throw new Error("unreachable");
+    expect(snapshot.campaign).toBeNull();
+  });
+
+  maybe().each(["ACTIVE", "PAUSED"])("shows a %s campaign, which is live", async (status) => {
+    const id = await profile(`campaign-${status}`);
+    const campaign = await campaignsFor().createCampaign({
+      executionProfileId: id,
+      maxDispatches: 9,
+      note: "SECRET-OPERATOR-NOTE",
+    });
+    if (status === "PAUSED") await campaignsFor().pauseCampaign(campaign.id);
+
+    const snapshot = await snapshotFor(id).capture({ now: NOW });
+    if (snapshot.outcome !== "READY") throw new Error("unreachable");
+
+    expect(snapshot.campaign).toEqual({
+      id: campaign.id,
+      status,
+      maxDispatches: 9,
+      dispatchesUsed: 0,
+      dispatchesRemaining: 9,
+      startedAt: expect.any(Date),
+      lastAdmissionAt: null,
+      endedAt: null,
+    });
+    // The operator's own free text must never ride along.
+    expect(JSON.stringify(snapshot.campaign)).not.toContain("SECRET-OPERATOR-NOTE");
+  });
+
+  maybe().each(["EXHAUSTED", "COMPLETED", "ABORTED"])(
+    "still shows a %s campaign once it is no longer live",
+    async (status) => {
+      // The point of falling back to the latest campaign: the moment a backfill
+      // ends, the operator opening the panel needs to see what just happened
+      // rather than an empty space where it used to be.
+      const id = await profile(`campaign-terminal-${status}`);
+      const campaign = await campaignsFor().createCampaign({
+        executionProfileId: id,
+        maxDispatches: 4,
+      });
+      await forceStatus(campaign.id, status);
+
+      const snapshot = await snapshotFor(id).capture({ now: NOW });
+      if (snapshot.outcome !== "READY") throw new Error("unreachable");
+      expect(snapshot.campaign?.id).toBe(campaign.id);
+      expect(snapshot.campaign?.status).toBe(status);
+    }
+  );
+
+  maybe()("prefers the LIVE campaign over an older terminal one", async () => {
+    const id = await profile("campaign-live-wins");
+    const older = await campaignsFor().createCampaign({ executionProfileId: id, maxDispatches: 2 });
+    await forceStatus(older.id, "EXHAUSTED");
+    const live = await campaignsFor().createCampaign({ executionProfileId: id, maxDispatches: 6 });
+
+    const snapshot = await snapshotFor(id).capture({ now: NOW });
+    if (snapshot.outcome !== "READY") throw new Error("unreachable");
+    expect(snapshot.campaign?.id).toBe(live.id);
+    expect(snapshot.campaign?.status).toBe("ACTIVE");
+  });
+
+  maybe()("reports remaining budget, not just what was used", async () => {
+    const id = await profile("campaign-remaining");
+    const campaign = await campaignsFor().createCampaign({
+      executionProfileId: id,
+      maxDispatches: 10,
+    });
+    await prisma!.historicalFillCampaign.update({
+      where: { id: campaign.id },
+      data: { dispatchesUsed: 4 },
+    });
+
+    const snapshot = await snapshotFor(id).capture({ now: NOW });
+    if (snapshot.outcome !== "READY") throw new Error("unreachable");
+    expect(snapshot.campaign?.dispatchesUsed).toBe(4);
+    expect(snapshot.campaign?.dispatchesRemaining).toBe(6);
+  });
+
+  maybe().each(["ACTIVE", "PAUSED", "EXHAUSTED", "COMPLETED", "ABORTED"])(
+    "a %s campaign alone never makes the snapshot NEEDS_ATTENTION",
+    async (status) => {
+      // Campaign status is operational CONTEXT. A bounded campaign that spent
+      // its budget is a normal stop, and the authoritative triggers remain the
+      // terminal window issues.
+      const id = await profile(`campaign-quiet-${status}`);
+      const campaign = await campaignsFor().createCampaign({
+        executionProfileId: id,
+        maxDispatches: 3,
+      });
+      await forceStatus(campaign.id, status);
+
+      const snapshot = await snapshotFor(id).capture({ now: NOW });
+      expect(interpretHistoricalFillOperationalSnapshot(snapshot).state).toBe("NORMAL");
+    }
+  );
 });

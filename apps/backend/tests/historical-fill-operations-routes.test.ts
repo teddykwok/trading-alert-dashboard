@@ -35,10 +35,23 @@ const { prisma: testDatabase, available } = await connectTestDatabase();
 
 const CAPTURED_AT = new Date("2026-08-12T09:15:00.000Z");
 
+const CAMPAIGN_STARTED_AT = new Date("2026-08-12T08:00:00.000Z");
+const CAMPAIGN_ADMITTED_AT = new Date("2026-08-12T09:10:00.000Z");
+
 const READY_SNAPSHOT = {
   outcome: "READY" as const,
   capturedAt: CAPTURED_AT,
   executionProfileId: "profile-123",
+  campaign: {
+    id: "campaign-123",
+    status: "ACTIVE" as const,
+    maxDispatches: 10,
+    dispatchesUsed: 4,
+    dispatchesRemaining: 6,
+    startedAt: CAMPAIGN_STARTED_AT,
+    lastAdmissionAt: CAMPAIGN_ADMITTED_AT,
+    endedAt: null,
+  },
   windows: {
     total: 9,
     roots: 7,
@@ -247,6 +260,16 @@ describe("the wire contract", () => {
       outcome: "READY",
       capturedAt: "2026-08-12T09:15:00.000Z",
       executionProfileId: "profile-123",
+      campaign: {
+        id: "campaign-123",
+        status: "ACTIVE",
+        maxDispatches: 10,
+        dispatchesUsed: 4,
+        dispatchesRemaining: 6,
+        startedAt: "2026-08-12T08:00:00.000Z",
+        lastAdmissionAt: "2026-08-12T09:10:00.000Z",
+        endedAt: null,
+      },
       windows: {
         total: 9,
         roots: 7,
@@ -348,6 +371,9 @@ describe("the wire contract", () => {
       secret: "super-secret",
       debugInternal: { connectionString: "postgres://user:pw@host/db" },
       windows: { ...READY_SNAPSHOT.windows, internalNote: "leak" },
+      // The campaign row carries free operator text. It must never be
+      // forwarded, whatever the snapshot layer starts selecting.
+      campaign: { ...READY_SNAPSHOT.campaign, note: "operator typed this", secretKey: "nope" },
       pending: { ...READY_SNAPSHOT.pending, claimOwners: ["worker-a"] },
       ledger: { ...READY_SNAPSHOT.ledger, realizedPnl: "123.45", quantity: "68.8" },
     }));
@@ -366,10 +392,25 @@ describe("the wire contract", () => {
       "claimOwners",
       "realizedPnl",
       "quantity",
+      // The campaign's free operator text, and anything beside it.
+      "operator typed this",
+      "secretKey",
     ]) {
       expect(raw).not.toContain(forbidden);
     }
+    // The campaign block itself is constructed field by field too.
+    expect(Object.keys(response.json().campaign).sort()).toEqual([
+      "dispatchesRemaining",
+      "dispatchesUsed",
+      "endedAt",
+      "id",
+      "lastAdmissionAt",
+      "maxDispatches",
+      "startedAt",
+      "status",
+    ]);
     expect(Object.keys(response.json()).sort()).toEqual([
+      "campaign",
       "capturedAt",
       "executionProfileId",
       "interpretation",
