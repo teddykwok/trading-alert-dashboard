@@ -38,10 +38,15 @@ const CAPTURED_AT = new Date("2026-08-12T09:15:00.000Z");
 const CAMPAIGN_STARTED_AT = new Date("2026-08-12T08:00:00.000Z");
 const CAMPAIGN_ADMITTED_AT = new Date("2026-08-12T09:10:00.000Z");
 
+const CIRCUIT_OPENED_AT = new Date("2026-08-12T09:12:00.000Z");
+
 const READY_SNAPSHOT = {
   outcome: "READY" as const,
   capturedAt: CAPTURED_AT,
   executionProfileId: "profile-123",
+  // Null by default: most of these cases are about the queue, and a profile
+  // with no persisted breaker row is the ordinary shape.
+  circuitBreaker: null,
   campaign: {
     id: "campaign-123",
     status: "ACTIVE" as const,
@@ -296,6 +301,10 @@ describe("the wire contract", () => {
         nextBackoffEligibleAt: null, // J. a null instant stays null
       },
       ledger: { totalFills: 12, unattributedFills: 4 },
+      // Null, and deliberately not an object: this fixture's profile has no
+      // persisted breaker row, and the wire must say so rather than invent a
+      // CLOSED block for a circuit that was never recorded.
+      circuitBreaker: null,
       // Additive only: every factual field above is untouched. This
       // long-standing fixture carries ABANDONED 1 and INCOMPLETE_SKIPPED_ROWS
       // 1, so the honest answer for it is NEEDS_ATTENTION.
@@ -412,6 +421,7 @@ describe("the wire contract", () => {
     expect(Object.keys(response.json()).sort()).toEqual([
       "campaign",
       "capturedAt",
+      "circuitBreaker",
       "executionProfileId",
       "interpretation",
       "ledger",
@@ -688,6 +698,161 @@ describe("the interpretation field", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]).toEqual([]);
     expect(response.json().interpretation.state).toBe("NEEDS_ATTENTION");
+    await app.close();
+  });
+});
+
+/**
+ * The circuit breaker on the wire.
+ *
+ * Profile-level, so it must survive every campaign shape -- including none at
+ * all, which is the state a systemic fault tends to leave behind. And it must
+ * carry the safe fields only: the row also stores an epoch counter used to
+ * fence a late refund, and that is internal accounting no browser should see.
+ */
+describe("the circuit breaker on the wire", () => {
+  const OPENED_AT = new Date("2026-08-12T09:12:00.000Z");
+  const FIRST_FAILURE_AT = new Date("2026-08-12T09:11:00.000Z");
+
+  const openCircuit = {
+    state: "OPEN" as const,
+    failureFamily: "HARD_CONFIGURATION",
+    lastReasonCode: "AUTH",
+    consecutiveCount: 1,
+    firstFailureAt: FIRST_FAILURE_AT,
+    lastFailureAt: FIRST_FAILURE_AT,
+    openedAt: OPENED_AT,
+  };
+
+  it("A. null when no row has ever been persisted", async () => {
+    const { app } = await buildAppWith(() => READY_SNAPSHOT);
+
+    const response = await authorized(app);
+
+    expect(response.statusCode).toBe(200);
+    // Null, not a synthesized CLOSED block: the two mean different things.
+    expect(response.json().circuitBreaker).toBeNull();
+    expect(response.json().interpretation.state).toBe("NEEDS_ATTENTION");
+    expect(
+      response.json().interpretation.issues.map((issue: { code: string }) => issue.code)
+    ).not.toContain("HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN");
+    await app.close();
+  });
+
+  it("B. a persisted CLOSED streak serializes with openedAt null and is no issue", async () => {
+    const { app } = await buildAppWith(() => ({
+      ...READY_SNAPSHOT,
+      // Clean queue, so the only thing under test is the breaker block.
+      windows: {
+        ...READY_SNAPSHOT.windows,
+        byStatus: {
+          PENDING: 0,
+          COMPLETE: 0,
+          SPLIT: 0,
+          INCOMPLETE_SKIPPED_ROWS: 0,
+          SATURATED_SINGLE_MILLISECOND: 0,
+          ABANDONED: 0,
+        },
+      },
+      pending: { ...READY_SNAPSHOT.pending, staleLease: 0, attemptExhausted: 0 },
+      circuitBreaker: {
+        state: "CLOSED" as const,
+        failureFamily: "TRANSIENT_TRANSPORT",
+        lastReasonCode: "SERVER",
+        consecutiveCount: 2,
+        firstFailureAt: FIRST_FAILURE_AT,
+        lastFailureAt: FIRST_FAILURE_AT,
+        openedAt: null,
+      },
+    }));
+
+    const response = await authorized(app);
+    const body = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(body.circuitBreaker).toEqual({
+      state: "CLOSED",
+      failureFamily: "TRANSIENT_TRANSPORT",
+      lastReasonCode: "SERVER",
+      consecutiveCount: 2,
+      firstFailureAt: "2026-08-12T09:11:00.000Z",
+      lastFailureAt: "2026-08-12T09:11:00.000Z",
+      openedAt: null,
+    });
+    // A streak below its threshold is the system noticing, not the system
+    // stopped, so it must not demand a human.
+    expect(body.interpretation.state).toBe("NORMAL");
+    await app.close();
+  });
+
+  it("C. OPEN serializes with ISO dates and is the first reported issue", async () => {
+    const { app } = await buildAppWith(() => ({
+      ...READY_SNAPSHOT,
+      circuitBreaker: openCircuit,
+    }));
+
+    const response = await authorized(app);
+    const body = response.json();
+
+    expect(body.circuitBreaker.state).toBe("OPEN");
+    expect(body.circuitBreaker.openedAt).toBe("2026-08-12T09:12:00.000Z");
+    expect(body.interpretation.state).toBe("NEEDS_ATTENTION");
+    // First, because it is the only condition that stops the whole account.
+    expect(body.interpretation.issues[0]).toEqual({
+      code: "HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN",
+      count: 1,
+    });
+    // Additive: the fixture's window conditions are still reported beside it.
+    expect(body.interpretation.issues).toHaveLength(3);
+    await app.close();
+  });
+
+  it("D+E. stays visible with no campaign and with a terminal one", async () => {
+    for (const campaign of [
+      null,
+      { ...READY_SNAPSHOT.campaign, status: "EXHAUSTED" as const },
+    ]) {
+      const { app } = await buildAppWith(() => ({
+        ...READY_SNAPSHOT,
+        campaign,
+        circuitBreaker: openCircuit,
+      }));
+
+      const response = await authorized(app);
+      expect(response.json().circuitBreaker.state).toBe("OPEN");
+      expect(response.json().interpretation.state).toBe("NEEDS_ATTENTION");
+      await app.close();
+    }
+  });
+
+  it("F. carries the exact safe key set and never the epoch counter", async () => {
+    const { app } = await buildAppWith(() => ({
+      ...READY_SNAPSHOT,
+      // Whatever the snapshot layer starts selecting, the serializer names its
+      // own fields and these must not appear.
+      circuitBreaker: {
+        ...openCircuit,
+        generation: 7,
+        updatedAt: new Date(),
+        executionProfileId: "profile-123",
+      },
+    }));
+
+    const response = await authorized(app);
+    const raw = response.body;
+
+    expect(Object.keys(response.json().circuitBreaker).sort()).toEqual([
+      "consecutiveCount",
+      "failureFamily",
+      "firstFailureAt",
+      "lastFailureAt",
+      "lastReasonCode",
+      "openedAt",
+      "state",
+    ]);
+    for (const forbidden of ["generation", "updatedAt"]) {
+      expect(raw).not.toContain(forbidden);
+    }
     await app.close();
   });
 });

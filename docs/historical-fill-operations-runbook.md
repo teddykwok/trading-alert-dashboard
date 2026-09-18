@@ -42,7 +42,56 @@ A `NEEDS_ATTENTION` state is a reason to **look**, not a reason to act.
 
 ## Issue codes
 
-These five conditions, and only these five, set `NEEDS_ATTENTION`.
+These six conditions, and only these six, set `NEEDS_ATTENTION`.
+
+### `HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN`
+
+Repeated failures of a single kind tripped this account's systemic circuit.
+Historical ingestion is stopped **entirely**: no further request will be
+admitted for this profile, on this tick or any later one, until a person clears
+the latch.
+
+This is the only condition here that describes the ACCOUNT rather than an
+individual window, and the only one that requires a deliberate human action
+before anything resumes. It is reported first for that reason.
+
+**Check:** Read `failureFamily`, `lastReasonCode` and `openedAt` from the
+`circuitBreaker` block to identify the external cause — credentials, a
+permission, an IP restriction, a connector that was switched off — and confirm
+it is actually resolved before clearing anything.
+
+**Recovery sequence**
+
+This is the one place in this document with a remediation step, because the
+circuit is a latch that a person is expected to clear:
+
+1. **Inspect.** Run `pnpm execution:fill-campaign-status`. It reports the
+   campaign and, separately, the circuit — including when no campaign is live,
+   which is exactly the case a systemic fault tends to leave behind.
+2. **Fix the external cause.** Nothing in this system repairs a revoked key or
+   a banned address. Acknowledging a circuit whose cause is still present will
+   simply trip it again on the next dispatch.
+3. **Acknowledge.** Run `pnpm execution:fill-circuit-acknowledge`. It acts on
+   the configured, environment-bound profile; there is no profile flag, no
+   `--force` and no argument of any kind.
+4. **Verify.** Run `pnpm execution:fill-campaign-status` again and confirm the
+   circuit reads `CLOSED` with its failure metadata cleared.
+5. **Resume separately, if appropriate.** Acknowledgement clears the latch and
+   **nothing else**. A campaign the circuit paused is still `PAUSED`; a campaign
+   that spent its budget is still `EXHAUSTED`. Resuming or starting work is a
+   second, explicit decision — run `pnpm execution:fill-campaign-resume` or
+   `pnpm execution:fill-campaign-start` only if you intend the backfill to
+   continue.
+
+Acknowledgement never starts or resumes work. That separation is deliberate: it
+means clearing a latch can never, by itself, put an account back to work against
+a fault somebody has not finished investigating.
+
+If acknowledgement is **refused** because an `ACTIVE` campaign exists while the
+circuit is open, do not retry and do not repair it by hand from the dashboard.
+That combination should be unreachable — opening the circuit pauses the active
+campaign in the same transaction — so reaching it means something is wrong in a
+way this runbook does not cover. Escalate.
 
 ### `STALE_LEASES_PRESENT`
 

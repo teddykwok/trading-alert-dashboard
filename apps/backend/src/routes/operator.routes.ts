@@ -124,7 +124,7 @@ function serializeHistoricalFillSnapshot(snapshot: HistoricalFillOperationalSnap
     };
   }
 
-  const { windows, pending, ledger, campaign } = snapshot;
+  const { windows, pending, ledger, campaign, circuitBreaker } = snapshot;
   return {
     outcome: snapshot.outcome,
     capturedAt: snapshot.capturedAt.toISOString(),
@@ -149,6 +149,30 @@ function serializeHistoricalFillSnapshot(snapshot: HistoricalFillOperationalSnap
             startedAt: campaign.startedAt.toISOString(),
             lastAdmissionAt: campaign.lastAdmissionAt?.toISOString() ?? null,
             endedAt: campaign.endedAt?.toISOString() ?? null,
+          },
+    /**
+     * The account's systemic latch, or null when no row has ever been persisted.
+     *
+     * Field by field, and the omissions are the point. The breaker row also
+     * carries `generation` -- the epoch that fences a late refund from reopening
+     * a campaign -- and that is internal accounting an operator cannot act on;
+     * a spread would put it on the wire the moment somebody widened the select.
+     * `updatedAt` and the profile id are left out for the same reason.
+     *
+     * Null is a real answer: this profile has no recorded circuit state at all,
+     * which is different from having one that happens to be closed.
+     */
+    circuitBreaker:
+      circuitBreaker === null
+        ? null
+        : {
+            state: circuitBreaker.state,
+            failureFamily: circuitBreaker.failureFamily,
+            lastReasonCode: circuitBreaker.lastReasonCode,
+            consecutiveCount: circuitBreaker.consecutiveCount,
+            firstFailureAt: isoOrNull(circuitBreaker.firstFailureAt),
+            lastFailureAt: isoOrNull(circuitBreaker.lastFailureAt),
+            openedAt: isoOrNull(circuitBreaker.openedAt),
           },
     windows: {
       total: windows.total,

@@ -553,9 +553,20 @@ describe("many workers failing at once still trip the latch exactly once", () =>
     const gate = new Promise<void>((resolve) => {
       released = resolve;
     });
+    // A HANDSHAKE, not a sleep. `executeOne` is only ever reached AFTER the
+    // admission has committed, so its entry is proof the reservation exists --
+    // which is exactly the precondition this race needs. Timing this with a
+    // delay instead made the test lose under load: the trip could land before
+    // the admission, turning it into the stale-gate case a different test
+    // already covers.
+    let entered: (() => void) | null = null;
+    const dispatching = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
 
     const client = independentClient();
     const executeOne = vi.fn(async () => {
+      entered!();
       // Hold the "request" open while another worker trips the breaker.
       await gate;
       return { outcome: "COMPLETE" as FillIngestExecutionOutcome };
@@ -584,8 +595,8 @@ describe("many workers failing at once still trip the latch exactly once", () =>
     });
 
     const inFlight = runBatch(driver, { maxWindows: 3 });
-    // Let the admission commit and the executor start before tripping.
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    // The admission has committed by the time the executor is entered.
+    await dispatching;
     const opened = await breaker.observeDispatchOutcome({
       executionProfileId,
       campaignId,

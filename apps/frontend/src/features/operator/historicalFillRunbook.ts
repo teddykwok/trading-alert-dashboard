@@ -40,6 +40,12 @@ export const HISTORICAL_FILL_ISSUE_RUNBOOK: Record<
   HistoricalFillOperationalIssueCode,
   IssueRunbookEntry
 > = {
+  HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN: {
+    meaning:
+      "Repeated failures of a single kind tripped this account's systemic circuit, so historical ingestion is stopped entirely and no further request will be admitted until a person clears it.",
+    operatorCheck:
+      "Review the reported failure family, last reason code and opening time to identify the external cause, and confirm it is resolved. Clearing the latch is a separate, deliberate command run outside this panel; it clears the latch only and starts or resumes nothing.",
+  },
   STALE_LEASES_PRESENT: {
     meaning:
       "A pending ingestion window holds a claim whose lease is older than the configured lease boundary.",

@@ -441,6 +441,8 @@ export interface HistoricalFillPendingCountsDto {
 export type HistoricalFillOperationalState = "NORMAL" | "NEEDS_ATTENTION" | "UNAVAILABLE";
 
 export type HistoricalFillOperationalIssueCode =
+  /** The account's systemic latch is OPEN; nothing runs until a person clears it. */
+  | "HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN"
   | "STALE_LEASES_PRESENT"
   | "ATTEMPT_EXHAUSTED_PRESENT"
   | "ABANDONED_WINDOWS_PRESENT"
@@ -450,6 +452,24 @@ export type HistoricalFillOperationalIssueCode =
 export interface HistoricalFillOperationalIssueDto {
   code: HistoricalFillOperationalIssueCode;
   count: number;
+}
+
+/**
+ * The systemic circuit breaker exactly as the server sends it.
+ *
+ * Every field is a classification, a count or a timestamp. There is no epoch
+ * counter and no account identifier: the server keeps its internal fencing
+ * state internal, and this type exists partly to record that it must stay so.
+ */
+export interface HistoricalFillCircuitBreakerDto {
+  state: "CLOSED" | "OPEN";
+  failureFamily: string | null;
+  lastReasonCode: string | null;
+  consecutiveCount: number;
+  firstFailureAt: string | null;
+  lastFailureAt: string | null;
+  /** Non-null exactly when OPEN. */
+  openedAt: string | null;
 }
 
 export interface HistoricalFillInterpretationDto {
@@ -471,6 +491,16 @@ export type HistoricalFillOperationsDto =
       windows: HistoricalFillWindowCountsDto;
       pending: HistoricalFillPendingCountsDto;
       ledger: { totalFills: number; unattributedFills: number };
+      /**
+       * The account's systemic latch, or null when the server has never
+       * persisted one for this profile.
+       *
+       * Null is a real answer, not missing data: it means no circuit state has
+       * ever been recorded, which is different from a circuit that happens to be
+       * closed. The server deliberately does not send its internal epoch
+       * counter, so there is nothing here to render as a magnitude.
+       */
+      circuitBreaker: HistoricalFillCircuitBreakerDto | null;
       interpretation: HistoricalFillInterpretationDto;
     };
 

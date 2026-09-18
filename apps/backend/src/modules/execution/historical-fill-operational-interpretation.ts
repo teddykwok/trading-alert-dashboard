@@ -10,11 +10,15 @@ import type { HistoricalFillOperationalSnapshot } from "./historical-fill-operat
  *
  * ## Deliberately small
  *
- * Five triggers, each a plain `> 0`. No weighting, no score, no ranking and no
+ * Six triggers, each a plain `> 0`. No weighting, no score, no ranking and no
  * severity ladder -- the state is either NORMAL, NEEDS_ATTENTION or UNAVAILABLE
  * and nothing in between. A richer taxonomy would be easy to write and
  * impossible to defend, because nothing has yet established what "worse" means
  * for a fill queue.
+ *
+ * The one ordering judgement made here is that the systemic circuit is reported
+ * before the window conditions, because it is the only one that stops the whole
+ * account and the only one a person must clear by hand.
  *
  * ## No clock, no SLA
  *
@@ -47,6 +51,19 @@ export type HistoricalFillOperationalState = (typeof HISTORICAL_FILL_OPERATIONAL
  * arrays and an operator comparing two readings compares like with like.
  */
 export const HISTORICAL_FILL_ISSUE_CODES = [
+  /**
+   * The account's systemic latch is OPEN: repeated failures of one kind stopped
+   * historical ingestion entirely, and nothing will run again until a person
+   * acknowledges it.
+   *
+   * FIRST in the list, and that position is the judgement. Every other code
+   * below describes windows -- individual pieces of work that did not finish.
+   * This one describes the ACCOUNT, and it is the only condition here that a
+   * human must clear by hand before anything resumes. An operator reading the
+   * issues in order should meet "everything is stopped" before "three windows
+   * were abandoned", because the second is often a symptom of the first.
+   */
+  "HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN",
   "STALE_LEASES_PRESENT",
   "ATTEMPT_EXHAUSTED_PRESENT",
   "ABANDONED_WINDOWS_PRESENT",
@@ -83,6 +100,19 @@ const TRIGGERS: ReadonlyArray<{
   code: HistoricalFillIssueCode;
   countOf: (snapshot: ReadySnapshot) => number;
 }> = [
+  {
+    // A latch, not a count: it is open or it is not, so the only honest number
+    // is one. `consecutiveCount` is deliberately NOT used here -- it would make
+    // the issue look like a magnitude, and three failures do not stop an
+    // account any harder than one does.
+    //
+    // Null means no breaker row has ever been persisted, and a persisted CLOSED
+    // row -- including one carrying a live streak below its threshold -- is not
+    // a condition either. A streak is the system noticing, not the system
+    // stopped.
+    code: "HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN",
+    countOf: (s) => (s.circuitBreaker?.state === "OPEN" ? 1 : 0),
+  },
   { code: "STALE_LEASES_PRESENT", countOf: (s) => s.pending.staleLease },
   { code: "ATTEMPT_EXHAUSTED_PRESENT", countOf: (s) => s.pending.attemptExhausted },
   { code: "ABANDONED_WINDOWS_PRESENT", countOf: (s) => s.windows.byStatus.ABANDONED },

@@ -1,5 +1,9 @@
 import { Prisma, type PrismaClient } from "@prisma/client";
-import type { FillIngestWindowStatus, HistoricalFillCampaignStatus } from "@prisma/client";
+import type {
+  FillIngestWindowStatus,
+  HistoricalFillCampaignStatus,
+  HistoricalFillCircuitState,
+} from "@prisma/client";
 
 import {
   bindConfiguredExecutionProfileEnvironment,
@@ -115,6 +119,33 @@ export interface HistoricalFillCampaignSnapshot {
   endedAt: Date | null;
 }
 
+/**
+ * The account's systemic latch, as an operator may see it.
+ *
+ * ## Why `generation` is not here
+ *
+ * The breaker row carries one more column: a monotonic epoch counter that dates
+ * a weight reservation against the episode it was granted in, so a refund
+ * arriving after an acknowledgement cannot reopen a campaign. That number is
+ * INTERNAL FENCING STATE. It answers a question no operator asks, it cannot be
+ * acted on, and a counter on a dashboard invites exactly the misreading the
+ * design works to avoid -- that a higher number means something worse. The
+ * fields below are the cause and the count; the epoch stays in the database.
+ *
+ * `updatedAt`, `executionProfileId` and every raw exchange message are absent
+ * for the same reason the campaign's `note` is: this is served over HTTP.
+ */
+export interface HistoricalFillCircuitBreakerSnapshot {
+  state: HistoricalFillCircuitState;
+  failureFamily: string | null;
+  lastReasonCode: string | null;
+  consecutiveCount: number;
+  firstFailureAt: Date | null;
+  lastFailureAt: Date | null;
+  /** Non-null exactly when OPEN, by database CHECK constraint. */
+  openedAt: Date | null;
+}
+
 export type HistoricalFillOperationalSnapshot =
   | {
       outcome: "PROFILE_UNAVAILABLE";
@@ -131,6 +162,21 @@ export type HistoricalFillOperationalSnapshot =
       ledger: HistoricalFillLedgerCounts;
       /** Null only when this profile has never had a campaign. */
       campaign: HistoricalFillCampaignSnapshot | null;
+      /**
+       * The systemic latch, or null when NO ROW HAS EVER BEEN PERSISTED.
+       *
+       * Load-bearing, and deliberately NOT the service's synthetic reading. The
+       * breaker service answers an absent row as a logical CLOSED-and-clean
+       * state, which is exactly right for deciding whether to admit a dispatch
+       * -- but reporting that here would tell an operator this account HAS a
+       * circuit that is currently closed, when in truth nothing has ever
+       * recorded one. Null says "no persisted circuit state", which is a
+       * different and more honest fact.
+       *
+       * Nothing here creates a row. A profile that has never failed still ends
+       * this snapshot with no breaker row, as it should.
+       */
+      circuitBreaker: HistoricalFillCircuitBreakerSnapshot | null;
     };
 
 const CAMPAIGN_SNAPSHOT_FIELDS = {
@@ -165,6 +211,49 @@ function describeCampaignSnapshot(
     startedAt: campaign.startedAt,
     lastAdmissionAt: campaign.lastAdmissionAt,
     endedAt: campaign.endedAt,
+  };
+}
+
+/**
+ * Exactly the breaker columns this snapshot may read.
+ *
+ * `generation` is absent from the SELECT itself, not merely from the mapping
+ * below. A field that is never fetched cannot be leaked by a later spread, and
+ * the same reasoning keeps `updatedAt` and `executionProfileId` out.
+ */
+const CIRCUIT_SNAPSHOT_FIELDS = {
+  state: true,
+  failureFamily: true,
+  lastReasonCode: true,
+  consecutiveCount: true,
+  firstFailureAt: true,
+  lastFailureAt: true,
+  openedAt: true,
+} as const;
+
+/** Never a spread, for the same reason the campaign mapping is not one. */
+function describeCircuitBreakerSnapshot(
+  breaker: {
+    state: HistoricalFillCircuitState;
+    failureFamily: string | null;
+    lastReasonCode: string | null;
+    consecutiveCount: number;
+    firstFailureAt: Date | null;
+    lastFailureAt: Date | null;
+    openedAt: Date | null;
+  } | null
+): HistoricalFillCircuitBreakerSnapshot | null {
+  // NULL IS THE ANSWER when no row exists. Synthesizing a CLOSED block here
+  // would report a circuit this account has never actually had.
+  if (breaker === null) return null;
+  return {
+    state: breaker.state,
+    failureFamily: breaker.failureFamily,
+    lastReasonCode: breaker.lastReasonCode,
+    consecutiveCount: breaker.consecutiveCount,
+    firstFailureAt: breaker.firstFailureAt,
+    lastFailureAt: breaker.lastFailureAt,
+    openedAt: breaker.openedAt,
   };
 }
 
@@ -266,6 +355,7 @@ export class HistoricalFillOperationalSnapshotService {
       unattributedFills,
       liveCampaign,
       latestCampaign,
+      circuitBreaker,
     ] = await this.deps.prisma.$transaction(
       async (tx) =>
         Promise.all([
@@ -320,6 +410,16 @@ export class HistoricalFillOperationalSnapshotService {
             orderBy: { startedAt: "desc" },
             select: CAMPAIGN_SNAPSHOT_FIELDS,
           }),
+          // INSIDE THE SAME REPEATABLE READ as everything above it. The latch
+          // and the campaign it paused are two halves of one fact, and reading
+          // them at different instants could show an operator an OPEN circuit
+          // beside a campaign that was still ACTIVE when its row was fetched --
+          // a state that never existed. `findUnique` on the primary key, so an
+          // absent row is a null rather than a fabricated default.
+          tx.historicalFillCircuitBreaker.findUnique({
+            where: { executionProfileId },
+            select: CIRCUIT_SNAPSHOT_FIELDS,
+          }),
         ]),
       { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead }
     );
@@ -339,6 +439,10 @@ export class HistoricalFillOperationalSnapshotService {
       capturedAt,
       executionProfileId,
       campaign: describeCampaignSnapshot(liveCampaign ?? latestCampaign),
+      // Profile-level, so it is reported whether or not a campaign exists: an
+      // account stopped by a systemic fault is stopped even when nothing is
+      // currently authorised to run on it.
+      circuitBreaker: describeCircuitBreakerSnapshot(circuitBreaker),
       windows: { total, roots, children, distinctSymbolCount: symbolGroups.length, byStatus },
       pending: {
         total: byStatus.PENDING,

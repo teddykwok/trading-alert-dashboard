@@ -25,11 +25,19 @@ const ready = (
     windows?: Partial<Extract<HistoricalFillOperationalSnapshot, { outcome: "READY" }>["windows"]["byStatus"]>;
     pending?: Partial<Extract<HistoricalFillOperationalSnapshot, { outcome: "READY" }>["pending"]>;
     ledger?: Partial<Extract<HistoricalFillOperationalSnapshot, { outcome: "READY" }>["ledger"]>;
+    circuitBreaker?: Extract<
+      HistoricalFillOperationalSnapshot,
+      { outcome: "READY" }
+    >["circuitBreaker"];
   } = {}
 ): HistoricalFillOperationalSnapshot => ({
   outcome: "READY",
   capturedAt: CAPTURED_AT,
   executionProfileId: "profile-1",
+  campaign: null,
+  // Null by default, which is also the proof running through every case below:
+  // a profile with no persisted breaker row is never a condition.
+  circuitBreaker: overrides.circuitBreaker ?? null,
   windows: {
     total: 10,
     roots: 8,
@@ -61,7 +69,7 @@ const ready = (
 });
 
 describe("the contract", () => {
-  it("offers exactly three states and five issue codes", () => {
+  it("offers exactly three states and six issue codes", () => {
     expect([...HISTORICAL_FILL_OPERATIONAL_STATES]).toEqual([
       "NORMAL",
       "NEEDS_ATTENTION",
@@ -70,6 +78,9 @@ describe("the contract", () => {
     // No INFO/WARNING/CRITICAL ladder, and no colour is a state.
     expect(HISTORICAL_FILL_OPERATIONAL_STATES).toHaveLength(3);
     expect([...HISTORICAL_FILL_ISSUE_CODES]).toEqual([
+      // First: the only condition that stops the whole ACCOUNT rather than one
+      // window, and the only one a person must clear by hand.
+      "HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN",
       "STALE_LEASES_PRESENT",
       "ATTEMPT_EXHAUSTED_PRESENT",
       "ABANDONED_WINDOWS_PRESENT",
@@ -201,13 +212,25 @@ describe("the five conditions that do need a human", () => {
     const snapshot = ready({
       pending: { total: 6, staleLease: 2, attemptExhausted: 1 },
       windows: { ABANDONED: 3, INCOMPLETE_SKIPPED_ROWS: 4, SATURATED_SINGLE_MILLISECOND: 5 },
+      circuitBreaker: {
+        state: "OPEN",
+        failureFamily: "HARD_CONFIGURATION",
+        lastReasonCode: "AUTH",
+        consecutiveCount: 1,
+        firstFailureAt: CAPTURED_AT,
+        lastFailureAt: CAPTURED_AT,
+        openedAt: CAPTURED_AT,
+      },
     });
 
     const interpretation = interpretHistoricalFillOperationalSnapshot(snapshot);
 
-    // Five conditions at once is still NEEDS_ATTENTION. There is no "worse".
+    // Six conditions at once is still NEEDS_ATTENTION. There is no "worse".
     expect(interpretation.state).toBe("NEEDS_ATTENTION");
     expect(interpretation.issues).toEqual([
+      // A latch is not a magnitude, so its count is one however long the
+      // streak that tripped it was.
+      { code: "HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN", count: 1 },
       { code: "STALE_LEASES_PRESENT", count: 2 },
       { code: "ATTEMPT_EXHAUSTED_PRESENT", count: 1 },
       { code: "ABANDONED_WINDOWS_PRESENT", count: 3 },
@@ -251,5 +274,95 @@ describe("the five conditions that do need a human", () => {
     expect(interpretHistoricalFillOperationalSnapshot(snapshot)).toEqual(
       interpretHistoricalFillOperationalSnapshot(snapshot)
     );
+  });
+});
+
+/**
+ * The systemic latch, at the level where the judgement is actually made.
+ *
+ * The integration suite proves the snapshot carries the right block; this
+ * proves what the block MEANS. Three inputs, and the distinction between two of
+ * them is the whole point: a persisted CLOSED row and no row at all are
+ * different facts about an account, and NEITHER is a condition.
+ */
+describe("the systemic circuit", () => {
+  const circuit = (
+    state: "OPEN" | "CLOSED",
+    consecutiveCount: number
+  ): Extract<HistoricalFillOperationalSnapshot, { outcome: "READY" }>["circuitBreaker"] => ({
+    state,
+    failureFamily: state === "OPEN" ? "HARD_CONFIGURATION" : "TRANSIENT_TRANSPORT",
+    lastReasonCode: state === "OPEN" ? "AUTH" : "SERVER",
+    consecutiveCount,
+    firstFailureAt: CAPTURED_AT,
+    lastFailureAt: CAPTURED_AT,
+    openedAt: state === "OPEN" ? CAPTURED_AT : null,
+  });
+
+  it("OPEN needs a human, and reports exactly one", () => {
+    const interpretation = interpretHistoricalFillOperationalSnapshot(
+      ready({ circuitBreaker: circuit("OPEN", 1) })
+    );
+
+    expect(interpretation.state).toBe("NEEDS_ATTENTION");
+    expect(interpretation.issues).toEqual([
+      { code: "HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN", count: 1 },
+    ]);
+  });
+
+  it("the count is one however long the streak was", () => {
+    // `consecutiveCount` is context, not magnitude: three failures do not stop
+    // an account any harder than one does.
+    const interpretation = interpretHistoricalFillOperationalSnapshot(
+      ready({ circuitBreaker: circuit("OPEN", 7) })
+    );
+
+    expect(interpretation.issues).toEqual([
+      { code: "HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN", count: 1 },
+    ]);
+  });
+
+  it("a persisted CLOSED row is NORMAL, even mid-streak", () => {
+    // A streak below its threshold is the system noticing. Treating it as a
+    // condition would page somebody for a transport blip the breaker is
+    // already handling.
+    const interpretation = interpretHistoricalFillOperationalSnapshot(
+      ready({ circuitBreaker: circuit("CLOSED", 2) })
+    );
+
+    expect(interpretation.state).toBe("NORMAL");
+    expect(interpretation.issues).toEqual([]);
+  });
+
+  it("no persisted row at all is NORMAL", () => {
+    const interpretation = interpretHistoricalFillOperationalSnapshot(
+      ready({ circuitBreaker: null })
+    );
+
+    expect(interpretation.state).toBe("NORMAL");
+    expect(interpretation.issues).toEqual([]);
+  });
+
+  it("is additive: an OPEN circuit never hides a window condition", () => {
+    const interpretation = interpretHistoricalFillOperationalSnapshot(
+      ready({ circuitBreaker: circuit("OPEN", 1), windows: { ABANDONED: 2 } })
+    );
+
+    expect(interpretation.issues).toEqual([
+      { code: "HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN", count: 1 },
+      { code: "ABANDONED_WINDOWS_PRESENT", count: 2 },
+    ]);
+  });
+
+  it("an UNAVAILABLE profile reports no circuit condition", () => {
+    // Nothing was read, so there is nothing to have an opinion about.
+    const interpretation = interpretHistoricalFillOperationalSnapshot({
+      outcome: "PROFILE_UNAVAILABLE",
+      capturedAt: CAPTURED_AT,
+      reasonCode: "PROFILE_NOT_CONFIGURED",
+    });
+
+    expect(interpretation.state).toBe("UNAVAILABLE");
+    expect(interpretation.issues).toEqual([]);
   });
 });

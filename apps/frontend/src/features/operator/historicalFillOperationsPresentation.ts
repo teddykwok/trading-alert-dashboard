@@ -194,6 +194,9 @@ export function toneForOperationalState(state: HistoricalFillOperationalState): 
  * would commit this panel to advice nobody has reviewed.
  */
 export const HISTORICAL_FILL_ISSUE_WORDING: Record<HistoricalFillOperationalIssueCode, string> = {
+  // A noun like the rest, naming the STATE rather than counting anything: the
+  // server always sends one for this code, because a latch is open or it is not.
+  HISTORICAL_FILL_SYSTEMIC_CIRCUIT_OPEN: "Systemic circuit open (ingestion stopped)",
   STALE_LEASES_PRESENT: "Stale leases",
   ATTEMPT_EXHAUSTED_PRESENT: "Pending windows at the attempt limit",
   ABANDONED_WINDOWS_PRESENT: "Abandoned windows",

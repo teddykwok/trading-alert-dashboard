@@ -13,6 +13,7 @@ import {
   type FillCampaignCliDependencies,
 } from "../src/modules/execution/fill-campaign-cli";
 import { HistoricalFillCampaignService } from "../src/modules/execution/historical-fill-campaign.service";
+import { HistoricalFillCircuitBreakerService } from "../src/modules/execution/historical-fill-circuit-breaker.service";
 
 /**
  * The operator boundary for bounded backfills, against a REAL Postgres.
@@ -59,6 +60,9 @@ function cli(executionProfileId: string) {
   const deps: FillCampaignCliDependencies = {
     prisma: prisma!,
     campaigns: new HistoricalFillCampaignService(prisma!),
+    // The real breaker service. Status reads it and acknowledge writes it, so a
+    // stub here would prove nothing about either.
+    circuit: new HistoricalFillCircuitBreakerService(prisma!),
     bindProfile: async () => ({ ok: true, context: { executionProfileId } }) as never,
     out: (line) => printed.push(line),
   };

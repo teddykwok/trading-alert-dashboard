@@ -218,6 +218,9 @@ describe("the profile gates everything", () => {
       outcome: "READY",
       capturedAt: NOW,
       executionProfileId: id,
+      // Nothing has ever failed on this profile, so no breaker row exists and
+      // none is created to answer. Null, not a synthesized CLOSED block.
+      circuitBreaker: null,
       // A profile with no backfill history reports campaign: null — a real
       // answer meaning "nothing authorises spending here", not missing data.
       campaign: null,

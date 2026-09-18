@@ -1,6 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 
 import { HistoricalFillCampaignService } from "./historical-fill-campaign.service";
+import { HistoricalFillCircuitBreakerService } from "./historical-fill-circuit-breaker.service";
 import { runFillCampaignCli, type CliResult } from "./fill-campaign-cli";
 
 /**
@@ -16,6 +17,9 @@ export async function runFillCampaignCommand(command: string): Promise<void> {
     const result: CliResult = await runFillCampaignCli([command, ...process.argv.slice(2)], {
       prisma,
       campaigns: new HistoricalFillCampaignService(prisma),
+      // The SAME breaker service the runtime uses, on this process's own client.
+      // Status reads it; acknowledge is the one operator action that writes it.
+      circuit: new HistoricalFillCircuitBreakerService(prisma),
     });
     process.exitCode = result.exitCode;
   } finally {

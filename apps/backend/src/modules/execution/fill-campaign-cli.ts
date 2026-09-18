@@ -11,6 +11,11 @@ import {
   HistoricalFillCampaignValidationError,
   MAX_CAMPAIGN_DISPATCHES,
 } from "./historical-fill-campaign.service";
+import {
+  HistoricalFillCircuitInvariantError,
+  type HistoricalFillCircuitAcknowledgement,
+  type HistoricalFillCircuitSnapshot,
+} from "./historical-fill-circuit-breaker.service";
 
 /**
  * The operator boundary for bounded historical backfills.
@@ -46,8 +51,10 @@ export const USAGE = [
   "  pnpm execution:fill-campaign-resume [--campaign-id=<id>]",
   "  pnpm execution:fill-campaign-abort  [--campaign-id=<id>] [--note=\"why\"]",
   "  pnpm execution:fill-campaign-status [--campaign-id=<id>]",
+  "  pnpm execution:fill-circuit-acknowledge",
   "",
   "Acts on the configured, environment-bound execution profile. No profile flag exists.",
+  "Acknowledging the circuit clears the latch ONLY. It starts and resumes nothing.",
 ].join("\n");
 
 export interface CliResult {
@@ -68,9 +75,28 @@ export interface FillCampaignCliCampaignService {
   getCampaignStatus: (campaignId: string) => Promise<HistoricalFillCampaign | null>;
 }
 
+/**
+ * Exactly the breaker operations this CLI may perform.
+ *
+ * Two methods, and neither of them writes anything a campaign can run on.
+ * `readState` is the status display; `acknowledge` is the one explicit operator
+ * recovery action. There is deliberately no way from here to open a circuit, to
+ * reset an epoch, or to start or resume work.
+ */
+export interface FillCampaignCliCircuitService {
+  readState: (options: {
+    executionProfileId: string;
+  }) => Promise<HistoricalFillCircuitSnapshot>;
+  acknowledge: (options: {
+    executionProfileId: string;
+  }) => Promise<HistoricalFillCircuitAcknowledgement>;
+}
+
 export interface FillCampaignCliDependencies {
   prisma: PrismaClient;
   campaigns: FillCampaignCliCampaignService;
+  /** The systemic latch. Required: status must always be able to report it. */
+  circuit: FillCampaignCliCircuitService;
   /** Injectable only so tests can drive a binding failure; the default is the real binder. */
   bindProfile?: (prisma: PrismaClient) => Promise<BinanceProfileBindingResult>;
   /** Injectable so tests can read output instead of a terminal. */
@@ -106,6 +132,44 @@ function describe(out: (line: string) => void, campaign: HistoricalFillCampaign)
   line(out, "startedAt", campaign.startedAt.toISOString());
   line(out, "lastAdmissionAt", campaign.lastAdmissionAt?.toISOString() ?? null);
   line(out, "endedAt", campaign.endedAt?.toISOString() ?? null);
+}
+
+/**
+ * The systemic latch, printed whatever state it is in.
+ *
+ * Every field here is a classification or a count -- `HARD_CONFIGURATION`,
+ * `AUTH`, a streak length, three timestamps. None of it is a secret, and none
+ * of it is `generation`: the epoch that fences a late refund is internal
+ * accounting an operator cannot act on, so it is not printed here or anywhere
+ * else a person reads.
+ */
+function describeCircuit(out: (line: string) => void, circuit: HistoricalFillCircuitSnapshot): void {
+  line(out, "state", circuit.state);
+  line(out, "failureFamily", circuit.failureFamily);
+  line(out, "lastReasonCode", circuit.lastReasonCode);
+  line(out, "consecutiveCount", circuit.consecutiveCount);
+  line(out, "firstFailureAt", circuit.firstFailureAt?.toISOString() ?? null);
+  line(out, "lastFailureAt", circuit.lastFailureAt?.toISOString() ?? null);
+  line(out, "openedAt", circuit.openedAt?.toISOString() ?? null);
+}
+
+/**
+ * Whether this profile has a PERSISTED breaker row.
+ *
+ * `readState` answers an absent row as a logical CLOSED-and-clean snapshot,
+ * which is the right answer for admission and the wrong one for a status
+ * display: it would tell an operator the account has a circuit that is closed
+ * when nothing has ever recorded one. A row is never created to find out.
+ */
+async function persistedCircuitRow(
+  deps: FillCampaignCliDependencies,
+  executionProfileId: string
+): Promise<boolean> {
+  const row = await deps.prisma.historicalFillCircuitBreaker.findUnique({
+    where: { executionProfileId },
+    select: { executionProfileId: true },
+  });
+  return row !== null;
 }
 
 /**
@@ -353,14 +417,102 @@ export async function statusCommand(
   }
 
   const live = await deps.campaigns.getLiveCampaign(executionProfileId);
-  if (!live) {
+  if (live) {
+    out("Live historical fill campaign:");
+    describe(out, live);
+  } else {
     out("No live historical fill campaign for the configured profile.");
     out("The worker will admit no historical dispatches until one is started.");
-    return { exitCode: CLI_EXIT.OK };
   }
-  out("Live historical fill campaign:");
-  describe(out, live);
+
+  // NEVER an early return above this. The circuit is PROFILE-level: it outlives
+  // every campaign, and the single most important case for an operator is the
+  // one where a systemic fault stopped the account and left no live campaign
+  // behind to ask about. Returning on "no live campaign" would hide exactly the
+  // state the operator came here to find.
+  await reportCircuit(deps, out, executionProfileId);
   return { exitCode: CLI_EXIT.OK };
+}
+
+/** The latch, printed after the campaign and regardless of it. */
+async function reportCircuit(
+  deps: FillCampaignCliDependencies,
+  out: (line: string) => void,
+  executionProfileId: string
+): Promise<void> {
+  out("");
+  if (!(await persistedCircuitRow(deps, executionProfileId))) {
+    out("Historical fill circuit: CLOSED (no persisted breaker state).");
+    return;
+  }
+  const circuit = await deps.circuit.readState({ executionProfileId });
+  out("Historical fill circuit:");
+  describeCircuit(out, circuit);
+  if (circuit.state === "OPEN") {
+    out("");
+    out("The circuit is OPEN: no historical dispatch will be admitted for this profile.");
+    out("Investigate the cause above, then run: pnpm execution:fill-circuit-acknowledge");
+    out("Acknowledging clears the latch only. Resuming or starting a campaign stays separate.");
+  }
+}
+
+/**
+ * THE one explicit operator recovery action.
+ *
+ * Deliberately its own command rather than a flag on status or a side effect of
+ * resume. Clearing a systemic latch is a person saying "I looked at this and it
+ * is fixed", and that claim should cost a separate, deliberate keystroke --
+ * which is also why there is no `--force`, no `--yes` and no profile selector.
+ *
+ * It does exactly one thing. The campaign it paused stays paused; a campaign
+ * that exhausted its budget stays exhausted. Work resumes only when somebody
+ * explicitly resumes or starts it.
+ */
+export async function acknowledgeCircuitCommand(
+  argv: string[],
+  deps: FillCampaignCliDependencies
+): Promise<CliResult> {
+  const out = writer(deps);
+  // Zero arguments. Nothing here is tunable, so anything supplied is either a
+  // misunderstanding or an attempt to point this at another account.
+  if (argv.length > 0) {
+    out(USAGE);
+    return { exitCode: CLI_EXIT.USAGE };
+  }
+
+  const executionProfileId = await boundProfile(deps, out);
+  if (executionProfileId === null) return { exitCode: CLI_EXIT.REFUSED };
+
+  try {
+    const result = await deps.circuit.acknowledge({ executionProfileId });
+    if (result.result === "ALREADY_CLOSED") {
+      // Idempotent and unremarkable: an operator who runs this twice, or who
+      // acknowledges a circuit somebody else already cleared, has done nothing
+      // wrong and nothing happened.
+      out("Historical fill circuit is already CLOSED. Nothing was changed.");
+      return { exitCode: CLI_EXIT.OK };
+    }
+    out("Historical fill circuit ACKNOWLEDGED and CLOSED.");
+    describeCircuit(out, result.circuit);
+    out("");
+    out("No campaign was started, resumed or changed.");
+    out("Run pnpm execution:fill-campaign-status to confirm, then resume or start explicitly.");
+    return { exitCode: CLI_EXIT.OK };
+  } catch (error) {
+    if (error instanceof HistoricalFillCircuitInvariantError) {
+      // The service refuses to clear a latch while an ACTIVE campaign exists,
+      // because opening the circuit is supposed to have paused it. Reaching
+      // here means something bypassed that, and clearing the latch would expose
+      // runnable work to a fault nobody has finished investigating. Surfaced as
+      // a refusal, never repaired automatically and never softened into
+      // ALREADY_CLOSED.
+      out(`Refused: ${error.message}`);
+      out("The circuit is still OPEN and nothing was changed.");
+      out("Resolve the ACTIVE campaign first, then acknowledge again.");
+      return { exitCode: CLI_EXIT.REFUSED };
+    }
+    throw error;
+  }
 }
 
 /** Dispatches one subcommand. Unknown or missing commands are a usage error. */
@@ -380,6 +532,8 @@ export async function runFillCampaignCli(
       return abortCommand(rest, deps);
     case "status":
       return statusCommand(rest, deps);
+    case "acknowledge-circuit":
+      return acknowledgeCircuitCommand(rest, deps);
     default:
       writer(deps)(USAGE);
       return { exitCode: CLI_EXIT.USAGE };
