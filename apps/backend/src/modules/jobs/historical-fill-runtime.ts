@@ -47,6 +47,22 @@ export const HISTORICAL_FILL_BATCH_COMPLETE_EVENT = "historical_fill_batch_compl
 /** The stable machine name for a batch that threw. */
 export const HISTORICAL_FILL_BATCH_FAILED_EVENT = "historical_fill_batch_failed";
 
+/**
+ * The stable machine name for the moment an account's historical backfill was
+ * stopped by repeated systemic failure.
+ *
+ * ONE PER EPISODE, not one per tick. It is emitted only when a batch performed
+ * the CLOSED -> OPEN transition itself, never when the gate, the admission or a
+ * late in-flight observation merely discovered a latch somebody else had
+ * already closed over. Six workers failing at once therefore produce one of
+ * these, not six, because only one of them wins the transition.
+ *
+ * This is OBSERVABILITY, not the latch. Postgres holds the durable truth, so a
+ * crash between the commit and this line loses a log entry and nothing else --
+ * which is why there is no outbox here.
+ */
+export const HISTORICAL_FILL_CIRCUIT_OPENED_EVENT = "historical_fill_campaign_circuit_opened";
+
 /** Matches the orchestration scheduler's own cap on relayed error text. */
 const MAX_LOGGED_ERROR_LENGTH = 300;
 
@@ -243,6 +259,30 @@ export async function runHistoricalFillRuntimeTick(
       "Historical fill batch failed"
     );
     throw error;
+  }
+
+  // BEFORE the batch summary, because it is the more important line and an
+  // operator scanning a log should meet the incident before the accounting.
+  //
+  // Guarded on `circuitOpened` rather than on the stop reason: all three ways a
+  // batch can stop for an open circuit share that reason, and only one of them
+  // is a transition. Every field comes from the breaker service's own return --
+  // the runtime decides nothing about families or thresholds, and carries no
+  // generation, no account identifier and no exchange payload.
+  if (result.outcome === "SYSTEMIC_CIRCUIT_OPEN" && result.circuitOpened !== null) {
+    logger.error(
+      {
+        event: HISTORICAL_FILL_CIRCUIT_OPENED_EVENT,
+        workerId: options.workerId,
+        campaignId: result.circuitOpened.campaignId,
+        failureFamily: result.circuitOpened.failureFamily,
+        lastReasonCode: result.circuitOpened.lastReasonCode,
+        consecutiveCount: result.circuitOpened.consecutiveCount,
+        threshold: result.circuitOpened.threshold,
+        openedAt: result.circuitOpened.openedAt?.toISOString() ?? null,
+      },
+      "Historical fill circuit opened"
+    );
   }
 
   logger.info(

@@ -308,15 +308,35 @@ describe("the production chain stays singular", () => {
     // and the campaign that authorises spending it, so production wiring
     // cannot reach executeOne or Binance on an unbudgeted or uncounted path.
     expect(composition).toContain(
-      "new HistoricalFillBatchDriver({ bootstrap, executor, weightBudget, campaigns })"
+      "new HistoricalFillBatchDriver({"
     );
     expect(composition).toContain("new HistoricalFillWeightBudgetService(prisma)");
-    // Both on the SHARED client, never a second pool.
+    // All THREE on the SHARED client, never a second pool.
     expect(composition).toContain("new HistoricalFillCampaignGate({ prisma })");
+    expect(composition).toContain("new HistoricalFillCircuitBreakerService(prisma)");
     expect(composition).not.toContain("new HistoricalFillBatchDriver({ bootstrap, executor })");
     expect(composition).not.toContain(
       "new HistoricalFillBatchDriver({ bootstrap, executor, weightBudget })"
     );
+  });
+
+  it("builds no Prisma client of its own for any of them", async () => {
+    // One pool for the worker. A breaker on a second client would hold its own
+    // connections and, worse, could observe outside the transactions the rest
+    // of this subsystem serialises on.
+    const source = await read("src/modules/jobs/historical-fill-worker-runtime.ts");
+    expect(source).not.toContain("new PrismaClient");
+    const shared = source.match(/\(prisma\)|\{ prisma \}/g) ?? [];
+    expect(shared.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("hands the breaker to the driver, not merely constructs it", async () => {
+    const source = await read("src/modules/jobs/historical-fill-worker-runtime.ts");
+    const construction = /new HistoricalFillBatchDriver\(\{[\s\S]*?\}\);/.exec(source);
+    expect(construction).not.toBeNull();
+    expect(construction![0]).toContain("circuitBreaker");
+    expect(construction![0]).toContain("weightBudget");
+    expect(construction![0]).toContain("campaigns");
   });
 
   it("no other production entry point starts it", async () => {

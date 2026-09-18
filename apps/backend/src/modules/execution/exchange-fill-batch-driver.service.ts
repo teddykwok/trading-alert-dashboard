@@ -2,6 +2,7 @@ import { BINANCE_READ_ONLY_ENDPOINTS } from "../binance/binance.endpoints";
 import type {
   ExchangeFillOneWindowExecutor,
   FillIngestExecutionOutcome,
+  FillIngestExecutionResult,
 } from "./exchange-fill-one-window-executor.service";
 import type { ExchangeFillRootBootstrap, FillRootBootstrapResult } from "./exchange-fill-root-bootstrap.service";
 // TYPE-ONLY, and load-bearing that it stays so: the weight budget imports
@@ -15,7 +16,11 @@ import type {
   HistoricalFillBatchCampaign,
   HistoricalFillCampaignGateResult,
 } from "./historical-fill-campaign-gate.service";
-import type { HistoricalFillCircuitDenial } from "./historical-fill-circuit-breaker.service";
+import {
+  circuitDenialOf,
+  type HistoricalFillCircuitDenial,
+  type HistoricalFillCircuitObservation,
+} from "./historical-fill-circuit-breaker.service";
 import type { HistoricalFillCampaignStatus } from "@prisma/client";
 
 /**
@@ -229,6 +234,25 @@ export interface FillBatchOutcomeCounts {
   STALE_CLAIM: number;
 }
 
+/**
+ * What the breaker reported about a trip THIS pass caused.
+ *
+ * Deliberately not the full snapshot. A transition is an event, and an event
+ * needs the cause and the rule it met -- family, reason, how many in a row, and
+ * what the bound was. `generation` is absent on purpose: it is internal fencing
+ * state whose only consumer is the refund comparison, and an epoch number in an
+ * operator log invites exactly the interpretation this design avoids.
+ */
+export interface HistoricalFillCircuitTransition {
+  campaignId: string;
+  failureFamily: string | null;
+  lastReasonCode: string | null;
+  consecutiveCount: number;
+  /** The bound this family had to reach, as the breaker service reported it. */
+  threshold: number | null;
+  openedAt: Date | null;
+}
+
 /** The bootstrap's own success summary, unaltered. */
 export type FillRootBootstrapSummary = Extract<FillRootBootstrapResult, { outcome: "BOOTSTRAPPED" }>;
 
@@ -289,6 +313,21 @@ export type HistoricalFillBatchResult =
        * Never the two mixed, and never invented.
        */
       circuit: HistoricalFillCircuitDenial;
+      /**
+       * Set ONLY when THIS pass performed the CLOSED -> OPEN transition.
+       *
+       * Null on both already-open paths -- the gate's and the admission's -- and
+       * null when a late observation returns ALREADY_OPEN, because in all three
+       * the latch was already closed over by someone else. It is what lets the
+       * runtime log the trip exactly once per episode instead of once per tick,
+       * which is the difference between an alert and a stream.
+       *
+       * Every field comes from the breaker service's own return. The driver does
+       * not decide the family or the threshold, so nothing here can drift away
+       * from the rule that actually fired. Carries no generation, no account
+       * identifier, no raw error and no exchange payload.
+       */
+      circuitOpened: HistoricalFillCircuitTransition | null;
     } & UserTradesWeightAccounting &
       HistoricalFillCampaignAccounting)
   | ({
@@ -359,6 +398,30 @@ export interface HistoricalFillBatchDependencies {
       campaignId: string
     ) => Promise<HistoricalFillCampaignStatus>;
   };
+  /**
+   * The systemic latch, required whenever a campaign-governed budget is wired.
+   *
+   * Until this existed the breaker could refuse work but nothing could ever
+   * OPEN it: the gate and the admission both read a latch that only a human
+   * could set. This is the seam that lets repeated systemic failures stop the
+   * account by themselves, and it is required rather than optional for exactly
+   * that reason -- a scheduled loop that admits, dispatches and admits again
+   * with no observer in between is the unbounded burn the whole breaker exists
+   * to prevent, and it must not be constructible.
+   *
+   * The driver hands over the executor's outcome and reason UNTOUCHED. It forms
+   * no opinion about families, thresholds or what counts as systemic; the
+   * breaker service is the only classifier, and duplicating its rules here is
+   * how the two would eventually disagree.
+   */
+  circuitBreaker?: {
+    observeDispatchOutcome: (options: {
+      executionProfileId: string;
+      campaignId: string;
+      outcome: string;
+      reasonCode?: string | null;
+    }) => Promise<HistoricalFillCircuitObservation>;
+  };
 }
 
 const emptyCounts = (): FillBatchOutcomeCounts => ({
@@ -414,6 +477,10 @@ export class HistoricalFillBatchDriver {
       options.globalUserTradesWeightPerMinute
     );
     assertCampaignGate(this.deps.weightBudget !== undefined, this.deps.campaigns !== undefined);
+    assertCircuitObserver(
+      this.deps.weightBudget !== undefined,
+      this.deps.circuitBreaker !== undefined
+    );
 
     const outcomes = emptyCounts();
     const budget = options.maxUserTradesWeight;
@@ -461,6 +528,9 @@ export class HistoricalFillBatchDriver {
             ...weighed(budget, used),
             ...campaignAccounting(gate.campaign),
             circuit: gate.circuit,
+            // The gate found the latch ALREADY closed over, so this pass caused
+            // no transition and must not log one.
+            circuitOpened: null,
           },
           0
         );
@@ -608,6 +678,8 @@ export class HistoricalFillBatchDriver {
               // The ADMISSION'S snapshot, read under the lock. Deliberately not
               // the gate's, which is known stale on exactly this path.
               circuit: admission.circuit,
+              // Another worker opened it; this pass only discovered that.
+              circuitOpened: null,
             },
             0
           );
@@ -738,6 +810,24 @@ export class HistoricalFillBatchDriver {
         }
       }
 
+      // THE ACTIVATION HOOK.
+      //
+      // Placed HERE, and the position is the whole design:
+      //
+      //   admission -> executeOne -> DURABLE RESULT -> refund -> OBSERVE -> ...
+      //
+      // After the executor, because only a returned result is a durable fact
+      // about a window; the executor owns that truth and this must never run
+      // inside its transaction. After the refund, because a proven zero-dispatch
+      // must have given its slot and weight back before anything else looks at
+      // the campaign. And before every remaining branch, so no path can reach a
+      // second admission without having asked.
+      //
+      // The outcome and reason go across UNTOUCHED. This driver has no table of
+      // families, no threshold and no notion of which codes are systemic -- it
+      // asks, and the breaker service answers.
+      const observation = await this.observeOutcome(campaign, campaignProfileId, result);
+
       // Nothing was eligible, so asking again can only produce the same answer.
       if (result.outcome === "NO_WORK") {
         // The queue is empty from this worker's point of view, which is the one
@@ -747,6 +837,13 @@ export class HistoricalFillBatchDriver {
         if (campaign !== null && campaignProfileId !== null && this.deps.campaigns !== undefined) {
           const status = await this.deps.campaigns.completeIfDrained(campaignProfileId, campaign.id);
           campaign = { ...campaign, status };
+        }
+        // NO_WORK is NEUTRAL to the breaker -- it was decided before the
+        // transport was touched -- so it can never open the latch. It can still
+        // discover one another worker opened, and that outranks an empty queue
+        // as the reason this account stopped.
+        if (stopsForCircuit(observation)) {
+          return this.circuitStop(observation, bootstrap, executionInvocations, outcomes, budget, used, campaign, 1);
         }
         return this.settled(
           {
@@ -768,6 +865,9 @@ export class HistoricalFillBatchDriver {
           throw new FillBatchInvariantError(
             "the executor reported PROFILE_UNAVAILABLE without a reason code"
           );
+        }
+        if (stopsForCircuit(observation)) {
+          return this.circuitStop(observation, bootstrap, executionInvocations, outcomes, budget, used, campaign, 1);
         }
         return this.settled(
           {
@@ -791,6 +891,19 @@ export class HistoricalFillBatchDriver {
       // asks the durable queue for whatever is eligible now, which is how a
       // split's children and a backed-off window get their correct turn.
       outcomes[result.outcome] += 1;
+
+      // STOP, AFTER COUNTING. The triggering result is already durable and its
+      // request already reached the exchange, so dropping it from the summary
+      // would understate exactly the spending this driver exists to bound -- the
+      // count above happens first for that reason.
+      //
+      // CIRCUIT_OPENED means this pass tripped it; ALREADY_OPEN means another
+      // worker did while this request was in flight. Operationally they are the
+      // same instruction: no further admission, on this tick or any other, until
+      // somebody acknowledges.
+      if (stopsForCircuit(observation)) {
+        return this.circuitStop(observation, bootstrap, executionInvocations, outcomes, budget, used, campaign, 0);
+      }
     }
 
     return this.settled(
@@ -803,6 +916,95 @@ export class HistoricalFillBatchDriver {
         ...campaignAccounting(campaign),
       },
       0
+    );
+  }
+
+  /**
+   * Reports ONE durable executor result to the breaker, or nothing at all.
+   *
+   * Returns null when there is no campaign to attribute the outcome to -- the
+   * legacy composition with no budget and no gate -- because the breaker's
+   * lineage check exists precisely so that a trip can never be opened for a
+   * profile on the strength of a request no campaign owned.
+   *
+   * ## Not caught, deliberately
+   *
+   * If this throws, the batch throws. A failure here means the process does not
+   * KNOW whether systemic protection was recorded, and the only safe reading of
+   * "I don't know" is to stop: swallowing it would let the loop admit again
+   * against a fault that may have just tripped the latch, which is the burn this
+   * whole subsystem exists to bound. An error is not NO_CHANGE.
+   */
+  private async observeOutcome(
+    campaign: HistoricalFillBatchCampaign | null,
+    executionProfileId: string | null,
+    result: FillIngestExecutionResult
+  ): Promise<HistoricalFillCircuitObservation | null> {
+    if (this.deps.circuitBreaker === undefined) return null;
+    if (campaign === null || executionProfileId === null) return null;
+    return this.deps.circuitBreaker.observeDispatchOutcome({
+      // The profile the GATE bound and the bootstrap independently agreed with,
+      // checked against each other before any admission happened. The breaker
+      // re-proves the campaign's lineage itself rather than trusting either.
+      executionProfileId,
+      campaignId: campaign.id,
+      // Passed through verbatim. No mapping, no normalisation, no opinion.
+      outcome: result.outcome,
+      reasonCode: result.reasonCode ?? null,
+    });
+  }
+
+  /**
+   * Ends the pass because the account's circuit is open.
+   *
+   * Re-reads the campaign rather than reporting the snapshot this pass was
+   * holding. Opening the latch moves the CURRENT ACTIVE campaign to PAUSED in
+   * the same transaction, so a pre-observation snapshot says ACTIVE about a row
+   * that is no longer ACTIVE -- and a campaign whose final slot this very
+   * invocation spent is EXHAUSTED and must stay EXHAUSTED, not be reported as
+   * paused. Null when it cannot be read, which is "not known" rather than an
+   * invented zero.
+   */
+  private async circuitStop(
+    observation: HistoricalFillCircuitObservation,
+    bootstrap: FillRootBootstrapSummary,
+    executionInvocations: number,
+    outcomes: FillBatchOutcomeCounts,
+    budget: number,
+    used: number,
+    campaign: HistoricalFillBatchCampaign | null,
+    terminalInvocations: 0 | 1
+  ): Promise<HistoricalFillBatchResult> {
+    const settledCampaign =
+      campaign !== null && this.deps.campaigns !== undefined
+        ? await this.deps.campaigns.describeCampaign(campaign.id)
+        : campaign;
+
+    return this.settled(
+      {
+        outcome: "SYSTEMIC_CIRCUIT_OPEN",
+        bootstrap,
+        executionInvocations,
+        outcomes,
+        ...weighed(budget, used),
+        ...campaignAccounting(settledCampaign),
+        // The breaker's own post-transaction snapshot, which is OPEN on both
+        // paths that reach here.
+        circuit: circuitDenialOf(observation.circuit),
+        // ONLY a real transition earns the dedicated event downstream.
+        circuitOpened:
+          observation.result === "CIRCUIT_OPENED" && campaign !== null
+            ? {
+                campaignId: campaign.id,
+                failureFamily: observation.circuit.failureFamily,
+                lastReasonCode: observation.circuit.lastReasonCode,
+                consecutiveCount: observation.circuit.consecutiveCount,
+                threshold: observation.threshold,
+                openedAt: observation.circuit.openedAt,
+              }
+            : null,
+      },
+      terminalInvocations
     );
   }
 
@@ -915,6 +1117,49 @@ function assertGlobalUserTradesWeightCap(
  * that no campaign counts -- the exact bypass this slice exists to close -- and
  * the cheapest place to make that impossible is before the pass does anything.
  */
+/**
+ * A campaign-governed loop may not run without something watching its outcomes.
+ *
+ * Refused at the top of the pass, before the gate and before the bootstrap, so
+ * a misassembled scheduled path fails loudly on its first tick instead of
+ * quietly dispatching forever with no systemic protection. Symmetric to the
+ * gate check above and for the same reason: the dangerous composition is the
+ * one that LOOKS complete.
+ *
+ * The converse is refused too. An observer with no budget would watch a loop
+ * that admits nothing through a campaign, which means it could pause campaigns
+ * on the strength of dispatches no campaign ever authorised.
+ */
+/**
+ * Whether an observation means this pass must not admit anything further.
+ *
+ * Two results, one instruction. CIRCUIT_OPENED is this pass tripping the latch;
+ * ALREADY_OPEN is discovering that someone else did while this request was in
+ * flight. Neither may be followed by another admission.
+ *
+ * A null observation means nothing was watching -- the legacy uncampaigned
+ * composition -- and never stops the loop.
+ */
+function stopsForCircuit(
+  observation: HistoricalFillCircuitObservation | null
+): observation is HistoricalFillCircuitObservation {
+  if (observation === null) return false;
+  return observation.result === "CIRCUIT_OPENED" || observation.result === "ALREADY_OPEN";
+}
+
+function assertCircuitObserver(budgetWired: boolean, breakerWired: boolean): void {
+  if (budgetWired && !breakerWired) {
+    throw new FillBatchRefusedError(
+      "a shared weight budget was wired without a circuit breaker to observe its dispatches"
+    );
+  }
+  if (!budgetWired && breakerWired) {
+    throw new FillBatchRefusedError(
+      "a circuit breaker was wired without a shared weight budget whose dispatches it would observe"
+    );
+  }
+}
+
 function assertCampaignGate(budgetWired: boolean, gateWired: boolean): void {
   if (budgetWired && !gateWired) {
     throw new FillBatchRefusedError(

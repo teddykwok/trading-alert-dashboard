@@ -121,14 +121,20 @@ function workerProcess(options: {
           completeIfDrained: (profile: string, id: string) => gate.completeIfDrained(profile, id),
         } as HistoricalFillCampaignGate);
 
+  // The REAL breaker, on this worker's own client. Required by the driver, and
+  // real rather than stubbed so activation is proven against the classifier
+  // that actually ships.
+  const circuitBreaker = new HistoricalFillCircuitBreakerService(client);
+
   const driver = new HistoricalFillBatchDriver({
     bootstrap: { bootstrapHistoricalRoots } as never,
     executor: { executeOne } as never,
     weightBudget: new HistoricalFillWeightBudgetService(client),
     campaigns: campaignsDep,
+    circuitBreaker,
   });
 
-  return { driver, executeOne, bootstrapHistoricalRoots, gate };
+  return { driver, executeOne, bootstrapHistoricalRoots, gate, circuitBreaker };
 }
 
 const runBatch = (driver: HistoricalFillBatchDriver, overrides: Record<string, unknown> = {}) =>

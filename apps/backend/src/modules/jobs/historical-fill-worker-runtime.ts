@@ -11,6 +11,7 @@ import { ExchangeFillOneWindowExecutor } from "../execution/exchange-fill-one-wi
 import { ExchangeFillRootBootstrap } from "../execution/exchange-fill-root-bootstrap.service";
 import { HistoricalFillWeightBudgetService } from "../execution/historical-fill-weight-budget.service";
 import { HistoricalFillCampaignGate } from "../execution/historical-fill-campaign-gate.service";
+import { HistoricalFillCircuitBreakerService } from "../execution/historical-fill-circuit-breaker.service";
 import {
   createHistoricalFillScheduler,
   historicalFillIntervalMs,
@@ -117,7 +118,25 @@ export function startHistoricalFillWorkerRuntime(
   // COMPLETED once the queue is drained. Starting, pausing, resuming and
   // aborting stay entirely with the operator CLI.
   const campaigns = new HistoricalFillCampaignGate({ prisma });
-  const driver = new HistoricalFillBatchDriver({ bootstrap, executor, weightBudget, campaigns });
+  // The systemic latch, on the SAME Prisma singleton as everything above it --
+  // no second client, no second pool. It is what turns the breaker from
+  // something only a human could set into something repeated systemic failures
+  // set by themselves: the driver reports every durable executor result here,
+  // and a trip stops the pass before it can admit again.
+  //
+  // Composed unconditionally alongside the budget and the gate because the
+  // driver refuses to run a campaign-governed loop without it. A scheduled path
+  // that could dispatch, fail, and dispatch again with nothing watching is
+  // precisely the burn this subsystem exists to bound, so it is not assembled
+  // and then checked -- it cannot be assembled at all.
+  const circuitBreaker = new HistoricalFillCircuitBreakerService(prisma);
+  const driver = new HistoricalFillBatchDriver({
+    bootstrap,
+    executor,
+    weightBudget,
+    campaigns,
+    circuitBreaker,
+  });
 
   const scheduler = (options.createScheduler ?? createHistoricalFillScheduler)({
     // The runner owns the call; this only supplies what it may build.

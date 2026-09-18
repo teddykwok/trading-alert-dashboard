@@ -505,3 +505,111 @@ describe("the gate the runner actually reads", () => {
     expect(code.match(/env\./g)).toHaveLength(1);
   });
 });
+
+/**
+ * The dedicated circuit-open event.
+ *
+ * It exists because an OPEN latch is an incident, not an accounting line, and
+ * the batch summary is far too quiet a place to say an account has stopped
+ * until somebody intervenes. What makes it useful rather than noise is that it
+ * marks the TRANSITION: every later tick while the circuit stays open reports
+ * the same stop reason and must say nothing more.
+ */
+describe("historical fill circuit opened event", () => {
+  const CIRCUIT = {
+    state: "OPEN" as const,
+    failureFamily: "HARD_CONFIGURATION",
+    lastReasonCode: "AUTH",
+    consecutiveCount: 1,
+    openedAt: new Date("2026-09-18T11:22:33.000Z"),
+  };
+
+  function circuitResult(circuitOpened: unknown): HistoricalFillBatchResult {
+    return {
+      ...RESULT,
+      outcome: "SYSTEMIC_CIRCUIT_OPEN",
+      executionInvocations: 1,
+      outcomes: { ...RESULT.outcomes, ABANDONED: 1 },
+      circuit: CIRCUIT,
+      circuitOpened,
+    } as HistoricalFillBatchResult;
+  }
+
+  const TRANSITION = {
+    campaignId: "campaign-xyz",
+    failureFamily: "HARD_CONFIGURATION",
+    lastReasonCode: "AUTH",
+    consecutiveCount: 1,
+    threshold: 1,
+    openedAt: CIRCUIT.openedAt,
+  };
+
+  async function tick(result: HistoricalFillBatchResult) {
+    return runHistoricalFillRuntimeTick({
+      enabled: true,
+      workerId: WORKER_ID,
+      now: new Date(),
+      horizonDays: 30,
+      maxWindows: 5,
+      maxUserTradesWeight: 50,
+      globalUserTradesWeightPerMinute: 500,
+      createDriver: () => ({ runHistoricalFillBatch: async () => result }) as never,
+    });
+  }
+
+  it("emits exactly once when THIS batch opened the circuit", async () => {
+    await tick(circuitResult(TRANSITION));
+
+    const opened = error.mock.calls.filter(
+      (call) => (call[0] as { event?: string }).event === "historical_fill_campaign_circuit_opened"
+    );
+    expect(opened).toHaveLength(1);
+    expect(opened[0][0]).toEqual({
+      event: "historical_fill_campaign_circuit_opened",
+      workerId: WORKER_ID,
+      campaignId: "campaign-xyz",
+      failureFamily: "HARD_CONFIGURATION",
+      lastReasonCode: "AUTH",
+      consecutiveCount: 1,
+      threshold: 1,
+      openedAt: "2026-09-18T11:22:33.000Z",
+    });
+  });
+
+  it("stays silent when the circuit was ALREADY open", async () => {
+    // Every tick of an ongoing incident reaches the same stop reason. Logging
+    // on the reason rather than the transition would turn one incident into a
+    // stream, which is how a real alert gets ignored.
+    await tick(circuitResult(null));
+
+    expect(
+      error.mock.calls.filter(
+        (call) => (call[0] as { event?: string }).event === "historical_fill_campaign_circuit_opened"
+      )
+    ).toHaveLength(0);
+  });
+
+  it("still writes the ordinary batch summary alongside the incident", async () => {
+    await tick(circuitResult(TRANSITION));
+
+    const summary = info.mock.calls.find(
+      (call) => (call[0] as { event?: string }).event === HISTORICAL_FILL_BATCH_COMPLETE_EVENT
+    );
+    expect(summary).toBeDefined();
+    expect((summary![0] as { outcome: string }).outcome).toBe("SYSTEMIC_CIRCUIT_OPEN");
+    // The triggering dispatch is still accounted for.
+    expect((summary![0] as { executionInvocations: number }).executionInvocations).toBe(1);
+  });
+
+  it("carries no generation and no account identifier", async () => {
+    await tick(circuitResult(TRANSITION));
+
+    const opened = error.mock.calls.find(
+      (call) => (call[0] as { event?: string }).event === "historical_fill_campaign_circuit_opened"
+    );
+    const keys = Object.keys(opened![0] as object);
+    expect(keys).not.toContain("generation");
+    expect(keys).not.toContain("executionProfileId");
+    expect(JSON.stringify(opened![0])).not.toContain("generation");
+  });
+});

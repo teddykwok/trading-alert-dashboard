@@ -11,6 +11,7 @@ import type {
   HistoricalFillWeightReservation,
 } from "../src/modules/execution/historical-fill-weight-budget.service";
 import type { HistoricalFillCampaignGateResult } from "../src/modules/execution/historical-fill-campaign-gate.service";
+import type { HistoricalFillCircuitObservation } from "../src/modules/execution/historical-fill-circuit-breaker.service";
 
 /**
  * The SHARED ceiling, at the driver seam.
@@ -58,6 +59,7 @@ function scripted(options: {
   throwOn?: number;
   admit?: () => Promise<HistoricalFillCampaignAdmissionResult>;
   gate?: () => Promise<HistoricalFillCampaignGateResult>;
+  observe?: () => Promise<HistoricalFillCircuitObservation>;
   bootstrap?: unknown;
 }) {
   const queue = [...(options.outcomes ?? [])];
@@ -80,6 +82,16 @@ function scripted(options: {
     campaignStatus: "ACTIVE",
   } as never;
   const admitCampaignDispatch = vi.fn(options.admit ?? (async () => admitted));
+  const closedCircuit = {
+    state: "CLOSED" as const,
+    failureFamily: null,
+    lastReasonCode: null,
+    consecutiveCount: 0,
+    firstFailureAt: null,
+    lastFailureAt: null,
+    openedAt: null,
+    generation: 0,
+  };
   const releaseCertainNonDispatch = vi.fn(async (_r: HistoricalFillWeightReservation) => undefined);
 
   const bootstrapHistoricalRoots = vi.fn(async () => options.bootstrap ?? bootstrapped);
@@ -87,11 +99,27 @@ function scripted(options: {
   const describeCampaign = vi.fn(async () => activeGate.outcome === "ACTIVE" ? activeGate.campaign : null);
   const completeIfDrained = vi.fn(async () => "ACTIVE" as const);
 
+  // Scripted like everything else here, and NEUTRAL by default so these weight
+  // tests measure the ceiling rather than the latch. The driver requires an
+  // observer whenever a budget is wired, which is the invariant that makes an
+  // unobserved dispatch loop unconstructible.
+  const observeDispatchOutcome = vi.fn(
+    options.observe ??
+      (async () => ({
+        result: "NO_CHANGE" as const,
+        observedFamily: null,
+        threshold: null,
+        pausedCampaignId: null,
+        circuit: closedCircuit,
+      }))
+  );
+
   const driver = new HistoricalFillBatchDriver({
     bootstrap: { bootstrapHistoricalRoots } as never,
     executor: { executeOne } as never,
     weightBudget: { admitCampaignDispatch, releaseCertainNonDispatch },
     campaigns: { resolveForBatch, describeCampaign, completeIfDrained },
+    circuitBreaker: { observeDispatchOutcome },
   });
 
   return {

@@ -75,12 +75,15 @@ describe("the scheduled historical path admits through a campaign", () => {
     expect(callers).toEqual([]);
   });
 
-  it("the worker composes the driver with BOTH the budget and the campaign gate", () => {
+  it("the worker composes the driver with the budget, the gate AND the breaker", () => {
     const runtime = codeOf(WORKER_RUNTIME);
-    expect(runtime).toContain(
-      "new HistoricalFillBatchDriver({ bootstrap, executor, weightBudget, campaigns })"
-    );
+    const construction = /new HistoricalFillBatchDriver\(\{[\s\S]*?\}\);/.exec(runtime);
+    expect(construction).not.toBeNull();
+    for (const dependency of ["bootstrap", "executor", "weightBudget", "campaigns", "circuitBreaker"]) {
+      expect(construction![0]).toContain(dependency);
+    }
     expect(runtime).toContain("new HistoricalFillCampaignGate({ prisma })");
+    expect(runtime).toContain("new HistoricalFillCircuitBreakerService(prisma)");
   });
 });
 

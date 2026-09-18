@@ -10,6 +10,7 @@ import {
 import { HistoricalFillWeightBudgetService } from "../src/modules/execution/historical-fill-weight-budget.service";
 import { HistoricalFillCampaignGate } from "../src/modules/execution/historical-fill-campaign-gate.service";
 import { HistoricalFillCampaignService } from "../src/modules/execution/historical-fill-campaign.service";
+import { HistoricalFillCircuitBreakerService } from "../src/modules/execution/historical-fill-circuit-breaker.service";
 
 /**
  * END-TO-END campaign enforcement at the driver seam, against a REAL Postgres.
@@ -101,6 +102,10 @@ function workerProcess(options: {
     bootstrap: { bootstrapHistoricalRoots } as never,
     executor: { executeOne } as never,
     weightBudget: new HistoricalFillWeightBudgetService(client),
+    // Required by the driver from 3B.3C1 onward: a campaign-governed loop may
+    // not run without something observing its outcomes. Real, on the same
+    // client, so these campaign tests keep exercising the shipping composition.
+    circuitBreaker: new HistoricalFillCircuitBreakerService(client),
     campaigns: new HistoricalFillCampaignGate({
       prisma: client,
       // Injected because the real binder reads process configuration, which

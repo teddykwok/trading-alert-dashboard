@@ -9,6 +9,7 @@ import {
 import { HistoricalFillWeightBudgetService } from "../src/modules/execution/historical-fill-weight-budget.service";
 import { HistoricalFillCampaignGate } from "../src/modules/execution/historical-fill-campaign-gate.service";
 import { HistoricalFillCampaignService } from "../src/modules/execution/historical-fill-campaign.service";
+import { HistoricalFillCircuitBreakerService } from "../src/modules/execution/historical-fill-circuit-breaker.service";
 
 /**
  * THE load-bearing proof: N worker processes do not multiply historical
@@ -49,6 +50,9 @@ function workerProcess(outcome: FillIngestExecutionOutcome = "COMPLETE") {
   const client = new PrismaClient({ datasources: { db: { url: resolveTestDatabase().url } } });
   clients.push(client);
   return new HistoricalFillBatchDriver({
+    // Required whenever a budget is wired. Real, on this worker's own client;
+    // the default outcome here is COMPLETE, which the breaker treats as health.
+    circuitBreaker: new HistoricalFillCircuitBreakerService(client),
     bootstrap: {
       bootstrapHistoricalRoots: async () => ({
         outcome: "BOOTSTRAPPED",
