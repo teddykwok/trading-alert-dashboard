@@ -448,6 +448,7 @@ model ExecutionProfile {
   fillIngestWindows ExchangeFillIngestWindow[]
   fillWeightBuckets HistoricalFillWeightBucket[]
   fillCampaigns     HistoricalFillCampaign[]
+  fillCircuitBreaker HistoricalFillCircuitBreaker?
   safetyPolicy  ExecutionSafetyPolicy?
   canaryAuthorizations ExecutionCanaryAuthorization[]
 
@@ -1787,6 +1788,82 @@ model HistoricalFillCampaign {
 /// because the dispatch provably never happened may return to ACTIVE. COMPLETED
 /// and ABORTED are hard -- an operator who aborted a campaign must never find it
 /// running again.
+/// Whether historical fill dispatch is currently permitted for one ACCOUNT.
+///
+/// Two states, deliberately. A breaker with a half-open probe state would have
+/// to issue a trial exchange request to decide, and the faults this exists for
+/// -- rejected credentials, a revoked permission, a banned IP -- are fixed by a
+/// person changing configuration, not by waiting. An operator acknowledgement
+/// is the only thing that can honestly close it.
+enum HistoricalFillCircuitState {
+  CLOSED
+  OPEN
+}
+
+/// The systemic stop for one execution profile's historical backfill.
+///
+/// ## Why this is scoped to the PROFILE, not the campaign
+///
+/// The faults that open it -- MISSING_CREDENTIALS, AUTH, PERMISSION, IP_BANNED,
+/// IP_RESTRICTED, FUTURES_NOT_ENABLED, DISABLED, READ_ONLY_VIOLATION -- describe
+/// the account, the key or the connector. None of them is a fact about a
+/// campaign, and campaign-scoped state was proven insufficient twice over:
+///
+///   * a campaign that spends its final slot becomes EXHAUSTED, which the live
+///     uniqueness index does not cover, so a replacement campaign could be
+///     created immediately and burned against the identical unresolved fault;
+///   * a campaign manually PAUSED while a request was in flight could not
+///     record the systemic result at all, and ordinary resume would then walk
+///     straight back into it.
+///
+/// Keyed by the profile, the latch outlives every campaign, every worker and
+/// every restart, which is the only scope at which those two holes close.
+///
+/// ## CURRENT STATE ONLY
+///
+/// This is not an audit table. It holds the cause that is in force right now:
+/// a healthy dispatch clears the streak, and an acknowledgement clears
+/// everything. The permanent record of a trip is the structured log event, not
+/// these columns -- which is why nothing here is append-only and why there is
+/// no campaign id, no error message and no history.
+///
+/// ## The row is LAZY
+///
+/// No row means CLOSED and never-failed. The healthy path therefore performs
+/// zero writes, existing profiles need no backfill, and absence is unambiguous.
+model HistoricalFillCircuitBreaker {
+  /// One breaker per account. The primary key IS the profile.
+  executionProfileId String           @id
+  executionProfile   ExecutionProfile @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)
+
+  /// No default: a row only ever exists because this service wrote it, and it
+  /// states which state it meant. A defaulted breaker would be a licence to
+  /// dispatch that nobody granted.
+  state HistoricalFillCircuitState
+
+  /// Which FAMILY the current streak is counting -- a source-level constant
+  /// name, never a DB enum, because the underlying transport kinds grow and a
+  /// database enum would force a migration each time one is added.
+  failureFamily String?
+  /// The most recent contributing code. A `BinanceErrorKind` or executor reason
+  /// NAME, never a message and never an exchange body.
+  lastReasonCode String?
+  /// Consecutive failures within `failureFamily`. Moved only under the profile
+  /// advisory lock, so concurrent workers cannot lose an increment.
+  consecutiveCount Int @default(0)
+
+  /// Start of the CURRENT streak, not of history.
+  firstFailureAt DateTime?
+  lastFailureAt  DateTime?
+  /// Set exactly when the latch closes over, and cleared only by acknowledgement.
+  /// Distinct from `lastFailureAt` because requests already in flight may land
+  /// afterwards -- though while OPEN nothing here is rewritten at all, so the
+  /// snapshot always describes the cause that actually opened the circuit.
+  openedAt DateTime?
+
+  updatedAt DateTime @updatedAt
+}
+
 enum HistoricalFillCampaignStatus {
   ACTIVE
   PAUSED
