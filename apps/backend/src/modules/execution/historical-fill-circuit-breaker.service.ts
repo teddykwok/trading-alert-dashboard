@@ -273,6 +273,90 @@ function snapshotOf(row: BreakerRow | null): HistoricalFillCircuitSnapshot {
   return row === null ? CLOSED_AND_CLEAN : { ...row };
 }
 
+/**
+ * What an ENFORCEMENT denial is allowed to say about the latch.
+ *
+ * Deliberately narrower than the snapshot an operator reads. A denial travels
+ * outward -- into an admission result, a driver summary, eventually a log -- so
+ * it carries the five fields that explain WHY work is refused and nothing else.
+ * `firstFailureAt` and `lastFailureAt` are diagnostics for somebody already
+ * looking at the breaker, not facts a refusal needs to justify itself.
+ *
+ * `state` is the literal `"OPEN"`, not the enum: a denial that could carry
+ * `CLOSED` would be a denial that might not be one.
+ *
+ * Never a raw message, a response body, an account identifier or a credential.
+ */
+export interface HistoricalFillCircuitDenial {
+  state: "OPEN";
+  failureFamily: string | null;
+  lastReasonCode: string | null;
+  consecutiveCount: number;
+  openedAt: Date | null;
+}
+
+/**
+ * Narrows an OPEN snapshot to what a denial may carry.
+ *
+ * Throws rather than coerces if handed a CLOSED one: every caller reaches this
+ * only inside an `if (state === "OPEN")`, so a CLOSED snapshot here means the
+ * guard above it was edited away, and inventing an OPEN-shaped denial from a
+ * closed latch would manufacture exactly the false refusal this type exists to
+ * make impossible.
+ */
+export function circuitDenialOf(
+  snapshot: HistoricalFillCircuitSnapshot
+): HistoricalFillCircuitDenial {
+  if (snapshot.state !== "OPEN") {
+    throw new HistoricalFillCircuitInvariantError(
+      `a circuit denial was built from a ${snapshot.state} snapshot`
+    );
+  }
+  return {
+    state: "OPEN",
+    failureFamily: snapshot.failureFamily,
+    lastReasonCode: snapshot.lastReasonCode,
+    consecutiveCount: snapshot.consecutiveCount,
+    openedAt: snapshot.openedAt,
+  };
+}
+
+/**
+ * Reads the latch through a client the CALLER chooses, which decides what the
+ * answer is worth.
+ *
+ * ## Pass a LOCKED transaction to enforce; pass a plain client to report
+ *
+ * Every site that REFUSES work on this answer -- admission, campaign creation,
+ * resume, and the refund's reactivation decision -- must pass its own `tx`,
+ * having already taken `lockCampaignForProfile` for the same profile. Only then
+ * is the latch read inside the same lock as the mutation it governs, so a trip
+ * committing a microsecond later cannot slip between the question and the act.
+ * The service's own `readState` cannot serve those callers: it uses the
+ * service's client, so its read would land outside their transaction.
+ *
+ * Passing a plain `PrismaClient` is deliberately allowed, and is exactly what
+ * the batch gate does. That read is ADVISORY -- a fast fail-closed path that
+ * saves a bootstrap -- and may be stale by the time anything acts on it, which
+ * is precisely why the admission re-asks under its lock and is the one that
+ * decides.
+ *
+ * The precondition is stated rather than typed because no type can express it.
+ *
+ * No row means CLOSED and never-failed -- a complete answer, which is why a
+ * healthy profile never needs a breaker row to exist.
+ */
+export async function readCircuitState(
+  client: Prisma.TransactionClient | PrismaClient,
+  executionProfileId: string
+): Promise<HistoricalFillCircuitSnapshot> {
+  const row = await client.historicalFillCircuitBreaker.findUnique({
+    where: { executionProfileId },
+    select: BREAKER_FIELDS,
+  });
+  return snapshotOf(row);
+}
+
 export class HistoricalFillCircuitBreakerService {
   constructor(private readonly prisma: PrismaClient) {}
 

@@ -6,6 +6,11 @@ import {
   type BinanceProfileBindingResult,
 } from "./binance-profile-binding";
 import { lockCampaignForProfile } from "./historical-fill-campaign-lock";
+import {
+  circuitDenialOf,
+  readCircuitState,
+  type HistoricalFillCircuitDenial,
+} from "./historical-fill-circuit-breaker.service";
 
 /**
  * The campaign a historical batch is running under, and the queue question
@@ -43,6 +48,34 @@ export interface HistoricalFillBatchCampaign {
 
 export type HistoricalFillCampaignGateResult =
   | { outcome: "PROFILE_UNAVAILABLE"; reasonCode: BinanceProfileBindingFailure }
+  | {
+      /**
+       * The profile's systemic latch is OPEN. Nothing may run, and CIRCUIT_OPEN
+       * WINS over every campaign state.
+       *
+       * Reported before the bootstrap, which is the entire value of asking here
+       * rather than only at admission: a stopped account writes no roots, claims
+       * no window, burns no ingest attempt and issues no request. Admission
+       * remains the authoritative check, because this read is unlocked and can
+       * go stale between here and there.
+       *
+       * An ACTIVE campaign alongside an OPEN latch should be unreachable --
+       * opening pauses the current ACTIVE campaign in the same transaction --
+       * so if one is seen here it is corruption or an older race, and the
+       * refusal is still the right answer. The campaign is reported as metadata,
+       * never as authority.
+       */
+      outcome: "CIRCUIT_OPEN";
+      executionProfileId: string;
+      /**
+       * The most recent campaign, for context, or null if the profile never had
+       * one. Best-effort and advisory: it is a second unlocked read, so it may
+       * not be perfectly coherent with the latch beside it. Nothing decides
+       * anything on it.
+       */
+      campaign: HistoricalFillBatchCampaign | null;
+      circuit: HistoricalFillCircuitDenial;
+    }
   | {
       outcome: "ACTIVE";
       executionProfileId: string;
@@ -106,6 +139,31 @@ export class HistoricalFillCampaignGate {
     }
     const executionProfileId = binding.context.executionProfileId;
 
+    // THE LATCH IS ASKED FIRST, and it OUTRANKS every campaign state.
+    //
+    // Ordered ahead of the ACTIVE lookup on purpose. Asking about the campaign
+    // first and the circuit second would leave a reachable shape in which a
+    // stale or corrupted ACTIVE row returns ACTIVE while the account is stopped
+    // -- and the driver would bootstrap on it. Asked in this order, no campaign
+    // state can outvote an open circuit.
+    //
+    // Unlocked and read-only, like the rest of this method. That makes it a
+    // FAST FAIL-CLOSED PATH rather than the decision: its value is saving the
+    // bootstrap, the claim and the request. The admission that follows re-reads
+    // the same latch under the profile lock and is the authority.
+    const circuit = await readCircuitState(this.deps.prisma, executionProfileId);
+    if (circuit.state === "OPEN") {
+      // Context only, and gathered AFTER the refusal is already decided: this
+      // second read cannot change the answer, it can only describe it.
+      const latest = await this.latestCampaign(executionProfileId);
+      return {
+        outcome: "CIRCUIT_OPEN",
+        executionProfileId,
+        campaign: latest,
+        circuit: circuitDenialOf(circuit),
+      };
+    }
+
     const active = await this.deps.prisma.historicalFillCampaign.findFirst({
       where: { executionProfileId, status: "ACTIVE" },
       select: { id: true, status: true, dispatchesUsed: true, maxDispatches: true },
@@ -114,16 +172,23 @@ export class HistoricalFillCampaignGate {
       return { outcome: "ACTIVE", executionProfileId, campaign: describe(active) };
     }
 
+    return {
+      outcome: "NO_ACTIVE_CAMPAIGN",
+      executionProfileId,
+      campaign: await this.latestCampaign(executionProfileId),
+    };
+  }
+
+  /** The profile's most recent campaign, whatever became of it, or null. */
+  private async latestCampaign(
+    executionProfileId: string
+  ): Promise<HistoricalFillBatchCampaign | null> {
     const latest = await this.deps.prisma.historicalFillCampaign.findFirst({
       where: { executionProfileId },
       orderBy: { startedAt: "desc" },
       select: { id: true, status: true, dispatchesUsed: true, maxDispatches: true },
     });
-    return {
-      outcome: "NO_ACTIVE_CAMPAIGN",
-      executionProfileId,
-      campaign: latest ? describe(latest) : null,
-    };
+    return latest ? describe(latest) : null;
   }
 
   /**

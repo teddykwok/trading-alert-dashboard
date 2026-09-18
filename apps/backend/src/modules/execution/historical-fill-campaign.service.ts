@@ -6,6 +6,10 @@ import {
 } from "@prisma/client";
 
 import { lockCampaignForProfile } from "./historical-fill-campaign-lock";
+import {
+  readCircuitState,
+  type HistoricalFillCircuitSnapshot,
+} from "./historical-fill-circuit-breaker.service";
 
 /**
  * The only bound on a historical backfill that survives the next tick.
@@ -101,6 +105,71 @@ export class HistoricalFillCampaignStateError extends Error {
   }
 }
 
+/**
+ * The profile's systemic circuit is OPEN, so no campaign may be made runnable.
+ *
+ * Its own class, distinct from a conflict and from a state error, because the
+ * operator action is completely different: there is nothing wrong with the
+ * request and nothing to fix about the campaign -- an account-wide fault
+ * stopped this profile, and it has to be investigated and acknowledged before
+ * anything starts again.
+ *
+ * ## No override
+ *
+ * No `force`, no flag, no auto-acknowledgement. A refusal that could be argued
+ * with is not a circuit breaker, and a create or resume that silently cleared
+ * the latch would destroy the one signal saying a fault was never looked at.
+ * Acknowledgement is a separate, deliberate operator action, and always a
+ * second one.
+ *
+ * Carries the family, the last reason code and when it opened -- enough for an
+ * operator or a future CLI to say what happened. Never a raw exchange message,
+ * a response body, an account identifier or a credential.
+ */
+export class HistoricalFillCircuitOpenError extends Error {
+  readonly reasonCode = "FILL_CAMPAIGN_CIRCUIT_OPEN";
+  readonly failureFamily: string | null;
+  readonly lastReasonCode: string | null;
+  readonly openedAt: Date | null;
+
+  constructor(
+    detail: string,
+    circuit: Pick<
+      HistoricalFillCircuitSnapshot,
+      "failureFamily" | "lastReasonCode" | "openedAt"
+    >
+  ) {
+    super(
+      `Historical fill circuit is OPEN for this profile: ${detail}. ` +
+        `Acknowledge the circuit before starting or resuming a campaign.`
+    );
+    this.name = "HistoricalFillCircuitOpenError";
+    this.failureFamily = circuit.failureFamily;
+    this.lastReasonCode = circuit.lastReasonCode;
+    this.openedAt = circuit.openedAt;
+  }
+}
+
+/**
+ * Refuses the caller when the profile's latch is OPEN.
+ *
+ * Takes the caller's LOCKED `tx`, never the service client: the whole point is
+ * that the latch is read inside the same advisory lock as the transition it
+ * guards, so a trip cannot commit between the check and the write.
+ */
+async function assertCircuitClosed(
+  tx: Prisma.TransactionClient,
+  executionProfileId: string,
+  action: string
+): Promise<void> {
+  const circuit = await readCircuitState(tx, executionProfileId);
+  if (circuit.state !== "OPEN") return;
+  throw new HistoricalFillCircuitOpenError(
+    `refusing to ${action} for profile ${executionProfileId}`,
+    circuit
+  );
+}
+
 /** No campaign with that id. Separate from a state error: nothing to act on at all. */
 export class HistoricalFillCampaignNotFoundError extends Error {
   readonly reasonCode = "FILL_CAMPAIGN_NOT_FOUND";
@@ -172,6 +241,22 @@ export class HistoricalFillCampaignService {
       return await this.prisma.$transaction(async (tx) => {
         await lockCampaignForProfile(tx, input.executionProfileId);
 
+        // THE LATCH, BEFORE THE CONFLICT CHECK AND BEFORE THE ROW.
+        //
+        // A create is the purest form of "make runnable work exist", so it is
+        // the one thing an open circuit must never allow -- including, and
+        // especially, the case this catches that nothing else would: a campaign
+        // whose final slot EXHAUSTED it, a circuit that opened afterwards, and
+        // an operator starting a REPLACEMENT. The dead campaign is not live, so
+        // the conflict check below would wave that through; the latch is the
+        // only thing standing in its way.
+        //
+        // Read under the lock, so a trip committing concurrently either loses
+        // the lock to this create -- and then pauses the campaign it just made
+        // -- or wins it and refuses this one. There is no interleaving in which
+        // an OPEN circuit ends up beside an ACTIVE campaign.
+        await assertCircuitClosed(tx, input.executionProfileId, "start a campaign");
+
         const live = await tx.historicalFillCampaign.findFirst({
           where: { executionProfileId: input.executionProfileId, status: { in: [...LIVE_CAMPAIGN_STATUSES] } },
           select: { id: true, status: true },
@@ -239,6 +324,12 @@ export class HistoricalFillCampaignService {
       from: ["PAUSED"],
       to: "ACTIVE",
       endedAt: "unchanged",
+      // PAUSED -> ACTIVE creates runnable work, so the latch governs it. This
+      // is the other half of the systemic stop: opening the circuit pauses the
+      // campaign that was running, and this is what stops an operator from
+      // simply putting it back without acknowledging why it stopped. A manual
+      // pause plus an open circuit therefore STAYS paused.
+      refuseWhileCircuitOpen: "resume a campaign",
     });
   }
 
@@ -302,6 +393,18 @@ export class HistoricalFillCampaignService {
       to: HistoricalFillCampaignStatus;
       endedAt: "now" | "unchanged";
       note?: string | null;
+      /**
+       * Set ONLY by transitions that make a campaign runnable, naming the action
+       * for the refusal message.
+       *
+       * Opt-in rather than opt-out, deliberately. PAUSE and ABORT are the
+       * operator's safety actions, and a circuit that blocked them would trap
+       * somebody out of stopping work during exactly the fault it exists to
+       * announce. So the latch guards the one direction that starts work, and
+       * an omitted flag can only ever make a transition MORE available, never
+       * less.
+       */
+      refuseWhileCircuitOpen?: string;
     }
   ): Promise<HistoricalFillCampaign> {
     // The profile is immutable, so reading it before the lock cannot go stale.
@@ -313,6 +416,12 @@ export class HistoricalFillCampaignService {
 
     return this.prisma.$transaction(async (tx) => {
       await lockCampaignForProfile(tx, existing.executionProfileId);
+
+      // Under the lock, and before the state is even read: a transition that
+      // may not happen at all should not report which state stood in its way.
+      if (spec.refuseWhileCircuitOpen !== undefined) {
+        await assertCircuitClosed(tx, existing.executionProfileId, spec.refuseWhileCircuitOpen);
+      }
 
       const current = await tx.historicalFillCampaign.findUnique({
         where: { id: campaignId },

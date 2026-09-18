@@ -15,6 +15,7 @@ import type {
   HistoricalFillBatchCampaign,
   HistoricalFillCampaignGateResult,
 } from "./historical-fill-campaign-gate.service";
+import type { HistoricalFillCircuitDenial } from "./historical-fill-circuit-breaker.service";
 import type { HistoricalFillCampaignStatus } from "@prisma/client";
 
 /**
@@ -138,7 +139,23 @@ export type FillBatchStopReason =
    * ceilings: "your budget is spent" and "this minute is busy" demand
    * completely different operator responses.
    */
-  | "CAMPAIGN_DISPATCH_BUDGET_EXHAUSTED";
+  | "CAMPAIGN_DISPATCH_BUDGET_EXHAUSTED"
+  /**
+   * The profile's SYSTEMIC circuit is open, so the account is stopped entirely.
+   *
+   * Categorically different from every other stop reason here, and that is why
+   * it is its own. The rest describe a bound being reached -- a budget, a
+   * ceiling, a queue -- all of which are the system working as designed. This
+   * one says a repeated fault was detected and an operator must look at it:
+   * nothing will run for this account again, on any tick, until somebody
+   * acknowledges the circuit. Folding it into `NO_ACTIVE_FILL_CAMPAIGN` would
+   * turn a standing incident into an ordinary quiet pass.
+   *
+   * Reached two ways, and the result says which by whether `bootstrap` is null:
+   * refused by the pre-bootstrap gate, or refused by the authoritative
+   * admission after a stale gate let the pass get that far.
+   */
+  | "SYSTEMIC_CIRCUIT_OPEN";
 
 /**
  * The campaign this pass ran under, as it stood when the pass ended.
@@ -245,6 +262,33 @@ export type HistoricalFillBatchResult =
       bootstrap: null;
       executionInvocations: number;
       outcomes: FillBatchOutcomeCounts;
+    } & UserTradesWeightAccounting &
+      HistoricalFillCampaignAccounting)
+  | ({
+      /**
+       * Stopped because the account's systemic circuit is OPEN.
+       *
+       * `bootstrap` is nullable here and NOT always null, which is the honest
+       * shape rather than a tidy one: the gate refuses before the bootstrap and
+       * reports null, while the stale-gate race is refused at admission, by
+       * which point roots have already been written. Roots are idempotent and
+       * cost nothing, so that is acceptable -- but claiming null would be a
+       * summary that said no work was done when some was.
+       *
+       * What is guaranteed on BOTH paths is the part that matters: no campaign
+       * slot, no minute weight, no reservation row and no executor invocation
+       * attributable to this denial.
+       */
+      outcome: "SYSTEMIC_CIRCUIT_OPEN";
+      bootstrap: FillRootBootstrapSummary | null;
+      executionInvocations: number;
+      outcomes: FillBatchOutcomeCounts;
+      /**
+       * The latch that stopped the pass, from whichever check refused it: the
+       * gate's advisory read, or the admission's authoritative locked one.
+       * Never the two mixed, and never invented.
+       */
+      circuit: HistoricalFillCircuitDenial;
     } & UserTradesWeightAccounting &
       HistoricalFillCampaignAccounting)
   | ({
@@ -399,6 +443,29 @@ export class HistoricalFillBatchDriver {
         };
       }
 
+      if (gate.outcome === "CIRCUIT_OPEN") {
+        // The whole value of the pre-bootstrap check, cashed in here: this
+        // returns before `bootstrapHistoricalRoots` is called even once, so a
+        // stopped account writes NO roots, claims NO window, burns NO ingest
+        // attempt, reserves NO weight and issues NO request.
+        //
+        // The breaker snapshot is the GATE'S, carried through unaltered. It is
+        // the only one this path ever read, and mixing it with anything else
+        // would report a latch state that no single moment ever held.
+        return this.settled(
+          {
+            outcome: "SYSTEMIC_CIRCUIT_OPEN",
+            bootstrap: null,
+            executionInvocations: 0,
+            outcomes,
+            ...weighed(budget, used),
+            ...campaignAccounting(gate.campaign),
+            circuit: gate.circuit,
+          },
+          0
+        );
+      }
+
       if (gate.outcome === "NO_ACTIVE_CAMPAIGN") {
         // Zero roots, zero claims, zero reservations, zero requests. The
         // campaign metadata still says WHICH of the five situations this is.
@@ -505,6 +572,46 @@ export class HistoricalFillBatchDriver {
           weightCap: options.globalUserTradesWeightPerMinute as number,
         });
 
+        if (admission.outcome === "SYSTEMIC_CIRCUIT_OPEN") {
+          // THE STALE-GATE RACE, refused by the authority.
+          //
+          // The gate said ACTIVE a moment ago and another worker has opened the
+          // circuit since. That read was unlocked, so it was allowed to be
+          // wrong; this one was taken under the profile lock in the transaction
+          // that would have spent the slot, and it is the one that counts. The
+          // pass therefore stops HERE, before `executeOne`, with nothing spent:
+          // the admission unwound whatever it had touched, so no slot, no
+          // weight and no reservation row exist for it.
+          //
+          // The bootstrap already ran -- the gate waved this pass through
+          // before the circuit opened -- and that is reported honestly rather
+          // than nulled. Roots are idempotent and no request followed them.
+          //
+          // The campaign is RE-READ rather than carried from the gate. Opening
+          // the circuit pauses the ACTIVE campaign in the same transaction, so
+          // the gate's snapshot now describes a state that no longer exists;
+          // reporting it would put a status in an operator's summary that was
+          // untrue by the time it was written. Null when it cannot be read is
+          // the one honest answer available.
+          const stopped =
+            campaign !== null && this.deps.campaigns !== undefined
+              ? await this.deps.campaigns.describeCampaign(campaign.id)
+              : campaign;
+          return this.settled(
+            {
+              outcome: "SYSTEMIC_CIRCUIT_OPEN",
+              bootstrap,
+              executionInvocations,
+              outcomes,
+              ...weighed(budget, used),
+              ...campaignAccounting(stopped),
+              // The ADMISSION'S snapshot, read under the lock. Deliberately not
+              // the gate's, which is known stale on exactly this path.
+              circuit: admission.circuit,
+            },
+            0
+          );
+        }
         if (admission.outcome === "NO_ACTIVE_FILL_CAMPAIGN") {
           // The campaign ended UNDER us -- an operator paused or aborted it, or
           // another worker took its last slot -- between the pre-bootstrap gate

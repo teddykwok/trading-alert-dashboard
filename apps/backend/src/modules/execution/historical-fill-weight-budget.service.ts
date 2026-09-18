@@ -6,6 +6,11 @@ import {
 
 import { USER_TRADES_REQUEST_WEIGHT } from "./exchange-fill-batch-driver.service";
 import { lockCampaignForProfile } from "./historical-fill-campaign-lock";
+import {
+  circuitDenialOf,
+  readCircuitState,
+  type HistoricalFillCircuitDenial,
+} from "./historical-fill-circuit-breaker.service";
 
 /**
  * The CROSS-PROCESS ceiling on historical userTrades request weight.
@@ -156,7 +161,25 @@ export type HistoricalFillCampaignAdmissionResult =
       weightCap: number;
       weightUsed: number;
     }
-  | { outcome: "CAP_MISMATCH"; bucketStart: Date; storedCap: number; configuredCap: number };
+  | { outcome: "CAP_MISMATCH"; bucketStart: Date; storedCap: number; configuredCap: number }
+  | {
+      /**
+       * The profile's systemic latch is OPEN, so nothing may be dispatched.
+       *
+       * The AUTHORITATIVE refusal. The batch driver's pre-bootstrap gate asks
+       * the same question a moment earlier, but that read is unlocked and can
+       * be overtaken between asking and admitting -- so this one, taken under
+       * the profile lock in the same transaction that would have spent the
+       * slot, is the one that decides. It is also why a stale gate is harmless
+       * rather than a bypass.
+       *
+       * Ordered FIRST inside the transaction: no campaign slot, no minute
+       * weight, no reservation row and no `lastAdmissionAt` may move before it.
+       */
+      outcome: "SYSTEMIC_CIRCUIT_OPEN";
+      /** The latch as it stood under the lock; never a stale pre-lock read. */
+      circuit: HistoricalFillCircuitDenial;
+    };
 
 /** Every admission outcome that must leave the database exactly as it found it. */
 type HistoricalFillCampaignAdmissionDenial = Exclude<
@@ -403,11 +426,11 @@ export class HistoricalFillWeightBudgetService {
    *
    * ## Row access order, as the code actually does it
    *
-   * campaign advisory lock -> clock -> CAMPAIGN row -> BUCKET row -> RESERVATION
-   * insert.
+   * campaign advisory lock -> BREAKER row -> clock -> CAMPAIGN row -> BUCKET
+   * row -> RESERVATION insert.
    *
    * This is genuinely the reverse of the refund path, which goes RESERVATION ->
-   * BUCKET -> CAMPAIGN. Two transactions taking the same rows in opposite
+   * BUCKET -> CAMPAIGN -> BREAKER. Two transactions taking the same rows in opposite
    * orders is the textbook deadlock, and the per-profile advisory lock is what
    * makes it safe: both sides take it FIRST, so for one profile an admission
    * and a refund never interleave at all. The order is written down here
@@ -428,6 +451,31 @@ export class HistoricalFillWeightBudgetService {
       return await this.prisma.$transaction(async (tx) => {
         // FIRST, always. Everything below is campaign-aware budget mutation.
         await lockCampaignForProfile(tx, options.executionProfileId);
+
+        // THE SYSTEMIC LATCH, BEFORE ANY ACCOUNTING IS TOUCHED.
+        //
+        // Ordered here, immediately after the lock and before the clock, the
+        // campaign and the bucket, because everything below this line either
+        // reads state a mutation depends on or performs one. An OPEN latch must
+        // cost NOTHING: zero slot, zero `lastAdmissionAt`, zero minute weight,
+        // zero reservation row and, because the caller returns on this denial,
+        // zero executor invocations.
+        //
+        // Read through `tx`, so it is the latch as it stands INSIDE this lock.
+        // An unlocked read could be overtaken by a trip committing a
+        // microsecond later, and this admission would then spend a slot against
+        // a circuit that was already open when it did so.
+        const circuit = await readCircuitState(tx, options.executionProfileId);
+        if (circuit.state === "OPEN") {
+          // Thrown, not returned, like every other denial here -- see the
+          // rollback error's own note. Nothing has been written yet, so this
+          // particular unwind gives nothing back; it is written this way so
+          // that it STAYS correct if a future edit adds a write above it.
+          throw new HistoricalFillCampaignAdmissionRollback({
+            outcome: "SYSTEMIC_CIRCUIT_OPEN",
+            circuit: circuitDenialOf(circuit),
+          });
+        }
 
         const bucketStart = await this.currentBucketStart(tx);
 
@@ -471,6 +519,14 @@ export class HistoricalFillWeightBudgetService {
 
         const dispatchesUsed = campaign.dispatchesUsed + 1;
         const isFinalSlot = dispatchesUsed === campaign.maxDispatches;
+        // ONE instant for everything this admission stamps, so a final slot's
+        // `lastAdmissionAt` and `endedAt` name the same moment rather than two
+        // microseconds either side of it. Host time, matching every other row
+        // timestamp this service writes; the DATABASE clock is used only for
+        // the accounting minute, where contenders must agree on a bucket, and
+        // it is truncated to the minute so it would read as much as 59 seconds
+        // early here.
+        const admittedAt = new Date();
 
         // The final slot and the state change commit TOGETHER. No committed
         // state where a campaign is ACTIVE with every slot spent can exist,
@@ -484,7 +540,14 @@ export class HistoricalFillWeightBudgetService {
           },
           data: {
             dispatchesUsed: { increment: 1 },
-            ...(isFinalSlot ? { status: "EXHAUSTED" as const, endedAt: new Date() } : {}),
+            // The SAME statement that spends the slot. A successful admission
+            // is exactly the event this timestamp names, so writing it here
+            // means it can never be set without a slot being spent, nor a slot
+            // spent without it moving -- and every denial above and below
+            // unwinds both together. No extra query: the row is already being
+            // written.
+            lastAdmissionAt: admittedAt,
+            ...(isFinalSlot ? { status: "EXHAUSTED" as const, endedAt: admittedAt } : {}),
           },
         });
         // Under the advisory lock nothing else can move this campaign, so a
@@ -579,9 +642,10 @@ export class HistoricalFillWeightBudgetService {
    *
    * ## Row access order, as the code actually does it
    *
-   * campaign advisory lock -> RESERVATION -> BUCKET -> CAMPAIGN.
+   * campaign advisory lock -> RESERVATION -> BUCKET -> CAMPAIGN -> BREAKER.
    *
-   * That is the reverse of admission's CAMPAIGN -> BUCKET -> RESERVATION. The
+   * That is the reverse of admission's BREAKER -> CAMPAIGN -> BUCKET ->
+   * RESERVATION. The
    * advisory lock, taken first by both, is the only reason those opposite
    * orders cannot deadlock. A legacy reservation takes no campaign lock and
    * touches no campaign row, so it cannot close a cycle either.
@@ -708,11 +772,20 @@ export class HistoricalFillWeightBudgetService {
    * - ABORTED   hard terminal. The slot returns, the abort stands, and nothing
    *             here may resurrect it.
    * - EXHAUSTED the only reopenable state, and only if the profile has no other
-   *             live campaign -- reopening beside one would be two live
-   *             campaigns, each with its own ceiling, which is the exact
-   *             overspend the partial unique index exists to prevent. When one
-   *             does exist the refund still COMMITS; only the reopening is
-   *             skipped.
+   *             live campaign AND its systemic circuit is not OPEN -- reopening
+   *             beside a live campaign would be two live campaigns, each with
+   *             its own ceiling, which is the exact overspend the partial
+   *             unique index exists to prevent, and reopening under an OPEN
+   *             circuit would create runnable work for a fault nobody has
+   *             cleared yet. In both cases the refund still COMMITS; only the
+   *             reopening is skipped.
+   *
+   *             KNOWN GAP, deliberately left for the acknowledgement slice: the
+   *             veto is on the latch as it stands RIGHT NOW. A refund that
+   *             lands after an operator has acknowledged sees a CLOSED circuit
+   *             and reopens the campaign, because acknowledgement wipes the row
+   *             and the schema keeps no record that an episode ever happened.
+   *             Closing that needs durable history this slice may not add.
    * - COMPLETED impossible for an outstanding reservation: COMPLETED means the
    *             queue was declared finished, which cannot be true while a
    *             dispatch this campaign paid for was still unresolved. Treated
@@ -739,6 +812,24 @@ export class HistoricalFillWeightBudgetService {
 
     if (campaign.status !== "EXHAUSTED") return;
     if (campaign.dispatchesUsed >= campaign.maxDispatches) return;
+
+    // THE SYSTEMIC LATCH VETOES REOPENING -- but never the refund itself.
+    //
+    // Reactivation is the one place in this service that CREATES runnable work:
+    // an ACTIVE campaign is immediately dispatchable by any worker. Doing that
+    // while the profile's circuit is OPEN would hand the very fault the breaker
+    // stopped a fresh campaign to burn, and would break the invariant the whole
+    // design rests on -- OPEN commits => zero ACTIVE campaigns.
+    //
+    // The ACCOUNTING above still commits, deliberately. The weight and the slot
+    // were charged for a dispatch that provably never happened; refusing to
+    // give them back would leave a permanent overcount to punish an outage. So
+    // the books are corrected and only the reopening is withheld, exactly as it
+    // already is when another live campaign exists.
+    //
+    // Read under this transaction's own lock, like every other enforcement site.
+    const circuit = await readCircuitState(tx, linked.executionProfileId);
+    if (circuit.state === "OPEN") return;
 
     const otherLive = await tx.historicalFillCampaign.count({
       where: {
