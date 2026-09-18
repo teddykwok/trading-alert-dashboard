@@ -588,7 +588,25 @@ export class HistoricalFillWeightBudgetService {
         }
 
         const reservation = await tx.historicalFillWeightReservation.create({
-          data: { bucketId: weightStep.bucketId, weight, campaignId: campaign.id },
+          data: {
+            bucketId: weightStep.bucketId,
+            weight,
+            campaignId: campaign.id,
+            // THE EPOCH THIS GRANT BELONGS TO, stated rather than defaulted.
+            //
+            // `circuit` was read through `tx` after this transaction took the
+            // profile lock, and this insert commits inside that same lock, so the
+            // value cannot be stale with respect to any committed trip: a trip
+            // either finished before the lock was granted -- in which case the
+            // OPEN check above refused this admission and there is no reservation
+            // at all -- or it has not started, and will land on the next epoch.
+            //
+            // Written explicitly because the column's DEFAULT exists for the
+            // reservations that predate all of this. Relying on it here would
+            // silently tag every campaign-aware grant as epoch zero, which reads
+            // as "admitted before the first episode" forever.
+            circuitGeneration: circuit.generation,
+          },
           select: { id: true },
         });
 
@@ -711,18 +729,34 @@ export class HistoricalFillWeightBudgetService {
   }
 
   /** The reservation's campaign and that campaign's account, or null for a legacy grant. */
-  private async readCampaignLink(
-    reservationId: string
-  ): Promise<{ campaignId: string; executionProfileId: string } | null> {
+  private async readCampaignLink(reservationId: string): Promise<{
+    campaignId: string;
+    executionProfileId: string;
+    circuitGeneration: number;
+  } | null> {
     const row = await this.prisma.historicalFillWeightReservation.findUnique({
       where: { id: reservationId },
       // The campaign is the CANONICAL owner of the profile identity. The
       // reservation deliberately does not carry a second copy, because a
       // duplicate would create an invariant nothing enforces.
-      select: { campaignId: true, campaign: { select: { executionProfileId: true } } },
+      //
+      // `circuitGeneration` joins the same pre-lock read for the same reason the
+      // other two are safe here: it is written once by the admission that created
+      // the row and never updated afterwards, so it cannot go stale. It is a fact
+      // about when this grant happened, not about the world now -- the half of
+      // the comparison that IS about now is read under the lock, below.
+      select: {
+        campaignId: true,
+        circuitGeneration: true,
+        campaign: { select: { executionProfileId: true } },
+      },
     });
     if (!row?.campaignId || !row.campaign) return null;
-    return { campaignId: row.campaignId, executionProfileId: row.campaign.executionProfileId };
+    return {
+      campaignId: row.campaignId,
+      executionProfileId: row.campaign.executionProfileId,
+      circuitGeneration: row.circuitGeneration,
+    };
   }
 
   /** The pre-campaign release, unchanged: CAS the reservation, decrement the bucket. */
@@ -780,12 +814,13 @@ export class HistoricalFillWeightBudgetService {
    *             cleared yet. In both cases the refund still COMMITS; only the
    *             reopening is skipped.
    *
-   *             KNOWN GAP, deliberately left for the acknowledgement slice: the
-   *             veto is on the latch as it stands RIGHT NOW. A refund that
-   *             lands after an operator has acknowledged sees a CLOSED circuit
-   *             and reopens the campaign, because acknowledgement wipes the row
-   *             and the schema keeps no record that an episode ever happened.
-   *             Closing that needs durable history this slice may not add.
+   *             The latch being CLOSED is necessary but NOT sufficient, because
+   *             acknowledgement wipes every other column and leaves a row that
+   *             looks exactly like one from a streak that recovered on its own.
+   *             So the reservation's epoch must also match the breaker's: a
+   *             grant made before an episode that has since been acknowledged
+   *             is refused reopening, and only refused reopening -- its refund
+   *             still commits in full.
    * - COMPLETED impossible for an outstanding reservation: COMPLETED means the
    *             queue was declared finished, which cannot be true while a
    *             dispatch this campaign paid for was still unresolved. Treated
@@ -797,7 +832,7 @@ export class HistoricalFillWeightBudgetService {
    */
   private async reactivateIfFreed(
     tx: Prisma.TransactionClient,
-    linked: { campaignId: string; executionProfileId: string }
+    linked: { campaignId: string; executionProfileId: string; circuitGeneration: number }
   ): Promise<void> {
     const campaign = await tx.historicalFillCampaign.findUniqueOrThrow({
       where: { id: linked.campaignId },
@@ -830,6 +865,29 @@ export class HistoricalFillWeightBudgetService {
     // Read under this transaction's own lock, like every other enforcement site.
     const circuit = await readCircuitState(tx, linked.executionProfileId);
     if (circuit.state === "OPEN") return;
+
+    // THE EPOCH FENCE: this grant must belong to the epoch that is running now.
+    //
+    // The OPEN check above only sees a latch that is open AT THIS MOMENT, and
+    // that is not enough. An operator who investigates a fault and acknowledges
+    // it leaves a CLOSED latch with every other column wiped -- indistinguishable
+    // from a profile that merely had a streak and recovered. A reservation
+    // granted before that episode would then sail through the check above and
+    // reopen the campaign its final slot paid for, handing the account runnable
+    // work that nobody started and nobody resumed.
+    //
+    // The generations make that impossible without dating anything by a clock.
+    // Both values were captured inside a transaction holding this profile's lock
+    // -- the reservation's when it was admitted, the breaker's just now -- so
+    // comparing them compares positions in the lock's own order. Equal means no
+    // episode came between admission and refund. Different means one did, and the
+    // only safe answer is to leave the campaign where the episode left it.
+    //
+    // A VETO ON REOPENING ONLY. The accounting above has already committed and
+    // must stay committed: the weight and the slot were charged for a dispatch
+    // that provably never happened, and refusing to give them back would turn an
+    // outage into a permanent overcount. So this returns; it never throws.
+    if (linked.circuitGeneration !== circuit.generation) return;
 
     const otherLive = await tx.historicalFillCampaign.count({
       where: {

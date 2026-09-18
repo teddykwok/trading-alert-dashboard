@@ -1716,6 +1716,21 @@ model HistoricalFillWeightReservation {
   campaignId String?
   campaign   HistoricalFillCampaign? @relation(fields: [campaignId], references: [id], onDelete: Restrict)
 
+  /// The breaker epoch this admission was granted in.
+  ///
+  /// Written by the campaign-aware admission from the latch it read inside its
+  /// own locked transaction, so it records WHEN this grant happened in terms of
+  /// episodes rather than clocks. The refund compares it against the breaker's
+  /// generation at release time: equal means no episode intervened and the
+  /// established reactivation rule applies; different means this grant predates
+  /// an episode somebody has since acknowledged, and reopening the campaign it
+  /// paid for would resurrect work the operator never restarted.
+  ///
+  /// NOT NULL with a zero default so the reservations written before any of this
+  /// existed read as epoch 0, which is exactly what they are. A nullable column
+  /// would put three-valued logic into a safety comparison.
+  circuitGeneration Int @default(0)
+
   createdAt DateTime @default(now())
 
   @@index([bucketId, releasedAt])
@@ -1851,6 +1866,22 @@ model HistoricalFillCircuitBreaker {
   /// Consecutive failures within `failureFamily`. Moved only under the profile
   /// advisory lock, so concurrent workers cannot lose an increment.
   consecutiveCount Int @default(0)
+
+  /// How many times this profile's latch has CLOSED OVER, ever.
+  ///
+  /// The one field here that is HISTORY rather than current state, and it exists
+  /// because acknowledgement erases everything else. A reservation admitted
+  /// before an episode and one admitted after it are otherwise indistinguishable
+  /// once the latch is cleared -- every other column is reset to the same values
+  /// a profile that merely had a streak and recovered would carry. Without this,
+  /// a refund landing after an acknowledgement reopens an EXHAUSTED campaign and
+  /// creates runnable work nobody asked for.
+  ///
+  /// Monotonic, and moved ONLY by the CLOSED -> OPEN transition. Acknowledgement
+  /// leaves it alone, a healthy streak reset leaves it alone, and an observation
+  /// arriving while already OPEN writes nothing at all. Absence of a row is
+  /// logical generation 0, so the healthy path still never writes here.
+  generation Int @default(0)
 
   /// Start of the CURRENT streak, not of history.
   firstFailureAt DateTime?

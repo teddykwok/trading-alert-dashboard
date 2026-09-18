@@ -35,6 +35,7 @@ function codeOf(relative: string): string {
 }
 
 const BUDGET = "src/modules/execution/historical-fill-weight-budget.service.ts";
+const BREAKER = "src/modules/execution/historical-fill-circuit-breaker.service.ts";
 const GATE = "src/modules/execution/historical-fill-campaign-gate.service.ts";
 const CAMPAIGNS = "src/modules/execution/historical-fill-campaign.service.ts";
 const DRIVER = "src/modules/execution/exchange-fill-batch-driver.service.ts";
@@ -180,5 +181,82 @@ describe("the gate refuses before the bootstrap, and the driver obeys both", () 
     // would silently turn on automatic tripping a slice early, so its absence
     // is pinned rather than assumed.
     expect(codeOf(DRIVER)).not.toContain("observeDispatchOutcome");
+  });
+});
+
+/**
+ * The epoch counter is the only breaker state that survives acknowledgement, so
+ * everything about it is an ordering or an omission -- and an omission is
+ * invisible to a behavioural test that was not written for it. A `generation`
+ * quietly added to `acknowledge`'s data, or dropped from the reservation insert,
+ * leaves every other assertion in this suite passing while reopening the exact
+ * hole it was added to close.
+ */
+describe("the epoch moves in one place and is erased in none", () => {
+  const breaker = codeOf(BREAKER);
+  const budget = codeOf(BUDGET);
+
+  it("increments ONLY inside the opening branch", () => {
+    const increments = breaker.match(/generation: \{ increment: 1 \}/g) ?? [];
+    expect(increments).toHaveLength(1);
+    // The increment and the opening timestamp are written by the same guard, so
+    // the epoch cannot advance on anything but a CLOSED -> OPEN transition.
+    expect(breaker).toContain("...(opening ? { openedAt: now, generation: { increment: 1 } } : {})");
+  });
+
+  it("starts a row born OPEN at one and a streak row at zero", () => {
+    expect(breaker).toContain("generation: opening ? 1 : 0");
+  });
+
+  it("acknowledge does NOT assign generation", () => {
+    const body = methodBody(breaker, "async acknowledge(");
+    expect(body).toContain('state: "CLOSED"');
+    expect(body).toContain("openedAt: null");
+    // The whole point: everything else is cleared, this is not.
+    expect(body).not.toContain("generation");
+  });
+
+  it("the healthy streak reset does NOT assign generation", () => {
+    const body = methodBody(breaker, "private async reset(");
+    expect(body).toContain("consecutiveCount: 0");
+    expect(body).not.toContain("generation");
+  });
+
+  it("an absent breaker row reads as generation zero", () => {
+    expect(breaker).toMatch(/CLOSED_AND_CLEAN[\s\S]*?generation: 0/);
+  });
+
+  it("the campaign-aware reservation insert writes the epoch explicitly", () => {
+    // Relying on the column DEFAULT here would tag every campaign-aware grant as
+    // epoch zero forever, which reads as "granted before the first episode".
+    const body = methodBody(budget, "async admitCampaignDispatch(");
+    expect(body).toContain("circuitGeneration: circuit.generation");
+    const insert = /historicalFillWeightReservation\.create\(\{[\s\S]*?\}\);/.exec(body);
+    expect(insert).not.toBeNull();
+    expect(insert![0]).toContain("circuitGeneration");
+  });
+
+  it("the admission reads the epoch through its own locked transaction", () => {
+    const body = methodBody(budget, "async admitCampaignDispatch(");
+    ordered(body, "lockCampaignForProfile(tx,", "readCircuitState(tx,");
+    ordered(body, "readCircuitState(tx,", "circuitGeneration: circuit.generation");
+    expect(body).not.toContain("readCircuitState(this.prisma");
+  });
+
+  it("the refund compares epochs AFTER the OPEN veto, and returns rather than throws", () => {
+    const body = methodBody(budget, "private async reactivateIfFreed(");
+    ordered(body, 'if (circuit.state === "OPEN") return;', "linked.circuitGeneration !==");
+    expect(body).toContain("if (linked.circuitGeneration !== circuit.generation) return;");
+    // A throw here would roll the accounting refund back with it, turning an
+    // outage into a permanent overcount.
+    expect(body).not.toMatch(/circuitGeneration[\s\S]{0,120}throw/);
+  });
+
+  it("the epoch fence stays BELOW the legacy no-campaign branch", () => {
+    // A legacy grant carries no campaign, so it must never reach campaign
+    // reactivation logic at all -- epoch comparison included.
+    const body = methodBody(budget, "async releaseCertainNonDispatch(");
+    ordered(body, "if (linked === null) {", "this.releaseWeightOnly(reservation)");
+    expect(body).not.toContain("circuitGeneration");
   });
 });

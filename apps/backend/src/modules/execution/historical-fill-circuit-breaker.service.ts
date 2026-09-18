@@ -206,6 +206,17 @@ export interface HistoricalFillCircuitSnapshot {
   firstFailureAt: Date | null;
   lastFailureAt: Date | null;
   openedAt: Date | null;
+  /**
+   * How many episodes this profile has had. See the schema field for why it
+   * exists; in short, it is the ONLY thing here that survives acknowledgement,
+   * and therefore the only thing that can date a reservation against an episode.
+   *
+   * INTERNAL FENCING STATE. It is deliberately absent from the denial payload a
+   * refusal carries outward: an operator needs the cause, not a counter, and a
+   * number whose meaning is "which epoch" would invite exactly the kind of
+   * interpretation this slice is trying to make unnecessary.
+   */
+  generation: number;
 }
 
 /** A profile that has never failed: no row, and nothing stopped. */
@@ -217,6 +228,9 @@ const CLOSED_AND_CLEAN: HistoricalFillCircuitSnapshot = {
   firstFailureAt: null,
   lastFailureAt: null,
   openedAt: null,
+  // Absence IS epoch zero, which is what keeps the healthy path free of breaker
+  // writes: nothing has to create a row just so a generation can be read.
+  generation: 0,
 };
 
 export type HistoricalFillCircuitObservationResult =
@@ -257,6 +271,7 @@ type BreakerRow = {
   firstFailureAt: Date | null;
   lastFailureAt: Date | null;
   openedAt: Date | null;
+  generation: number;
 };
 
 const BREAKER_FIELDS = {
@@ -267,6 +282,7 @@ const BREAKER_FIELDS = {
   firstFailureAt: true,
   lastFailureAt: true,
   openedAt: true,
+  generation: true,
 } as const;
 
 function snapshotOf(row: BreakerRow | null): HistoricalFillCircuitSnapshot {
@@ -500,6 +516,10 @@ export class HistoricalFillCircuitBreakerService {
         consecutiveCount: 0,
         firstFailureAt: null,
         lastFailureAt: null,
+        // `generation` is ABSENT here too. A streak recovering is not an episode
+        // ending -- it is an episode that never happened -- so there is nothing
+        // for the epoch to record, and a profile that HAS had episodes must not
+        // have them forgotten because a later unrelated streak recovered.
       },
       select: BREAKER_FIELDS,
     });
@@ -549,11 +569,26 @@ export class HistoricalFillCircuitBreakerService {
         state: opening ? "OPEN" : "CLOSED",
         ...streak,
         openedAt: opening ? now : null,
+        // A row that is born OPEN is this profile's FIRST episode, so it starts
+        // at one rather than zero. A row born from a streak that has not reached
+        // its threshold has had no episode at all and takes the default.
+        generation: opening ? 1 : 0,
       },
       update: {
         state: opening ? "OPEN" : "CLOSED",
         ...streak,
-        ...(opening ? { openedAt: now } : {}),
+        // THE EPOCH MOVES ONLY HERE, on the CLOSED -> OPEN transition.
+        //
+        // Reachable only from a transaction that read CLOSED under this
+        // profile's advisory lock -- an observation arriving while already OPEN
+        // returned ALREADY_OPEN far above this and wrote nothing -- so a burst of
+        // concurrent failures produces exactly one increment, not one each.
+        //
+        // `increment` rather than a computed value: the read that produced
+        // `locked` happened in this same transaction under the same lock, but
+        // incrementing in the database keeps the counter correct on its own terms
+        // rather than on the freshness of a value carried in application memory.
+        ...(opening ? { openedAt: now, generation: { increment: 1 } } : {}),
       },
       select: BREAKER_FIELDS,
     });
@@ -672,6 +707,14 @@ export class HistoricalFillCircuitBreakerService {
           consecutiveCount: 0,
           firstFailureAt: null,
           lastFailureAt: null,
+          // `generation` is ABSENT, and that is the point of this slice.
+          //
+          // Everything above is current state, and an operator who has finished
+          // investigating is entitled to clear all of it. The epoch is history:
+          // it is what lets a refund arriving after this acknowledgement still
+          // know that its reservation was granted before the episode. Resetting
+          // it here would erase the only remaining evidence and reopen exactly
+          // the hole this column was added to close.
         },
         select: BREAKER_FIELDS,
       });

@@ -109,8 +109,19 @@ describe("the Prisma schema agrees with the migration", () => {
     expect(model).toMatch(/@relation\([^)]*onDelete: Restrict/);
   });
 
-  it("defaults only the counter, and to zero", () => {
+  it("defaults both integer counters, and both to zero", () => {
     expect(model).toMatch(/consecutiveCount Int @default\(0\)/);
+    // The epoch joined this model in the generation slice. Zero is meaningful
+    // rather than merely convenient: it is the value an absent row reads as, so
+    // a row that has never opened is indistinguishable from no row at all.
+    expect(model).toMatch(/generation Int @default\(0\)/);
+  });
+
+  it("keeps the epoch a plain non-null Int, never a BigInt or a nullable", () => {
+    // Nullable would put three-valued logic into a safety comparison; BigInt
+    // would not survive JSON serialization on the operator surfaces to come.
+    expect(model).not.toMatch(/generation\s+BigInt/);
+    expect(model).not.toMatch(/generation\s+Int\?/);
   });
 
   it("declares every timestamp nullable", () => {
@@ -142,5 +153,60 @@ describe("the Prisma schema agrees with the migration", () => {
     for (const forbidden of ["pauseReason", "systemicFailure", "circuit"]) {
       expect(campaign).not.toContain(forbidden);
     }
+  });
+});
+
+/**
+ * The epoch migration, which is a SECOND migration on purpose.
+ *
+ * The breaker migration above is committed and has already been applied to the
+ * local test database, so editing it would leave Prisma's recorded checksum
+ * disagreeing with the file. Additive history is cheaper than that argument.
+ */
+describe("the generation migration is additive and leaves the first one alone", () => {
+  const GENERATION_DIR = "prisma/migrations/20260918130000_add_historical_fill_circuit_generation";
+  const GENERATION_SQL = codeOf(
+    readFileSync(path.join(BACKEND, GENERATION_DIR, "migration.sql"), "utf8")
+  );
+
+  it("drops, truncates, deletes, rewrites and backfills nothing", () => {
+    expect(GENERATION_SQL).not.toMatch(/\bDROP\b/i);
+    expect(GENERATION_SQL).not.toMatch(/\bTRUNCATE\b/i);
+    expect(GENERATION_SQL).not.toMatch(/\bDELETE\s+FROM\b/i);
+    expect(GENERATION_SQL).not.toMatch(/\bUPDATE\s+"/i);
+    expect(GENERATION_SQL).not.toMatch(/\bINSERT\s+INTO\b/i);
+    expect(GENERATION_SQL).not.toMatch(/ALTER COLUMN/i);
+    expect(GENERATION_SQL).not.toMatch(/CREATE TABLE/i);
+  });
+
+  it("adds exactly the two columns, both NOT NULL DEFAULT 0", () => {
+    const added = [...GENERATION_SQL.matchAll(/ADD COLUMN "(\w+)" (\w+) NOT NULL DEFAULT 0/g)].map(
+      (m) => `${m[1]}:${m[2]}`
+    );
+    expect(added.sort()).toEqual(["circuitGeneration:INTEGER", "generation:INTEGER"]);
+  });
+
+  it("touches only the breaker and the reservation", () => {
+    const altered = [...GENERATION_SQL.matchAll(/ALTER TABLE "(\w+)"/g)].map((m) => m[1]);
+    expect(new Set(altered)).toEqual(
+      new Set(["HistoricalFillCircuitBreaker", "HistoricalFillWeightReservation"])
+    );
+  });
+
+  it("guards both counters against going negative", () => {
+    expect(GENERATION_SQL).toMatch(/CHECK \("generation" >= 0\)/);
+    expect(GENERATION_SQL).toMatch(/CHECK \("circuitGeneration" >= 0\)/);
+  });
+
+  it("adds no index", () => {
+    expect(GENERATION_SQL).not.toMatch(/CREATE\s+(UNIQUE\s+)?INDEX/i);
+  });
+
+  it("the reservation carries the epoch as a non-null defaulted Int", () => {
+    const model = codeOf(/model HistoricalFillWeightReservation \{[\s\S]*?\n\}/.exec(SCHEMA)![0]);
+    expect(model).toMatch(/circuitGeneration Int @default\(0\)/);
+    expect(model).not.toMatch(/circuitGeneration\s+Int\?/);
+    // campaignId stays nullable: the legacy grant is still a valid record.
+    expect(model).toMatch(/campaignId String\?/);
   });
 });

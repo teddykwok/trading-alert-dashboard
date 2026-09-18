@@ -111,6 +111,15 @@ async function weightUsed(executionProfileId: string): Promise<number> {
   return buckets.reduce((total, bucket) => total + bucket.weightUsed, 0);
 }
 
+/** The breaker epoch a reservation was granted in. */
+async function reservationGeneration(reservationId: string): Promise<number> {
+  const row = await prisma!.historicalFillWeightReservation.findUniqueOrThrow({
+    where: { id: reservationId },
+    select: { circuitGeneration: true },
+  });
+  return row.circuitGeneration;
+}
+
 async function activeCount(executionProfileId: string): Promise<number> {
   return prisma!.historicalFillCampaign.count({
     where: { executionProfileId, status: "ACTIVE" },
@@ -706,32 +715,47 @@ describe("a refund corrects the books without reopening a stopped account", () =
   });
 
   /**
-   * KNOWN GAP, pinned deliberately -- see the handoff's refund/ack analysis.
+   * THE RACE THIS SUBSYSTEM'S EPOCH COUNTER EXISTS TO CLOSE.
    *
-   * Acknowledgement wipes the breaker row, and the schema records nothing to
-   * say an episode ever happened, so a refund that lands afterwards sees a
-   * CLOSED latch and reopens the campaign. That contradicts the principle that
-   * acknowledgement alone must never produce runnable work.
+   * Acknowledgement wipes every other column on the breaker row, leaving one
+   * that is field-for-field identical to a row from a streak that recovered on
+   * its own. So "is the latch open right now" cannot answer this: at refund time
+   * it is closed, and without the epoch the reservation would reopen the campaign
+   * its final slot paid for -- handing a stopped account runnable work with no
+   * start and no resume behind it.
    *
-   * This asserts the behaviour AS IT IS rather than as it should be, so that
-   * the slice which adds the durable history has to come here and change it
-   * deliberately. It must NOT be read as an endorsement.
+   * The reservation was granted at epoch 0 and the breaker is now at 1, so the
+   * refund pays its accounting back in full and stops there.
    */
-  maybe()("KNOWN GAP: a refund landing after acknowledgement still reopens", async () => {
+  maybe()("a refund landing after acknowledgement refunds but does NOT reopen", async () => {
     const { executionProfileId, campaignId, reservation } =
       await finalSlotOutstanding("refund-after-ack");
+    expect(await reservationGeneration(reservation.id)).toBe(0);
+
     await openCircuit(executionProfileId, campaignId);
+    expect((await breaker.readState({ executionProfileId })).generation).toBe(1);
 
     const acknowledged = await breaker.acknowledge({ executionProfileId });
     expect(acknowledged.result).toBe("ACKNOWLEDGED");
-    // At the moment the operator acknowledged, nothing was runnable.
+    // The epoch is the ONE thing acknowledgement leaves behind.
+    expect(acknowledged.circuit.state).toBe("CLOSED");
+    expect(acknowledged.circuit.generation).toBe(1);
     expect(await activeCount(executionProfileId)).toBe(0);
 
     await budget.releaseCertainNonDispatch(reservation);
 
-    // ...and afterwards, something is -- with no further operator action.
-    expect((await campaignRow(campaignId)).status).toBe("ACTIVE");
-    expect(await activeCount(executionProfileId)).toBe(1);
+    // THE ACCOUNTING IS STILL PAID BACK IN FULL.
+    const row = await campaignRow(campaignId);
+    expect(row.dispatchesUsed).toBe(0);
+    expect(await weightUsed(executionProfileId)).toBe(0);
+    const released = await prisma!.historicalFillWeightReservation.findUniqueOrThrow({
+      where: { id: reservation.id },
+    });
+    expect(released.releasedAt).not.toBeNull();
+
+    // AND NOTHING BECAME RUNNABLE. 0 !== 1, so the reopening is vetoed.
+    expect(row.status).toBe("EXHAUSTED");
+    expect(await activeCount(executionProfileId)).toBe(0);
   });
 
   maybe()("the refund's veto reads the latch under the refund's own lock", async () => {
