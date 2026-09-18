@@ -40,6 +40,7 @@
     "execution:fill-campaign-abort": "tsx src/modules/execution/run-fill-campaign-abort.ts",
     "execution:fill-campaign-status": "tsx src/modules/execution/run-fill-campaign-status.ts",
     "execution:fill-circuit-acknowledge": "tsx src/modules/execution/run-fill-circuit-acknowledge.ts",
+    "execution:fill-bootstrap-roots": "tsx src/modules/execution/run-fill-bootstrap-roots.ts",
     "execution:protection-recovery": "tsx src/modules/execution/run-protection-recovery.ts",
     "execution:prepare-shutdown": "tsx src/modules/execution/run-shutdown-drain.ts",
     "test": "vitest run",
