@@ -17,6 +17,18 @@ import {
  * every construction lives inside the enabled branch.
  */
 
+/**
+ * An ENABLED runtime composes a signed Binance client, and composing one now
+ * refuses outright when the process has no credentials -- that refusal is the
+ * point of the seam, not an accident of this suite.
+ *
+ * The test environment configures none, so the enabled-path cases below pin a
+ * synthetic pair. Nothing here ever calls the client: the scheduler factory is
+ * a spy and no tick runs, so these values only ever reach a constructor.
+ */
+process.env.BINANCE_API_KEY ||= "wiring-test-api-key";
+process.env.BINANCE_API_SECRET ||= "wiring-test-api-secret";
+
 let info: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {

@@ -35,6 +35,9 @@ import {
   evaluateNaturalWindowForArm,
 } from "./natural-arm";
 import { validateCanarySymbol } from "./canary-symbol-validation";
+import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
+import { BinanceReadOnlyClient } from "../binance/binance.client";
+import { configuredExchangeClientOptions } from "./exchange-runtime-binding";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
 /**
@@ -160,7 +163,10 @@ export async function prepareCanary(): Promise<void> {
     // Read-only exchange metadata, the same GETs the Phase 3 planner uses.
     // Nothing below this point can leave a half-applied state, because the
     // allowlist change and the authorization share one transaction.
-    const validation = await validateCanarySymbol(symbol);
+    const validation = await validateCanarySymbol(
+      symbol,
+      new BinanceReadOnlyService(new BinanceReadOnlyClient(configuredExchangeClientOptions()))
+    );
     if (!validation.ok) {
       console.log(`BLOCKED — ${validation.reasonCode}: ${validation.message}`);
       console.log("Neither allowedSymbols nor any authorization was changed.");

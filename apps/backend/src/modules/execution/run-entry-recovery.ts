@@ -1,5 +1,8 @@
 import { PrismaClient } from "@prisma/client";
 
+import { BinanceReadOnlyClient } from "../binance/binance.client";
+import { configuredExchangeClientOptions } from "./exchange-runtime-binding";
+
 import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { EntryRecoveryService } from "./entry-recovery.service";
 import { runEntryRecoveryCli } from "./entry-recovery-cli";
@@ -27,7 +30,10 @@ async function main(): Promise<void> {
   try {
     const { exitCode } = await runEntryRecoveryCli(process.argv.slice(2), {
       prisma,
-      recovery: new EntryRecoveryService(prisma, new BinanceReadOnlyService()),
+      recovery: new EntryRecoveryService(
+        prisma,
+        new BinanceReadOnlyService(new BinanceReadOnlyClient(configuredExchangeClientOptions()))
+      ),
     });
     process.exitCode = exitCode;
   } finally {

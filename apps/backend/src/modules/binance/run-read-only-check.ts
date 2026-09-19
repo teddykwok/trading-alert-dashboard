@@ -2,6 +2,8 @@ import { env } from "../../config/env";
 import { BinanceError } from "./binance.errors";
 import { allowedReadOnlyPaths } from "./binance.endpoints";
 import { BinanceReadOnlyService } from "./binance-read-only.service";
+import { BinanceReadOnlyClient } from "./binance.client";
+import { configuredExchangeClientOptions } from "../execution/exchange-runtime-binding";
 import type { BinancePositionDto } from "./binance.types";
 
 /**
@@ -68,7 +70,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  const service = new BinanceReadOnlyService();
+  const service = new BinanceReadOnlyService(
+    new BinanceReadOnlyClient(configuredExchangeClientOptions())
+  );
 
   const summary = await service.getAccountSummary();
 

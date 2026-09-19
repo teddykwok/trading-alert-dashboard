@@ -1,5 +1,7 @@
 import { prisma } from "../../plugins/prisma";
+import { configuredExchangeClientOptions } from "../execution/exchange-runtime-binding";
 import { logger } from "../../config/logger";
+import { BinanceReadOnlyClient } from "../binance/binance.client";
 import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { BinanceUsdMExecutionClient } from "../binance/binance-execution.client";
 import { SafetyAdmissionService } from "../execution/safety-admission.service";
@@ -90,8 +92,12 @@ let lastStallReportAtMs: number | null = null;
 
 /** Built once and reused; holds no per-execution state between calls. */
 export function createExecutionOrchestrator(): ExecutionOrchestrator {
-  const readOnly = new BinanceReadOnlyService();
-  const mutations = new BinanceUsdMExecutionClient({ readOnlyClient: undefined });
+  // EXPLICIT credentials for the configured profile. The constructors would
+  // otherwise read them from the environment invisibly, which is exactly the
+  // ambient selection a second account would turn into a wrong-key dispatch.
+  const exchange = configuredExchangeClientOptions();
+  const readOnly = new BinanceReadOnlyService(new BinanceReadOnlyClient(exchange));
+  const mutations = new BinanceUsdMExecutionClient({ readOnlyClient: undefined, ...exchange });
   const alerts = new CriticalAlertService(prisma, async () => {
     // Critical alerts are PERSISTED here and delivered by the Phase 9
     // dispatcher. Returning false leaves the row queued rather than letting a

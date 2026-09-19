@@ -67,6 +67,18 @@ export interface EnvironmentBoundBinanceExecutionProfile {
    * already settled.
    */
   readonly environment: "TESTNET" | "MAINNET";
+  /**
+   * The rest of the profile's NON-SECRET identity, carried so a caller that
+   * holds this context never has to go and look the profile up again -- and,
+   * more importantly, cannot look up a DIFFERENT one while believing it is
+   * describing this binding.
+   *
+   * `accountIdentifier` is the operator-chosen alias. It is not a credential,
+   * not an exchange-issued account number, and safe to print.
+   */
+  readonly exchange: string;
+  readonly product: string;
+  readonly accountIdentifier: string;
 }
 
 /**
@@ -129,6 +141,9 @@ export async function bindConfiguredExecutionProfileEnvironment(
     context: {
       executionProfileId: profile.id,
       environment: profile.environment,
+      exchange: profile.exchange,
+      product: profile.product,
+      accountIdentifier: profile.accountIdentifier,
     } as EnvironmentBoundBinanceExecutionProfile,
   };
 }

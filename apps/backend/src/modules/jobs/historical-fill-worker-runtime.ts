@@ -4,6 +4,8 @@ import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import { prisma } from "../../plugins/prisma";
 import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
+import { BinanceReadOnlyClient } from "../binance/binance.client";
+import { configuredExchangeClientOptions } from "../execution/exchange-runtime-binding";
 import { HistoricalFillBatchDriver } from "../execution/exchange-fill-batch-driver.service";
 import { ExchangeFillLedgerService } from "../execution/exchange-fill-ledger.service";
 import { ExchangeFillIngestWindowService } from "../execution/exchange-fill-ingest-window.service";
@@ -108,7 +110,9 @@ export function startHistoricalFillWorkerRuntime(
   // it precisely so this worker process can reuse it.
   const work = new ExchangeFillIngestWindowService(prisma);
   const ledger = new ExchangeFillLedgerService(prisma);
-  const reader = new BinanceReadOnlyService();
+  const reader = new BinanceReadOnlyService(
+    new BinanceReadOnlyClient(configuredExchangeClientOptions())
+  );
   const executor = new ExchangeFillOneWindowExecutor({ prisma, reader, ledger, work });
   const bootstrap = new ExchangeFillRootBootstrap({ prisma, work });
   const weightBudget = new HistoricalFillWeightBudgetService(prisma);

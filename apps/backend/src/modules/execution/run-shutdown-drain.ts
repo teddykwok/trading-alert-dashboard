@@ -1,5 +1,8 @@
 import { PrismaClient } from "@prisma/client";
 
+import { BinanceReadOnlyClient } from "../binance/binance.client";
+import { configuredExchangeClientOptions } from "./exchange-runtime-binding";
+
 import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { BinanceUsdMExecutionClient } from "../binance/binance-execution.client";
 import { EntryLifecycleService } from "./entry-lifecycle.service";
@@ -35,8 +38,11 @@ async function main(): Promise<void> {
       argv[0] === "drain"
         ? new EntryLifecycleService(
             prisma,
-            new BinanceReadOnlyService(),
-            new BinanceUsdMExecutionClient({ readOnlyClient: undefined })
+            new BinanceReadOnlyService(new BinanceReadOnlyClient(configuredExchangeClientOptions())),
+            new BinanceUsdMExecutionClient({
+              readOnlyClient: undefined,
+              ...configuredExchangeClientOptions(),
+            })
           )
         : undefined;
 

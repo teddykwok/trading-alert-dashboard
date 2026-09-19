@@ -209,8 +209,19 @@ describe("a Binance execution profile binding exists only when both sides agree"
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    // A plain, loggable value: an id and an environment, nothing else.
-    expect(Object.keys(result.context).sort()).toEqual(["environment", "executionProfileId"]);
+    // A plain, loggable value: the profile's NON-SECRET identity and nothing
+    // else. The set grew in 11B so a holder of this context never has to look
+    // the profile up again -- `accountIdentifier` is the operator-chosen alias,
+    // not an exchange account number and not a credential.
+    expect(Object.keys(result.context).sort()).toEqual([
+      "accountIdentifier",
+      "environment",
+      "exchange",
+      "executionProfileId",
+      "product",
+    ]);
+    // Still nothing credential-shaped in the value itself.
+    expect(JSON.stringify(result.context)).not.toMatch(/apiKey|apiSecret|secret/i);
 
     const source = readFileSync(SOURCE, "utf8");
     for (const forbidden of ["apiKey", "apiSecret", "BINANCE_API_KEY", "BINANCE_API_SECRET"]) {

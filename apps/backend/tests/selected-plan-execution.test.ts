@@ -434,7 +434,12 @@ describe("production registration", () => {
   it("constructs the executor with the real production services", () => {
     const source = worker();
     expect(source).toContain("new SelectedPlanExecutor(");
-    expect(source).toContain("new BinanceMarginPlanService()");
+    // 11B: the planner reaches SIGNED endpoints (account summary, leverage
+    // brackets), so production now hands it a read-only service built with the
+    // configured profile's credentials instead of letting the constructor read
+    // them from the environment on its own.
+    expect(source).toContain("new BinanceMarginPlanService(");
+    expect(source).toContain("configuredExchangeClientOptions()");
     expect(source).toContain("new ExecutionService(prisma)");
     expect(source).toContain("createExecutionOrchestrator()");
   });

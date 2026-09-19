@@ -193,11 +193,15 @@ describe("the canary cannot materialize, loop or schedule", () => {
     }
   });
 
-  it("constructs exactly the client and the seven guarded services", () => {
+  it("constructs exactly the client and the guarded services", () => {
     const constructed = [...codeOf(COMPOSITION).matchAll(/new\s+([A-Za-z0-9_]+)\s*\(/g)].map(
       (match) => match[1]!
     );
+    // 11B added `BinanceReadOnlyClient`: the reader is now built with the
+    // configured profile's credentials explicitly instead of the constructor
+    // reading them from the environment. Same capability, named at the site.
     expect(constructed.sort()).toEqual([
+      "BinanceReadOnlyClient",
       "BinanceReadOnlyService",
       "ExchangeFillIngestWindowService",
       "ExchangeFillLedgerService",

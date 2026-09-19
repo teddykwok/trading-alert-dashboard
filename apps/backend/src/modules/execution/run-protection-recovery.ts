@@ -1,5 +1,8 @@
 import { PrismaClient } from "@prisma/client";
 
+import { BinanceReadOnlyClient } from "../binance/binance.client";
+import { configuredExchangeClientOptions } from "./exchange-runtime-binding";
+
 import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { BinanceUsdMExecutionClient } from "../binance/binance-execution.client";
 import { CriticalAlertService } from "./critical-alert.service";
@@ -29,7 +32,10 @@ import { runProtectionRecoveryCli } from "./protection-recovery-cli";
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const prisma = new PrismaClient();
-  const readOnly = new BinanceReadOnlyService();
+  // EXPLICIT credentials for the configured profile: no constructor may
+  // reach into the environment on its own.
+  const exchange = configuredExchangeClientOptions();
+  const readOnly = new BinanceReadOnlyService(new BinanceReadOnlyClient(exchange));
 
   try {
     const protection =
@@ -37,7 +43,7 @@ async function main(): Promise<void> {
         ? new ProtectionLifecycleService(
             prisma,
             readOnly,
-            new BinanceUsdMExecutionClient({ readOnlyClient: undefined }),
+            new BinanceUsdMExecutionClient({ readOnlyClient: undefined, ...exchange }),
             new CriticalAlertService(prisma, async () => {
               // Persist only. A Telegram problem must never surface inside a
               // protection code path, exactly as the scheduler wires it.

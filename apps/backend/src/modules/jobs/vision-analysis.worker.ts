@@ -35,6 +35,9 @@ import {
   startExecutionOrchestrationScheduler,
 } from "./execution-orchestration.scheduler";
 import { BinanceMarginPlanService } from "../binance/binance-margin-plan.service";
+import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
+import { BinanceReadOnlyClient } from "../binance/binance.client";
+import { configuredExchangeClientOptions } from "../execution/exchange-runtime-binding";
 import { ExecutionService } from "../execution/execution.service";
 import { SelectedPlanExecutor } from "../execution/selected-plan-executor";
 import { recordSelectedPlanOutcome } from "../execution/selected-plan-outcome.service";
@@ -244,7 +247,11 @@ const extremeRRService = new ExtremeRRService(prisma);
 // Phase 11A.1 production signal -> execution link.
 const selectedPlanExecutor = new SelectedPlanExecutor({
   prisma,
-  marginPlanner: new BinanceMarginPlanService(),
+  // Signed: the planner reads account summary and leverage brackets, so its
+  // read-only service gets the configured profile's credentials explicitly.
+  marginPlanner: new BinanceMarginPlanService(
+    new BinanceReadOnlyService(new BinanceReadOnlyClient(configuredExchangeClientOptions()))
+  ),
   executions: new ExecutionService(prisma),
   orchestrator: createExecutionOrchestrator(),
 });

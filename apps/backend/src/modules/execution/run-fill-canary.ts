@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 
 import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
+import { BinanceReadOnlyClient } from "../binance/binance.client";
+import { configuredExchangeClientOptions } from "./exchange-runtime-binding";
 import { env } from "../../config/env";
 import { ExchangeFillIngestWindowService } from "./exchange-fill-ingest-window.service";
 import { ExchangeFillLedgerService } from "./exchange-fill-ledger.service";
@@ -43,7 +45,9 @@ export async function runFillWindowCanaryCommand(): Promise<void> {
   try {
     const work = new ExchangeFillIngestWindowService(prisma);
     const ledger = new ExchangeFillLedgerService(prisma);
-    const reader = new BinanceReadOnlyService();
+    const reader = new BinanceReadOnlyService(
+      new BinanceReadOnlyClient(configuredExchangeClientOptions())
+    );
 
     const result: CanaryCliResult = await runFillWindowCanaryCli(process.argv.slice(2), {
       canary: new HistoricalFillTargetedCanary({
