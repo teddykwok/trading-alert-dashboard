@@ -169,6 +169,74 @@ targeted recovery.
 
 ---
 
+## Rollout preflight, before arming the scheduled runtime
+
+```
+pnpm execution:fill-rollout-preflight
+```
+
+Read-only. It reports the effective historical configuration and the durable
+preconditions, derives theoretical bounds, and answers `READY` (exit 0) or
+`BLOCKED` (non-zero). It writes nothing, contacts no exchange, and starts
+nothing.
+
+**Why it exists.** Environment values are frozen when a process starts. Editing
+`.env` does **not** change a worker that is already running, so arming the
+scheduled runtime means writing the file and restarting -- and until that
+restart there is otherwise no way to see what the new process will believe.
+
+**When to run it.** In a fresh CLI process, **after** writing the intended
+`.env` values and **before** restarting the worker. The campaign may be created
+first: while the running worker still has the historical runtime disabled, an
+`ACTIVE` campaign dispatches nothing.
+
+`READY` requires all of: the runtime flag effectively true; the ingest horizon
+supplied **explicitly**; a shared userTrades weight-per-minute present; an
+`ACTIVE` campaign with at least one dispatch remaining; the circuit `CLOSED`;
+and zero pending attempt-exhausted windows.
+
+### Reading the output
+
+**Horizon source** distinguishes `EXPLICIT` from `DEFAULT`. An absent key parses
+to 30 days, and an explicit 30 and a defaulted 30 are not the same decision, so
+a defaulted horizon is refused even when its value would have been acceptable.
+
+**Projected root upper bound** is `symbols x horizon`. It is a BOUND on the
+workset the bootstrap would consider, **not** the number of rows it will create:
+roots that already exist are skipped. It matters because the bootstrap runs
+BEFORE any weight or campaign admission, so the request caps do not bound root
+materialization at all.
+
+The horizon is a **rolling** window of closed UTC days. Pinning `3` therefore
+does **not** imply zero root creation: on a later calendar day it names a
+different set of days, and any newly executed symbol adds roots across the whole
+horizon. It bounds the magnitude, not the existence, of root creation.
+
+**Projected requests per tick** is the minimum of every restrictive factor --
+max windows per tick, per-tick weight budget, shared cap, and campaign
+dispatches remaining -- not merely the window count.
+
+**Projected requests per minute** is the shared cap divided by the per-request
+weight. That shared ceiling is **per configured execution profile and historical
+fill only**. It is not an account-wide Binance limiter and knows nothing about
+other API consumers.
+
+`READY` means the configuration and preconditions are coherent. It performs no
+work and promises nothing about what the exchange will return. `BLOCKED` means
+do not restart the worker; fix each reported blocker deliberately -- the
+preflight changes nothing on its own.
+
+### Stopping, once the runtime is live
+
+`pnpm execution:fill-campaign-pause` is the fastest durable stop: it needs no
+file edit and no restart, takes effect at the next admission, and survives a
+process restart. Disabling the runtime flag requires an `.env` edit **and** a
+worker restart, so it is the slower control.
+
+After a controlled run, returning the runtime to OFF -- editing `.env` back and
+restarting the worker -- is a separate, deliberate operator step. A forgotten
+`true` re-arms the scheduler on the next unrelated restart.
+
 ## Conditions that are NOT issues
 
 These are ordinary states of a working queue and deliberately do not raise

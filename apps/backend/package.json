@@ -43,6 +43,7 @@
     "execution:fill-bootstrap-roots": "tsx src/modules/execution/run-fill-bootstrap-roots.ts",
     "execution:fill-window-canary": "tsx src/modules/execution/run-fill-window-canary.ts",
     "execution:fill-window-finalize-exhausted": "tsx src/modules/execution/run-fill-window-finalize-exhausted.ts",
+    "execution:fill-rollout-preflight": "tsx src/modules/execution/run-fill-rollout-preflight.ts",
     "execution:protection-recovery": "tsx src/modules/execution/run-protection-recovery.ts",
     "execution:prepare-shutdown": "tsx src/modules/execution/run-shutdown-drain.ts",
     "test": "vitest run",
