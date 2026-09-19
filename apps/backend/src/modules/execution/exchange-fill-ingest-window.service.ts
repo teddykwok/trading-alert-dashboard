@@ -334,6 +334,92 @@ export class ExchangeFillIngestWindowService {
   }
 
   /**
+   * Claims ONE named window, or nothing at all.
+   *
+   * The operator canary's entry into the work table, and deliberately a SECOND
+   * method rather than a filter on `claimNextWindow`. The scheduled path is the
+   * one that must never change, and a targeting parameter threaded through it --
+   * even an optional one -- is a parameter some future caller can pass. Here the
+   * two paths cannot be confused, because they are not the same function.
+   *
+   * ## Targeting narrows WHICH row, never WHETHER it may be claimed
+   *
+   * Every predicate `claimNextWindow` applies is applied here, spelled the same
+   * way and meaning the same thing: PENDING, attempts under the ceiling, backoff
+   * elapsed, lease absent or stale under the SAME threshold, and the
+   * compare-and-set on the exact `attempts` and `claimedAt` that were read. A
+   * named window is not a privileged window.
+   *
+   * `executionProfileId` is required and matched, so a window id belonging to
+   * another account cannot be claimed by naming it -- the id alone is never
+   * authority.
+   *
+   * ## There is no fallback
+   *
+   * Null means "this window could not be claimed", and nothing else is ever
+   * claimed instead. A caller that wanted any window would have called
+   * `claimNextWindow`; a caller that named one and silently got a different one
+   * would spend a real exchange request on work nobody asked for.
+   */
+  async claimSpecificWindow(
+    client: Prisma.TransactionClient,
+    options: { executionProfileId: string; workerId: string; windowId: string; now?: Date }
+  ): Promise<FillIngestWindowClaim | null> {
+    const now = options.now ?? new Date();
+    const staleBefore = new Date(now.getTime() - INGEST_CLAIM_LEASE_MS);
+
+    // The SAME eligibility question, asked of one row instead of the queue.
+    // Read first so the compare-and-set below has an exact generation to fence
+    // on, exactly as the scan-then-CAS pair does.
+    const candidate = await client.exchangeFillIngestWindow.findFirst({
+      where: {
+        id: options.windowId,
+        executionProfileId: options.executionProfileId,
+        status: "PENDING",
+        attempts: { lt: MAX_INGEST_ATTEMPTS },
+        AND: [
+          { OR: [{ nextEligibleAt: null }, { nextEligibleAt: { lte: now } }] },
+          { OR: [{ claimedAt: null }, { claimedAt: { lt: staleBefore } }] },
+        ],
+      },
+      select: {
+        id: true, symbol: true, startTimeMs: true, endTimeMs: true,
+        attempts: true, claimedAt: true,
+      },
+    });
+    if (candidate === null) return null;
+
+    const won = await client.exchangeFillIngestWindow.updateMany({
+      where: {
+        id: candidate.id,
+        status: "PENDING",
+        // Both halves of the generation, as above: a racing worker changes both,
+        // and its change is what makes this update match nothing.
+        attempts: candidate.attempts,
+        claimedAt: candidate.claimedAt,
+      },
+      data: {
+        attempts: { increment: 1 },
+        claimedAt: now,
+        claimOwner: options.workerId,
+        lastAttemptAt: now,
+      },
+    });
+    // Lost the race. NOT a signal to look for other work.
+    if (won.count !== 1) return null;
+
+    return {
+      windowId: candidate.id,
+      executionProfileId: options.executionProfileId,
+      symbol: candidate.symbol,
+      startTimeMs: toMs(candidate.startTimeMs),
+      endTimeMs: toMs(candidate.endTimeMs),
+      attempt: candidate.attempts + 1,
+      claimOwner: options.workerId,
+    };
+  }
+
+  /**
    * The fencing predicate every claimed mutation shares.
    *
    * `attempts` is the generation token: it only ever increments, and only

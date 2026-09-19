@@ -1,4 +1,9 @@
 import { BINANCE_READ_ONLY_ENDPOINTS } from "../binance/binance.endpoints";
+// The dispatch-attempted table is a VALUE, and deliberately imported rather
+// than restated: it is the single predicate deciding whether weight was spent,
+// and a second copy here could drift from the one the operator canary applies.
+// Safe as a value import -- the executor does not import this module back.
+import { USER_TRADES_DISPATCH_ATTEMPTED } from "./exchange-fill-one-window-executor.service";
 import type {
   ExchangeFillOneWindowExecutor,
   FillIngestExecutionOutcome,
@@ -80,30 +85,6 @@ import type { HistoricalFillCampaignStatus } from "@prisma/client";
  */
 export const USER_TRADES_REQUEST_WEIGHT = BINANCE_READ_ONLY_ENDPOINTS.userTrades.weight;
 
-/**
- * Whether an outcome proves a userTrades request was ATTEMPTED.
- *
- * Traced from the executor, not assumed. `PROFILE_UNAVAILABLE` returns at the
- * binding check and `NO_WORK` returns when no claim exists -- both strictly
- * before the single `listRecentTradesOnce` call. Every other outcome is only
- * reachable after that call has been made, including the failures: a request
- * that came back 429 or 5xx still spent its weight at the exchange.
- *
- * Exhaustive by type. A new executor outcome fails this object to compile,
- * which is the point -- a future union member must be classified deliberately
- * rather than silently defaulting to "free".
- */
-const USER_TRADES_DISPATCH_ATTEMPTED: Record<FillIngestExecutionOutcome, boolean> = {
-  PROFILE_UNAVAILABLE: false,
-  NO_WORK: false,
-  COMPLETE: true,
-  INCOMPLETE_SKIPPED_ROWS: true,
-  SPLIT: true,
-  SATURATED_SINGLE_MILLISECOND: true,
-  RETRY_SCHEDULED: true,
-  ABANDONED: true,
-  STALE_CLAIM: true,
-};
 
 /** Why the pass stopped. Exactly one of these ends every invocation. */
 export type FillBatchStopReason =

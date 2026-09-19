@@ -144,6 +144,33 @@ export interface FillIngestExecutionResult {
  * transport retry inside it would make that budget mean up to three times what
  * it says.
  */
+/**
+ * Whether an outcome PROVES a userTrades request reached the exchange.
+ *
+ * The single source of truth for "was weight actually spent", shared by every
+ * caller that reserves budget before an attempt -- the scheduled batch driver
+ * and the operator canary alike. It lives beside `FillIngestExecutionOutcome`
+ * because it is a fact about that union: exhaustive by type, so a new outcome
+ * cannot be added without deciding, here, whether it cost a request.
+ *
+ * `false` means CERTAIN zero dispatch, which is the only condition under which
+ * a reservation may be refunded. A failed REQUEST is deliberately `true`: it
+ * reached the exchange and spent its weight there. An invocation that THROWS
+ * never consults this table at all -- uncertain dispatch is always counted as
+ * spent.
+ */
+export const USER_TRADES_DISPATCH_ATTEMPTED: Record<FillIngestExecutionOutcome, boolean> = {
+  PROFILE_UNAVAILABLE: false,
+  NO_WORK: false,
+  COMPLETE: true,
+  INCOMPLETE_SKIPPED_ROWS: true,
+  SPLIT: true,
+  SATURATED_SINGLE_MILLISECOND: true,
+  RETRY_SCHEDULED: true,
+  ABANDONED: true,
+  STALE_CLAIM: true,
+};
+
 export interface UserTradesPageReader {
   listRecentTradesOnce(
     symbol: string,
@@ -236,6 +263,74 @@ export class ExchangeFillOneWindowExecutor {
     });
     if (claim === null) return { outcome: "NO_WORK" };
 
+    return this.executeClaimed(bound.executionProfileId, claim, now);
+  }
+
+  /**
+   * Processes ONE EXPLICITLY NAMED window attempt, then returns.
+   *
+   * The operator canary's executor entrypoint. It differs from `executeOne` in
+   * exactly one respect -- WHICH row it claims -- and in no other: the same
+   * binder decides the account, the same fencing decides whether the row may be
+   * claimed, and the same post-claim path below decides everything that happens
+   * afterwards.
+   *
+   * Still no profile argument. Naming a window does not name an account, and
+   * `claimSpecificWindow` matches the bound profile as a predicate, so a window
+   * id belonging to somebody else simply fails to claim.
+   *
+   * `NO_WORK` here means "the named window could not be claimed" -- it was
+   * finished, exhausted, backing off, already leased, or won by somebody else
+   * between the read and the compare-and-set. NOTHING ELSE IS CLAIMED INSTEAD,
+   * and no exchange request is made. Callers that reserved budget on the
+   * assumption of a dispatch may refund it under the same proven-zero-dispatch
+   * predicate they already apply to `executeOne`.
+   */
+  async executeSpecificWindow(options: {
+    workerId: string;
+    windowId: string;
+    now?: Date;
+  }): Promise<FillIngestExecutionResult> {
+    const now = options.now ?? new Date();
+
+    // Identical to `executeOne`, and for the identical reason: a configuration
+    // failure is not evidence about a window, so it must not burn an attempt.
+    const binding = await this.bindProfile(this.deps.prisma);
+    if (!binding.ok) {
+      return { outcome: "PROFILE_UNAVAILABLE", reasonCode: binding.reasonCode };
+    }
+    const bound = binding.context;
+
+    const claim = await this.deps.work.claimSpecificWindow(this.deps.prisma, {
+      executionProfileId: bound.executionProfileId,
+      workerId: options.workerId,
+      windowId: options.windowId,
+      now,
+    });
+    if (claim === null) return { outcome: "NO_WORK" };
+
+    return this.executeClaimed(bound.executionProfileId, claim, now);
+  }
+
+  /**
+   * Everything that happens to a window once it is CLAIMED, whichever route
+   * claimed it.
+   *
+   * THE CONVERGENCE POINT, and the reason targeting is safe. The request, the
+   * symbol-integrity refusal, the saturation planner and the ledger commit
+   * exist once, here. A targeted invocation cannot drift from the scheduled one
+   * because there is no second copy of this logic to drift from -- and anything
+   * a future slice changes about ingestion changes for both at the same instant.
+   *
+   * Extraction only: every line below came from `executeOne` unchanged, and the
+   * profile it commits against is now a parameter rather than a local binding
+   * because the two callers bind it at their own boundary.
+   */
+  private async executeClaimed(
+    executionProfileId: string,
+    claim: FillIngestWindowClaim,
+    now: Date
+  ): Promise<FillIngestExecutionResult> {
     // --- The one exchange request. No transaction is open across it. --------
     let trades: BinanceUserTradeDto[];
     try {
@@ -290,7 +385,7 @@ export class ExchangeFillOneWindowExecutor {
       throw new FillIngestPlannerInvariantError(claim.windowId, decision.reasonCode, decision.message);
     }
 
-    return this.commit(bound.executionProfileId, claim, trades, decision, now);
+    return this.commit(executionProfileId, claim, trades, decision, now);
   }
 
   /**
