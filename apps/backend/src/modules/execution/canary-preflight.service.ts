@@ -262,15 +262,39 @@ export class CanaryPreflightService {
     }
   }
 
-  /** Counts only — never a symbol, quantity or id. */
+  /**
+   * Counts only — never a symbol, quantity or id — and only for the
+   * CONFIGURED profile.
+   *
+   * This surface already resolves the configured profile for its
+   * authorization and policy reads; these counts used to be the one part of
+   * it that described the whole table. A readiness report that mixes one
+   * profile's policy with every profile's execution counts is not a report
+   * about anything an operator can act on.
+   *
+   * Unresolvable stays UNREADABLE (nulls), exactly as an unreadable database
+   * does: the evaluator turns that into a blocker rather than a zero.
+   */
   private async readLocalExecutionState() {
     try {
+      const resolution = await resolveExecutionProfile(this.prisma, configuredProfileIdentity());
+      if (!resolution.ok) throw new Error(resolution.reasonCode);
+      const executionProfileId = resolution.profile.id;
       const [activeExecutionCount, pendingEntryCount, openPositionCount, recoveryRequiredCount] = await Promise.all([
-        this.prisma.tradeExecution.count({ where: { status: { in: [...ACTIVE_STATUSES] } } }),
-        this.prisma.tradeExecution.count({ where: { status: { in: [...PENDING_ENTRY_STATUSES] } } }),
-        this.prisma.tradeExecution.count({ where: { status: { in: [...OPEN_POSITION_STATUSES] } } }),
         this.prisma.tradeExecution.count({
-          where: { OR: [{ status: "MANUAL_INTERVENTION" }, { requiresManualIntervention: true }] },
+          where: { executionProfileId, status: { in: [...ACTIVE_STATUSES] } },
+        }),
+        this.prisma.tradeExecution.count({
+          where: { executionProfileId, status: { in: [...PENDING_ENTRY_STATUSES] } },
+        }),
+        this.prisma.tradeExecution.count({
+          where: { executionProfileId, status: { in: [...OPEN_POSITION_STATUSES] } },
+        }),
+        this.prisma.tradeExecution.count({
+          where: {
+            executionProfileId,
+            OR: [{ status: "MANUAL_INTERVENTION" }, { requiresManualIntervention: true }],
+          },
         }),
       ]);
       return { activeExecutionCount, pendingEntryCount, openPositionCount, recoveryRequiredCount };

@@ -212,6 +212,9 @@ describe("the durable posture guard", () => {
 
 const EXECUTION_ID = "cmt82ziwr000e7y9jnas7l14q";
 
+/** The profile this fake process is bound to. */
+const BOUND_PROFILE_ID = "profile-1";
+
 function deps(overrides: { evaluate?: unknown; recover?: unknown; execution?: unknown } = {}) {
   const calls = { evaluate: 0, recover: 0 };
   const execution =
@@ -229,7 +232,14 @@ function deps(overrides: { evaluate?: unknown; recover?: unknown; execution?: un
   return {
     calls,
     prisma: {
-      tradeExecution: { findUnique: async () => execution },
+      // Selected by id AND by the bound profile, in one predicate. The fake
+      // HONOURS the predicate, so dropping it fails these tests rather than
+      // passing unnoticed.
+      tradeExecution: {
+        findFirst: async (args: { where?: { executionProfileId?: string } }) =>
+          args?.where?.executionProfileId === BOUND_PROFILE_ID ? execution : null,
+        count: async () => (execution ? 1 : 0),
+      },
       executionCanaryAuthorization: { findMany: async () => [] },
       // The posture guard resolves the configured profile before it will let
       // `recover` reach the service, so the fake has to answer that too.
@@ -246,6 +256,9 @@ function deps(overrides: { evaluate?: unknown; recover?: unknown; execution?: un
       },
     } as never,
     recovery: {
+      // What the CLI prints about ownership comes from the service, never
+      // from a second resolution of its own.
+      boundExecutionProfileId: BOUND_PROFILE_ID,
       evaluate: async () => {
         calls.evaluate += 1;
         return overrides.evaluate ?? { verdict: judgeProtectionRecovery(enjEvidence()), evidence: enjEvidence() };

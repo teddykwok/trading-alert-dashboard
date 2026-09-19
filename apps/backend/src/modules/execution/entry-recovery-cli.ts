@@ -163,12 +163,31 @@ export async function evaluateCommand(argv: string[], deps: CliDependencies): Pr
     return { exitCode: CLI_EXIT.USAGE };
   }
 
-  const execution = await deps.prisma.tradeExecution.findUnique({
-    where: { id: executionId },
-    select: { id: true, symbol: true, positionSide: true, status: true, version: true },
+  // Selected by id AND by the bound profile, in one predicate. Another
+  // profile's row is never loaded here, so nothing about it can be printed
+  // or handed onward.
+  const execution = await deps.prisma.tradeExecution.findFirst({
+    where: { id: executionId, executionProfileId: deps.recovery.boundExecutionProfileId },
+    select: {
+      id: true,
+      symbol: true,
+      positionSide: true,
+      status: true,
+      version: true,
+    },
   });
   if (!execution) {
-    out(`No execution ${executionId} exists.`);
+    // EXISTENCE ONLY, and a count rather than a row: an operator who names
+    // another profile's execution during an incident must not be told it
+    // does not exist. Nothing here returns an object, so nothing here can
+    // reach the recovery service.
+    const elsewhere = await deps.prisma.tradeExecution.count({ where: { id: executionId } });
+    if (elsewhere > 0) {
+      out(`Execution ${executionId} belongs to a different execution profile than this process is bound to.`);
+      out("Nothing was read from the exchange and nothing was changed.");
+    } else {
+      out(`No execution ${executionId} exists.`);
+    }
     return { exitCode: CLI_EXIT.REFUSED };
   }
 

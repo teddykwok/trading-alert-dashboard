@@ -50,6 +50,13 @@ export const PROTECTION_RECOVERY_OUTCOMES = [
   "BLOCKED",
   /** Not a candidate — wrong status, wrong reason, or no such execution. */
   "NOT_APPLICABLE",
+  /**
+   * The execution belongs to a different profile than this process is bound
+   * to. A refusal, never a skip: installing another account's protection with
+   * this account's credentials is the exact outcome this code exists to
+   * prevent.
+   */
+  "FOREIGN_PROFILE",
 ] as const;
 
 export type ProtectionRecoveryOutcome = (typeof PROTECTION_RECOVERY_OUTCOMES)[number];
@@ -76,9 +83,19 @@ const AMBIGUOUS_ORDER_STATUSES = ["SUBMITTING", "UNKNOWN", "PLANNED"];
 const ACTIVE_ALGO_STATUSES = ["NEW", "WORKING", "ACTIVE"];
 
 export class ProtectionRecoveryService {
+  /**
+   * Bound to ONE profile, and unable to be built without one.
+   *
+   * `recover` hands the execution to the protection lifecycle, which submits
+   * STOP and TAKE_PROFIT orders with this process's credentials. The
+   * executionId comes from an operator's terminal, so the row's ownership is
+   * checked here against something supplied at construction rather than by
+   * the caller.
+   */
   constructor(
     private readonly prisma: PrismaClient,
-    private readonly readOnly: BinanceReadOnlyService
+    private readonly readOnly: BinanceReadOnlyService,
+    private readonly executionProfileId: string
   ) {}
 
   /**
@@ -91,8 +108,12 @@ export class ProtectionRecoveryService {
   async evaluate(
     executionId: string
   ): Promise<{ verdict: ProtectionRecoveryVerdict; evidence: ProtectionRecoveryEvidence } | null> {
-    const execution = await this.prisma.tradeExecution.findUnique({ where: { id: executionId } });
+    const execution = await this.loadOwnedExecution(executionId);
     if (!execution) return null;
+    // SECONDARY guard. The query above cannot return a foreign row, so this
+    // can only fire if something bypassed it; it still runs BEFORE `gather`,
+    // which is the first thing that reads the exchange.
+    if (!this.belongsToBoundProfile(execution)) return null;
 
     const evidence = await this.gather(execution);
     return { verdict: judgeProtectionRecovery(evidence), evidence };
@@ -110,9 +131,45 @@ export class ProtectionRecoveryService {
     protection: ProtectionLifecycleService,
     evaluatedAt: Date = new Date()
   ): Promise<ProtectionRecoveryResult> {
-    const execution = await this.prisma.tradeExecution.findUnique({ where: { id: executionId } });
+    const execution = await this.loadOwnedExecution(executionId);
     if (!execution) {
-      return this.result(false, "NOT_APPLICABLE", executionId, "No such execution.", [], [], null, null, null);
+      // The row was not selected, so nothing about it is known here. Which
+      // refusal to print is decided by a COUNT -- no row, no fields, nothing
+      // that could be carried onward into evidence gathering.
+      return (await this.existsUnderAnyProfile(executionId))
+        ? this.result(
+            false,
+            "FOREIGN_PROFILE",
+            executionId,
+            "The execution belongs to a different execution profile than this process is bound to; nothing was read from the exchange and nothing was changed.",
+            [],
+            ["execution belongs to another execution profile"],
+            null,
+            null,
+            null
+          )
+        : this.result(false, "NOT_APPLICABLE", executionId, "No such execution.", [], [], null, null, null);
+    }
+    // SECONDARY guard, kept deliberately: the DB predicate is the primary
+    // one, so reaching this branch means the query was defeated. Said out
+    // loud, with ids only -- never an account alias or a credential.
+    // one, and a row that reached here mismatched means something bypassed it.
+    if (!this.belongsToBoundProfile(execution)) {
+      logger.error(
+        { executionId, boundExecutionProfileId: this.executionProfileId },
+        "Protection recovery refused an execution that bypassed its profile-scoped query"
+      );
+      return this.result(
+        false,
+        "FOREIGN_PROFILE",
+        executionId,
+        "The execution belongs to a different execution profile than this process is bound to; nothing was read from the exchange and nothing was changed.",
+        [],
+        ["execution belongs to another execution profile (it bypassed the scoped query)"],
+        null,
+        null,
+        null
+      );
     }
 
     const evidence = await this.gather(execution);
@@ -284,8 +341,8 @@ export class ProtectionRecoveryService {
   }
 
   private async loadStates(executionId: string) {
-    const execution = await this.prisma.tradeExecution.findUnique({
-      where: { id: executionId },
+    const execution = await this.prisma.tradeExecution.findFirst({
+      where: { id: executionId, executionProfileId: this.executionProfileId },
       select: { status: true },
     });
     const protection = await this.prisma.executionProtectionState.findUnique({
@@ -297,6 +354,55 @@ export class ProtectionRecoveryService {
       protectionState: protection?.state ?? null,
       protectionReasonCode: protection?.reasonCode ?? null,
     };
+  }
+
+  /**
+   * THE load-bearing read: an execution is selected by id AND by the bound
+   * profile, in one predicate, at the database boundary.
+   *
+   * A row-addressed read followed by a JavaScript ownership check is not the
+   * same thing. It brings another account's execution into this process, and
+   * `recover` hands its argument to a lifecycle that SUBMITS stop and take
+   * profit orders. Not selecting it at all removes that possibility rather
+   * than guarding against it.
+   */
+  private async loadOwnedExecution(executionId: string): Promise<TradeExecution | null> {
+    return this.prisma.tradeExecution.findFirst({
+      where: { id: executionId, executionProfileId: this.executionProfileId },
+    });
+  }
+
+  /**
+   * EXISTENCE ONLY, and deliberately a count rather than a row.
+   *
+   * It exists so an operator who names another profile's execution is told
+   * that, instead of being told the row does not exist during an incident.
+   * It returns a number: there is no object to pass to `gather`, no field to
+   * print, and no path from here into signed logic.
+   */
+  private async existsUnderAnyProfile(executionId: string): Promise<boolean> {
+    return (await this.prisma.tradeExecution.count({ where: { id: executionId } })) > 0;
+  }
+
+  /**
+   * The profile this service is bound to, for callers that need to EXPLAIN
+   * a refusal rather than re-derive it.
+   *
+   * Exposing the id is not a selector: it is read-only, it is the value
+   * supplied at construction, and no method accepts one.
+   */
+  get boundExecutionProfileId(): string {
+    return this.executionProfileId;
+  }
+
+  /**
+   * Whether a loaded row belongs to the profile this process is bound to.
+   *
+   * Persisted ids only: no account number is invented and no credential is
+   * consulted.
+   */
+  private belongsToBoundProfile(execution: TradeExecution): boolean {
+    return execution.executionProfileId === this.executionProfileId;
   }
 
   private result(
@@ -313,3 +419,23 @@ export class ProtectionRecoveryService {
     return { ok, outcome, executionId, message, checks, blockers, status, protectionState, protectionReasonCode };
   }
 }
+
+/**
+ * Compile-time parameter contracts.
+ *
+ * Asserted in typechecked SOURCE rather than in a test, because the backend
+ * tsconfig excludes `tests` -- a contract pinned only in a test file would
+ * never be seen by `tsc`. Making the profile OPTIONAL, or dropping it, stops
+ * these tuples matching and fails the build.
+ */
+type ExactTuple<A extends readonly unknown[], B extends readonly unknown[]> = [A] extends [B]
+  ? [B] extends [A]
+    ? true
+    : false
+  : false;
+
+const protectionRecoveryRequiresAProfile: ExactTuple<
+  ConstructorParameters<typeof ProtectionRecoveryService>,
+  [PrismaClient, BinanceReadOnlyService, string]
+> = true;
+void protectionRecoveryRequiresAProfile;

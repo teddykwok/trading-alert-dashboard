@@ -9,6 +9,7 @@ import { EntryLifecycleService } from "./entry-lifecycle.service";
 import { TradingControlService } from "../operator/trading-control.service";
 import { ShutdownDrainService } from "./shutdown-drain.service";
 import { runShutdownDrainCli } from "./shutdown-drain-cli";
+import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 import type { ShutdownPosture } from "./shutdown-drain";
 
 /**
@@ -34,6 +35,17 @@ async function main(): Promise<void> {
   const prisma = new PrismaClient();
 
   try {
+    // BIND FIRST, before any Binance client exists. A command that cannot say
+    // which account it is acting as must not read the exchange or write a row.
+    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
+    if (!resolution.ok) {
+      console.error(`REFUSED (${resolution.reasonCode}): ${resolution.message}`);
+      console.error("No exchange request was made and nothing was changed.");
+      process.exitCode = 1;
+      return;
+    }
+    const executionProfileId = resolution.profile.id;
+
     const entry =
       argv[0] === "drain"
         ? new EntryLifecycleService(
@@ -74,7 +86,7 @@ async function main(): Promise<void> {
 
     const { exitCode } = await runShutdownDrainCli(argv, {
       prisma,
-      drain: new ShutdownDrainService(prisma),
+      drain: new ShutdownDrainService(prisma, executionProfileId),
       readPosture,
       entry,
     });

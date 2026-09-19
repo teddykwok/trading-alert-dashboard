@@ -9,6 +9,7 @@ import { CriticalAlertService } from "./critical-alert.service";
 import { ProtectionLifecycleService } from "./protection-lifecycle.service";
 import { ProtectionRecoveryService } from "./protection-recovery.service";
 import { runProtectionRecoveryCli } from "./protection-recovery-cli";
+import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
 /**
  * Stranded protection recovery.
@@ -38,6 +39,17 @@ async function main(): Promise<void> {
   const readOnly = new BinanceReadOnlyService(new BinanceReadOnlyClient(exchange));
 
   try {
+    // BIND FIRST, before any Binance client exists. A command that cannot say
+    // which account it is acting as must not read the exchange or write a row.
+    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
+    if (!resolution.ok) {
+      console.error(`REFUSED (${resolution.reasonCode}): ${resolution.message}`);
+      console.error("No exchange request was made and nothing was changed.");
+      process.exitCode = 1;
+      return;
+    }
+    const executionProfileId = resolution.profile.id;
+
     const protection =
       argv[0] === "recover"
         ? new ProtectionLifecycleService(
@@ -54,7 +66,7 @@ async function main(): Promise<void> {
 
     const { exitCode } = await runProtectionRecoveryCli(argv, {
       prisma,
-      recovery: new ProtectionRecoveryService(prisma, readOnly),
+      recovery: new ProtectionRecoveryService(prisma, readOnly, executionProfileId),
       protection,
     });
     process.exitCode = exitCode;

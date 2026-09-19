@@ -441,10 +441,11 @@ async function createExecution(
  * Per-scenario isolation.
  *
  * Sharing one profile between scenarios was the proven cause of the earlier
- * failures: a leaked MANUAL_INTERVENTION execution made `countRecoveryRequired`
- * non-zero, and the orchestrator then (correctly) refused all later work with
- * RECOVERY_REQUIRED. Rewriting statuses in afterEach could not fix that — it
- * left SafetyAdmission reservations, orders, protection rows and events behind.
+ * failures: a leaked MANUAL_INTERVENTION execution made
+ * `countRecoveryRequired` non-zero FOR THAT PROFILE, and the orchestrator then
+ * (correctly) refused all later work under it with RECOVERY_REQUIRED. Rewriting
+ * statuses in afterEach could not fix that — it left SafetyAdmission
+ * reservations, orders, protection rows and events behind.
  *
  * So each scenario now owns its ENTIRE object graph: a unique profile, its own
  * policy, its own alerts and executions, and a fresh exchange. Nothing is
@@ -698,13 +699,20 @@ async function deleteOwnedGraph(): Promise<void> {
 /**
  * Ownership-based teardown for every profile in this suite's namespace.
  *
- * A unique profile per scenario is NOT sufficient on its own:
- * `countRecoveryRequired()` deliberately counts across the whole database
- * rather than per profile — the conservative choice, since unresolved exposure
- * anywhere is a reason not to open new work. So a leaked execution from an
- * earlier scenario blocks a later one even under a different profile, and the
- * only correct fix is to remove each scenario's object graph rather than to
- * relax the production rule.
+ * A unique profile per scenario is not sufficient on its own.
+ *
+ * Since Phase 11C, recovery-required admission blocking is SCOPED to the
+ * process's bound ExecutionProfile: `countRecoveryRequired(profileId)` counts
+ * that profile's rows and no others, because a process holding one account's
+ * credentials can neither see nor resolve another account's exposure. A leaked
+ * execution therefore no longer blocks a LATER scenario under a different
+ * profile — but it does still block anything reusing its own profile, and it
+ * leaves SafetyAdmission reservations, orders, protection rows and events
+ * behind for every count and assertion that reads them.
+ *
+ * So the ownership teardown stays: removing each scenario's whole object graph
+ * is what keeps the suite deterministic, and it never relaxes a production
+ * rule to buy isolation.
  */
 async function cleanupOwnedGraphs(): Promise<void> {
   if (!prisma || !available) return;

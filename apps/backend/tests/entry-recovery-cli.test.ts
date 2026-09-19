@@ -45,6 +45,8 @@ function codeOf(relative: string): string {
     .replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 const EXECUTION_ID = "exec-stuck-1";
+/** The profile this fake process is bound to. */
+const BOUND_PROFILE_ID = "profile-1";
 
 function deps(options: {
   execution?: Record<string, unknown> | null;
@@ -57,6 +59,10 @@ function deps(options: {
   const calls = { evaluate: 0, recover: 0 };
 
   const recovery = {
+    // The CLI asks the service which profile it is bound to rather than
+    // resolving one of its own, so what it prints can never describe a
+    // different profile from the one the service will enforce.
+    boundExecutionProfileId: BOUND_PROFILE_ID,
     evaluate: vi.fn(async () => {
       calls.evaluate += 1;
       return options.evaluate === undefined
@@ -81,11 +87,18 @@ function deps(options: {
 
   const prisma = {
     tradeExecution: {
-      findUnique: vi.fn(async () =>
-        options.execution === undefined
+      // The CLI selects by id AND by the bound profile, in one predicate. The
+      // fake HONOURS that predicate rather than ignoring it, so dropping
+      // `executionProfileId` from the query fails these tests instead of
+      // passing unnoticed.
+      findFirst: vi.fn(async (args: { where?: { executionProfileId?: string } }) => {
+        if (args?.where?.executionProfileId !== BOUND_PROFILE_ID) return null;
+        return options.execution === undefined
           ? { id: EXECUTION_ID, symbol: "SOLUSDC", positionSide: "SHORT", status: "ENTRY_SUBMITTING", version: 3 }
-          : options.execution
-      ),
+          : options.execution;
+      }),
+      // Existence-only probe behind the refusal wording.
+      count: vi.fn(async () => (options.execution === null ? 0 : 1)),
     },
     executionProfile: {
       findMany: vi.fn(async () => [

@@ -468,6 +468,14 @@ describe("reconciliation routing", () => {
           findMany: async () => [execution({ id: "bad", status: "ENTRY_FILLED" }), execution({ id: "good", status: "ENTRY_FILLED" })],
           count: async () => 0,
         },
+        // The tick BINDS before it discovers: a fake prisma driving one has to
+        // be able to resolve the configured profile, or the tick correctly
+        // refuses before reaching the rows this case is about.
+        executionProfile: {
+          findMany: async () => [
+            { id: "profile-1", accountIdentifier: "alias", environment: "TESTNET", safetyPolicy: { id: "policy-1" } },
+          ],
+        },
       } as never,
       readOnly: {} as never,
       admission: {} as never,
@@ -490,6 +498,7 @@ describe("reconciliation routing", () => {
           return { mutationsDispatched: 0 };
         },
       } as never,
+      profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
     });
 
     const result = await orchestrator.runExecutionReconciliationTick();
@@ -507,11 +516,20 @@ describe("reconciliation routing", () => {
           },
           count: async () => 0,
         },
+        // The tick BINDS before it discovers: a fake prisma driving one has to
+        // be able to resolve the configured profile, or the tick correctly
+        // refuses before reaching the rows this case is about.
+        executionProfile: {
+          findMany: async () => [
+            { id: "profile-1", accountIdentifier: "alias", environment: "TESTNET", safetyPolicy: { id: "policy-1" } },
+          ],
+        },
       } as never,
       readOnly: {} as never,
       admission: {} as never,
       entry: {} as never,
       protection: {} as never,
+      profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
     });
     const result = await orchestrator.runExecutionReconciliationTick();
     expect(result.failed).toBe(true);

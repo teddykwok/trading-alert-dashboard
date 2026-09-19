@@ -196,8 +196,14 @@ describe("entry recovery: the absence judge", () => {
 // The recovery service
 // ---------------------------------------------------------------------------
 
+/** The profile this fake process is bound to. */
+const BOUND_PROFILE_ID = "profile-bound";
+
 const EXECUTION = {
   id: "exec-stuck-1",
+  // Present on purpose. Without it the service's ownership check would be
+  // comparing undefined to undefined and would pass for any row at all.
+  executionProfileId: BOUND_PROFILE_ID,
   symbol: "SOLUSDC",
   positionSide: "SHORT",
   status: "ENTRY_SUBMITTING",
@@ -207,6 +213,8 @@ const EXECUTION = {
 
 function harness(options: {
   status?: string;
+  /** Bind the service to a DIFFERENT profile than the row belongs to. */
+  boundProfileId?: string;
   queryThrows?: unknown;
   history?: unknown[];
   trades?: unknown[];
@@ -221,7 +229,15 @@ function harness(options: {
 
   const prisma = {
     tradeExecution: {
-      findUnique: vi.fn(async () => ({ ...EXECUTION, status: state.status })),
+      // The service selects by id AND profile in one predicate, so the fake
+      // HONOURS that predicate: a harness that ignored it would let a missing
+      // `executionProfileId` pass unnoticed.
+      findFirst: vi.fn(async (args: { where?: { executionProfileId?: string } }) => {
+        const wanted = args?.where?.executionProfileId;
+        if (wanted !== EXECUTION.executionProfileId) return null;
+        return { ...EXECUTION, status: state.status };
+      }),
+      count: vi.fn(async () => 1),
       updateMany: vi.fn(async () => {
         const count = options.updateCount ?? 1;
         if (count > 0) {
@@ -230,7 +246,7 @@ function harness(options: {
         }
         return { count };
       }),
-      findUniqueOrThrow: vi.fn(async () => ({ ...EXECUTION, status: "FAILED", version: EXECUTION.version + 1 })),
+      findFirstOrThrow: vi.fn(async () => ({ ...EXECUTION, status: "FAILED", version: EXECUTION.version + 1 })),
     },
     binanceOrder: {
       findFirst: vi.fn(async () => ({
@@ -263,8 +279,43 @@ function harness(options: {
     getOpenAlgoOrders: vi.fn(async () => options.algo ?? []),
   } as unknown as BinanceReadOnlyService;
 
-  return { service: new EntryRecoveryService(prisma, readOnly), prisma, readOnly, state };
+  return {
+    service: new EntryRecoveryService(prisma, readOnly, options.boundProfileId ?? BOUND_PROFILE_ID),
+    prisma,
+    readOnly,
+    state,
+  };
 }
+
+describe("entry recovery: the profile it is bound to", () => {
+  it("P1. a service bound elsewhere does not select the row at all", async () => {
+    // The fake honours the query predicate, so binding to another profile is
+    // indistinguishable from the row not existing -- which is the point: it is
+    // never loaded, so no evidence is gathered about it.
+    const { service, readOnly } = harness({ boundProfileId: "a-different-profile" });
+
+    expect(await service.evaluate(EXECUTION.id)).toBeNull();
+
+    const result = await service.recover(EXECUTION.id);
+    expect(result.ok).toBe(false);
+    expect(result.outcome).toBe("FOREIGN_PROFILE");
+    // Never selected, so there is no status to report, and the blocker is the
+    // QUERY's wording rather than the secondary guard's.
+    expect(result.status).toBeNull();
+    expect(result.blockers).toEqual(["execution belongs to another execution profile"]);
+    // And not one exchange call was made about it.
+    expect(readOnly.queryOrderByClientOrderId).not.toHaveBeenCalled();
+    expect(readOnly.listRecentOrders).not.toHaveBeenCalled();
+    expect(readOnly.getPositionForSide).not.toHaveBeenCalled();
+  });
+
+  it("P2. its own profile's row is selected and follows the ordinary path", async () => {
+    const { service, readOnly } = harness();
+
+    expect(await service.evaluate(EXECUTION.id)).not.toBeNull();
+    expect(readOnly.queryOrderByClientOrderId).toHaveBeenCalled();
+  });
+});
 
 describe("entry recovery: the explicit recovery action", () => {
   it("D2. releases exactly once when absence is proven", async () => {

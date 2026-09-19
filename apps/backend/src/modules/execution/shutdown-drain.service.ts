@@ -47,7 +47,19 @@ export interface DrainReport {
 }
 
 export class ShutdownDrainService {
-  constructor(private readonly prisma: PrismaClient) {}
+  /**
+   * Built for ONE profile and unable to be built without one.
+   *
+   * A drain cancels real orders through an entry lifecycle holding this
+   * process's Binance credentials. Taking the profile in the CONSTRUCTOR
+   * rather than per call means there is no unbound drain to construct and no
+   * call site that can forget to pass one -- the omission is a compile error
+   * rather than a silent table-wide cancellation.
+   */
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly executionProfileId: string
+  ) {}
 
   /**
    * READ-ONLY. Reports what a drain WOULD target and whether the posture allows
@@ -198,18 +210,46 @@ export class ShutdownDrainService {
   }
 
   /**
-   * Teddy-owned pending entries, using the CANONICAL pending status set rather
-   * than a second hand-written list.
+   * Teddy-owned pending entries FOR THE BOUND PROFILE, using the CANONICAL
+   * pending status set rather than a second hand-written list.
    *
    * Ownership is structural: every row here belongs to a local execution this
    * system created, and the lifecycle mints the cancellation from the PERSISTED
    * reservation, so no caller-supplied symbol or order id can reach the
    * exchange. An order placed by anyone else is unreachable from this path.
+   *
+   * Ownership by profile is now structural too, and at the QUERY rather than
+   * afterwards: shutting down the worker for one account must not cancel
+   * another account's pending entries, and a row that is never selected
+   * cannot be cancelled by mistake.
    */
   private async findPendingEntries(): Promise<TradeExecution[]> {
     return this.prisma.tradeExecution.findMany({
-      where: { status: { in: [...DRAIN_CANDIDATE_STATUSES] as never } },
+      where: {
+        executionProfileId: this.executionProfileId,
+        status: { in: [...DRAIN_CANDIDATE_STATUSES] as never },
+      },
       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     });
   }
 }
+
+/**
+ * Compile-time parameter contracts.
+ *
+ * Asserted in typechecked SOURCE rather than in a test, because the backend
+ * tsconfig excludes `tests` -- a contract pinned only in a test file would
+ * never be seen by `tsc`. Making the profile OPTIONAL, or dropping it, stops
+ * these tuples matching and fails the build.
+ */
+type ExactTuple<A extends readonly unknown[], B extends readonly unknown[]> = [A] extends [B]
+  ? [B] extends [A]
+    ? true
+    : false
+  : false;
+
+const drainRequiresAProfile: ExactTuple<
+  ConstructorParameters<typeof ShutdownDrainService>,
+  [PrismaClient, string]
+> = true;
+void drainRequiresAProfile;

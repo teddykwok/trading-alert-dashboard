@@ -127,6 +127,12 @@ function hasConfirmedEntryExposure(execution: TradeExecution): boolean {
   return (CONFIRMED_ENTRY_EXPOSURE_STATUSES as readonly string[]).includes(execution.status);
 }
 
+/**
+ * A discovered execution did not belong to the profile this process is bound
+ * to. Used by admission and by reconciliation so one name covers both.
+ */
+export const PROFILE_MISMATCH_REASON_CODE = "PROFILE_MISMATCH";
+
 export interface OrchestratorDependencies {
   prisma: PrismaClient;
   readOnly: BinanceReadOnlyService;
@@ -257,6 +263,33 @@ export class ExecutionOrchestrator {
 
   constructor(private readonly deps: OrchestratorDependencies) {}
 
+  /**
+   * The execution profile THIS PROCESS is configured as.
+   *
+   * Server-controlled and unparameterised on purpose: the identity comes from
+   * the same configuration the Binance credentials come from, so a caller
+   * cannot name a profile and have this process act on it with the account's
+   * keys. It is the SAME resolution `admitAndSubmit` has always used, so
+   * admission and reconciliation can never disagree about which profile this
+   * process is.
+   *
+   * Resolved per call rather than cached. Persisted state is the source of
+   * truth here exactly as it is for `profilesAtSoftOpenTarget`, and a cached
+   * id would be one more piece of process memory that a restart could
+   * disagree with.
+   */
+  private async boundProfileId(): Promise<
+    { ok: true; id: string } | { ok: false; reasonCode: ProfileResolutionFailure; message: string }
+  > {
+    const resolution = await resolveExecutionProfile(
+      this.deps.prisma,
+      this.deps.profileIdentity ?? configuredProfileIdentity()
+    );
+    return resolution.ok
+      ? { ok: true, id: resolution.profile.id }
+      : { ok: false, reasonCode: resolution.reasonCode, message: resolution.message };
+  }
+
   // -------------------------------------------------------------------------
   // A. New-signal admission
   // -------------------------------------------------------------------------
@@ -284,7 +317,7 @@ export class ExecutionOrchestrator {
       return { admitted: false, decision: null, reasonCode: profile.reasonCode, message: profile.message };
     }
 
-    const recoveryPending = await this.countRecoveryRequired();
+    const recoveryPending = await this.countRecoveryRequired(profile.profile.id);
     if (recoveryPending > 0) {
       return {
         admitted: false,
@@ -304,7 +337,7 @@ export class ExecutionOrchestrator {
       return {
         admitted: false,
         decision: null,
-        reasonCode: "PROFILE_MISMATCH",
+        reasonCode: PROFILE_MISMATCH_REASON_CODE,
         message: "The execution belongs to a different execution profile than the configured one.",
       };
     }
@@ -387,7 +420,22 @@ export class ExecutionOrchestrator {
     const versionsBefore = new Map<string, number>();
 
     try {
-      const executions = await this.selectReconciliationBatch(batchSize);
+      // BIND FIRST. Nothing below may read an execution row, let alone reach
+      // the exchange, until this process knows which profile it is acting as:
+      // the Binance client it holds is authenticated for exactly one account,
+      // and a row belonging to another one must never reach it.
+      const bound = await this.boundProfileId();
+      if (!bound.ok) {
+        // FAIL CLOSED: no discovery, no exchange request, no state change.
+        result.failed = true;
+        logger.error(
+          { reasonCode: bound.reasonCode },
+          "Execution reconciliation refused — the configured execution profile could not be resolved"
+        );
+        return result;
+      }
+
+      const executions = await this.selectReconciliationBatch(batchSize, bound.id);
 
       // Which profiles have already reached their SOFT open-position target.
       // Derived from persisted state every tick — no in-memory counter — so it
@@ -397,6 +445,29 @@ export class ExecutionOrchestrator {
       );
 
       for (const execution of executions) {
+        // DEFENCE IN DEPTH. The query above cannot return a foreign row, so
+        // reaching this branch means an invariant is broken -- a predicate was
+        // lost, or something handed this loop rows it did not select. Refuse
+        // loudly rather than skip quietly: nothing is inspected, nothing is
+        // dispatched, and the tick reports itself failed so the next one is not
+        // mistaken for a healthy pass.
+        if (execution.executionProfileId !== bound.id) {
+          result.failed = true;
+          result.rows.push({
+            executionId: execution.id,
+            statusBefore: execution.status,
+            reasonCode: PROFILE_MISMATCH_REASON_CODE,
+            positionObservation: "NOT_READ",
+            errorCode: PROFILE_MISMATCH_REASON_CODE,
+          });
+          // Ids only. Never an account identifier, a key or a payload.
+          logger.error(
+            { executionId: execution.id, boundProfileId: bound.id },
+            "Reconciliation refused an execution belonging to another profile — no exchange request was made"
+          );
+          continue;
+        }
+
         result.inspected += 1;
         const probe: {
           reasonCode: string | null;
@@ -463,7 +534,7 @@ export class ExecutionOrchestrator {
       // metric must never be able to abort the reconciliation it reports on.
       // A failure leaves the field null, which reads as unknown, not as zero.
       try {
-        result.reconcilableTotal = await this.countReconcilable();
+        result.reconcilableTotal = await this.countReconcilable(bound.id);
       } catch (error) {
         logger.warn(
           { error: error instanceof Error ? error.message.slice(0, 300) : "unknown" },
@@ -471,7 +542,7 @@ export class ExecutionOrchestrator {
         );
       }
 
-      result.recoveryPending = await this.countRecoveryRequired();
+      result.recoveryPending = await this.countRecoveryRequired(bound.id);
     } catch (error) {
       result.failed = true;
       logger.error(
@@ -595,10 +666,22 @@ export class ExecutionOrchestrator {
    * eligible row is therefore reached within one full cycle,
    * `ceil(total / batchSize)` ticks, whatever the rows ahead of it do.
    */
-  private async selectReconciliationBatch(batchSize: number): Promise<TradeExecution[]> {
+  private async selectReconciliationBatch(
+    batchSize: number,
+    /**
+     * The bound profile. REQUIRED, and deliberately not defaulted: a caller
+     * that forgot it would silently walk the whole table with one account's
+     * credentials loaded, which is the precise failure this parameter exists
+     * to make impossible to write.
+     */
+    executionProfileId: string
+  ): Promise<TradeExecution[]> {
     const query = (after: ReconciliationCursor | null) =>
       this.deps.prisma.tradeExecution.findMany({
         where: {
+          // AT THE DISCOVERY BOUNDARY, never as a later in-memory filter: a row
+          // that is never selected cannot be reconciled by mistake.
+          executionProfileId,
           status: { in: [...RECONCILABLE_STATUSES] },
           ...(after
             ? {
@@ -1052,7 +1135,30 @@ export class ExecutionOrchestrator {
    * idempotent.
    */
   async runStartupRecovery(options: { batchSize?: number } = {}): Promise<ReconcileTickResult> {
-    const pending = await this.countRecoveryRequired();
+    const bound = await this.boundProfileId();
+    if (!bound.ok) {
+      // FAIL CLOSED, before the count and before the tick: a process that
+      // cannot say which account it is must not read, report or recover.
+      logger.error(
+        { reasonCode: bound.reasonCode },
+        "Execution startup recovery refused — the configured execution profile could not be resolved"
+      );
+      return {
+        inspected: 0,
+        advanced: 0,
+        progressed: 0,
+        mutationsDispatched: 0,
+        recoveryPending: 0,
+        reconcilableTotal: null,
+        cursorActive: false,
+        failed: true,
+        rows: [],
+      };
+    }
+
+    // This profile's backlog, not the table's. A process for one account may
+    // honestly report zero while another account has work it cannot touch.
+    const pending = await this.countRecoveryRequired(bound.id);
     logger.info({ recoveryRequired: pending }, "Execution startup recovery beginning");
 
     const result = await this.runExecutionReconciliationTick({
@@ -1069,25 +1175,40 @@ export class ExecutionOrchestrator {
   }
 
   /**
-   * Executions currently eligible for reconciliation, table-wide.
+   * Executions currently eligible for reconciliation, FOR ONE PROFILE.
    *
    * Reads the SAME RECONCILABLE_STATUSES constant as
    * `selectReconciliationBatch`, so the reported total can never describe a
-   * different set from the one the cursor actually walks. A COUNT over the
-   * indexed `status` column: no execution rows are loaded, and it is strictly
-   * cheaper than `countRecoveryRequired`, which already runs every tick and
-   * whose OR reaches an unindexed column.
+   * different set from the one the cursor actually walks -- which is why the
+   * profile predicate has to be here too. A COUNT over indexed columns: no
+   * execution rows are loaded, and it is strictly cheaper than
+   * `countRecoveryRequired`, which already runs every tick and whose OR
+   * reaches an unindexed column.
+   *
+   * The profile is a REQUIRED parameter. A process that reports a number must
+   * be reporting about the work it can actually act on.
    */
-  async countReconcilable(): Promise<number> {
+  async countReconcilable(executionProfileId: string): Promise<number> {
     return this.deps.prisma.tradeExecution.count({
-      where: { status: { in: [...RECONCILABLE_STATUSES] } },
+      where: { executionProfileId, status: { in: [...RECONCILABLE_STATUSES] } },
     });
   }
 
-  /** Executions whose exposure is not yet provably resolved. */
-  async countRecoveryRequired(): Promise<number> {
+  /**
+   * Executions of ONE profile whose exposure is not yet provably resolved.
+   *
+   * This count blocks new admission, so scoping it is a real change of
+   * meaning: it used to count across the whole table on the conservative
+   * reading that unresolved exposure ANYWHERE is a reason not to open new
+   * work. With one profile per process that read is indistinguishable from
+   * this one; with two it is actively wrong, because this process can neither
+   * see nor resolve another account's exposure and would block forever on
+   * work it is structurally unable to do.
+   */
+  async countRecoveryRequired(executionProfileId: string): Promise<number> {
     return this.deps.prisma.tradeExecution.count({
       where: {
+        executionProfileId,
         OR: [
           { status: { in: [...RECOVERY_REQUIRED_STATUSES] } },
           { requiresManualIntervention: true },
@@ -1096,3 +1217,29 @@ export class ExecutionOrchestrator {
     });
   }
 }
+
+/**
+ * Compile-time parameter contracts.
+ *
+ * Asserted in typechecked SOURCE rather than in a test, because the backend
+ * tsconfig excludes `tests` -- a contract pinned only in a test file would
+ * never be seen by `tsc`. Making the profile OPTIONAL, or dropping it, stops
+ * these tuples matching and fails the build.
+ */
+type ExactTuple<A extends readonly unknown[], B extends readonly unknown[]> = [A] extends [B]
+  ? [B] extends [A]
+    ? true
+    : false
+  : false;
+
+const reconcilableCountRequiresAProfile: ExactTuple<
+  Parameters<ExecutionOrchestrator["countReconcilable"]>,
+  [string]
+> = true;
+void reconcilableCountRequiresAProfile;
+
+const recoveryCountRequiresAProfile: ExactTuple<
+  Parameters<ExecutionOrchestrator["countRecoveryRequired"]>,
+  [string]
+> = true;
+void recoveryCountRequiresAProfile;

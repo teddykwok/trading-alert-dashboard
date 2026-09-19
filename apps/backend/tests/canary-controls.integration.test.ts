@@ -83,14 +83,32 @@ let symbolValidationCalls: string[] = [];
 const OVERRIDDEN = [
   "EXECUTION_PROFILE_ACCOUNT_IDENTIFIER",
   "EXECUTION_PROFILE_ENVIRONMENT",
+  "BINANCE_API_KEY",
+  "BINANCE_API_SECRET",
   ...Object.keys(ARMED_GATES),
 ];
 const originalEnv = new Map(OVERRIDDEN.map((key) => [key, process.env[key]]));
+
+/**
+ * SYNTHETIC credentials, because `prepareCanary` composes a signed client.
+ *
+ * Composition fails closed when `BINANCE_API_KEY` or `BINANCE_API_SECRET` is
+ * missing, which is correct and must stay that way; the test environment
+ * configures neither. These two values exist only so the composition step
+ * completes -- symbol validation is stubbed above, so nothing in this suite
+ * reaches the network and these bytes never leave the process.
+ *
+ * They are snapshotted and restored with every other overridden variable.
+ */
+const SYNTHETIC_API_KEY = "canary-controls-test-api-key";
+const SYNTHETIC_API_SECRET = "canary-controls-test-api-secret";
 
 async function loadControls(gates: Record<string, string>) {
   vi.resetModules();
   process.env.EXECUTION_PROFILE_ACCOUNT_IDENTIFIER = TEST_IDENTIFIER;
   process.env.EXECUTION_PROFILE_ENVIRONMENT = "MAINNET";
+  process.env.BINANCE_API_KEY = SYNTHETIC_API_KEY;
+  process.env.BINANCE_API_SECRET = SYNTHETIC_API_SECRET;
   Object.assign(process.env, gates);
 
   // Phase 12.4D-A.1: exact arm now consults runtime attestation, which is a
