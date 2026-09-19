@@ -327,6 +327,58 @@ describe("the campaign bounds dispatches ACROSS batches", () => {
     expect(result.userTradesWeightUsed).toBe(5);
     expect(result.outcome).toBe("NO_ACTIVE_FILL_CAMPAIGN");
     expect((await campaignRow(campaign.id)).dispatchesUsed).toBe(1);
+
+    // THE BOOTSTRAP SUMMARY SURVIVES THE IN-LOOP STOP.
+    //
+    // Production proved the old behaviour wrong: a pass exactly like this one
+    // created 500 roots, claimed a window and spent a real request, then
+    // reported `bootstrap: null` because the second iteration found no ACTIVE
+    // campaign. The roots are durable whatever the admission decided, so the
+    // summary is a fact about the pass, not about its terminal outcome.
+    expect(result.bootstrap).not.toBeNull();
+    expect(result.bootstrap).toMatchObject({
+      outcome: "BOOTSTRAPPED",
+      horizonDays: 30,
+      dayCount: 30,
+      expectedRootCount: 30,
+      alreadyCompatibleCount: 30,
+      createdCount: 0,
+    });
+    // And the accounting this slice must NOT disturb.
+    expect(result.executionInvocations).toBe(1);
+    expect(result.userTradesWeightUsed).toBe(5);
+    expect(result.outcomes.COMPLETE).toBe(1);
+  });
+
+  maybe()("every genuine PRE-bootstrap exit still reports no bootstrap", async () => {
+    // The other half of the contract. These three refuse before the bootstrap
+    // is called at all, so null is the truthful answer and must stay.
+    const executionProfileId = await makeProfile("pre-bootstrap-null");
+
+    // 1. No campaign has ever existed for this profile.
+    const none = workerProcess({ executionProfileId });
+    const noneResult = await runBatch(none.driver);
+    expect(noneResult.outcome).toBe("NO_ACTIVE_FILL_CAMPAIGN");
+    expect(noneResult.bootstrap).toBeNull();
+    expect(none.bootstrapHistoricalRoots).not.toHaveBeenCalled();
+    expect(noneResult.executionInvocations).toBe(0);
+
+    // 2. A campaign the operator paused.
+    const campaign = await campaigns.createCampaign({ executionProfileId, maxDispatches: 1 });
+    await campaigns.pauseCampaign(campaign.id);
+    const paused = workerProcess({ executionProfileId });
+    const pausedResult = await runBatch(paused.driver);
+    expect(pausedResult.outcome).toBe("NO_ACTIVE_FILL_CAMPAIGN");
+    expect(pausedResult.bootstrap).toBeNull();
+    expect(paused.bootstrapHistoricalRoots).not.toHaveBeenCalled();
+
+    // 3. A campaign the operator aborted.
+    await campaigns.abortCampaign(campaign.id, null);
+    const aborted = workerProcess({ executionProfileId });
+    const abortedResult = await runBatch(aborted.driver);
+    expect(abortedResult.outcome).toBe("NO_ACTIVE_FILL_CAMPAIGN");
+    expect(abortedResult.bootstrap).toBeNull();
+    expect(aborted.bootstrapHistoricalRoots).not.toHaveBeenCalled();
   });
 
   maybe()("N=5 with maxWindows=1: five ticks each dispatch once, the sixth dispatches none", async () => {

@@ -92,6 +92,26 @@ export interface PreflightConfig {
 /** The durable facts, read once. Every field comes from a SELECT. */
 export interface PreflightState {
   symbolUniverseCount: number;
+  /**
+   * THE PERSISTENT BACKLOG, reported and never judged.
+   *
+   * The ingest horizon governs ROOT CREATION ONLY: `claimNextWindow` has no
+   * date predicate, and nothing deletes or terminalizes a root when the
+   * horizon narrows. Rows created under a wider horizon therefore stay
+   * claimable indefinitely -- and because FIFO fairness is `createdAt` first,
+   * the oldest-CREATED rows are served first, which after a narrowing are
+   * precisely the ones outside it.
+   *
+   * An operator pinning a three-day horizon was previously shown only
+   * `symbols x horizon` and could not see that a far larger backlog sat at
+   * the head of the queue. These four fields close that blind spot. None of
+   * them is a blocker: a backlog is ordinary durable work, not a fault.
+   */
+  pendingTotal: number;
+  pendingClaimableNow: number;
+  pendingOutsideHorizon: number;
+  /** `YYYY-MM-DD` UTC of the oldest pending interval, or null when none. */
+  oldestPendingUtcDay: string | null;
   campaignStatus: string | null;
   campaignMaxDispatches: number | null;
   campaignDispatchesUsed: number | null;
@@ -233,6 +253,11 @@ export async function runFillRolloutPreflightCli(
   );
   line(out, "userTrades weight per request", config.userTradesWeightPerRequest);
   line(out, "symbol universe count", state.symbolUniverseCount);
+  // REPORTING ONLY. These four never reach `blockersFor`.
+  line(out, "pending total", state.pendingTotal);
+  line(out, "pending claimable now", state.pendingClaimableNow);
+  line(out, "pending outside current horizon", state.pendingOutsideHorizon);
+  line(out, "oldest pending UTC day", state.oldestPendingUtcDay);
   line(out, "projected root upper bound", projection.rootUpperBound);
   line(out, "projected requests per tick", projection.requestsPerFreshCapTick);
   line(out, "projected requests per minute", projection.requestsPerUtcMinute);

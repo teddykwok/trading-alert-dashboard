@@ -20,7 +20,7 @@ const DAY_START = Date.UTC(2026, 8, 15);
 const { prisma: testDatabase, available } = await connectTestDatabase();
 const prisma: PrismaClient | null = testDatabase;
 
-const { MAX_INGEST_ATTEMPTS } = await import(
+const { MAX_INGEST_ATTEMPTS, INGEST_CLAIM_LEASE_MS } = await import(
   "../src/modules/execution/exchange-fill-ingest-window.service"
 );
 const { HistoricalFillCampaignService } = await import(
@@ -31,6 +31,19 @@ const { horizonSourceOf, readPreflightState, INGEST_HORIZON_KEY } = await import
 );
 
 const maybe = () => (available ? it : it.skip);
+
+/**
+ * A pinned instant and horizon for every read.
+ *
+ * The horizon is rolling, so a test that let it float would assert different
+ * days depending on when it ran. `NOW` sits mid-morning on Sep 19 UTC, which
+ * makes the canonical 3-day horizon exactly Sep 16 / 17 / 18 -- and leaves
+ * Sep 15 deliberately outside it.
+ */
+const NOW = new Date("2026-09-19T08:31:00.000Z");
+const HORIZON = 3;
+const readState = (executionProfileId: string, horizonDays = HORIZON, now = NOW) =>
+  readPreflightState(prisma!, executionProfileId, horizonDays, now);
 
 let campaigns: InstanceType<typeof HistoricalFillCampaignService>;
 let sequence = 0;
@@ -156,10 +169,10 @@ describe("the durable facts are read correctly", () => {
     await execution(target.id, SYMBOL_B);
     await execution(stranger.id, "OTHERUSDT");
 
-    const state = await readPreflightState(prisma!, target.id);
+    const state = await readState(target.id);
 
     expect(state.symbolUniverseCount).toBe(2);
-    expect((await readPreflightState(prisma!, stranger.id)).symbolUniverseCount).toBe(1);
+    expect((await readState(stranger.id)).symbolUniverseCount).toBe(1);
   });
 
   maybe()("reports an ACTIVE campaign with its budget", async () => {
@@ -169,7 +182,7 @@ describe("the durable facts are read correctly", () => {
       maxDispatches: 3,
     });
 
-    const state = await readPreflightState(prisma!, target.id);
+    const state = await readState(target.id);
 
     expect(state.campaignStatus).toBe("ACTIVE");
     expect(state.campaignMaxDispatches).toBe(3);
@@ -185,13 +198,13 @@ describe("the durable facts are read correctly", () => {
     });
     await campaigns.pauseCampaign(campaign.id);
 
-    expect((await readPreflightState(prisma!, target.id)).campaignStatus).toBe("PAUSED");
+    expect((await readState(target.id)).campaignStatus).toBe("PAUSED");
   });
 
   maybe()("reports no campaign at all as null", async () => {
     const target = await profile("nocampaign");
 
-    const state = await readPreflightState(prisma!, target.id);
+    const state = await readState(target.id);
 
     expect(state.campaignStatus).toBeNull();
     expect(state.campaignMaxDispatches).toBeNull();
@@ -206,13 +219,13 @@ describe("the durable facts are read correctly", () => {
     });
     await campaigns.abortCampaign(campaign.id, null);
 
-    expect((await readPreflightState(prisma!, target.id)).campaignStatus).toBeNull();
+    expect((await readState(target.id)).campaignStatus).toBeNull();
   });
 
   maybe()("reports an absent breaker row as CLOSED", async () => {
     const target = await profile("noscircuit");
 
-    expect((await readPreflightState(prisma!, target.id)).circuitState).toBe("CLOSED");
+    expect((await readState(target.id)).circuitState).toBe("CLOSED");
   });
 
   maybe()("reports an OPEN breaker row as OPEN", async () => {
@@ -221,7 +234,7 @@ describe("the durable facts are read correctly", () => {
       data: { executionProfileId: target.id, state: "OPEN", openedAt: new Date() },
     });
 
-    expect((await readPreflightState(prisma!, target.id)).circuitState).toBe("OPEN");
+    expect((await readState(target.id)).circuitState).toBe("OPEN");
   });
 
   maybe()("counts only pending windows at or above the attempt ceiling", async () => {
@@ -231,14 +244,127 @@ describe("the durable facts are read correctly", () => {
     await windowRow(target.id, 2, { status: "ABANDONED", attempts: MAX_INGEST_ATTEMPTS });
     await windowRow(target.id, 3, { status: "COMPLETE", attempts: MAX_INGEST_ATTEMPTS });
 
-    expect((await readPreflightState(prisma!, target.id)).attemptExhaustedCount).toBe(1);
+    expect((await readState(target.id)).attemptExhaustedCount).toBe(1);
   });
 
   maybe()("reports zero exhausted windows on a healthy profile", async () => {
     const target = await profile("healthy");
     await windowRow(target.id);
 
-    expect((await readPreflightState(prisma!, target.id)).attemptExhaustedCount).toBe(0);
+    expect((await readState(target.id)).attemptExhaustedCount).toBe(0);
+  });
+});
+
+describe("the persistent backlog is reported against the canonical horizon", () => {
+  // NOW is Sep 19 08:31 UTC, so the canonical 3-day horizon is Sep 16/17/18.
+  // Sep 15 is deliberately one day outside it.
+  // DAY_START in this file is Sep 15, so offset 0 IS Sep 15.
+  const SEP15 = 0, SEP16 = 1, SEP17 = 2, SEP18 = 3;
+
+  maybe()("B1. reports an empty queue as zeros and no oldest day", async () => {
+    const target = await profile("backlog-empty");
+
+    const state = await readState(target.id);
+
+    expect(state.pendingTotal).toBe(0);
+    expect(state.pendingClaimableNow).toBe(0);
+    expect(state.pendingOutsideHorizon).toBe(0);
+    expect(state.oldestPendingUtcDay).toBeNull();
+  });
+
+  maybe()("B2. counts rows wholly inside the horizon as inside", async () => {
+    const target = await profile("backlog-inside");
+    await windowRow(target.id, SEP16);
+    await windowRow(target.id, SEP17);
+    await windowRow(target.id, SEP18);
+
+    const state = await readState(target.id);
+
+    expect(state.pendingTotal).toBe(3);
+    expect(state.pendingClaimableNow).toBe(3);
+    expect(state.pendingOutsideHorizon).toBe(0);
+    expect(state.oldestPendingUtcDay).toBe("2026-09-16");
+  });
+
+  maybe()("B3. an out-of-horizon row is still pending, still claimable, and counted outside", async () => {
+    // THE WHOLE POINT OF THIS SLICE. Narrowing the horizon neither deletes the
+    // row nor makes it unclaimable -- it just stops being materialized anew.
+    const target = await profile("backlog-outside");
+    await windowRow(target.id, SEP15);
+    await windowRow(target.id, SEP16);
+
+    const state = await readState(target.id);
+
+    expect(state.pendingTotal).toBe(2);
+    expect(state.pendingClaimableNow).toBe(2);
+    expect(state.pendingOutsideHorizon).toBe(1);
+    expect(state.oldestPendingUtcDay).toBe("2026-09-15");
+  });
+
+  const UNCLAIMABLE = [
+    ["its backoff has not elapsed", { nextEligibleAt: new Date("2026-09-19T09:00:00.000Z") }],
+    ["a live worker holds the lease", { attempts: 1, claimedAt: new Date("2026-09-19T08:30:30.000Z"), claimOwner: "live" }],
+    ["its attempt budget is spent", { attempts: MAX_INGEST_ATTEMPTS }],
+  ] as const;
+
+  for (const [reason, overrides] of UNCLAIMABLE) {
+    maybe()(`B4. an out-of-horizon row is pending but NOT claimable when ${reason}`, async () => {
+      const target = await profile("backlog-unclaimable");
+      await windowRow(target.id, SEP15, overrides as Record<string, unknown>);
+
+      const state = await readState(target.id);
+
+      expect(state.pendingTotal).toBe(1);
+      expect(state.pendingOutsideHorizon).toBe(1);
+      // Pending and outside, but the authoritative claim predicate refuses it.
+      expect(state.pendingClaimableNow).toBe(0);
+    });
+  }
+
+  maybe()("B4. a stale lease rejoins the claimable count, as the claim path says", async () => {
+    const target = await profile("backlog-stale");
+    await windowRow(target.id, SEP15, {
+      attempts: 1,
+      claimedAt: new Date(NOW.getTime() - INGEST_CLAIM_LEASE_MS - 1),
+      claimOwner: "dead",
+    });
+
+    expect((await readState(target.id)).pendingClaimableNow).toBe(1);
+  });
+
+  maybe()("B5. the oldest pending day follows the INTERVAL, not creation order", async () => {
+    // Created newest-interval first, so a createdAt-driven answer would differ.
+    const target = await profile("backlog-oldest");
+    await windowRow(target.id, SEP18);
+    await windowRow(target.id, SEP17);
+    await windowRow(target.id, SEP15);
+
+    expect((await readState(target.id)).oldestPendingUtcDay).toBe("2026-09-15");
+  });
+
+  maybe()("counts only the bound profile's backlog", async () => {
+    const mine = await profile("backlog-mine");
+    const stranger = await profile("backlog-stranger");
+    await windowRow(mine.id, SEP15);
+    await windowRow(stranger.id, SEP15);
+    await windowRow(stranger.id, SEP16);
+
+    const state = await readState(mine.id);
+
+    expect(state.pendingTotal).toBe(1);
+    expect(state.pendingOutsideHorizon).toBe(1);
+  });
+
+  maybe()("a terminal row is not pending, however old its interval", async () => {
+    const target = await profile("backlog-terminal");
+    await windowRow(target.id, SEP15, { status: "COMPLETE" });
+    await windowRow(target.id, SEP16, { status: "ABANDONED" });
+
+    const state = await readState(target.id);
+
+    expect(state.pendingTotal).toBe(0);
+    expect(state.pendingOutsideHorizon).toBe(0);
+    expect(state.oldestPendingUtcDay).toBeNull();
   });
 });
 
@@ -258,8 +384,8 @@ describe("reading the state writes nothing", () => {
     });
 
     // Twice, so even an idempotent-looking write would show up.
-    await readPreflightState(prisma!, target.id);
-    await readPreflightState(prisma!, target.id);
+    await readState(target.id);
+    await readState(target.id);
 
     expect(await countsFor(target.id)).toEqual(before);
     // Field-for-field, including updatedAt -- any touch would move it.

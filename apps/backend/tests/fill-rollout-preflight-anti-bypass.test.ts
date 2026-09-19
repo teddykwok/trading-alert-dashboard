@@ -135,11 +135,42 @@ describe("the preflight reaches nothing that can act", () => {
     expect(codeOf("src/modules/binance/binance.endpoints.ts")).not.toMatch(/^import/m);
   });
 
-  it("constructs exactly one thing: a Prisma client", () => {
-    const constructed = [...codeOf(COMPOSITION).matchAll(/new\s+([A-Za-z0-9_]+)\s*\(/g)].map(
-      (match) => match[1]!
-    );
+  it("constructs exactly one client and no service of any kind", () => {
+    const constructed = [...codeOf(COMPOSITION).matchAll(/new\s+([A-Za-z0-9_]+)\s*\(/g)]
+      .map((match) => match[1]!)
+      // `Date` is value arithmetic for the lease threshold and the oldest-day
+      // rendering, not a capability. Everything else must be absent.
+      .filter((name) => name !== "Date");
     expect(constructed).toEqual(["PrismaClient"]);
+  });
+
+  it("the backlog reads add counting only, never a mutation", () => {
+    const composition = codeOf(COMPOSITION);
+    // Four new reads, and every one of them is a count or a find.
+    expect(composition).toContain("count({ where: pendingOnly })");
+    expect(composition).toContain("count({ where: claimable })");
+    expect(composition).toContain("count({ where: outsideHorizon })");
+    expect(composition).toContain("findFirst({");
+    for (const mutation of MUTATIONS) {
+      expect(composition).not.toContain(mutation);
+    }
+  });
+
+  it("reuses the canonical day generator rather than redefining a horizon", () => {
+    // A second definition of "closed UTC day" is exactly how a reporting
+    // field drifts away from the behaviour it claims to describe.
+    const composition = codeOf(COMPOSITION);
+    expect(composition).toContain("canonicalUtcDayRoots(now, horizonDays)");
+    expect(composition).not.toContain("86_400_000");
+    expect(composition).not.toContain("floor(");
+  });
+
+  it("spells the claim predicate with the authoritative constants", () => {
+    const composition = codeOf(COMPOSITION);
+    expect(composition).toContain("attempts: { lt: MAX_INGEST_ATTEMPTS }");
+    expect(composition).toContain("INGEST_CLAIM_LEASE_MS");
+    expect(composition).toContain("nextEligibleAt: { lte: now }");
+    expect(composition).toContain("claimedAt: { lt: staleBefore }");
   });
 });
 

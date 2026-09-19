@@ -258,13 +258,28 @@ export type HistoricalFillBatchResult =
       HistoricalFillCampaignAccounting)
   | ({
       /**
-       * Stopped before the bootstrap because nothing authorises this account.
+       * Stopped because nothing authorises a (further) dispatch on this account.
        *
-       * `bootstrap` is null and not a summary: the pass did not run one. That is
-       * the load-bearing part of this arm -- no roots, no claims, no requests.
+       * TWO DIFFERENT MOMENTS share this arm, and the `bootstrap` field is what
+       * tells them apart:
+       *
+       *   null      -- the PRE-BOOTSTRAP gate refused. Nothing ran: no roots, no
+       *                claims, no requests.
+       *   a summary -- the gate passed, the bootstrap RAN, and the loop then hit
+       *                a locked admission that found no ACTIVE campaign. A cap-1
+       *                campaign reaches here routinely: its final slot moves it to
+       *                EXHAUSTED, so the next iteration sees no ACTIVE row. Roots
+       *                may have been created, a window claimed and a request spent
+       *                before this outcome was decided.
+       *
+       * Reading this arm as "nothing happened" was wrong, and a production batch
+       * proved it: one executor invocation, one userTrades request, one COMPLETE
+       * window and 500 new roots, all reported under `bootstrap: null`.
+       * `executionInvocations` and the weight accounting were correct throughout;
+       * only the bootstrap summary was discarded.
        */
       outcome: "NO_ACTIVE_FILL_CAMPAIGN" | "CAMPAIGN_DISPATCH_BUDGET_EXHAUSTED";
-      bootstrap: null;
+      bootstrap: FillRootBootstrapSummary | null;
       executionInvocations: number;
       outcomes: FillBatchOutcomeCounts;
     } & UserTradesWeightAccounting &
@@ -683,7 +698,13 @@ export class HistoricalFillBatchDriver {
           return this.settled(
             {
               outcome: "NO_ACTIVE_FILL_CAMPAIGN",
-              bootstrap: null,
+              // THE REAL SUMMARY. The bootstrap ran before this loop was
+              // entered, and its roots are durable whatever the admission then
+              // decided. Reporting null here claimed a pass had done nothing
+              // when it may have created roots, claimed a window and spent a
+              // request -- which is exactly what a cap-1 campaign does on the
+              // iteration after it spends its final slot.
+              bootstrap,
               executionInvocations,
               outcomes,
               ...weighed(budget, used),
@@ -696,7 +717,13 @@ export class HistoricalFillBatchDriver {
           return this.settled(
             {
               outcome: "CAMPAIGN_DISPATCH_BUDGET_EXHAUSTED",
-              bootstrap: null,
+              // Same reasoning as above. This branch is a DEFENSIVE guard: the
+              // admission spends a campaign's final slot and moves it to
+              // EXHAUSTED in one statement, so no committed state has an ACTIVE
+              // campaign with every slot spent. It is reported honestly anyway,
+              // because a branch that cannot be reached today must not carry a
+              // claim that would be false if it ever were.
+              bootstrap,
               executionInvocations,
               outcomes,
               ...weighed(budget, used),

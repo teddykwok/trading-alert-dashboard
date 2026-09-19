@@ -35,6 +35,10 @@ const READY_CONFIG: PreflightConfig = {
 /** Durable state that satisfies every database-side gate. */
 const READY_STATE: PreflightState = {
   symbolUniverseCount: 500,
+  pendingTotal: 1993,
+  pendingClaimableNow: 1993,
+  pendingOutsideHorizon: 499,
+  oldestPendingUtcDay: "2026-09-15",
   campaignStatus: "ACTIVE",
   campaignMaxDispatches: 1,
   campaignDispatchesUsed: 0,
@@ -193,6 +197,64 @@ describe("every gate blocks independently", () => {
   });
 });
 
+describe("the backlog fields report and never judge", () => {
+  // B6. The verdict must depend on exactly the seven pre-existing gates.
+  const BACKLOGS: ReadonlyArray<readonly [string, Partial<PreflightState>]> = [
+    ["no pending work at all", { pendingTotal: 0, pendingClaimableNow: 0, pendingOutsideHorizon: 0, oldestPendingUtcDay: null }],
+    ["everything inside the horizon", { pendingTotal: 1500, pendingClaimableNow: 1500, pendingOutsideHorizon: 0, oldestPendingUtcDay: "2026-09-16" }],
+    ["a large backlog entirely outside the horizon", { pendingTotal: 15000, pendingClaimableNow: 15000, pendingOutsideHorizon: 15000, oldestPendingUtcDay: "2026-08-20" }],
+    ["a backlog none of which is claimable right now", { pendingTotal: 900, pendingClaimableNow: 0, pendingOutsideHorizon: 900, oldestPendingUtcDay: "2026-09-01" }],
+  ];
+
+  for (const [description, patch] of BACKLOGS) {
+    it(`stays READY with ${description}`, async () => {
+      const state = { ...READY_STATE, ...patch };
+      const { deps, lines } = cli(READY_CONFIG, state);
+
+      const result = await runFillRolloutPreflightCli([], deps);
+
+      expect(result.exitCode).toBe(PREFLIGHT_CLI_EXIT.READY);
+      expect(blockersFor(READY_CONFIG, state)).toEqual([]);
+      expect(labelsOf(lines)).not.toContain("blocker");
+    });
+
+    it(`stays BLOCKED for the same single reason with ${description}`, async () => {
+      // One pre-existing blocker, and the backlog must neither add nor mask one.
+      const state = { ...READY_STATE, ...patch, circuitState: "OPEN" };
+      const { deps } = cli(READY_CONFIG, state);
+
+      const result = await runFillRolloutPreflightCli([], deps);
+
+      expect(result.exitCode).toBe(PREFLIGHT_CLI_EXIT.BLOCKED);
+      expect(blockersFor(READY_CONFIG, state)).toEqual(["CIRCUIT_OPEN"]);
+    });
+  }
+
+  it("renders an absent oldest pending day as the null marker", async () => {
+    const { deps, lines } = cli(READY_CONFIG, {
+      ...READY_STATE, pendingTotal: 0, pendingClaimableNow: 0,
+      pendingOutsideHorizon: 0, oldestPendingUtcDay: null,
+    });
+
+    await runFillRolloutPreflightCli([], deps);
+
+    expect(lines.join("\n")).toContain("oldest pending UTC day           \u2014");
+    expect(lines.join("\n")).toContain("pending total                    0");
+  });
+
+  it("prints the backlog it was given, verbatim", async () => {
+    const { deps, lines } = cli();
+
+    await runFillRolloutPreflightCli([], deps);
+    const text = lines.join("\n");
+
+    expect(text).toContain("pending total                    1993");
+    expect(text).toContain("pending claimable now            1993");
+    expect(text).toContain("pending outside current horizon  499");
+    expect(text).toContain("oldest pending UTC day           2026-09-15");
+  });
+});
+
 describe("an explicit horizon and a defaulted one are different answers", () => {
   it("refuses a DEFAULTED 30 even though 30 is a legal value", async () => {
     const { deps, lines } = cli({ ...READY_CONFIG, horizonDays: 30, horizonSource: "DEFAULT" });
@@ -327,7 +389,7 @@ describe("the projections take the minimum of every restrictive factor", () => {
 });
 
 describe("the printed report is an exact, safe field set", () => {
-  it("prints the twenty rollout fields, in order, with no blocker when READY", async () => {
+  it("prints the rollout fields, in order, with no blocker when READY", async () => {
     const { deps, lines } = cli();
 
     await runFillRolloutPreflightCli([], deps);
@@ -345,6 +407,10 @@ describe("the printed report is an exact, safe field set", () => {
       "shared cap source",
       "userTrades weight per request",
       "symbol universe count",
+      "pending total",
+      "pending claimable now",
+      "pending outside current horizon",
+      "oldest pending UTC day",
       "projected root upper bound",
       "projected requests per tick",
       "projected requests per minute",

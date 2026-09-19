@@ -226,6 +226,49 @@ work and promises nothing about what the exchange will return. `BLOCKED` means
 do not restart the worker; fix each reported blocker deliberately -- the
 preflight changes nothing on its own.
 
+### Horizon governs creation only, never claiming
+
+`EXECUTION_FILL_INGEST_HORIZON_DAYS` controls **root creation only**. It decides
+which closed UTC days a bootstrap materializes, and nothing else.
+
+Narrowing the horizon does **not**:
+
+- delete old roots,
+- terminalize old roots, or
+- make old pending rows unclaimable.
+
+Durable pending work stays eligible under ordinary FIFO claim semantics for as
+long as it remains `PENDING`.
+
+FIFO fairness is **`createdAt` ascending first**, then deterministic tiebreaks
+(interval start, symbol, interval end, id). An older-CREATED backlog is
+therefore served **before** newly created roots, even when its historical UTC
+day lies outside the current bootstrap horizon. After a narrowing, the
+out-of-horizon rows are usually the ones at the head of the queue, because they
+were created first.
+
+The preflight reports this directly: **pending total**, **pending claimable
+now**, **pending outside current horizon** and **oldest pending UTC day**. They
+are reporting fields and never change the `READY`/`BLOCKED` verdict -- a backlog
+is ordinary durable work, not a fault.
+
+Request exposure is bounded by, and only by:
+
+- campaign `maxDispatches` (lifetime, persisted, survives restart),
+- the shared per-profile UTC-minute userTrades weight cap,
+- per-tick max windows,
+- per-tick userTrades weight, and
+- the circuit breaker.
+
+**The horizon is not a request-spend bound.** It limits how much work is
+created, never how much is attempted.
+
+If a future requirement is to abandon old history, do **not** add an invisible
+age filter to the claim path: that would leave durable rows permanently
+`PENDING` yet unclaimable -- hidden zombies that also stop a campaign from ever
+being observed as drained. Such work must instead terminalize those rows
+explicitly, so the abandonment is recorded and auditable.
+
 ### Stopping, once the runtime is live
 
 `pnpm execution:fill-campaign-pause` is the fastest durable stop: it needs no

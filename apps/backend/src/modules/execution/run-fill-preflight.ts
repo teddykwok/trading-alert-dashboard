@@ -7,7 +7,11 @@ import { env } from "../../config/env";
 // the driver, the executor, the bootstrap, the campaign gate, the weight
 // budget and the circuit breaker into this read-only command's graph.
 import { BINANCE_READ_ONLY_ENDPOINTS } from "../binance/binance.endpoints";
-import { MAX_INGEST_ATTEMPTS } from "./exchange-fill-ingest-window.service";
+import { canonicalUtcDayRoots } from "./exchange-fill-day-roots";
+import {
+  INGEST_CLAIM_LEASE_MS,
+  MAX_INGEST_ATTEMPTS,
+} from "./exchange-fill-ingest-window.service";
 import { executionSymbolsForProfile } from "./exchange-fill-symbol-universe";
 import {
   runFillRolloutPreflightCli,
@@ -85,9 +89,58 @@ export function preflightConfig(raw: RawEnvironment): PreflightConfig {
  */
 export async function readPreflightState(
   prisma: PrismaClient,
-  executionProfileId: string
+  executionProfileId: string,
+  horizonDays: number,
+  now: Date = new Date()
 ): Promise<PreflightState> {
-  const [symbols, campaign, circuit, attemptExhausted] = await Promise.all([
+  // The CANONICAL horizon span, from the generator the bootstrap itself uses.
+  // Not a second definition of "closed UTC day" -- the two must never drift.
+  const days = canonicalUtcDayRoots(now, horizonDays);
+  const horizonStart = BigInt(days[0]!.startTimeMs);
+  const horizonEnd = BigInt(days[days.length - 1]!.endTimeMs);
+
+  const pendingOnly = { executionProfileId, status: "PENDING" } as const;
+  const staleBefore = new Date(now.getTime() - INGEST_CLAIM_LEASE_MS);
+
+  /**
+   * The claim predicate, spelled exactly as `claimNextWindow` spells it.
+   *
+   * `lte` on the backoff and `lt` on the lease are not stylistic: a row whose
+   * backoff expires exactly now IS claimable, and a lease taken exactly one
+   * lease-length ago is still ACTIVE. Same constants, same operators, same
+   * order as the operational snapshot uses for the same reason.
+   */
+  const claimable = {
+    ...pendingOnly,
+    attempts: { lt: MAX_INGEST_ATTEMPTS },
+    AND: [
+      { OR: [{ nextEligibleAt: null }, { nextEligibleAt: { lte: now } }] },
+      { OR: [{ claimedAt: null }, { claimedAt: { lt: staleBefore } }] },
+    ],
+  };
+
+  /**
+   * OUTSIDE = the interval is not wholly contained in the horizon span.
+   *
+   * Compared as a RANGE rather than by matching a canonical day start, so a
+   * split child -- whose bounds are a slice of its parent day and never a
+   * midnight boundary -- is correctly counted as inside the day it came from.
+   */
+  const outsideHorizon = {
+    ...pendingOnly,
+    NOT: { startTimeMs: { gte: horizonStart }, endTimeMs: { lte: horizonEnd } },
+  };
+
+  const [
+    symbols,
+    campaign,
+    circuit,
+    attemptExhausted,
+    pendingTotal,
+    pendingClaimableNow,
+    pendingOutsideHorizon,
+    oldestPending,
+  ] = await Promise.all([
     executionSymbolsForProfile(prisma, executionProfileId),
     prisma.historicalFillCampaign.findFirst({
       where: { executionProfileId, status: { in: ["ACTIVE", "PAUSED"] } },
@@ -104,6 +157,17 @@ export async function readPreflightState(
         attempts: { gte: MAX_INGEST_ATTEMPTS },
       },
     }),
+    prisma.exchangeFillIngestWindow.count({ where: pendingOnly }),
+    prisma.exchangeFillIngestWindow.count({ where: claimable }),
+    prisma.exchangeFillIngestWindow.count({ where: outsideHorizon }),
+    prisma.exchangeFillIngestWindow.findFirst({
+      where: pendingOnly,
+      // The oldest INTERVAL, deliberately not the oldest row: an operator
+      // asking how far back the backlog reaches means calendar time, and
+      // `createdAt` answers a different question entirely.
+      orderBy: { startTimeMs: "asc" },
+      select: { startTimeMs: true },
+    }),
   ]);
 
   return {
@@ -114,6 +178,13 @@ export async function readPreflightState(
     // An absent breaker row is a profile that has never tripped: CLOSED.
     circuitState: circuit?.state ?? "CLOSED",
     attemptExhaustedCount: attemptExhausted,
+    pendingTotal,
+    pendingClaimableNow,
+    pendingOutsideHorizon,
+    oldestPendingUtcDay:
+      oldestPending === null
+        ? null
+        : new Date(Number(oldestPending.startTimeMs)).toISOString().slice(0, 10),
   };
 }
 
@@ -123,7 +194,8 @@ export async function runFillRolloutPreflightCommand(): Promise<void> {
     const result: PreflightCliResult = await runFillRolloutPreflightCli(process.argv.slice(2), {
       prisma,
       config: preflightConfig(process.env),
-      readState: (executionProfileId) => readPreflightState(prisma, executionProfileId),
+      readState: (executionProfileId) =>
+        readPreflightState(prisma, executionProfileId, env.EXECUTION_FILL_INGEST_HORIZON_DAYS),
     });
     process.exitCode = result.exitCode;
   } finally {
