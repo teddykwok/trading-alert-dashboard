@@ -106,8 +106,40 @@ refresh, before considering any manual recovery.
 
 One or more pending windows have reached the configured attempt limit.
 
+Such a window is **unclaimable**. Both claim paths -- the scheduled FIFO claim
+and the targeted canary -- require the attempt count to be below the limit, so
+nothing will look at the window again. It also keeps the pending queue
+non-empty, which is what stops an active campaign from ever being observed as
+drained.
+
 **Check:** Review the repeated ingestion failures that exhausted the attempt
-budget before planning any recovery.
+budget before running any recovery. The repair closes the window out as a known
+gap; it does not explain why the attempts failed.
+
+**Recover:**
+
+```
+pnpm execution:fill-window-finalize-exhausted
+```
+
+The command finalizes only pending windows whose attempt budget is already
+spent and whose lease has expired. A window still held under a live lease is
+deliberately left alone -- that worker may yet report.
+
+It is bounded: one invocation is one pass over a bounded batch, not a sweep. If
+the condition is still reported afterwards, run it again.
+
+The command issues **zero exchange requests** and spends no request weight. It
+does not start, resume, pause, abort or complete a campaign; it does not read or
+change the circuit breaker; it materializes no root windows; and it does not
+enable or start the historical runtime. Nothing runs it automatically -- it
+repairs only when an operator runs it.
+
+**After running:** re-check the operator status to confirm the condition has
+cleared. Completing a campaign remains the normal path's job: if the historical
+runtime is enabled and the campaign is still active, a later tick evaluates the
+now-drained queue and moves it to completed. This command never does that
+itself.
 
 ### `ABANDONED_WINDOWS_PRESENT`
 
