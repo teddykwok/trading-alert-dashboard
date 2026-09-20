@@ -46,8 +46,19 @@ const SERVICE_SOURCE = readFileSync(
   path.join(BACKEND, "src/modules/execution/selected-plan-outcome.service.ts"),
   "utf8"
 );
+/** The GENERIC worker. After 11E it decides nothing for an account. */
 const WORKER_SOURCE = readFileSync(
   path.join(BACKEND, "src/modules/jobs/vision-analysis.worker.ts"),
+  "utf8"
+);
+/** The ACCOUNT execution worker, which owns the decision now. */
+const EXECUTION_WORKER_SOURCE = readFileSync(
+  path.join(BACKEND, "src/modules/jobs/execution.worker.ts"),
+  "utf8"
+);
+/** Where the decision is taken and where this row is written. */
+const ADOPTION_SOURCE = readFileSync(
+  path.join(BACKEND, "src/modules/jobs/selected-plan-adoption.service.ts"),
   "utf8"
 );
 
@@ -458,20 +469,22 @@ describe("K/P/Q/R. observability cannot alter a trading decision", () => {
     expect(code).not.toContain("recordSelectedPlanOutcome");
   });
 
-  maybe()("persistence happens AFTER the decision, in its own guard", () => {
-    const block = WORKER_SOURCE.slice(
-      // Phase 11D: the executor is barrier-owned, so the handler takes a
-      // local non-null reference first. The decision point is unchanged.
-      WORKER_SOURCE.indexOf("const outcome = await executor.handleSelectedPlan"),
-      WORKER_SOURCE.indexOf("} catch (executionError) {")
+  maybe()("persistence happens AFTER the decision, and not through this row", () => {
+    // Phase 11E FINAL: this row stopped receiving new per-account verdicts
+    // altogether. It is keyed alertId UNIQUE with an upsert writer, so two
+    // accounts writing through it would mean the second overwrote the first
+    // and the dashboard showed one account's refusal as the system's.
+    //
+    // The ordering claim did not disappear; it moved to the canonical row.
+    const pass = ADOPTION_SOURCE.slice(ADOPTION_SOURCE.indexOf("async runOnce("));
+    expect(pass.indexOf("executor.handleSelectedPlan")).toBeLessThan(
+      pass.indexOf("this.complete(")
     );
-    // Order is the safety argument: decide, return, THEN record.
-    expect(block.indexOf("handleSelectedPlan")).toBeLessThan(block.indexOf("recordSelectedPlanOutcome"));
-    // Its own try/catch, so a write failure cannot reach the outer handler and
-    // cause the job to retry and re-decide against different state.
-    expect(block).toContain("try {");
-    expect(block).toContain("catch (outcomeError)");
-    expect(block).toContain("decision already stands");
+
+    // And nothing in the account path touches the singleton.
+    for (const source of [ADOPTION_SOURCE, EXECUTION_WORKER_SOURCE, WORKER_SOURCE]) {
+      expect(source.includes("recordSelectedPlanOutcome")).toBe(false);
+    }
   });
 
   maybe()("a persistence failure neither admits a trade nor reverses a refusal", async () => {
@@ -504,12 +517,21 @@ describe("K/P/Q/R. observability cannot alter a trading decision", () => {
     }
   });
 
-  maybe()("the worker logs the failure safely and carries on", () => {
-    const block = WORKER_SOURCE.slice(WORKER_SOURCE.indexOf("catch (outcomeError)"));
-    expect(block).toContain("logger.warn");
+  maybe()("an evaluation failure is logged safely and never recorded as a verdict", () => {
+    // The pass catches, sanitizes and moves on; the claim's lease is what
+    // returns the plan. What it must never do is write a terminal row for a
+    // decision nobody actually reached.
+    const block = ADOPTION_SOURCE.slice(
+      ADOPTION_SOURCE.indexOf("executor.handleSelectedPlan"),
+      ADOPTION_SOURCE.indexOf("if (await this.complete(")
+    );
+    expect(block).toContain("logger.error");
     expect(block).toContain("message.slice(0, 300)");
     // Never the raw error object, which can carry a connection string.
-    expect(block).not.toContain("error: outcomeError,");
+    expect(block).not.toContain("error,");
+    expect(`complete in the failure path: ${block.includes("this.complete(")}`).toBe(
+      `complete in the failure path: false`
+    );
   });
 });
 
@@ -534,16 +556,18 @@ describe("S-V. no Binance, vision-queue or supervision interaction", () => {
     }
   });
 
-  maybe()("the recent reliability features are unchanged in the worker", () => {
-    // This branch adds a call; it must not have disturbed what was already there.
+  maybe()("the recent reliability features survived the 11E split", () => {
+    // They did not disappear, they were DIVIDED: queue reliability stayed
+    // with the generic worker, account liveness went with the account.
+    for (const marker of ["startAlertQueueRecoveryScheduler", "concurrency: 2"]) {
+      expect(WORKER_SOURCE, marker).toContain(marker);
+    }
     for (const marker of [
-      "startAlertQueueRecoveryScheduler",
       "startExecutionOrchestrationScheduler",
       "createRuntimeAttestationPublisher",
       "isReconciliationHealthy",
-      "concurrency: 2",
     ]) {
-      expect(WORKER_SOURCE, marker).toContain(marker);
+      expect(EXECUTION_WORKER_SOURCE, marker).toContain(marker);
     }
   });
 

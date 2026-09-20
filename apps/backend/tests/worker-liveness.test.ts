@@ -411,13 +411,32 @@ describe("worker liveness: the attestation connection is isolated and bounded", 
   });
 
   it("neither runtime heartbeats over the BullMQ connection any more", () => {
-    for (const file of ["src/modules/jobs/vision-analysis.worker.ts", "src/server.ts"]) {
+    for (const file of ["src/modules/jobs/execution.worker.ts", "src/server.ts"]) {
       const source = readFileSync(path.join(BACKEND, file), "utf8");
       const publisher = source.slice(source.indexOf("createRuntimeAttestationPublisher({"));
       expect(`${file}:${publisher.includes("bullConnection")}`).toBe(`${file}:false`);
       expect(`${file}:${source.includes("createAttestationRedisClient")}`).toBe(`${file}:true`);
       // The dedicated connection is released on shutdown.
       expect(`${file}:${source.includes("attestationRedis.close()")}`).toBe(`${file}:true`);
+    }
+  });
+
+  it("the generic worker publishes no runtime attestation at all", () => {
+    // Phase 11E: the WORKER role means an ACCOUNT-bound process now. The
+    // generic worker binds no account, so a deployment could run it alone
+    // with no account executing -- and an attestation from it would say the
+    // opposite, letting the activation interlock count a runtime that
+    // cannot trade. It must publish nothing, not publish something weaker.
+    const generic = readFileSync(path.join(BACKEND, "src/modules/jobs/vision-analysis.worker.ts"), "utf8");
+    for (const forbidden of [
+      "createRuntimeAttestationPublisher",
+      "createAttestationRedisClient",
+      "runtimeAttestation",
+      "isReconciliationHealthy",
+    ]) {
+      expect(`${forbidden} in generic worker: ${generic.includes(forbidden)}`).toBe(
+        `${forbidden} in generic worker: false`
+      );
     }
   });
 
@@ -752,7 +771,7 @@ describe("worker liveness: an unhealthy worker cannot be armed over", () => {
   });
 
   it("F4. the WORKER publisher is wired to reconciliation health", () => {
-    const worker = readFileSync(path.join(BACKEND, "src/modules/jobs/vision-analysis.worker.ts"), "utf8");
+    const worker = readFileSync(path.join(BACKEND, "src/modules/jobs/execution.worker.ts"), "utf8");
     const publisher = worker.slice(worker.indexOf("createRuntimeAttestationPublisher({"));
     expect(publisher).toContain("healthy: isReconciliationHealthy");
   });
@@ -760,7 +779,7 @@ describe("worker liveness: an unhealthy worker cannot be armed over", () => {
   it("F4b. the withdrawal ERROR carries the same safe guidance as the stall ERROR", () => {
     // These two fire together. Fixing only one would put the safe wording and
     // the unsafe wording side by side in the same incident log.
-    const worker = readFileSync(path.join(BACKEND, "src/modules/jobs/vision-analysis.worker.ts"), "utf8");
+    const worker = readFileSync(path.join(BACKEND, "src/modules/jobs/execution.worker.ts"), "utf8");
     // `onError:` also appears earlier, on the connection factory, so the end of
     // the block is the first one AFTER the withdrawal handler begins.
     const start = worker.indexOf("onWithdraw:");

@@ -366,7 +366,7 @@ describe("runtime launcher: process ownership", () => {
 describe("runtime launcher: the Windows spawn shape", () => {
   const REPO = "C:\\Projects\\trading-alert-dashboard";
   const env = { ComSpec: "C:\\WINDOWS\\system32\\cmd.exe" } as NodeJS.ProcessEnv;
-  const plan = (role: "backend" | "worker" | "frontend" = "backend") =>
+  const plan = (role: "backend" | "analysis" | "worker" | "frontend" = "backend") =>
     windowsSpawnPlan(role, REPO, "SAFE", env);
 
   it("never executes pnpm.cmd directly", () => {
@@ -403,7 +403,12 @@ describe("runtime launcher: the Windows spawn shape", () => {
 
   it.each([
     ["backend", "@trading-alert-dashboard/backend", "dev"],
-    ["worker", "@trading-alert-dashboard/backend", "worker"],
+    // Phase 11E: the GENERIC half, which binds no account.
+    ["analysis", "@trading-alert-dashboard/backend", "worker"],
+    // Phase 11E: the ACCOUNT executor. This is the role the WORKER
+    // attestation describes and the role supervision restarts, so pointing
+    // it at the generic entrypoint would make a healthy stack read STALE.
+    ["worker", "@trading-alert-dashboard/backend", "execution-worker"],
     ["frontend", "@trading-alert-dashboard/frontend", "dev"],
   ] as const)("maps %s to the repo's own pnpm script", (role, filter, script) => {
     expect(windowsSpawnPlan(role, REPO, "SAFE", env).args).toEqual([
@@ -444,10 +449,15 @@ describe("runtime launcher: the Windows spawn shape", () => {
   });
 
   it("exposes no path from operator input to an arbitrary command", () => {
-    // Every value is a fixed repo constant. A role is one of three literals,
+    // Every value is a fixed repo constant. A role is one of four literals,
     // and the table is frozen.
     expect(Object.isFrozen(ROLE_COMMANDS)).toBe(true);
-    expect(Object.keys(ROLE_COMMANDS).sort()).toEqual(["backend", "frontend", "worker"]);
+    expect(Object.keys(ROLE_COMMANDS).sort()).toEqual([
+      "analysis",
+      "backend",
+      "frontend",
+      "worker",
+    ]);
     for (const role of LAUNCHER_ROLES) {
       const args = windowsSpawnPlan(role, REPO, "SAFE", env).args;
       // No shell metacharacter can appear, because nothing is concatenated.
@@ -457,6 +467,30 @@ describe("runtime launcher: the Windows spawn shape", () => {
     }
   });
 
+  it("starts the whole single-account topology, generic AND account", () => {
+    // After 11E a working deployment needs BOTH workers: the generic one
+    // generates the plans, the account one adopts and executes them. A
+    // launcher that started only one would produce a stack that either
+    // analyses nothing or trades nothing.
+    expect([...LAUNCHER_ROLES]).toEqual([
+      "backend",
+      "analysis",
+      "worker",
+      "frontend",
+    ]);
+    // And generation comes before the process that consumes it.
+    expect(LAUNCHER_ROLES.indexOf("analysis")).toBeLessThan(LAUNCHER_ROLES.indexOf("worker"));
+  });
+
+  it("points the two worker roles at DIFFERENT entrypoints", () => {
+    const analysis = windowsSpawnPlan("analysis", REPO, "SAFE", env).args.join(" ");
+    const account = windowsSpawnPlan("worker", REPO, "SAFE", env).args.join(" ");
+    expect(analysis).not.toBe(account);
+    expect(account).toContain("execution-worker");
+    expect(`generic script in account role: ${/\sworker$/.test(account)}`).toBe(
+      `generic script in account role: false`
+    );
+  });
   it("is the only way the CLI starts a process", () => {
     const source = readFileSync(
       path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"),
@@ -1189,11 +1223,28 @@ describe("runtime launcher: durable trading state", () => {
 
 describe("runtime launcher: status", () => {
   const base = {
-    running: { backend: true, worker: true, frontend: true },
+    running: { backend: true, analysis: true, worker: true, frontend: true },
     backendPortOpen: true,
     frontendPortOpen: true,
     operatorToken: "CONFIGURED" as const,
   };
+
+
+  it("judges only the attesting roles, and the generic worker on process alone", () => {
+    // The bug this closes: the launcher started the generic worker under the
+    // name `worker` and then judged it against an attestation only an
+    // account-bound process publishes, so a correct stack read STALE and
+    // supervision restarted a healthy process.
+    const view = presentStatus({
+      ...base,
+      diskMode: "SAFE",
+      running: { backend: true, analysis: true, worker: true, frontend: true },
+    });
+    expect(Object.keys(view.health).sort()).toEqual(["backend", "worker"]);
+    expect(view.analysis).toBe("ON");
+    // Its process state is reported; its health is not invented.
+    expect(renderStatus(view).join("\n")).toContain("Analysis    process ON");
+  });
 
   it.each(["SAFE", "LIVE_READY"] as const)("shows %s without a warning", (diskMode) => {
     const view = presentStatus({ ...base, diskMode });
@@ -1211,7 +1262,7 @@ describe("runtime launcher: status", () => {
     const view = presentStatus({
       ...base,
       diskMode: "SAFE",
-      running: { backend: true, worker: false, frontend: true },
+      running: { backend: true, analysis: true, worker: false, frontend: true },
     });
     expect(`${view.backend}/${view.worker}/${view.frontend}`).toBe("ON/OFF/ON");
   });
@@ -1448,7 +1499,7 @@ describe("standard LIMIT take profit is a launch choice, never an inherited one"
   });
 
   it("15/16. every role receives the value explicitly, never by omission", () => {
-    for (const role of ["backend", "worker", "frontend"] as const) {
+    for (const role of ["backend", "analysis", "worker", "frontend"] as const) {
       const env = windowsSpawnPlan(role, REPO, "SAFE", {} as NodeJS.ProcessEnv, true).options.env;
       expect(Object.prototype.hasOwnProperty.call(env, KEY)).toBe(true);
       expect(env[KEY]).toBe("true");

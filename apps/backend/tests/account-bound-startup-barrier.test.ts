@@ -7,16 +7,21 @@ import type { PrismaClient } from "@prisma/client";
 import { connectTestDatabase } from "./helpers/test-database";
 
 /**
- * Phase 11D — the account-bound startup barrier.
+ * Phase 11D's account-bound startup barrier, in the file that owns it now.
  *
- * The worker used to compose everything account-specific at module load, each
- * piece reaching for configuration on its own. Now one binding is awaited and
- * everything able to act as the account is built from it.
+ * 11D put the barrier inside the vision worker because there was one worker.
+ * 11E split that process in two -- the generic queues are BullMQ competing
+ * consumers, so a second copy of the combined worker would have made the
+ * account that trades a signal a race -- and the barrier moved with the
+ * account work into execution.worker.ts. The INVARIANTS did not change, so
+ * this suite did not change either: it simply reads the entrypoint that now
+ * holds them, and additionally proves the account work is not ALSO still in
+ * the generic worker.
  *
  * The property that matters is an ORDERING one, and it is deliberately proved
  * two ways:
  *
- *   - structurally, over the worker source, because importing that module
+ *   - structurally, over the worker source, because importing either module
  *     would start real timers, a retention schedule and an attestation
  *     heartbeat, and a test that did all that would be testing the harness;
  *   - behaviourally, over the binder itself against the test database, because
@@ -28,21 +33,29 @@ const BACKEND = process.cwd().endsWith(path.join("apps", "backend"))
   ? process.cwd()
   : path.join(process.cwd(), "apps", "backend");
 
-const WORKER = readFileSync(
+const EXECUTION_WORKER = readFileSync(
+  path.join(BACKEND, "src", "modules", "jobs", "execution.worker.ts"),
+  "utf8"
+);
+
+/** The other half of the split. Read so the account work can be proved ABSENT. */
+const GENERIC_WORKER = readFileSync(
   path.join(BACKEND, "src", "modules", "jobs", "vision-analysis.worker.ts"),
   "utf8"
 );
 
 /** The bootstrap function, sliced out so ordering claims are about IT. */
-const BOOTSTRAP = WORKER.slice(
-  WORKER.indexOf("async function startAccountBoundRuntime(): Promise<void> {"),
-  WORKER.indexOf("void startAccountBoundRuntime()")
+const BOOTSTRAP = EXECUTION_WORKER.slice(
+  EXECUTION_WORKER.indexOf("async function startExecutionRuntime(): Promise<void> {"),
+  EXECUTION_WORKER.indexOf("void startExecutionRuntime()")
 );
 
-const SHUTDOWN = WORKER.slice(WORKER.indexOf('process.on("SIGTERM"'));
+/** Shutdown is registered INSIDE the barrier: a process that never bound owns nothing. */
+const SHUTDOWN = BOOTSTRAP.slice(BOOTSTRAP.indexOf('process.on("SIGTERM"'));
 
 // ---------------------------------------------------------------------------
-// A, C. What the barrier owns, and that it is built once
+// A, C. What the barrier owns, that it is built once, and that the generic
+//       worker does not also build it
 // ---------------------------------------------------------------------------
 
 describe("everything account-specific is built inside the barrier", () => {
@@ -50,47 +63,78 @@ describe("everything account-specific is built inside the barrier", () => {
     ["the selected-plan executor", "new SelectedPlanExecutor({"],
     ["the orchestration scheduler", "startExecutionOrchestrationScheduler(runtime)"],
     ["the historical fill runtime", "startHistoricalFillWorkerRuntime(runtime)"],
-    ["the extreme-RR consumer", "new Worker<ExtremeRRJobData>("],
+    ["the plan adoption scheduler", "startSelectedPlanAdoptionScheduler("],
+    ["the runtime attestation publisher", "createRuntimeAttestationPublisher({"],
   ] as const;
 
   for (const [description, construction] of OWNED) {
     it(`${description} is constructed inside the bootstrap, exactly once`, () => {
       expect(BOOTSTRAP).toContain(construction);
       // Once in the bootstrap, and nowhere else in the module.
-      const everywhere = WORKER.split(construction).length - 1;
+      const everywhere = EXECUTION_WORKER.split(construction).length - 1;
       expect(`${description} constructions: ${everywhere}`).toBe(
         `${description} constructions: 1`
       );
     });
-  }
 
-  it("the vision-analysis consumer stays OUTSIDE it", () => {
-    // It handles no account-specific work, and holding it back would stop
-    // screenshots and analysis for a reason that has nothing to do with them.
-    expect(BOOTSTRAP).not.toContain("new Worker<VisionAnalysisJobData>(");
-    expect(WORKER).toContain("new Worker<VisionAnalysisJobData>(");
+    it(`${description} is not ALSO built by the generic worker`, () => {
+      // The split is only real if the account work left. A copy still sitting
+      // in the generic worker would mean two processes competing to be the
+      // account, which is the exact failure 11E exists to remove.
+      expect(`${description} in generic worker: ${GENERIC_WORKER.includes(construction)}`).toBe(
+        `${description} in generic worker: false`
+      );
+    });
+  }
+});
+
+describe("the generic worker keeps the work that belongs to no account", () => {
+  it("still consumes both generic queues", () => {
+    for (const consumer of ["new Worker<VisionAnalysisJobData>(", "new Worker<ExtremeRRJobData>("]) {
+      expect(GENERIC_WORKER).toContain(consumer);
+      // And the execution worker consumes NO queue at all: it polls durable
+      // rows instead, because a queue hands a job to exactly one consumer.
+      expect(`${consumer} in execution worker: ${EXECUTION_WORKER.includes(consumer)}`).toBe(
+        `${consumer} in execution worker: false`
+      );
+    }
   });
 
-  it("the non-account schedulers stay OUTSIDE it", () => {
+  it("still owns the schedulers that are not account-specific", () => {
     for (const scheduler of [
       "startCleanupScheduler()",
       "startExecutionNotificationScheduler()",
       "startAlertQueueRecoveryScheduler()",
       "setupRetentionSchedule()",
     ]) {
-      expect(`${scheduler} inside barrier: ${BOOTSTRAP.includes(scheduler)}`).toBe(
-        `${scheduler} inside barrier: false`
+      expect(GENERIC_WORKER).toContain(scheduler);
+      expect(`${scheduler} in execution worker: ${EXECUTION_WORKER.includes(scheduler)}`).toBe(
+        `${scheduler} in execution worker: false`
       );
-      expect(WORKER).toContain(scheduler);
+    }
+  });
+
+  it("binds no account and reaches for no credential", () => {
+    for (const forbidden of [
+      "bindConfiguredExchangeRuntime",
+      "configuredExchangeClientOptions",
+      "profileProjectionOf",
+      "marginPlanServiceFromRuntime",
+      "BINANCE_API_KEY",
+      "BINANCE_API_SECRET",
+    ]) {
+      expect(`${forbidden} in generic worker: ${GENERIC_WORKER.includes(forbidden)}`).toBe(
+        `${forbidden} in generic worker: false`
+      );
     }
   });
 });
 
 // ---------------------------------------------------------------------------
-// A, B. Ordering: bind, refuse, then build — and the queue is last
+// A, B. Ordering: bind, refuse, then build
 // ---------------------------------------------------------------------------
 
-describe("the barrier binds before it builds, and consumes last", () => {
+describe("the barrier binds before it builds", () => {
   it("binds first and refuses before anything is constructed", () => {
     const bind = BOOTSTRAP.indexOf("const bound = await bindConfiguredExchangeRuntime(prisma);");
     const refuse = BOOTSTRAP.indexOf("if (!bound.ok) {");
@@ -103,13 +147,23 @@ describe("the barrier binds before it builds, and consumes last", () => {
     expect(earlyReturn).toBeLessThan(firstBuild);
   });
 
-  it("starts the extreme-RR consumer LAST, after the executor it needs", () => {
+  it("starts adoption only after the executor and the orchestration it needs", () => {
     const executor = BOOTSTRAP.indexOf("new SelectedPlanExecutor({");
     const scheduler = BOOTSTRAP.indexOf("startExecutionOrchestrationScheduler(runtime)");
-    const consumer = BOOTSTRAP.indexOf("new Worker<ExtremeRRJobData>(");
+    const adoption = BOOTSTRAP.indexOf("startSelectedPlanAdoptionScheduler(");
 
-    expect(executor).toBeLessThan(consumer);
-    expect(scheduler).toBeLessThan(consumer);
+    expect(executor).toBeLessThan(adoption);
+    expect(scheduler).toBeLessThan(adoption);
+  });
+
+  it("publishes the WORKER attestation only after it is actually orchestrating", () => {
+    // A process that binds but never schedules must not be counted as a live
+    // runtime: that was the false-READY 11D closed, and the split must not
+    // reopen it in the file that inherited the heartbeat.
+    const scheduler = BOOTSTRAP.indexOf("startExecutionOrchestrationScheduler(runtime)");
+    const attestation = BOOTSTRAP.indexOf("createRuntimeAttestationPublisher({");
+    expect(scheduler).toBeGreaterThan(-1);
+    expect(attestation).toBeGreaterThan(scheduler);
   });
 
   it("the refusal names a reason code and no credential or alias", () => {
@@ -123,61 +177,58 @@ describe("the barrier binds before it builds, and consumes last", () => {
     }
   });
 
-  it("is invoked without top-level await, and cannot take the worker down", () => {
+  it("is invoked without top-level await, and cannot take the process down", () => {
     // CommonJS: there is no top-level await to reach for, and a bootstrap that
-    // threw unhandled would kill a process that still has non-account duties.
-    expect(WORKER).toContain("void startAccountBoundRuntime().catch((error) => {");
-    expect(WORKER).not.toMatch(/^await /m);
+    // threw unhandled would leave a process with no diagnosis of why.
+    expect(EXECUTION_WORKER).toContain("void startExecutionRuntime().catch((error) => {");
+    expect(EXECUTION_WORKER).not.toMatch(/^await /m);
   });
 });
 
 // ---------------------------------------------------------------------------
-// D. No admission gap
+// D. There is no admission gap left to close
 // ---------------------------------------------------------------------------
 
-describe("no selected-plan job can be handled without a bound executor", () => {
-  it("the handler asserts the invariant rather than skipping", () => {
-    const handler = WORKER.slice(
-      WORKER.indexOf("async function processExtremeRRJob"),
-      WORKER.indexOf("const extremeRRService")
-    );
-    expect(handler).toContain("const executor = selectedPlanExecutor;");
-    expect(handler).toContain("if (!executor) {");
-    // A THROW, so BullMQ retries. Never a return that drops the plan and hopes
-    // reconciliation notices.
-    const guard = handler.slice(handler.indexOf("if (!executor) {"));
-    expect(guard).toContain("throw new Error(");
-    expect(guard.slice(0, guard.indexOf("}"))).not.toContain("return");
+describe("no account work can observe a half-built runtime", () => {
+  it("holds no nullable account handle at all", () => {
+    // 11D needed four module-level `let ... | null` handles, because the
+    // account work shared a process with work that had to start immediately,
+    // and it needed a guard in the queue handler to cover the window. After
+    // the split every one of them is a const INSIDE the barrier, so the
+    // half-built state it guarded against cannot be represented.
+    expect(EXECUTION_WORKER).not.toMatch(/^let /m);
+    expect(EXECUTION_WORKER).not.toContain("| null = null");
   });
 
-  it("the queue that reaches it does not exist until the executor does", () => {
-    const executor = BOOTSTRAP.indexOf("selectedPlanExecutor = new SelectedPlanExecutor({");
-    const consumer = BOOTSTRAP.indexOf("extremeRRWorker = new Worker<ExtremeRRJobData>(");
-    expect(executor).toBeGreaterThan(-1);
-    expect(consumer).toBeGreaterThan(executor);
+  it("the generic worker cannot execute a plan even if it wanted to", () => {
+    for (const forbidden of [
+      "SelectedPlanExecutor",
+      "handleSelectedPlan",
+      "createExecutionOrchestrator",
+    ]) {
+      // A comment may name the thing that moved; code may not call it.
+      const code = GENERIC_WORKER.split("\n")
+        .filter((line) => !line.trimStart().startsWith("//") && !line.trimStart().startsWith("*") && !line.trimStart().startsWith("/*"))
+        .join("\n");
+      expect(`${forbidden} in generic worker code: ${code.includes(forbidden)}`).toBe(
+        `${forbidden} in generic worker code: false`
+      );
+    }
   });
 });
 
 // ---------------------------------------------------------------------------
-// E, F. Shutdown
+// E, F. Shutdown closes what THIS process owns, and nothing else
 // ---------------------------------------------------------------------------
 
-describe("shutdown closes what exists and tolerates what does not", () => {
-  it("every barrier-owned handle is closed optionally", () => {
-    expect(SHUTDOWN).toContain("if (orchestrationTimer) clearInterval(orchestrationTimer);");
-    expect(SHUTDOWN).toContain("await historicalFillRuntime?.stop();");
-    expect(SHUTDOWN).toContain("await extremeRRWorker?.close();");
-  });
-
-  it("the resources it closed before are still closed", () => {
+describe("shutdown is scoped to the process that registered it", () => {
+  it("closes every handle the barrier created", () => {
     for (const closed of [
       "await runtimeAttestation.stop();",
       "await attestationRedis.close();",
-      "clearInterval(cleanupTimer);",
-      "clearInterval(notificationTimer);",
-      "clearInterval(alertRecoveryTimer);",
-      "await worker.close();",
-      "await retentionWorker?.close();",
+      "clearInterval(orchestrationTimer);",
+      "clearInterval(adoptionTimer);",
+      "await historicalFillRuntime.stop();",
       "await prisma.$disconnect();",
     ]) {
       expect(SHUTDOWN).toContain(closed);
@@ -185,10 +236,39 @@ describe("shutdown closes what exists and tolerates what does not", () => {
   });
 
   it("the historical drain still precedes the client disconnect", () => {
-    const drain = SHUTDOWN.indexOf("await historicalFillRuntime?.stop();");
+    const drain = SHUTDOWN.indexOf("await historicalFillRuntime.stop();");
     const disconnect = SHUTDOWN.indexOf("await prisma.$disconnect();");
     expect(drain).toBeGreaterThan(-1);
     expect(drain).toBeLessThan(disconnect);
+  });
+
+  it("touches nothing the generic worker owns", () => {
+    for (const foreign of [
+      "await worker.close();",
+      "extremeRRWorker",
+      "retentionWorker",
+      "cleanupTimer",
+      "notificationTimer",
+      "alertRecoveryTimer",
+    ]) {
+      expect(`${foreign} in execution shutdown: ${SHUTDOWN.includes(foreign)}`).toBe(
+        `${foreign} in execution shutdown: false`
+      );
+    }
+  });
+
+  it("and the generic worker withdraws no attestation it never published", () => {
+    const genericShutdown = GENERIC_WORKER.slice(
+      GENERIC_WORKER.indexOf('process.on("SIGTERM"')
+    );
+    // Stopping the generic worker must not make an account look absent and
+    // block activation, or make a live account look gone to the launcher.
+    for (const foreign of ["runtimeAttestation", "attestationRedis", "orchestrationTimer"]) {
+      expect(`${foreign} in generic shutdown: ${genericShutdown.includes(foreign)}`).toBe(
+        `${foreign} in generic shutdown: false`
+      );
+    }
+    expect(genericShutdown).toContain("await extremeRRWorker.close();");
   });
 });
 

@@ -21,11 +21,25 @@ export async function cleanupStaleAlerts(): Promise<void> {
   });
 
   for (const alert of staleAlerts) {
-    const updated = await prisma.alert.update({
-      where: { id: alert.id },
+    // CONDITIONAL. The sweep runs on a timer in a process that may not be the
+    // only one: an unconditional update let two sweeps both write FAILED and
+    // both send the Telegram message, because the second had no way to learn
+    // the first had already claimed the row. Re-asserting the exact status we
+    // read makes the database decide, and only the winner notifies.
+    const won = await prisma.alert.updateMany({
+      where: {
+        id: alert.id,
+        // The same eligibility this pass selected on. A row that left the
+        // stuck states in the meantime is no longer stale, and a row another
+        // sweep already failed no longer matches either.
+        status: alert.status,
+      },
       data: { status: "FAILED", errorMessage: "Processing timed out and was cleaned up." },
     });
-    await notifyAlertFailed(updated);
+    if (won.count !== 1) continue;
+
+    const updated = await prisma.alert.findUnique({ where: { id: alert.id } });
+    if (updated) await notifyAlertFailed(updated);
     logger.warn({ alertId: alert.id }, "Marked stale alert as FAILED");
   }
 }

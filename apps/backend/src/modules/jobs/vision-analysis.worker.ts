@@ -20,28 +20,8 @@ import { ExtremeRRService } from "../extreme-rr/extreme-rr.service";
 import { bullConnection, type ExtremeRRJobData, type VisionAnalysisJobData } from "./queue";
 import { startCleanupScheduler } from "./cleanup.worker";
 import { setupRetentionSchedule } from "./retention.worker";
-import { createRuntimeAttestationPublisher } from "../runtime/runtime-attestation";
-import {
-  createAttestationRedisClient,
-  describeRedisFailure,
-} from "../runtime/attestation-redis";
 import { startExecutionNotificationScheduler } from "./execution-notification.scheduler";
 import { startAlertQueueRecoveryScheduler } from "./alert-queue-recovery.scheduler";
-import { startHistoricalFillWorkerRuntime } from "./historical-fill-worker-runtime";
-import {
-  createExecutionOrchestrator,
-  isReconciliationHealthy,
-  reconciliationAttestation,
-  startExecutionOrchestrationScheduler,
-} from "./execution-orchestration.scheduler";
-import { marginPlanServiceFromRuntime } from "../binance/binance-margin-plan.service";
-import {
-  bindConfiguredExchangeRuntime,
-  profileProjectionOf,
-} from "../execution/exchange-runtime-binding";
-import { ExecutionService } from "../execution/execution.service";
-import { SelectedPlanExecutor } from "../execution/selected-plan-executor";
-import { recordSelectedPlanOutcome } from "../execution/selected-plan-outcome.service";
 
 const alertsService = new AlertsService(prisma);
 
@@ -203,76 +183,34 @@ async function processExtremeRRJob(job: Job<ExtremeRRJobData>): Promise<void> {
 
   logger.info({ alertId, status: plan.status }, "Extreme RR plan generated");
 
-  // Phase 11A.1: the selected plan becomes a PLAN_READY TradeExecution and is
-  // handed to safety admission. Idempotent through the unique
-  // (alertId, executionProfileId) constraint, so a redelivered job adopts the
-  // existing row instead of creating a second one. Wrapped so an execution
-  // problem can never fail the plan job — the persisted PLAN_READY row is
-  // recovered by the reconciliation scheduler regardless.
-  try {
-    // An INVARIANT, not a readiness check. This queue is started inside the
-    // startup barrier, after the executor exists, so a null here would mean
-    // the barrier was bypassed. Throwing lets BullMQ retry the job; skipping
-    // it and hoping reconciliation notices would be a silent admission gap.
-    const executor = selectedPlanExecutor;
-    if (!executor) {
-      throw new Error(
-        "selected-plan execution reached before the account-bound runtime was established"
-      );
-    }
-
-    const evaluatedAt = new Date();
-    const outcome = await executor.handleSelectedPlan(plan, alert.symbol);
-    logger.info({ alertId, outcome: outcome.handled ? outcome.reasonCode : outcome.reasonCode }, "Selected plan execution handling completed");
-
-    // Durable evidence of what was just decided, written AFTER the decision has
-    // been made and returned. Its own try/catch, deliberately: the trading
-    // decision is already final by this point, and an observability write must
-    // never be able to fail it, retry it, or let the outer handler re-run it
-    // later against different state. A lost row costs an explanation; a
-    // re-decided signal could cost a trade.
-    try {
-      await recordSelectedPlanOutcome(prisma, {
-        alertId,
-        extremeRRPlanId: plan.id,
-        outcome,
-        evaluatedAt,
-      });
-    } catch (outcomeError) {
-      logger.warn(
-        {
-          alertId,
-          planId: plan.id,
-          reasonCode: outcome.handled ? outcome.reasonCode : outcome.reasonCode,
-          error: outcomeError instanceof Error ? outcomeError.message.slice(0, 300) : "unknown",
-        },
-        "Selected plan outcome could not be persisted (decision already stands)"
-      );
-    }
-  } catch (executionError) {
-    logger.error({ alertId, error: executionError }, "Selected plan execution handling failed (non-fatal)");
-  }
+  // Phase 11E: generation ends here. The account decision that used to
+  // follow -- SelectedPlanExecutor, safety admission, the signed margin
+  // planner -- moved to execution.worker.ts, because this queue hands the
+  // job to exactly one consumer and that made "which account trades" a race.
+  // Each account-bound worker now discovers this durable plan for itself.
 }
 
 const extremeRRService = new ExtremeRRService(prisma);
 
 /**
- * Phase 11D - everything account-specific lives behind the startup barrier.
+ * Phase 11E - the extreme-RR consumer is generic again.
  *
- * These four handles used to be module-level constants, each independently
- * reaching for configuration: the executor built its own margin planner from
- * ambient credentials, the scheduler built its own clients, and the
- * orchestrator resolved its own profile. Three answers to one question.
- *
- * Now there is ONE binding, awaited once, and everything able to act as the
- * account is constructed from it. They are null only BEFORE the barrier
- * resolves, and the extreme-RR queue -- the only consumer of any of them --
- * is not started until after, so no job can observe the null state.
+ * It generates and persists the plan, which is shared analysis owned by no
+ * account, and stops there. The account decision that used to follow it in
+ * this same handler now lives in execution.worker.ts, one process per
+ * account, discovering the durable plan independently -- because this queue
+ * is a competing consumer and could only ever have given the opportunity to
+ * one account.
  */
-let selectedPlanExecutor: SelectedPlanExecutor | null = null;
-let extremeRRWorker: Worker<ExtremeRRJobData> | null = null;
-let orchestrationTimer: NodeJS.Timeout | null = null;
-let historicalFillRuntime: ReturnType<typeof startHistoricalFillWorkerRuntime> | null = null;
+const extremeRRWorker = new Worker<ExtremeRRJobData>(
+  EXTREME_RR_QUEUE_NAME,
+  processExtremeRRJob,
+  { connection: bullConnection, concurrency: 2 }
+);
+
+extremeRRWorker.on("failed", (job, error) => {
+  logger.error({ jobId: job?.id, error }, "Extreme RR plan job failed");
+});
 
 const worker = new Worker<VisionAnalysisJobData>(VISION_ANALYSIS_QUEUE_NAME, processVisionAnalysisJob, {
   connection: bullConnection,
@@ -313,136 +251,23 @@ setupRetentionSchedule()
     logger.error({ error }, "Failed to set up data-retention schedule (worker continues)");
   });
 
-/**
- * THE STARTUP BARRIER.
- *
- * One binding, awaited before anything able to act as the account exists.
- * A failure here leaves this worker running its non-account duties -- alerts,
- * screenshots, vision analysis, cleanup, notifications, alert-queue recovery,
- * retention -- and starts NO exchange client, NO reconciliation and NO
- * extreme-RR consumer. That is the fail-closed shape: a process that cannot
- * prove which account it is does not get to trade as one.
- *
- * The extreme-RR queue is started INSIDE this function, last. Jobs enqueued
- * before it starts wait in Redis and are consumed once binding succeeds -- a
- * startup DELAY, never a window in which a trading job is consumed without a
- * bound runtime.
- */
-async function startAccountBoundRuntime(): Promise<void> {
-  const bound = await bindConfiguredExchangeRuntime(prisma);
-  if (!bound.ok) {
-    // The reason code only. Never a key, a secret or an account alias.
-    logger.error(
-      { reasonCode: bound.reasonCode },
-      "Account-bound runtime could not be established - execution, reconciliation and selected-plan handling are NOT started"
-    );
-    return;
-  }
-
-  const runtime = bound.runtime;
-
-  selectedPlanExecutor = new SelectedPlanExecutor({
-    prisma,
-    // Signed: the planner reads account summary and leverage brackets, so its
-    // read-only service takes the BOUND runtime's credentials.
-    marginPlanner: marginPlanServiceFromRuntime(runtime),
-    executions: new ExecutionService(prisma),
-    orchestrator: createExecutionOrchestrator(runtime),
-    boundProfile: profileProjectionOf(runtime),
-  });
-
-  // Phase 11A.1: startup execution recovery, then bounded periodic
-  // reconciliation. Every mutation still travels through the Phase 6/7 gates,
-  // so with the live gates closed this registers work that dispatches nothing.
-  orchestrationTimer = startExecutionOrchestrationScheduler(runtime);
-
-  // Phase 9: the ONLY production start call-site for historical fill ingestion.
-  // Dormant unless EXECUTION_FILL_RUNTIME_ENABLED=true, and dormant means it
-  // builds nothing at all -- no timer, no Prisma-backed service, no Binance
-  // client -- so this worker is unaffected by it and never touches the
-  // historical tables while the gate is closed.
-  //
-  // Several worker processes may each run one of these. There is deliberately no
-  // leader election: window correctness comes from the claim CAS and its attempts
-  // fencing token, and exchange request production is bounded across processes by
-  // the shared Postgres weight budget.
-  historicalFillRuntime = startHistoricalFillWorkerRuntime(runtime);
-
-  // LAST, and only now: the queue whose handler reaches the executor above.
-  extremeRRWorker = new Worker<ExtremeRRJobData>(EXTREME_RR_QUEUE_NAME, processExtremeRRJob, {
-    connection: bullConnection,
-    concurrency: 2,
-  });
-
-  extremeRRWorker.on("failed", (job, error) => {
-    logger.error({ jobId: job?.id, error }, "Extreme RR plan job failed");
-  });
-
-  logger.info(
-    "Account-bound runtime established - execution and selected-plan handling started"
-  );
-}
-
-void startAccountBoundRuntime().catch((error) => {
-  logger.error(
-    { error: error instanceof Error ? error.message.slice(0, 300) : "unknown" },
-    "Account-bound runtime bootstrap threw - execution handling is NOT started"
-  );
-});
-
 logger.info("vision-analysis worker started, waiting for jobs...");
 
-// Phase 12.4D-A.1: published only after the worker has reached its ready point,
-// carrying the execution gates THIS process loaded. An activation command
-// refuses unless this agrees with the backend and with the command's own
-// snapshot, which is what makes a stale-.env worker impossible to arm over.
-// The heartbeat runs on its OWN bounded connection, never the BullMQ one:
-// BullMQ requires maxRetriesPerRequest=null, which is precisely the option
-// that lets a command wait forever instead of failing. See attestation-redis.
-const attestationRedis = createAttestationRedisClient({
-  onError: (detail) => logger.error({ detail }, "Runtime attestation Redis connection error"),
-});
 
-const runtimeAttestation = createRuntimeAttestationPublisher({
-  role: "WORKER",
-  redis: attestationRedis.redis,
-  // A worker whose reconciliation has stalled stops attesting, so the
-  // existing fail-closed interlock refuses to arm over it. This gates NEW
-  // activation only — protection and reconciliation of executions already
-  // admitted never consult attestation.
-  healthy: isReconciliationHealthy,
-  // What this worker's reconciliation has actually DONE, on every heartbeat.
-  //
-  // `healthy` above answers "is a pass hung?", and answers it identically for
-  // a worker that is idle between passes and one that has never run a pass at
-  // all. This is the field that tells those apart, and it gates nothing.
-  reconciliation: reconciliationAttestation,
-  onWithdraw: () =>
-    logger.error(
-      {},
-      "Runtime attestation WITHDRAWN — this worker is no longer fit to be counted as a live " +
-        "runtime, so new live activation is blocked. Controlled worker recovery is required; " +
-        "do NOT start another runtime stack while the launcher-owned runtime is still active."
-    ),
-  onError: (error) =>
-    logger.error({ detail: describeRedisFailure(error) }, "Runtime attestation heartbeat failed"),
-});
-runtimeAttestation.start();
-
+/**
+ * Closes ONLY what this process owns.
+ *
+ * After 11E that is the generic half: two queues and four schedulers. It
+ * withdraws no runtime attestation, because it publishes none -- an account
+ * execution worker owns that, and stopping the generic worker must not make
+ * an account look absent.
+ */
 process.on("SIGTERM", async () => {
-  // Best effort; a crash relies on TTL expiry instead.
-  await runtimeAttestation.stop();
-  await attestationRedis.close();
   clearInterval(cleanupTimer);
   clearInterval(notificationTimer);
-  if (orchestrationTimer) clearInterval(orchestrationTimer);
   clearInterval(alertRecoveryTimer);
-  // Before the shared Prisma client goes away below: this stops future
-  // historical ticks and then waits for one already running, so a claim and its
-  // transaction are never torn out mid-flight. Nothing is aborted.
-  await historicalFillRuntime?.stop();
   await worker.close();
-  await extremeRRWorker?.close();
+  await extremeRRWorker.close();
   await retentionWorker?.close();
   await prisma.$disconnect();
   process.exit(0);

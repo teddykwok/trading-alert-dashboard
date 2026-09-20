@@ -322,6 +322,29 @@ export interface SelectedPlanOutcomeDto {
   evaluatedAt: string;
 }
 
+/**
+ * ONE account's own verdict on a plan. Canonical after Phase 11E.
+ *
+ * There is exactly one of these per execution profile that evaluated the
+ * plan, and two accounts may legitimately disagree -- account A admitting
+ * while account B refuses is a correct outcome, not a conflict to resolve.
+ * So these are never merged, ranked or collapsed.
+ */
+export interface SelectedPlanAccountOutcomeDto {
+  /** The evaluating profile's row id. Never an exchange account alias. */
+  executionProfileId: string;
+  /** False for a pre-execution refusal; true when an execution was reached. */
+  handled: boolean;
+  /** The executor's canonical code, verbatim. Never re-interpreted. */
+  reasonCode: string | null;
+  /** The executor's own sentence, when it had one. Never a UI string. */
+  message: string | null;
+  /** Present only when handled — the execution remains authoritative for it. */
+  executionId: string | null;
+  /** When the decision was actually taken. */
+  evaluatedAt: string;
+}
+
 export interface ExtremeRRPlanDto {
   id: string;
   alertId: string;
@@ -349,6 +372,27 @@ export interface ExtremeRRPlanDto {
    * fetch. It stays a structured domain object rather than a formatted
    * sentence: presentation belongs to the frontend's shared reason vocabulary,
    * not to the API.
+   */
+  /**
+   * Every account's verdict, one entry per profile that finished evaluating.
+   *
+   * Ordered by executionProfileId so the list is stable between reads; the
+   * order carries no precedence and must not be read as any.
+   */
+  executionOutcomes: SelectedPlanAccountOutcomeDto[];
+  /**
+   * Compatibility projection of the above, and null whenever projecting one
+   * would be a lie.
+   *
+   * Exactly one account evaluated  -> that account's verdict, unambiguous.
+   * Two or more accounts evaluated -> NULL. There is no overall verdict to
+   *   report, and picking the latest, the first or any other arbitrary one
+   *   would present one account's decision as the system's.
+   * No account evaluated           -> the pre-11E SelectedPlanOutcome row if
+   *   one exists, which is how historical plans keep their explanation.
+   *
+   * Read `executionOutcomes` for anything that must be correct with more
+   * than one account.
    */
   executionOutcome: SelectedPlanOutcomeDto | null;
   generatedAt: string | null;

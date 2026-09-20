@@ -151,6 +151,43 @@ function machine(options: { processes?: Map<number, ProcessProbe>; spawnPid?: nu
 // A. A healthy worker is left completely alone
 // ===========================================================================
 
+describe("phase 11E: the two worker roles are independent", () => {
+  it("replacing the account worker leaves the generic analysis worker owned", () => {
+    // Supervision restarts the ACCOUNT executor. If that dropped the generic
+    // worker's ownership record the launcher could never stop it again, and
+    // plan generation would be orphaned by an execution-side incident.
+    const state = {
+      repoRoot: "C:\\repo",
+      mode: "SAFE" as const,
+      startedAtMs: 1_700_000_000_000,
+      standardLimitTakeProfit: false,
+      processes: [
+        { role: "backend" as const, pid: 101, startedAtMs: 1_700_000_000_001 },
+        { role: "analysis" as const, pid: 102, startedAtMs: 1_700_000_000_002 },
+        { role: "worker" as const, pid: 103, startedAtMs: 1_700_000_000_003 },
+        { role: "frontend" as const, pid: 104, startedAtMs: 1_700_000_000_004 },
+      ],
+    };
+
+    const replaced = withReplacedWorker(state, {
+      role: "worker",
+      pid: 999,
+      startedAtMs: 1_700_000_000_999,
+    });
+
+    const roles = replaced.processes.map((entry) => entry.role).sort();
+    expect(roles).toEqual(["analysis", "backend", "frontend", "worker"]);
+    expect(replaced.processes.find((entry) => entry.role === "analysis")?.pid).toBe(102);
+    expect(replaced.processes.find((entry) => entry.role === "worker")?.pid).toBe(999);
+  });
+
+  it("supervises the account worker and nothing else", () => {
+    // Never the generic worker: it publishes no attestation, so every
+    // supervision pass would read it as STALE and restart a healthy process.
+    expect([...SUPERVISED_ROLES]).toEqual(["worker"]);
+  });
+});
+
 describe("A. a healthy worker is untouched", () => {
   it("decides to do nothing", () => {
     const decision = decideWorkerSupervision(input({ workerHealth: "HEALTHY" }));

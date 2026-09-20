@@ -1,4 +1,10 @@
-import type { Alert, ExtremeRRPlan, PrismaClient, SelectedPlanOutcome } from "@prisma/client";
+import type {
+  Alert,
+  ExtremeRRPlan,
+  PrismaClient,
+  SelectedPlanAdoption,
+  SelectedPlanOutcome,
+} from "@prisma/client";
 import {
   EXTREME_RR_DEFAULT_LOOKBACK,
   EXTREME_RR_LOOKBACKS,
@@ -14,6 +20,7 @@ import {
   type ExtremeRRPlanDto,
   type ExtremeRRPlanStatus,
   type ExtremeRRTemplateSnapshot,
+  type SelectedPlanAccountOutcomeDto,
 } from "@trading-alert-dashboard/shared";
 import { getClosedCandlesBefore } from "../market-data/market-data.service";
 import type { SnapshotCandle } from "../market-data/market-data.types";
@@ -170,7 +177,68 @@ function decimalToString(value: unknown): string | null {
   return value === null || value === undefined ? null : String(value);
 }
 
-type PlanWithOutcome = ExtremeRRPlan & { selectedPlanOutcome?: SelectedPlanOutcome | null };
+type PlanWithOutcome = ExtremeRRPlan & {
+  selectedPlanOutcome?: SelectedPlanOutcome | null;
+  /** Phase 11E: the canonical per-account verdicts. */
+  selectedPlanAdoptions?: SelectedPlanAdoption[];
+};
+
+/**
+ * What every read of a plan fetches alongside it.
+ *
+ * Phase 11E: the per-account rows are canonical, so they are not optional
+ * enrichment -- a read that omitted them would silently report an evaluated
+ * plan as unevaluated. COMPLETED only: a PENDING row is a claim in progress,
+ * and showing one as a verdict would invent an outcome nobody reached.
+ */
+const PLAN_OUTCOME_INCLUDE = {
+  selectedPlanOutcome: true,
+  selectedPlanAdoptions: {
+    where: { status: "COMPLETED" as const },
+    // Stable between reads. Deliberately NOT by time: ordering by when an
+    // account happened to finish is the first step towards treating the last
+    // one as the answer.
+    orderBy: { executionProfileId: "asc" as const },
+  },
+} as const;
+
+/**
+ * The singular compatibility field, or null when projecting one would lie.
+ *
+ * Phase 11E made the per-account rows canonical. This exists so a UI and an
+ * API written when there was one account keep working unchanged -- and so
+ * they stop showing a singular answer the moment there is no longer one to
+ * give. Picking the latest, the first, or any other arbitrary account would
+ * present that account's refusal as the system's verdict.
+ */
+function projectSingularOutcome(
+  accounts: SelectedPlanAccountOutcomeDto[],
+  legacy: SelectedPlanOutcome | null
+): ExtremeRRPlanDto["executionOutcome"] {
+  if (accounts.length === 1) {
+    const only = accounts[0];
+    return {
+      handled: only.handled,
+      reasonCode: only.reasonCode,
+      message: only.message,
+      executionId: only.executionId,
+      evaluatedAt: only.evaluatedAt,
+    };
+  }
+  // Two or more: there is no overall verdict, and inventing one is the exact
+  // failure this projection exists to avoid.
+  if (accounts.length > 1) return null;
+  // None: a pre-11E plan may still carry its historical explanation.
+  return legacy
+    ? {
+        handled: legacy.handled,
+        reasonCode: legacy.reasonCode,
+        message: legacy.message,
+        executionId: legacy.executionId,
+        evaluatedAt: legacy.evaluatedAt.toISOString(),
+      }
+    : null;
+}
 
 export class ExtremeRRService {
   private readonly riskTemplates: RiskTemplateRepository;
@@ -243,7 +311,7 @@ export class ExtremeRRService {
 
     const existing = await this.prisma.extremeRRPlan.findUnique({
       where: { alertId },
-      include: { selectedPlanOutcome: true },
+      include: PLAN_OUTCOME_INCLUDE,
     });
     if (existing?.status === "READY") {
       return this.serialize(existing);
@@ -307,6 +375,21 @@ export class ExtremeRRService {
         ? "READY"
         : "INVALID";
 
+      // Phase 11E -- the generic fanout eligibility marker.
+      //
+      // Written in the SAME durable transition that makes the plan READY, so
+      // a plan is never executable-looking for a moment before it is marked,
+      // and never marked without being READY. INVALID gets null explicitly:
+      // a plan that regenerates from READY-looking to INVALID must not keep
+      // an eligibility it no longer earns.
+      //
+      // Every plan that reached READY BEFORE this code existed keeps null
+      // forever, because generateForAlert returns an existing READY plan
+      // untouched (above) rather than regenerating it. That is the rollout
+      // fence: those plans were already evaluated once, under an
+      // architecture with nowhere to record that they had been.
+      const executionFanoutReadyAt = status === "READY" ? new Date() : null;
+
       const saved = await this.prisma.extremeRRPlan.upsert({
         where: { alertId },
         create: {
@@ -316,6 +399,7 @@ export class ExtremeRRService {
           candidates: candidates as object[],
           errorReason: null,
           generatedAt: new Date(),
+          executionFanoutReadyAt,
           // Only on CREATE. The update branch below deliberately omits
           // selectedLookback so regenerating an existing plan preserves the
           // choice that plan was made under.
@@ -327,6 +411,7 @@ export class ExtremeRRService {
           candidates: candidates as object[],
           errorReason: null,
           generatedAt: new Date(),
+          executionFanoutReadyAt,
           // Regeneration produces a new outcome — reset the Telegram cycle so
           // the new result may notify once. (READY plans never reach here;
           // they short-circuit above, so a sent notification stays sent.)
@@ -334,7 +419,7 @@ export class ExtremeRRService {
           telegramNotifiedAt: null,
           telegramLastError: null,
         },
-        include: { selectedPlanOutcome: true },
+        include: PLAN_OUTCOME_INCLUDE,
       });
       return this.serialize(saved);
     } catch (error) {
@@ -343,18 +428,26 @@ export class ExtremeRRService {
 
       const saved = await this.prisma.extremeRRPlan.upsert({
         where: { alertId },
-        create: { alertId, ...baseData, status: "ERROR", errorReason: message },
+        create: {
+          alertId,
+          ...baseData,
+          status: "ERROR",
+          errorReason: message,
+          // An ERROR plan is not eligible for account fanout, ever.
+          executionFanoutReadyAt: null,
+        },
         update: {
           ...baseData,
           status: "ERROR",
           errorReason: message,
+          executionFanoutReadyAt: null,
           // Same reset as the success path: a regenerated outcome starts a
           // fresh (single) notification cycle.
           telegramStatus: null,
           telegramNotifiedAt: null,
           telegramLastError: null,
         },
-        include: { selectedPlanOutcome: true },
+        include: PLAN_OUTCOME_INCLUDE,
       });
       return this.serialize(saved);
     }
@@ -365,7 +458,7 @@ export class ExtremeRRService {
     await this.getAlertOrThrow(alertId);
     const plan = await this.prisma.extremeRRPlan.findUnique({
       where: { alertId },
-      include: { selectedPlanOutcome: true },
+      include: PLAN_OUTCOME_INCLUDE,
     });
     return plan ? this.serialize(plan) : null;
   }
@@ -382,7 +475,7 @@ export class ExtremeRRService {
         ...(input.selectedLookback !== undefined ? { selectedLookback: input.selectedLookback } : {}),
         ...(input.selectedLeverage !== undefined ? { selectedLeverage: input.selectedLeverage } : {}),
       },
-      include: { selectedPlanOutcome: true },
+      include: PLAN_OUTCOME_INCLUDE,
     });
     return this.serialize(updated);
   }
@@ -413,6 +506,23 @@ export class ExtremeRRService {
           targetAmount: decimalToString(plan.targetAmount) ?? "0",
         }
       : null;
+
+    // Canonical. One entry per profile that FINISHED evaluating this plan,
+    // and two accounts disagreeing is a correct result rather than a
+    // conflict, so nothing here merges or ranks them.
+    const accountOutcomes: SelectedPlanAccountOutcomeDto[] = (plan.selectedPlanAdoptions ?? []).map(
+      (adoption) => ({
+        executionProfileId: adoption.executionProfileId,
+        // Nullable in the row only because it is unset while a claim is
+        // PENDING; a COMPLETED row always carries it, and only COMPLETED rows
+        // are fetched.
+        handled: adoption.handled ?? false,
+        reasonCode: adoption.reasonCode,
+        message: adoption.message,
+        executionId: adoption.executionId,
+        evaluatedAt: (adoption.evaluatedAt ?? adoption.updatedAt).toISOString(),
+      })
+    );
 
     const stored = (plan.candidates as unknown as StoredCandidate[] | null) ?? [];
     const entryPrice = decimalToString(plan.entryPrice) ?? "0";
@@ -452,15 +562,8 @@ export class ExtremeRRService {
       // Historical evidence, passed through verbatim. Deliberately NOT derived
       // from anything current: the whole point is that a plan refused at 12:00
       // still says why at 15:00, whatever the system looks like by then.
-      executionOutcome: plan.selectedPlanOutcome
-        ? {
-            handled: plan.selectedPlanOutcome.handled,
-            reasonCode: plan.selectedPlanOutcome.reasonCode,
-            message: plan.selectedPlanOutcome.message,
-            executionId: plan.selectedPlanOutcome.executionId,
-            evaluatedAt: plan.selectedPlanOutcome.evaluatedAt.toISOString(),
-          }
-        : null,
+      executionOutcomes: accountOutcomes,
+      executionOutcome: projectSingularOutcome(accountOutcomes, plan.selectedPlanOutcome ?? null),
       generatedAt: plan.generatedAt?.toISOString() ?? null,
       createdAt: plan.createdAt.toISOString(),
       updatedAt: plan.updatedAt.toISOString(),

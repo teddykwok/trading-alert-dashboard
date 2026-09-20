@@ -101,7 +101,7 @@ const UNSIGNED_ONLY = new Set(["src/modules/operator/allowlist.service.ts"]);
 const SIGNED_COMPOSITION: ReadonlyArray<readonly [string, string]> = [
   ["src/modules/jobs/execution-orchestration.scheduler.ts", "the orchestration scheduler"],
   ["src/modules/jobs/historical-fill-worker-runtime.ts", "the historical fill runtime"],
-  ["src/modules/jobs/vision-analysis.worker.ts", "the normal worker"],
+  ["src/modules/jobs/execution.worker.ts", "the account execution worker"],
   ["src/modules/execution/run-protection-recovery.ts", "protection recovery"],
   ["src/modules/execution/run-shutdown-drain.ts", "shutdown drain"],
   ["src/modules/execution/run-entry-recovery.ts", "entry recovery"],
@@ -166,6 +166,33 @@ describe("no production composition authenticates ambiently", () => {
       expect(ZERO_ARG.test(code)).toBe(false);
     });
   }
+
+  it("the generic worker composes no signed client and reads no credential", () => {
+    // Phase 11E: this file used to be a SIGNED_COMPOSITION site. Membership
+    // of that list moving is not by itself proof that the credentials left,
+    // so this asserts the absence directly: no signed wrapper, no binding
+    // helper, no credential variable. A second copy of this process is
+    // expected to exist one day, and it must never be able to act as an
+    // account.
+    const code = codeOf("src/modules/jobs/vision-analysis.worker.ts");
+    for (const wrapper of SIGNED_WRAPPERS) {
+      expect(`${wrapper} constructed in generic worker: ${code.includes(`new ${wrapper}`)}`).toBe(
+        `${wrapper} constructed in generic worker: false`
+      );
+    }
+    for (const helper of [
+      "exchangeClientOptionsOf(",
+      "marginPlanServiceFromRuntime(",
+      "accountConnectionFromRuntime(",
+      "configuredExchangeClientOptions(",
+      "bindConfiguredExchangeRuntime(",
+    ]) {
+      expect(`${helper} in generic worker: ${code.includes(helper)}`).toBe(
+        `${helper} in generic worker: false`
+      );
+    }
+    expect(CREDENTIAL_ENV_READ.test(code)).toBe(false);
+  });
 
   it("no production composition passes an execution client without credentials", () => {
     // The precise shape the orchestrator used to have.

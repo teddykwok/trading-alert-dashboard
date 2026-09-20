@@ -198,9 +198,41 @@ function describeMissingExecution(alert: Alert, plan: ExtremeRRPlanDto | null) {
       </span>
     );
   }
+  // Phase 11E: more than one account can evaluate the same plan, and they
+  // may legitimately disagree. The API refuses to project a singular
+  // executionOutcome in that case, so this shows each account's own verdict
+  // rather than presenting one of them as the answer.
+  if (plan.executionOutcomes.length > 1) {
+    return (
+      <ul className="space-y-1 text-slate-300">
+        {plan.executionOutcomes.map((account) => (
+          <li key={account.executionProfileId} title={account.reasonCode ?? undefined}>
+            <span className="font-mono text-slate-500">Profile {account.executionProfileId}</span>{" "}
+            {account.handled
+              ? "reached execution."
+              : describeExecutionReason({
+                  status: "SKIPPED",
+                  reasonCode: account.reasonCode,
+                  symbol: alert.symbol,
+                  direction: alert.signal,
+                }) ?? account.message}
+            <span className="text-slate-500">
+              {" (evaluated "}
+              <TimestampValue value={account.evaluatedAt} />
+              {")"}
+            </span>
+          </li>
+        ))}
+      </ul>
+    );
+  }
+
   // The plan was READY. If the executor recorded a refusal, that recorded
   // verdict is the answer — it is what was true when the decision was made,
   // which is exactly what cannot be reconstructed afterwards.
+  //
+  // With zero or one account evaluation this is the same field it always
+  // was: one account, or a pre-11E historical row.
   const outcome = plan.executionOutcome;
   if (outcome && !outcome.handled) {
     const reason =

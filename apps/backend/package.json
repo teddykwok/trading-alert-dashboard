@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/server.js",
     "worker": "tsx watch src/modules/jobs/vision-analysis.worker.ts",
+    "execution-worker": "tsx watch src/modules/jobs/execution.worker.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:seed": "tsx prisma/seed.ts",

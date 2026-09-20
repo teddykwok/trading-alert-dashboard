@@ -134,6 +134,7 @@ export type {
   ExtremeRRLeverage,
   ExtremeRRLookback,
   ExtremeRRPlanDto,
+  SelectedPlanAccountOutcomeDto,
   SelectedPlanOutcomeDto,
   ExtremeRRPlanStatus,
   ExtremeRRTemplateSnapshot,

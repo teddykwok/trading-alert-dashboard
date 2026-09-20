@@ -276,11 +276,11 @@ describe("shutdown drains before the shared client goes away", () => {
 
   it("the worker drains BEFORE disconnecting the shared Prisma client", async () => {
     const worker = (await import("node:fs")).readFileSync(
-      "src/modules/jobs/vision-analysis.worker.ts",
+      "src/modules/jobs/execution.worker.ts",
       "utf8"
     );
 
-    const drainAt = worker.indexOf("await historicalFillRuntime?.stop();");
+    const drainAt = worker.indexOf("await historicalFillRuntime.stop();");
     const disconnectAt = worker.indexOf("await prisma.$disconnect();");
 
     expect(drainAt).toBeGreaterThan(-1);
@@ -296,7 +296,7 @@ describe("the production chain stays singular", () => {
     (await import("node:fs")).readFileSync(relative, "utf8");
 
   it("the worker starts the runtime exactly once and calls nothing deeper", async () => {
-    const worker = await read("src/modules/jobs/vision-analysis.worker.ts");
+    const worker = await read("src/modules/jobs/execution.worker.ts");
 
     // Phase 11D: exactly one start, now from the BOUND runtime.
     expect(worker.match(/startHistoricalFillWorkerRuntime\(runtime\)/g)).toHaveLength(1);
@@ -376,7 +376,7 @@ describe("the production chain stays singular", () => {
 
   it("adds no leader election of any kind", async () => {
     const composition = await read("src/modules/jobs/historical-fill-worker-runtime.ts");
-    const worker = await read("src/modules/jobs/vision-analysis.worker.ts");
+    const worker = await read("src/modules/jobs/execution.worker.ts");
 
     for (const source of [composition, worker]) {
       for (const elected of [

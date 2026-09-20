@@ -157,8 +157,9 @@ describe("binding happens before discovery, and cannot be aimed", () => {
   it("an unresolvable profile fails closed BEFORE an orchestrator exists", () => {
     // Phase 11D moved this refusal to the worker's startup barrier: the
     // orchestrator cannot be constructed without a bound projection, so
-    // there is no per-tick failure branch left to take.
-    const worker = codeOf("src/modules/jobs/vision-analysis.worker.ts");
+    // there is no per-tick failure branch left to take. Phase 11E moved
+    // that barrier into the account execution worker.
+    const worker = codeOf("src/modules/jobs/execution.worker.ts");
     const bind = worker.indexOf("const bound = await bindConfiguredExchangeRuntime(prisma);");
     const refuse = worker.indexOf("if (!bound.ok) {", bind);
     const build = worker.indexOf("createExecutionOrchestrator(runtime)");

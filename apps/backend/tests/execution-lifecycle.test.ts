@@ -384,13 +384,35 @@ describe("phase 4 safety boundary", () => {
       // TradeExecution. If retention removes that alert, the explanation of it
       // must go too rather than dangle, which is the opposite of the rule this
       // guard enforces for rows that record money.
-      .replace(/model SelectedPlanOutcome \{[\s\S]*?\n\}/, "");
+      .replace(/model SelectedPlanOutcome \{[\s\S]*?\n\}/, "")
+      // Phase 11E's SelectedPlanAdoption is the same category again, and its
+      // Cascade is deliberate. It records that ONE profile has evaluated one
+      // plan: no money, no order, no lifecycle state, and nothing that
+      // decides anything reads it except the adoption query that offers the
+      // plan. Its executionId is a denormalized pointer for diagnosis -- the
+      // TradeExecution is the authority, and THAT row is still Restrict from
+      // the profile side. It hangs off the plan, so if retention removes the
+      // plan the per-profile verdict about it must go too rather than dangle
+      // and hold a deleted plan un-offerable forever.
+      //
+      // The half of it that IS covered: the profile relation is Restrict, so
+      // a profile cannot be deleted out from under its own decisions.
+      .replace(/model SelectedPlanAdoption \{[\s\S]*?\n\}/, "");
 
     // Alert/plan links degrade to null so retention cannot destroy history.
     expect(financial).toContain("onDelete: SetNull");
     // Profile, orders and events are restricted.
     expect(financial).toContain("onDelete: Restrict");
     expect(financial).not.toContain("onDelete: Cascade");
+  });
+
+  it("a profile cannot be deleted out from under its own plan decisions", () => {
+    // The half of SelectedPlanAdoption the exclusion above stops checking.
+    const adoption = schema.slice(
+      schema.indexOf("model SelectedPlanAdoption"),
+      schema.indexOf("enum SelectedPlanAdoptionStatus")
+    );
+    expect(adoption).toContain("executionProfile   ExecutionProfile @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)");
   });
 
   it("seeds no real account, symbol or balance anywhere in Phase 4 sources", () => {

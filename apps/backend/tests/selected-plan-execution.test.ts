@@ -426,25 +426,44 @@ describe("crash between creation and admission", () => {
 // ---------------------------------------------------------------------------
 
 describe("production registration", () => {
-  const worker = () => readFileSync(path.join(BACKEND, "src", "modules", "jobs", "vision-analysis.worker.ts"), "utf8");
+  const read = (relative: string) =>
+    readFileSync(path.join(BACKEND, "src", "modules", ...relative.split("/")), "utf8");
 
-  it("calls the selected-plan handler from the Extreme RR job", () => {
-    const source = worker();
+  const executionWorker = () => read("jobs/execution.worker.ts");
+  const adoption = () => read("jobs/selected-plan-adoption.service.ts");
+  const genericWorker = () => read("jobs/vision-analysis.worker.ts");
+
+  it("calls the selected-plan handler from the adoption pass", () => {
+    // Phase 11E: the call site moved off the Extreme-RR job. That queue is a
+    // competing consumer, so it could only ever have handed the plan to ONE
+    // account; the account decision is now driven by each execution worker
+    // polling durable rows for its OWN profile.
+    const source = adoption();
     // A call site, not merely an import: removing the call fails this.
-    // Phase 11D: the executor is barrier-owned, so the handler takes a local
-    // non-null reference first -- the call itself is unchanged.
     expect(source).toMatch(/executor\.handleSelectedPlan\(/);
-    expect(source).toContain("const executor = selectedPlanExecutor;");
-    // Inside the Extreme RR job handler.
-    const handler = source.slice(
-      source.indexOf("async function processExtremeRRJob"),
-      source.indexOf("const extremeRRService")
+    // Inside the bounded pass, and AFTER the claim -- the executor reaches
+    // SIGNED endpoints, so a worker that has not won the claim must not.
+    const pass = source.slice(source.indexOf("async runOnce("));
+    expect(pass.indexOf("await this.claim(")).toBeLessThan(
+      pass.indexOf("executor.handleSelectedPlan(")
     );
-    expect(handler).toContain("handleSelectedPlan");
+  });
+
+  it("the generic worker can no longer execute a selected plan", () => {
+    const source = genericWorker();
+    for (const forbidden of [
+      "handleSelectedPlan(",
+      "new SelectedPlanExecutor(",
+      "recordSelectedPlanOutcome(",
+    ]) {
+      expect(`${forbidden} in generic worker: ${source.includes(forbidden)}`).toBe(
+        `${forbidden} in generic worker: false`
+      );
+    }
   });
 
   it("constructs the executor with the real production services", () => {
-    const source = worker();
+    const source = executionWorker();
     expect(source).toContain("new SelectedPlanExecutor(");
     // 11B: the planner reaches SIGNED endpoints (account summary, leverage
     // brackets), so production now hands it a read-only service built with the
@@ -456,26 +475,33 @@ describe("production registration", () => {
     expect(source).toContain("new ExecutionService(prisma)");
     expect(source).toContain("createExecutionOrchestrator(runtime)");
     // And the profile it owns is the projection of that SAME runtime.
-    expect(source).toContain("boundProfile: profileProjectionOf(runtime)");
+    expect(source).toContain("profileProjectionOf(runtime)");
+    expect(source).toContain("boundProfile,");
   });
 
-  it("registers startup recovery and the reconciliation scheduler", () => {
-    const source = worker();
+  it("registers startup recovery, reconciliation and plan adoption together", () => {
+    const source = executionWorker();
     expect(source).toContain("startExecutionOrchestrationScheduler(runtime)");
-    const scheduler = readFileSync(
-      path.join(BACKEND, "src", "modules", "jobs", "execution-orchestration.scheduler.ts"),
-      "utf8"
-    );
+    // Phase 11E: reconciling work it already has, without adopting anything
+    // new, would be a runtime that looks ready and can never trade.
+    expect(source).toContain("startSelectedPlanAdoptionScheduler(");
+    const scheduler = read("jobs/execution-orchestration.scheduler.ts");
     expect(scheduler).toContain("runStartupRecovery(");
   });
 
-  it("never lets an execution failure fail the plan job", () => {
-    const source = worker();
-    const handler = source.slice(source.indexOf("handleSelectedPlan"), source.indexOf("const extremeRRService"));
-    // Wrapped in try/catch: the persisted PLAN_READY row is recovered by the
-    // scheduler regardless of what happens here.
-    expect(handler).toContain("catch");
-    expect(handler).toContain("non-fatal");
+  it("never lets an execution failure end the pass or mark the plan decided", () => {
+    const source = adoption();
+    const pass = source.slice(source.indexOf("async runOnce("));
+    const guard = pass.slice(pass.indexOf("executor.handleSelectedPlan("));
+    // Caught, so one plan's failure cannot abandon the rest of the batch.
+    expect(guard).toContain("} catch (error) {");
+    // And NOT recorded as a verdict: the row stays PENDING, and its lease is
+    // what offers the plan again -- the same recovery a thrown BullMQ job got.
+    const handler = guard.slice(0, guard.indexOf("continue;"));
+    expect(`complete in the failure path: ${handler.includes("this.complete(")}`).toBe(
+      `complete in the failure path: false`
+    );
+    expect(handler).toContain("lease will release it for retry");
   });
 });
 

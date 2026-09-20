@@ -687,15 +687,22 @@ describe("orchestrator boundary", () => {
     }
   });
 
-  it("is registered in the production worker with startup recovery first", () => {
-    const worker = readFileSync(path.join(BACKEND, "src", "modules", "jobs", "vision-analysis.worker.ts"), "utf8");
+  it("is registered in the ACCOUNT execution worker with startup recovery first", () => {
+    const worker = readFileSync(path.join(BACKEND, "src", "modules", "jobs", "execution.worker.ts"), "utf8");
     // Phase 11D: started from the BOUND runtime, inside the startup barrier.
+    // Phase 11E: that barrier is its own process now, so the timer is a const
+    // and shutdown no longer has to tolerate its absence.
     expect(worker).toContain("startExecutionOrchestrationScheduler(runtime)");
     expect(worker.match(/startExecutionOrchestrationScheduler\(runtime\)/g)).toHaveLength(1);
     expect(worker).toContain("bindConfiguredExchangeRuntime(prisma)");
     expect(worker.slice(worker.indexOf('process.on("SIGTERM"'))).toContain(
-      "if (orchestrationTimer) clearInterval(orchestrationTimer)"
+      "clearInterval(orchestrationTimer)"
     );
+    // And the generic worker no longer schedules it.
+    const generic = readFileSync(path.join(BACKEND, "src", "modules", "jobs", "vision-analysis.worker.ts"), "utf8");
+    expect(
+      `orchestration in generic worker: ${generic.includes("startExecutionOrchestrationScheduler")}`
+    ).toBe(`orchestration in generic worker: false`);
 
     const scheduler = readCode(SCHEDULER);
     // Recovery is kicked off before the interval is created.

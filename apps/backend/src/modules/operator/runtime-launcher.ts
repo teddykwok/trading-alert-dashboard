@@ -229,8 +229,29 @@ export function isLiveReadyConfirmed(typed: unknown): boolean {
 // Process ownership
 // ---------------------------------------------------------------------------
 
-export type LauncherRole = "backend" | "worker" | "frontend";
-export const LAUNCHER_ROLES: readonly LauncherRole[] = ["backend", "worker", "frontend"];
+/**
+ * The processes this launcher owns.
+ *
+ * Phase 11E split the single worker in two, so the taxonomy had to say
+ * which one it means. `worker` keeps its name and its meaning in the place
+ * that matters -- it is the process that EXECUTES for the account, the one
+ * the WORKER attestation describes and the one supervision restarts -- and
+ * `analysis` is the new name for the generic half that binds no account.
+ *
+ * Getting this wrong is not cosmetic. Before this change the launcher
+ * started the generic worker under the name `worker` and then judged it
+ * against an attestation only an account-bound process publishes, so a
+ * correctly running stack read as STALE and supervision restarted a healthy
+ * process three times before giving up.
+ */
+export type LauncherRole = "backend" | "analysis" | "worker" | "frontend";
+export const LAUNCHER_ROLES: readonly LauncherRole[] = [
+  "backend",
+  // Before the account worker: it generates the plans the account adopts.
+  "analysis",
+  "worker",
+  "frontend",
+];
 
 export interface OwnedProcess {
   role: LauncherRole;
@@ -312,7 +333,12 @@ export function verifyOwnership(
  */
 export const ROLE_COMMANDS: Readonly<Record<LauncherRole, { filter: string; script: string }>> = Object.freeze({
   backend: { filter: "@trading-alert-dashboard/backend", script: "dev" },
-  worker: { filter: "@trading-alert-dashboard/backend", script: "worker" },
+  // The generic half: vision analysis, extreme-RR plan generation, cleanup,
+  // notifications, alert-queue recovery and retention. Binds no account.
+  analysis: { filter: "@trading-alert-dashboard/backend", script: "worker" },
+  // The account half: orchestration, plan adoption and historical fill for
+  // ONE account, and the only process that publishes a WORKER attestation.
+  worker: { filter: "@trading-alert-dashboard/backend", script: "execution-worker" },
   frontend: { filter: "@trading-alert-dashboard/frontend", script: "dev" },
 });
 
@@ -840,9 +866,20 @@ export interface StatusView {
   diskMode: DiskMode;
   diskModeWarning: string | null;
   backend: "ON" | "OFF";
+  /** The GENERIC analysis worker. Binds no account, so process state is all it has. */
+  analysis: "ON" | "OFF";
+  /** The ACCOUNT execution worker. */
   worker: "ON" | "OFF";
   frontend: "ON" | "OFF";
-  /** Per-role heartbeat verdict. Frontend publishes none, so it has none. */
+  /**
+   * Per-role heartbeat verdict.
+   *
+   * Frontend publishes none, so it has none. Neither does the generic
+   * analysis worker after Phase 11E: it binds no account, so there is no
+   * account liveness for it to attest to, and giving it the account WORKER
+   * attestation to fill this shape would make an accountless deployment
+   * look like a live runtime to the activation interlock.
+   */
   health: { backend: RoleHealth; worker: RoleHealth };
   ports: { backend: number; frontend: number; backendOpen: boolean; frontendOpen: boolean };
   operatorToken: "CONFIGURED" | "NOT CONFIGURED";
@@ -888,8 +925,15 @@ export function presentStatus(input: {
     diskMode: input.diskMode,
     diskModeWarning: input.diskMode === "INVALID" ? INVALID_MODE_WARNING : null,
     backend: input.running.backend ? "ON" : "OFF",
+    analysis: input.running.analysis ? "ON" : "OFF",
     worker: input.running.worker ? "ON" : "OFF",
     frontend: input.running.frontend ? "ON" : "OFF",
+    // Only the two ATTESTING roles are judged here. The generic analysis
+    // worker publishes no attestation -- it binds no account, so it has no
+    // account liveness to report -- and its model is deliberately
+    // process-only: ON or OFF, above. Making it publish the account WORKER
+    // attestation to satisfy this shape would be a lie the activation
+    // interlock reads.
     health: {
       backend: judgeRoleHealth(input.running.backend, roles?.backend ?? null),
       worker: judgeRoleHealth(input.running.worker, roles?.worker ?? null),
@@ -967,6 +1011,9 @@ export function renderStatus(view: StatusView): string[] {
   return [
     "Runtime:",
     `  Backend     process ${view.backend}   health ${view.health.backend}`,
+    // Named for what it is. It has no health column because it attests to
+    // nothing, and an empty column would read as a missing heartbeat.
+    `  Analysis    process ${view.analysis}`,
     `  Worker      process ${view.worker}   health ${view.health.worker}`,
     `  Frontend    process ${view.frontend}`,
     "",

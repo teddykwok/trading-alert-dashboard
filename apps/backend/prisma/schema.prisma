@@ -280,6 +280,22 @@ model ExtremeRRPlan {
   errorReason String?
   generatedAt DateTime?
 
+  /// Phase 11E: the ROLLOUT boundary for per-account execution fanout.
+  ///
+  /// Signal lifetime is not a rollout fence. A plan the pre-11E worker
+  /// already evaluated and refused leaves no TradeExecution and no
+  /// adoption row, so to a newly started execution worker it is
+  /// indistinguishable from new work -- and if it is still inside
+  /// EXECUTION_MAX_ALERT_AGE_SECONDS it would be evaluated a second time,
+  /// re-spending signed account reads and possibly deciding differently.
+  ///
+  /// This is set ONLY by the generic pipeline's durable READY transition
+  /// under 11E, so every plan that reached READY before the migration
+  /// carries NULL and can never be adopted. It is generic, not
+  /// profile-specific: it is never cleared, never consumed, and one
+  /// account's adoption leaves it exactly as the next account finds it.
+  executionFanoutReadyAt DateTime?
+
   // One Telegram notification per plan lifecycle (READY / INVALID / final
   // ERROR). Reset when a plan is explicitly regenerated so the new outcome
   // notifies again. telegramLastError never contains tokens or chat ids.
@@ -292,8 +308,12 @@ model ExtremeRRPlan {
 
   tradeExecutions TradeExecution[]
   selectedPlanOutcome SelectedPlanOutcome?
+  /// Phase 11E: one row PER EXECUTION PROFILE that evaluated this plan.
+  selectedPlanAdoptions SelectedPlanAdoption[]
 
   @@index([status])
+  /// The adoption discovery query's exact shape.
+  @@index([status, executionFanoutReadyAt, cutoffAt])
 }
 
 // ===========================================================================
@@ -451,6 +471,7 @@ model ExecutionProfile {
   fillCircuitBreaker HistoricalFillCircuitBreaker?
   safetyPolicy  ExecutionSafetyPolicy?
   canaryAuthorizations ExecutionCanaryAuthorization[]
+  selectedPlanAdoptions SelectedPlanAdoption[]
 
   @@unique([exchange, environment, accountIdentifier])
   @@index([isEnabled])
@@ -1901,4 +1922,75 @@ enum HistoricalFillCampaignStatus {
   EXHAUSTED
   COMPLETED
   ABORTED
+}
+
+/// Phase 11E — what ONE execution profile decided about ONE generic plan.
+///
+/// The generic ExtremeRRPlan is shared analysis: exactly one row per alert,
+/// produced by the single generic worker and owned by no account. Each
+/// account-bound execution worker evaluates that same plan against its own
+/// authorization, policy, limits and exchange state, and reaches its own
+/// verdict. This row IS that verdict, and (plan, profile) is unique, so
+/// Account A's decision can never overwrite Account B's.
+///
+/// It is ALSO the concurrency fence. The claim is taken BEFORE the margin
+/// planner's signed reads, so two workers for the same profile cannot both
+/// spend request weight on one plan and then race at the TradeExecution
+/// unique constraint afterwards.
+model SelectedPlanAdoption {
+  id String @id @default(cuid())
+
+  extremeRRPlanId String
+  extremeRRPlan   ExtremeRRPlan @relation(fields: [extremeRRPlanId], references: [id], onDelete: Cascade)
+
+  /// The profile that evaluated it. Restrict, like every other execution
+  /// relation: a decision must not vanish because a profile row was removed.
+  executionProfileId String
+  executionProfile   ExecutionProfile @relation(fields: [executionProfileId], references: [id], onDelete: Restrict)
+
+  status SelectedPlanAdoptionStatus @default(PENDING)
+
+  /// Incremented when a claim is ACQUIRED, not when one fails, and doubling
+  /// as the claim's fencing token exactly as ExchangeFillIngestWindow does:
+  /// a stale owner re-asserting the attempts value it saw finds it changed
+  /// and writes nothing.
+  attempts   Int       @default(0)
+  /// Lease. Both claim columns are set and cleared together.
+  claimedAt  DateTime?
+  /// Operational identity of the worker holding the lease. Never a
+  /// credential and never an account alias.
+  claimOwner String?
+
+  /// The executor's own verdict, stored verbatim. Null until terminal.
+  handled     Boolean?
+  reasonCode  String?
+  message     String?
+  /// Set only when an execution was reached. Deliberately NOT a foreign key:
+  /// this row is a historical record of a decision.
+  executionId String?
+
+  evaluatedAt DateTime?
+  /// Doubles as the terminal timestamp: COMPLETED is immutable.
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([extremeRRPlanId, executionProfileId])
+  /// The discovery query's shape: this profile's non-terminal rows, and the
+  /// lease age that decides whether one is reclaimable.
+  @@index([executionProfileId, status, claimedAt])
+}
+
+enum SelectedPlanAdoptionStatus {
+  /// Claimed and being evaluated, or claimed by a worker that died and now
+  /// waiting out its lease. The claim columns say which. Deliberately not
+  /// split into a separate CLAIMED state, for the same reason
+  /// FillIngestWindowStatus is not: a crash between the two writes would
+  /// leave them disagreeing and every consumer would have to accept both.
+  PENDING
+  /// This profile has evaluated this plan. Terminal and immutable, whether
+  /// the verdict was an execution or a refusal -- the generic queue job it
+  /// replaces was also evaluated exactly once.
+  COMPLETED
 }

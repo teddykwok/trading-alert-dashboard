@@ -421,12 +421,16 @@ describe("the frozen surfaces stayed frozen, and nothing runs by default", () =>
     expect(scheduler).not.toContain("exchange-fill-batch-driver");
   });
 
-  it("only the worker reaches this, and only through the composition seam", async () => {
+  it("only the account worker reaches this, and only through the seam", async () => {
     // Phase 9 Slice 3C made the worker the ONE production start call-site, so
     // it is no longer unaware of historical fill. What still holds -- and what
     // this guards -- is that it starts the composed runtime and nothing deeper:
     // no driver, no budget service, no executor, no exchange call.
-    const worker = await read("src/modules/jobs/vision-analysis.worker.ts");
+    //
+    // Phase 11E: historical fill is account-specific -- it ingests THIS
+    // account's trades with THIS account's credentials -- so the call-site
+    // moved into the account execution worker with the rest of it.
+    const worker = await read("src/modules/jobs/execution.worker.ts");
     // Phase 11D: started from the BOUND runtime, inside the startup barrier.
     expect(worker).toContain("startHistoricalFillWorkerRuntime(runtime)");
     for (const deeper of [

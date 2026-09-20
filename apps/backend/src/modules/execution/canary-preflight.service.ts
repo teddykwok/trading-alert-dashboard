@@ -409,12 +409,30 @@ export class CanaryPreflightService {
 // Runtime detection
 // ---------------------------------------------------------------------------
 
+/** The GENERIC analysis runtime. Binds no account; hosts the global schedulers. */
 const WORKER_ENTRYPOINT = path.join(
   process.cwd(),
   "src",
   "modules",
   "jobs",
   "vision-analysis.worker.ts"
+);
+
+/**
+ * The ACCOUNT execution runtime, one process per account.
+ *
+ * Phase 11E moved account execution out of the generic worker, because the
+ * generic BullMQ queues are competing consumers and two copies of that
+ * worker would have made "which account trades a signal" a race. The generic
+ * worker can no longer satisfy an execution-readiness check: it binds no
+ * account and publishes no execution WORKER attestation.
+ */
+const EXECUTION_WORKER_ENTRYPOINT = path.join(
+  process.cwd(),
+  "src",
+  "modules",
+  "jobs",
+  "execution.worker.ts"
 );
 
 /**
@@ -428,9 +446,10 @@ const WORKER_ENTRYPOINT = path.join(
  */
 export async function detectExecutionOrchestration(): Promise<boolean> {
   try {
-    const worker = readFileSync(WORKER_ENTRYPOINT, "utf8");
-    const app = readFileSync(path.join(process.cwd(), "src", "app.ts"), "utf8");
-    const combined = `${worker}\n${app}`;
+    // Phase 11E: the ACCOUNT execution entrypoint is the subject now. The
+    // generic worker exists in every deployment and proves nothing about
+    // whether an account is being executed.
+    const combined = readFileSync(EXECUTION_WORKER_ENTRYPOINT, "utf8");
     // The worker must actually START the orchestration scheduler, and that
     // scheduler must construct all three lifecycle services and run startup
     // recovery. Checking registration AND construction keeps this honest: a
@@ -453,7 +472,12 @@ export async function detectExecutionOrchestration(): Promise<boolean> {
       /new\s+SafetyAdmissionService/.test(scheduler) &&
       /new\s+EntryLifecycleService/.test(scheduler) &&
       /new\s+ProtectionLifecycleService/.test(scheduler) &&
-      /runStartupRecovery\(/.test(scheduler)
+      /runStartupRecovery\(/.test(scheduler) &&
+      // Phase 11E's third leg: the same process must run the per-profile
+      // plan adoption that replaced the generic queue hop. Without it a
+      // bound account would reconcile work it already has while never
+      // adopting a new signal -- ready to trade, structurally unable to.
+      /startSelectedPlanAdoptionScheduler\(/.test(combined)
     );
   } catch {
     return false;
@@ -472,11 +496,13 @@ export async function detectNotificationScheduler(): Promise<boolean> {
 
 /**
  * Whether a worker runtime that could run execution work exists at all.
- * Today this is the vision worker process; it hosts the schedulers.
+ *
+ * Phase 11E: that is the ACCOUNT execution entrypoint. The generic worker
+ * is present in every deployment and says nothing about execution.
  */
 export async function detectWorkerRuntime(): Promise<boolean> {
   try {
-    readFileSync(WORKER_ENTRYPOINT, "utf8");
+    readFileSync(EXECUTION_WORKER_ENTRYPOINT, "utf8");
     return true;
   } catch {
     return false;

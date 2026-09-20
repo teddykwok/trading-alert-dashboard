@@ -524,8 +524,10 @@ export function executeWorkerRestart(
  * Replaces the worker entry in the runtime state, leaving every other role
  * untouched.
  *
- * A worker-only failure must never disturb the backend or the frontend, and
- * their ownership records are the only way the launcher can still stop them.
+ * A worker-only failure must never disturb the backend, the generic analysis
+ * worker or the frontend, and their ownership records are the only way the
+ * launcher can still stop them. After Phase 11E that matters more, not less:
+ * restarting the account executor must not take plan generation down with it.
  */
 export function withReplacedWorker(state: RuntimeState, worker: OwnedProcess | null): RuntimeState {
   const others = state.processes.filter((entry) => entry.role !== "worker");
