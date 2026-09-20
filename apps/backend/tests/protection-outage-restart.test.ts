@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
 import { connectTestDatabase } from "./helpers/test-database";
 import type { DynamicLeveragePlan } from "@trading-alert-dashboard/shared";
+import { testProfileProjection } from "./helpers/bound-runtime";
 
 /**
  * The 2026-08-26 outage, reconstructed: what a restart actually repairs.
@@ -301,7 +302,9 @@ function freshRuntime(exchange: FakeExchange) {
     admission: new SafetyAdmissionService(prisma!, readOnly),
     entry: new EntryLifecycleService(prisma!, readOnly, mutations),
     protection,
-    profileIdentity: { accountIdentifier: `${SYNTHETIC_TAG}-account`, environment: "TESTNET" },
+    // The profile this orchestrator OWNS, projected as production does
+    // from the runtime that also produced its clients' credentials.
+    boundProfile: testProfileProjection({ executionProfileId: profileId }),
   });
   return { orchestrator, protection };
 }

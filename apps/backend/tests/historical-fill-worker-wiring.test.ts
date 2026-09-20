@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { logger } from "../src/config/logger";
+import { testBoundRuntime } from "./helpers/bound-runtime";
 import {
   createHistoricalFillWorkerId,
   startHistoricalFillWorkerRuntime,
@@ -48,7 +49,7 @@ describe("a disabled worker builds nothing historical", () => {
   it("reports DISABLED, creates no scheduler and no timer", () => {
     const setInterval = vi.spyOn(globalThis, "setInterval");
 
-    const runtime = startHistoricalFillWorkerRuntime({
+    const runtime = startHistoricalFillWorkerRuntime(testBoundRuntime(), {
       enabled: false,
       createScheduler: forbiddenScheduler,
     });
@@ -58,7 +59,7 @@ describe("a disabled worker builds nothing historical", () => {
   });
 
   it("mints no worker identity while dormant", () => {
-    const runtime = startHistoricalFillWorkerRuntime({
+    const runtime = startHistoricalFillWorkerRuntime(testBoundRuntime(), {
       enabled: false,
       createScheduler: forbiddenScheduler,
     });
@@ -68,7 +69,7 @@ describe("a disabled worker builds nothing historical", () => {
   });
 
   it("stopping a dormant runtime is safe and repeatable", async () => {
-    const runtime = startHistoricalFillWorkerRuntime({
+    const runtime = startHistoricalFillWorkerRuntime(testBoundRuntime(), {
       enabled: false,
       createScheduler: forbiddenScheduler,
     });
@@ -78,7 +79,7 @@ describe("a disabled worker builds nothing historical", () => {
   });
 
   it("says so once, and never on a timer", () => {
-    startHistoricalFillWorkerRuntime({ enabled: false, createScheduler: forbiddenScheduler });
+    startHistoricalFillWorkerRuntime(testBoundRuntime(), { enabled: false, createScheduler: forbiddenScheduler });
 
     expect(info).toHaveBeenCalledTimes(1);
     expect(info.mock.calls[0][0]).toBe(
@@ -154,7 +155,7 @@ describe("an enabled worker starts exactly one scheduler", () => {
     const module = await loadRuntime("25");
     const { createScheduler, start } = capture();
 
-    const runtime = module.startHistoricalFillWorkerRuntime({
+    const runtime = module.startHistoricalFillWorkerRuntime(testBoundRuntime(), {
       enabled: true,
       workerId: "worker-deterministic",
       createScheduler: createScheduler as never,
@@ -172,7 +173,7 @@ describe("an enabled worker starts exactly one scheduler", () => {
     const { env } = await import("../src/config/env");
     const { createScheduler } = capture();
 
-    module.startHistoricalFillWorkerRuntime({
+    module.startHistoricalFillWorkerRuntime(testBoundRuntime(), {
       enabled: true,
       workerId: "w",
       createScheduler: createScheduler as never,
@@ -194,7 +195,7 @@ describe("an enabled worker starts exactly one scheduler", () => {
     const module = await loadRuntime("25");
     const { createScheduler } = capture();
 
-    module.startHistoricalFillWorkerRuntime({
+    module.startHistoricalFillWorkerRuntime(testBoundRuntime(), {
       enabled: true,
       workerId: "w",
       createScheduler: createScheduler as never,
@@ -210,7 +211,7 @@ describe("an enabled worker starts exactly one scheduler", () => {
     // Fails closed. Reaching a batch without a ceiling would contend for a
     // shared row without knowing what it is allowed to spend.
     expect(() =>
-      module.startHistoricalFillWorkerRuntime({ enabled: true, workerId: "w" })
+      module.startHistoricalFillWorkerRuntime(testBoundRuntime(), { enabled: true, workerId: "w" })
     ).toThrow("EXECUTION_FILL_GLOBAL_USER_TRADES_WEIGHT_PER_MINUTE is required");
   });
 });
@@ -234,7 +235,7 @@ describe("the worker identity", () => {
     const start = vi.fn(() => ({ status: "RUNNING" as const, timer: 0 as never, stop: vi.fn(), stopAndDrain: vi.fn(async () => undefined) }));
     const createScheduler = vi.fn(() => ({ start }));
 
-    const runtime = module.startHistoricalFillWorkerRuntime({
+    const runtime = module.startHistoricalFillWorkerRuntime(testBoundRuntime(), {
       enabled: true,
       createScheduler: createScheduler as never,
     });
@@ -261,7 +262,7 @@ describe("shutdown drains before the shared client goes away", () => {
     });
     const start = vi.fn(() => ({ status: "RUNNING" as const, timer: 0 as never, stop: vi.fn(), stopAndDrain }));
 
-    const runtime = module.startHistoricalFillWorkerRuntime({
+    const runtime = module.startHistoricalFillWorkerRuntime(testBoundRuntime(), {
       enabled: true,
       workerId: "w",
       createScheduler: vi.fn(() => ({ start })) as never,
@@ -279,7 +280,7 @@ describe("shutdown drains before the shared client goes away", () => {
       "utf8"
     );
 
-    const drainAt = worker.indexOf("await historicalFillRuntime.stop();");
+    const drainAt = worker.indexOf("await historicalFillRuntime?.stop();");
     const disconnectAt = worker.indexOf("await prisma.$disconnect();");
 
     expect(drainAt).toBeGreaterThan(-1);
@@ -297,7 +298,8 @@ describe("the production chain stays singular", () => {
   it("the worker starts the runtime exactly once and calls nothing deeper", async () => {
     const worker = await read("src/modules/jobs/vision-analysis.worker.ts");
 
-    expect(worker.match(/startHistoricalFillWorkerRuntime\(\)/g)).toHaveLength(1);
+    // Phase 11D: exactly one start, now from the BOUND runtime.
+    expect(worker.match(/startHistoricalFillWorkerRuntime\(runtime\)/g)).toHaveLength(1);
     // It wires composition; it never duplicates orchestration.
     for (const deeper of [
       "runHistoricalFillBatch",

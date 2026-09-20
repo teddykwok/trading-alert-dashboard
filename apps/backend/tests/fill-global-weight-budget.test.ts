@@ -427,7 +427,8 @@ describe("the frozen surfaces stayed frozen, and nothing runs by default", () =>
     // this guards -- is that it starts the composed runtime and nothing deeper:
     // no driver, no budget service, no executor, no exchange call.
     const worker = await read("src/modules/jobs/vision-analysis.worker.ts");
-    expect(worker).toContain("startHistoricalFillWorkerRuntime()");
+    // Phase 11D: started from the BOUND runtime, inside the startup barrier.
+    expect(worker).toContain("startHistoricalFillWorkerRuntime(runtime)");
     for (const deeper of [
       "HistoricalFillWeightBudget",
       "HistoricalFillBatchDriver",

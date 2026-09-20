@@ -2,7 +2,13 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import type { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
-import { BinanceAccountConnectionService } from "../binance/binance-account-connection.service";
+import {
+  accountConnectionFromRuntime,
+  unbindableAccountHealth,
+  type BinanceAccountConnectionService,
+} from "../binance/binance-account-connection.service";
+import type { BinanceAccountHealthDto } from "../binance/binance-account-connection";
+import { bindConfiguredExchangeRuntime } from "./exchange-runtime-binding";
 import {
   evaluateCanaryPreflight,
   type AuthorizationReadinessState,
@@ -13,7 +19,6 @@ import {
   type RuntimeAttestationReadiness,
 } from "./canary-readiness";
 import { naturalWindowState } from "./natural-authorization";
-import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
 /**
  * Phase 11A — READ-ONLY live-canary preflight.
@@ -67,8 +72,26 @@ export interface PreflightProbes {
   runtimeAttestation?: () => Promise<RuntimeAttestationReadiness>;
 }
 
+/**
+ * A connection for a process that could not bind: it reports having learned
+ * nothing, and makes no request to do so.
+ */
+function unbindableConnection(reasonCode: string): {
+  checkAccountConnection: () => Promise<BinanceAccountHealthDto>;
+} {
+  const health = unbindableAccountHealth(reasonCode);
+  return { checkAccountConnection: async () => health };
+}
+
 export class CanaryPreflightService {
-  private readonly binance: BinanceAccountConnectionService;
+  /**
+   * INJECTED ONLY. It used to default to `new BinanceAccountConnectionService()`,
+   * which selected an account from ambient configuration inside a service whose
+   * every other profile read is already bound. Absent, the account health below
+   * is built from the canonical runtime binder instead -- and if that cannot
+   * bind, from an explicitly unreadable health that blocks.
+   */
+  private readonly binance: BinanceAccountConnectionService | null;
   private readonly probes: PreflightProbes;
   private readonly signedCheckCount: number;
 
@@ -76,7 +99,7 @@ export class CanaryPreflightService {
     private readonly prisma: PrismaClient,
     options: CanaryPreflightOptions = {}
   ) {
-    this.binance = options.binance ?? new BinanceAccountConnectionService();
+    this.binance = options.binance ?? null;
     this.signedCheckCount = options.signedCheckCount ?? REQUIRED_CONSECUTIVE_SIGNED_SUCCESSES;
     this.probes = {
       databaseReady: () => this.probeDatabase(),
@@ -111,11 +134,30 @@ export class CanaryPreflightService {
       ? await this.probes.runtimeAttestation()
       : { evaluated: false, ok: true, reasonCode: null, message: null };
 
+    // ONE binding for the whole run.
+    //
+    // Phase 11D final gate: this readiness decision combines DB state that
+    // belongs to a profile with SIGNED account state that belongs to a set of
+    // credentials. Establishing those separately -- a profile resolved three
+    // times from configuration, and a runtime bound once for health -- meant
+    // four independent answers feeding one verdict. They now come from one
+    // binding, so READY cannot describe one account's policy and another's
+    // exchange state.
+    const bound = await bindConfiguredExchangeRuntime(this.prisma);
+    const runtime = bound.ok ? bound.runtime : null;
+    const boundProfileId = runtime?.profile.executionProfileId ?? null;
+
+    const binance =
+      this.binance ??
+      (runtime
+        ? accountConnectionFromRuntime(runtime)
+        : unbindableConnection(bound.ok ? "UNKNOWN" : bound.reasonCode));
+
     // Repeated signed health checks against the real account (GET only).
     let consecutiveSignedSuccesses = 0;
-    let health = await this.binance.checkAccountConnection();
+    let health = await binance.checkAccountConnection();
     for (let attempt = 0; attempt < this.signedCheckCount; attempt += 1) {
-      const current = attempt === 0 ? health : await this.binance.checkAccountConnection();
+      const current = attempt === 0 ? health : await binance.checkAccountConnection();
       if (attempt > 0) health = current;
       if (!current.signedRequestWorks) break;
       consecutiveSignedSuccesses += 1;
@@ -124,7 +166,7 @@ export class CanaryPreflightService {
     const authenticationFailed = health.readinessCodes.includes("AUTHENTICATION_FAILED");
     const ipRestricted = health.warnings.some((warning) => /ip|restricted|-2015/i.test(warning));
 
-    const local = databaseReady ? await this.readLocalExecutionState() : {
+    const local = databaseReady ? await this.readLocalExecutionState(boundProfileId) : {
       activeExecutionCount: null,
       pendingEntryCount: null,
       openPositionCount: null,
@@ -133,13 +175,13 @@ export class CanaryPreflightService {
 
     // ONE read of the configured profile's row supplies both the kill switch
     // and the limits, so the two can never describe different rows.
-    const profileRow = databaseReady ? await this.readProfilePolicyRow() : null;
+    const profileRow = databaseReady ? await this.readProfilePolicyRow(boundProfileId) : null;
     const profileKillSwitchEngaged = profileRow ? profileRow.killSwitchActive : null;
 
     // Authorization readiness. READ ONLY — this never prepares, revokes,
     // consumes or claims anything.
     const authorization = databaseReady
-      ? await this.readAuthorizationState(mode)
+      ? await this.readAuthorizationState(mode, boundProfileId)
       : {
           mode,
           available: false,
@@ -211,7 +253,10 @@ export class CanaryPreflightService {
    * "none prepared". Preparation exclusivity guarantees a newer window implies
    * every older one was already shut.
    */
-  private async readAuthorizationState(mode: CanaryAuthorizationMode): Promise<AuthorizationReadinessState> {
+  private async readAuthorizationState(
+    mode: CanaryAuthorizationMode,
+    boundProfileId: string | null
+  ): Promise<AuthorizationReadinessState> {
     const unavailable: AuthorizationReadinessState = {
       mode,
       available: false,
@@ -223,9 +268,8 @@ export class CanaryPreflightService {
     };
 
     try {
-      const resolution = await resolveExecutionProfile(this.prisma, configuredProfileIdentity());
-      if (!resolution.ok) return unavailable;
-      const profileId = resolution.profile.id;
+      if (!boundProfileId) return unavailable;
+      const profileId = boundProfileId;
       const now = new Date();
 
       if (mode === "EXACT_SIGNAL") {
@@ -275,11 +319,10 @@ export class CanaryPreflightService {
    * Unresolvable stays UNREADABLE (nulls), exactly as an unreadable database
    * does: the evaluator turns that into a blocker rather than a zero.
    */
-  private async readLocalExecutionState() {
+  private async readLocalExecutionState(boundProfileId: string | null) {
     try {
-      const resolution = await resolveExecutionProfile(this.prisma, configuredProfileIdentity());
-      if (!resolution.ok) throw new Error(resolution.reasonCode);
-      const executionProfileId = resolution.profile.id;
+      if (!boundProfileId) throw new Error("NOT_BOUND");
+      const executionProfileId = boundProfileId;
       const [activeExecutionCount, pendingEntryCount, openPositionCount, recoveryRequiredCount] = await Promise.all([
         this.prisma.tradeExecution.count({
           where: { executionProfileId, status: { in: [...ACTIVE_STATUSES] } },
@@ -322,14 +365,18 @@ export class CanaryPreflightService {
    * configured, no match, an ambiguous match, no policy row, or an unreachable
    * database. The evaluator turns that into a blocker.
    */
-  private async readProfilePolicyRow(): Promise<{
+  private async readProfilePolicyRow(boundProfileId: string | null): Promise<{
     killSwitchActive: boolean;
     limits: CanaryPolicyLimits;
   } | null> {
     try {
-      const resolution = await resolveExecutionProfile(this.prisma, configuredProfileIdentity());
-      if (!resolution.ok) return null;
-      const policy = resolution.profile.safetyPolicy;
+      if (!boundProfileId) return null;
+      // The SAME row the binder proved: a bound runtime cannot exist without
+      // a safety policy, because the profile resolution it delegates to
+      // refuses PROFILE_POLICY_MISSING.
+      const policy = await this.prisma.executionSafetyPolicy.findUnique({
+        where: { executionProfileId: boundProfileId },
+      });
       if (!policy) return null;
       return {
         killSwitchActive: policy.killSwitchActive,
@@ -389,12 +436,20 @@ export async function detectExecutionOrchestration(): Promise<boolean> {
     // recovery. Checking registration AND construction keeps this honest: a
     // module that is merely imported, or a scheduler that reconciles without
     // recovering, would not satisfy it.
+    //
+    // Phase 11D STRENGTHENED it. The scheduler no longer builds its own
+    // clients from ambient configuration; it is handed a BOUND runtime, so the
+    // call now carries an argument and the old `\(\)` literal could no longer
+    // match. Rather than keep a string that no longer describes anything, the
+    // check now asserts the real invariant: the worker binds a configured
+    // exchange runtime AND starts the scheduler FROM it.
     const scheduler = readFileSync(
       path.join(process.cwd(), "src", "modules", "jobs", "execution-orchestration.scheduler.ts"),
       "utf8"
     );
     return (
-      /startExecutionOrchestrationScheduler\(\)/.test(combined) &&
+      /bindConfiguredExchangeRuntime\(/.test(combined) &&
+      /startExecutionOrchestrationScheduler\(runtime\)/.test(combined) &&
       /new\s+SafetyAdmissionService/.test(scheduler) &&
       /new\s+EntryLifecycleService/.test(scheduler) &&
       /new\s+ProtectionLifecycleService/.test(scheduler) &&

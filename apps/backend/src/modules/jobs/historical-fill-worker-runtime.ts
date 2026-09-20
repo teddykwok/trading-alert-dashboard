@@ -5,7 +5,10 @@ import { logger } from "../../config/logger";
 import { prisma } from "../../plugins/prisma";
 import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { BinanceReadOnlyClient } from "../binance/binance.client";
-import { configuredExchangeClientOptions } from "../execution/exchange-runtime-binding";
+import {
+  exchangeClientOptionsOf,
+  type BoundExchangeRuntime,
+} from "../execution/exchange-runtime-binding";
 import { HistoricalFillBatchDriver } from "../execution/exchange-fill-batch-driver.service";
 import { ExchangeFillLedgerService } from "../execution/exchange-fill-ledger.service";
 import { ExchangeFillIngestWindowService } from "../execution/exchange-fill-ingest-window.service";
@@ -79,10 +82,22 @@ export interface HistoricalFillWorkerRuntimeOptions {
  * control flow rather than a promise about what those objects would have done.
  */
 export function startHistoricalFillWorkerRuntime(
+  /**
+   * The bound runtime, for the ENABLED path only.
+   *
+   * Taken as a parameter rather than bound here on purpose: the worker has
+   * already bound one for the rest of execution, and a second binding would
+   * be a second answer to the same question. Nothing below the dormancy check
+   * reads it, so a disabled runtime still builds nothing at all.
+   */
+  runtime: BoundExchangeRuntime,
   options: HistoricalFillWorkerRuntimeOptions = {}
 ): HistoricalFillWorkerRuntime {
   const enabled = options.enabled ?? env.EXECUTION_FILL_RUNTIME_ENABLED;
 
+  // DORMANCY FIRST, before the runtime is so much as read. A disabled
+  // historical runtime must reach no exchange, start no campaign, bootstrap
+  // nothing and query no historical table.
   if (!enabled) {
     logger.info("Historical fill runtime disabled (EXECUTION_FILL_RUNTIME_ENABLED=false)");
     return { status: "DISABLED", stop: async () => undefined };
@@ -111,7 +126,7 @@ export function startHistoricalFillWorkerRuntime(
   const work = new ExchangeFillIngestWindowService(prisma);
   const ledger = new ExchangeFillLedgerService(prisma);
   const reader = new BinanceReadOnlyService(
-    new BinanceReadOnlyClient(configuredExchangeClientOptions())
+    new BinanceReadOnlyClient(exchangeClientOptionsOf(runtime))
   );
   const executor = new ExchangeFillOneWindowExecutor({ prisma, reader, ledger, work });
   const bootstrap = new ExchangeFillRootBootstrap({ prisma, work });

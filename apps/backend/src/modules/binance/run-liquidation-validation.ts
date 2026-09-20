@@ -1,6 +1,12 @@
+import { PrismaClient } from "@prisma/client";
+
 import { env } from "../../config/env";
+import { bindConfiguredExchangeRuntime } from "../execution/exchange-runtime-binding";
 import { BinanceError } from "./binance.errors";
-import { BinanceMarginPlanService, type LiquidationCheck } from "./binance-margin-plan.service";
+import {
+  marginPlanServiceFromRuntime,
+  type LiquidationCheck,
+} from "./binance-margin-plan.service";
 
 /**
  * Liquidation-estimator accuracy check — READ ONLY.
@@ -88,7 +94,24 @@ async function main(): Promise<void> {
     return;
   }
 
-  const checks = await new BinanceMarginPlanService().checkLiquidationEstimates();
+  // BIND FIRST. This command reaches SIGNED endpoints, so the account it
+  // acts as must be proven before any client exists -- not picked up from
+  // whatever the environment happens to hold. The database handle is used
+  // for the profile proof only and is released immediately.
+  const prisma = new PrismaClient();
+  const bound = await bindConfiguredExchangeRuntime(prisma).finally(() =>
+    prisma.$disconnect()
+  );
+  if (!bound.ok) {
+    console.error(`REFUSED (${bound.reasonCode}): ${bound.message}`);
+    console.error("No exchange client was constructed and no request was made.");
+    process.exitCode = 1;
+    return;
+  }
+
+  const marginPlanner = marginPlanServiceFromRuntime(bound.runtime);
+
+  const checks = await marginPlanner.checkLiquidationEstimates();
 
   if (checks.length === 0) {
     console.log("No open positions to validate.");

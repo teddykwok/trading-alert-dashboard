@@ -1,5 +1,7 @@
 import type { PrismaClient, TradeExecution } from "@prisma/client";
 
+import type { BoundExecutionProfileProjection } from "./exchange-runtime-binding";
+
 import { logger } from "../../config/logger";
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { classifyMutationOutcome, type MutationFailureShape } from "./entry-lifecycle";
@@ -92,7 +94,8 @@ export class EntryRecoveryService {
   constructor(
     private readonly prisma: PrismaClient,
     private readonly readOnly: BinanceReadOnlyService,
-    private readonly executionProfileId: string
+    /** The bound profile, immutable for the life of this service. */
+    private readonly boundProfile: BoundExecutionProfileProjection
   ) {}
 
   /**
@@ -144,7 +147,7 @@ export class EntryRecoveryService {
     // one, and a row that reached here mismatched means something bypassed it.
     if (!this.belongsToBoundProfile(execution)) {
       logger.error(
-        { executionId, boundExecutionProfileId: this.executionProfileId },
+        { executionId, boundExecutionProfileId: this.boundProfile.executionProfileId },
         "Entry recovery refused an execution that bypassed its profile-scoped query"
       );
       return this.result(
@@ -213,7 +216,7 @@ export class EntryRecoveryService {
       // rather than "except the one inside the transaction". The CAS above just
       // matched this exact row, so the predicate cannot change what is found.
       const next = await tx.tradeExecution.findFirstOrThrow({
-        where: { id: execution.id, executionProfileId: this.executionProfileId },
+        where: { id: execution.id, executionProfileId: this.boundProfile.executionProfileId },
       });
       // The local intent is closed out too, so nothing later mistakes a
       // SUBMITTING row for work still in flight.
@@ -382,7 +385,7 @@ export class EntryRecoveryService {
    */
   private async loadOwnedExecution(executionId: string): Promise<TradeExecution | null> {
     return this.prisma.tradeExecution.findFirst({
-      where: { id: executionId, executionProfileId: this.executionProfileId },
+      where: { id: executionId, executionProfileId: this.boundProfile.executionProfileId },
     });
   }
 
@@ -406,7 +409,7 @@ export class EntryRecoveryService {
    * supplied at construction, and no method accepts one.
    */
   get boundExecutionProfileId(): string {
-    return this.executionProfileId;
+    return this.boundProfile.executionProfileId;
   }
 
   /**
@@ -417,7 +420,7 @@ export class EntryRecoveryService {
    * row's came from the database, and those are the only two facts needed.
    */
   private belongsToBoundProfile(execution: TradeExecution): boolean {
-    return execution.executionProfileId === this.executionProfileId;
+    return execution.executionProfileId === this.boundProfile.executionProfileId;
   }
 
   private result(
@@ -468,7 +471,7 @@ type ExactTuple<A extends readonly unknown[], B extends readonly unknown[]> = [A
 
 const entryRecoveryRequiresAProfile: ExactTuple<
   ConstructorParameters<typeof EntryRecoveryService>,
-  [PrismaClient, BinanceReadOnlyService, string]
+  [PrismaClient, BinanceReadOnlyService, BoundExecutionProfileProjection]
 > = true;
 void entryRecoveryRequiresAProfile;
 

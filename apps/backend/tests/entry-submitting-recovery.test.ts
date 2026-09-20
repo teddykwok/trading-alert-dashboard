@@ -11,6 +11,7 @@ import {
 } from "../src/modules/execution/entry-absence-evidence";
 import { EntryRecoveryService } from "../src/modules/execution/entry-recovery.service";
 import type { BinanceReadOnlyService } from "../src/modules/binance/binance-read-only.service";
+import { testProfileProjection } from "./helpers/bound-runtime";
 
 /**
  * The stuck ENTRY_SUBMITTING defect.
@@ -280,7 +281,13 @@ function harness(options: {
   } as unknown as BinanceReadOnlyService;
 
   return {
-    service: new EntryRecoveryService(prisma, readOnly, options.boundProfileId ?? BOUND_PROFILE_ID),
+    service: new EntryRecoveryService(
+      prisma,
+      readOnly,
+      testProfileProjection({
+        executionProfileId: options.boundProfileId ?? BOUND_PROFILE_ID,
+      })
+    ),
     prisma,
     readOnly,
     state,

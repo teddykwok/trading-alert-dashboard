@@ -460,7 +460,9 @@ describe("K/P/Q/R. observability cannot alter a trading decision", () => {
 
   maybe()("persistence happens AFTER the decision, in its own guard", () => {
     const block = WORKER_SOURCE.slice(
-      WORKER_SOURCE.indexOf("const outcome = await selectedPlanExecutor.handleSelectedPlan"),
+      // Phase 11D: the executor is barrier-owned, so the handler takes a
+      // local non-null reference first. The decision point is unchanged.
+      WORKER_SOURCE.indexOf("const outcome = await executor.handleSelectedPlan"),
       WORKER_SOURCE.indexOf("} catch (executionError) {")
     );
     // Order is the safety argument: decide, return, THEN record.

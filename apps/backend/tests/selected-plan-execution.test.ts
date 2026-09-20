@@ -3,6 +3,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { SelectedPlanExecutor } from "../src/modules/execution/selected-plan-executor";
 import { RECONCILABLE_STATUSES } from "../src/modules/execution/execution-orchestrator";
+import { testProfileProjection } from "./helpers/bound-runtime";
 
 /**
  * Phase 11 — the signal → execution boundary.
@@ -131,7 +132,9 @@ function harness(options: {
         return { admitted: true, decision: "PASS", reasonCode: "ENTRY_SUBMITTED", mutationsDispatched: 0 };
       },
     } as never,
-    profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
+    // The profile this orchestrator OWNS, projected as production does
+    // from the runtime that also produced its clients' credentials.
+    boundProfile: testProfileProjection({ executionProfileId: "profile-1" }),
   });
 
   return {
@@ -348,11 +351,17 @@ describe("selected-plan eligibility", () => {
     expect(creates).toHaveLength(0);
   });
 
-  it("creates nothing when no execution profile is available", async () => {
-    const { executor, creates } = harness({ profileFound: false });
-    const result = await executor.handleSelectedPlan(PLAN as never, "FRAXUSDT");
-    expect((result as { reasonCode: string }).reasonCode).toBe("PROFILE_UNAVAILABLE");
-    expect(creates).toHaveLength(0);
+  it("no longer resolves a profile of its own to fail on", () => {
+    // Phase 11D: the executor is handed the profile its planner's
+    // credentials belong to. There is nothing left to look up, so there is
+    // no PROFILE_UNAVAILABLE path -- an unbindable process never gets an
+    // executor built at all.
+    const source = readFileSync(
+      path.join(BACKEND, "src", "modules", "execution", "selected-plan-executor.ts"),
+      "utf8"
+    );
+    expect(source).toContain("boundProfile: BoundExecutionProfileProjection;");
+    expect(source).not.toContain("resolveExecutionProfile(");
   });
 });
 
@@ -422,7 +431,10 @@ describe("production registration", () => {
   it("calls the selected-plan handler from the Extreme RR job", () => {
     const source = worker();
     // A call site, not merely an import: removing the call fails this.
-    expect(source).toMatch(/selectedPlanExecutor\.handleSelectedPlan\(/);
+    // Phase 11D: the executor is barrier-owned, so the handler takes a local
+    // non-null reference first -- the call itself is unchanged.
+    expect(source).toMatch(/executor\.handleSelectedPlan\(/);
+    expect(source).toContain("const executor = selectedPlanExecutor;");
     // Inside the Extreme RR job handler.
     const handler = source.slice(
       source.indexOf("async function processExtremeRRJob"),
@@ -438,15 +450,18 @@ describe("production registration", () => {
     // brackets), so production now hands it a read-only service built with the
     // configured profile's credentials instead of letting the constructor read
     // them from the environment on its own.
-    expect(source).toContain("new BinanceMarginPlanService(");
-    expect(source).toContain("configuredExchangeClientOptions()");
+    // Phase 11D: built by the runtime factory, so its credentials and the
+    // executor's profile come from one binding.
+    expect(source).toContain("marginPlanServiceFromRuntime(runtime)");
     expect(source).toContain("new ExecutionService(prisma)");
-    expect(source).toContain("createExecutionOrchestrator()");
+    expect(source).toContain("createExecutionOrchestrator(runtime)");
+    // And the profile it owns is the projection of that SAME runtime.
+    expect(source).toContain("boundProfile: profileProjectionOf(runtime)");
   });
 
   it("registers startup recovery and the reconciliation scheduler", () => {
     const source = worker();
-    expect(source).toContain("startExecutionOrchestrationScheduler()");
+    expect(source).toContain("startExecutionOrchestrationScheduler(runtime)");
     const scheduler = readFileSync(
       path.join(BACKEND, "src", "modules", "jobs", "execution-orchestration.scheduler.ts"),
       "utf8"

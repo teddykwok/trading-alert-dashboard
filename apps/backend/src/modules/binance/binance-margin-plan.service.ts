@@ -7,6 +7,11 @@ import {
 } from "@trading-alert-dashboard/shared";
 import { env } from "../../config/env";
 import { BinanceReadOnlyService } from "./binance-read-only.service";
+import { BinanceReadOnlyClient } from "./binance.client";
+import {
+  exchangeClientOptionsOf,
+  type BoundExchangeRuntime,
+} from "../execution/exchange-runtime-binding";
 import type { BinancePositionDto } from "./binance.types";
 
 /**
@@ -71,6 +76,22 @@ export interface LiquidationCheck {
   reportedLiquidationPrice: string | null;
   estimate: LiquidationEstimate;
   skippedReason: string | null;
+}
+
+/**
+ * The ONLY way production should build this service.
+ *
+ * The planner reads `account` and `leverageBracket`, both signed, so it is
+ * account-specific however read-only it looks. The zero-argument constructor
+ * below remains for tests and the testnet verifier; a production caller that
+ * used it would be selecting an account from ambient configuration.
+ */
+export function marginPlanServiceFromRuntime(
+  runtime: BoundExchangeRuntime
+): BinanceMarginPlanService {
+  return new BinanceMarginPlanService(
+    new BinanceReadOnlyService(new BinanceReadOnlyClient(exchangeClientOptionsOf(runtime)))
+  );
 }
 
 export class BinanceMarginPlanService {

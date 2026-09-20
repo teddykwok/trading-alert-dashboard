@@ -1,9 +1,14 @@
+import { PrismaClient } from "@prisma/client";
+
 import { env } from "../../config/env";
 import { BinanceError } from "./binance.errors";
 import { allowedReadOnlyPaths } from "./binance.endpoints";
 import { BinanceReadOnlyService } from "./binance-read-only.service";
 import { BinanceReadOnlyClient } from "./binance.client";
-import { configuredExchangeClientOptions } from "../execution/exchange-runtime-binding";
+import {
+  bindConfiguredExchangeRuntime,
+  exchangeClientOptionsOf,
+} from "../execution/exchange-runtime-binding";
 import type { BinancePositionDto } from "./binance.types";
 
 /**
@@ -70,8 +75,21 @@ async function main(): Promise<void> {
     return;
   }
 
+  // BIND FIRST. `getAccountSummary` is a SIGNED read, so read-only does not
+  // mean account-independent: the account has to be proven before asking.
+  const prisma = new PrismaClient();
+  const bound = await bindConfiguredExchangeRuntime(prisma).finally(() =>
+    prisma.$disconnect()
+  );
+  if (!bound.ok) {
+    console.error(`REFUSED (${bound.reasonCode}): ${bound.message}`);
+    console.error("No exchange client was constructed and no request was made.");
+    process.exitCode = 1;
+    return;
+  }
+
   const service = new BinanceReadOnlyService(
-    new BinanceReadOnlyClient(configuredExchangeClientOptions())
+    new BinanceReadOnlyClient(exchangeClientOptionsOf(bound.runtime))
   );
 
   const summary = await service.getAccountSummary();

@@ -41,7 +41,14 @@ const ARMED_GATES = {
   EXECUTION_EMERGENCY_CLOSE_MODE: "DISABLED",
 };
 
-const OVERRIDDEN = ["EXECUTION_PROFILE_ACCOUNT_IDENTIFIER", "EXECUTION_PROFILE_ENVIRONMENT", ...Object.keys(ARMED_GATES)];
+const OVERRIDDEN = [
+  "EXECUTION_PROFILE_ACCOUNT_IDENTIFIER",
+  "EXECUTION_PROFILE_ENVIRONMENT",
+  "BINANCE_API_KEY",
+  "BINANCE_API_SECRET",
+  "BINANCE_FUTURES_REST_BASE_URL",
+  ...Object.keys(ARMED_GATES),
+];
 const originalEnv = new Map(OVERRIDDEN.map((key) => [key, process.env[key]]));
 const originalArgv = process.argv;
 
@@ -95,6 +102,14 @@ attestationResult = passingAttestation();
 async function loadControls(gates: Record<string, string> = ARMED_GATES) {
   vi.resetModules();
   process.env.EXECUTION_PROFILE_ACCOUNT_IDENTIFIER = TEST_IDENTIFIER;
+  // Phase 11D: arm binds the configured exchange runtime, so the profile it
+  // arms and the account its preflight signs as come from one place. That
+  // binding needs SYNTHETIC credentials and a connector matching this
+  // suite's MAINNET profile. The preflight itself is stubbed below, so
+  // nothing here reaches the network and these bytes never leave the process.
+  process.env.BINANCE_API_KEY = "natural-arm-test-api-key";
+  process.env.BINANCE_API_SECRET = "natural-arm-test-api-secret";
+  process.env.BINANCE_FUTURES_REST_BASE_URL = "https://fapi.binance.com";
   process.env.EXECUTION_PROFILE_ENVIRONMENT = "MAINNET";
   Object.assign(process.env, gates);
 

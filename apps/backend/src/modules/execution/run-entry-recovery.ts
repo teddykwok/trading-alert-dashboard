@@ -1,12 +1,15 @@
 import { PrismaClient } from "@prisma/client";
 
 import { BinanceReadOnlyClient } from "../binance/binance.client";
-import { configuredExchangeClientOptions } from "./exchange-runtime-binding";
+import {
+  bindConfiguredExchangeRuntime,
+  exchangeClientOptionsOf,
+  profileProjectionOf,
+} from "./exchange-runtime-binding";
 
 import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { EntryRecoveryService } from "./entry-recovery.service";
 import { runEntryRecoveryCli } from "./entry-recovery-cli";
-import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
 /**
  * Stuck-entry recovery.
@@ -29,23 +32,27 @@ import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-
 async function main(): Promise<void> {
   const prisma = new PrismaClient();
   try {
-    // BIND FIRST, before any Binance client exists. A command that cannot say
-    // which account it is acting as must not read the exchange or write a row.
-    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
-    if (!resolution.ok) {
-      console.error(`REFUSED (${resolution.reasonCode}): ${resolution.message}`);
-      console.error("No exchange request was made and nothing was changed.");
+    // BIND FIRST, and bind ONCE. No Binance client exists yet, and no row has
+    // been read: a command that cannot prove which account it is must not do
+    // either. The credentials below and the profile this command acts on are
+    // the two halves of this one binding.
+    const bound = await bindConfiguredExchangeRuntime(prisma);
+    if (!bound.ok) {
+      console.error(`REFUSED (${bound.reasonCode}): ${bound.message}`);
+      console.error("No exchange client was constructed and nothing was changed.");
       process.exitCode = 1;
       return;
     }
-    const executionProfileId = resolution.profile.id;
+    const runtime = bound.runtime;
+    const exchange = exchangeClientOptionsOf(runtime);
+    const boundProfile = profileProjectionOf(runtime);
 
     const { exitCode } = await runEntryRecoveryCli(process.argv.slice(2), {
       prisma,
       recovery: new EntryRecoveryService(
         prisma,
-        new BinanceReadOnlyService(new BinanceReadOnlyClient(configuredExchangeClientOptions())),
-        executionProfileId
+        new BinanceReadOnlyService(new BinanceReadOnlyClient(exchange)),
+        boundProfile
       ),
     });
     process.exitCode = exitCode;

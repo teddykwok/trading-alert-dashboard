@@ -1,5 +1,8 @@
+import { PrismaClient } from "@prisma/client";
+
 import { env } from "../../config/env";
-import { BinanceAccountConnectionService } from "./binance-account-connection.service";
+import { bindConfiguredExchangeRuntime } from "../execution/exchange-runtime-binding";
+import { accountConnectionFromRuntime } from "./binance-account-connection.service";
 
 /**
  * Binance HEDGE MODE setup (Phase 10) — operator only.
@@ -42,7 +45,22 @@ async function main(): Promise<void> {
     return;
   }
 
-  const service = new BinanceAccountConnectionService();
+  // BIND FIRST. This command reaches SIGNED endpoints, so the account it
+  // acts as must be proven before any client exists -- not picked up from
+  // whatever the environment happens to hold. The database handle is used
+  // for the profile proof only and is released immediately.
+  const prisma = new PrismaClient();
+  const bound = await bindConfiguredExchangeRuntime(prisma).finally(() =>
+    prisma.$disconnect()
+  );
+  if (!bound.ok) {
+    console.error(`REFUSED (${bound.reasonCode}): ${bound.message}`);
+    console.error("No exchange client was constructed and no request was made.");
+    process.exitCode = 1;
+    return;
+  }
+
+  const service = accountConnectionFromRuntime(bound.runtime);
 
   // Always show the operator the account state first, whether or not they
   // confirmed. Counts only — never a symbol, quantity, price or order id.

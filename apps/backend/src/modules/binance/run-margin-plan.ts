@@ -1,6 +1,9 @@
+import { PrismaClient } from "@prisma/client";
+
 import { env } from "../../config/env";
+import { bindConfiguredExchangeRuntime } from "../execution/exchange-runtime-binding";
 import { BinanceError } from "./binance.errors";
-import { BinanceMarginPlanService } from "./binance-margin-plan.service";
+import { marginPlanServiceFromRuntime } from "./binance-margin-plan.service";
 import { formatMarginPlanLines } from "./margin-plan-format";
 
 /**
@@ -44,7 +47,24 @@ async function main(): Promise<void> {
     return;
   }
 
-  const plan = await new BinanceMarginPlanService().planForSymbol({
+  // BIND FIRST. This command reaches SIGNED endpoints, so the account it
+  // acts as must be proven before any client exists -- not picked up from
+  // whatever the environment happens to hold. The database handle is used
+  // for the profile proof only and is released immediately.
+  const prisma = new PrismaClient();
+  const bound = await bindConfiguredExchangeRuntime(prisma).finally(() =>
+    prisma.$disconnect()
+  );
+  if (!bound.ok) {
+    console.error(`REFUSED (${bound.reasonCode}): ${bound.message}`);
+    console.error("No exchange client was constructed and no request was made.");
+    process.exitCode = 1;
+    return;
+  }
+
+  const marginPlanner = marginPlanServiceFromRuntime(bound.runtime);
+
+  const plan = await marginPlanner.planForSymbol({
     symbol,
     direction,
     entryPrice,

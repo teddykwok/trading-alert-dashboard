@@ -100,7 +100,7 @@ import {
 } from "../src/modules/runtime/runtime-attestation";
 import {
   RECONCILIATION_STALL_MS,
-  isReconciliationHealthy,
+  reconciliationHealth,
   reconciliationHealth,
   resetOrchestrationTickGuardForTests,
   runReconciliationTickOnce,
@@ -239,6 +239,17 @@ function fakeOrchestrator() {
 // A. The heartbeat can no longer wait forever
 // ---------------------------------------------------------------------------
 
+/**
+ * Phase 11D note: these cases assert `reconciliationHealth().healthy`, the
+ * STALL predicate, which is what this suite has always been about.
+ *
+ * `isReconciliationHealthy` -- the predicate the attestation publisher
+ * consults -- now carries a SECOND precondition: that this process actually
+ * started orchestrating for a bound account. These tests drive ticks directly
+ * rather than through the scheduler, so that precondition is not met here and
+ * asserting it would be testing the harness. It has its own suite:
+ * tests/account-bound-readiness.test.ts.
+ */
 describe("worker liveness: attestation cannot hang", () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -445,7 +456,7 @@ describe("worker liveness: reconciliation cannot latch silently", () => {
 
     expect(state.tickCalls).toBe(1);
     expect(reconciliationHealth().inFlight).toBe(false);
-    expect(isReconciliationHealthy()).toBe(true);
+    expect(reconciliationHealth().healthy).toBe(true);
 
     // And the next interval is free to run.
     await runReconciliationTickOnce(orchestrator);
@@ -466,7 +477,7 @@ describe("worker liveness: reconciliation cannot latch silently", () => {
     await runReconciliationTickOnce(orchestrator);
     expect(messages(spy).join("\n")).toContain("threw");
     expect(reconciliationHealth().inFlight).toBe(false);
-    expect(isReconciliationHealthy()).toBe(true);
+    expect(reconciliationHealth().healthy).toBe(true);
 
     await runReconciliationTickOnce(orchestrator);
     expect(orchestrator.runExecutionReconciliationTick).toHaveBeenCalledTimes(2);
@@ -526,12 +537,12 @@ describe("worker liveness: reconciliation cannot latch silently", () => {
     // Still inside the allowance: ordinary, quiet, and still healthy.
     vi.setSystemTime(new Date(AT.getTime() + RECONCILIATION_STALL_MS));
     await runReconciliationTickOnce(orchestrator);
-    expect(isReconciliationHealthy()).toBe(true);
+    expect(reconciliationHealth().healthy).toBe(true);
     expect(messages(spy)).toEqual([]);
 
     // One millisecond past it: unhealthy, and said out loud.
     vi.setSystemTime(new Date(AT.getTime() + RECONCILIATION_STALL_MS + 1));
-    expect(isReconciliationHealthy()).toBe(false);
+    expect(reconciliationHealth().healthy).toBe(false);
     await runReconciliationTickOnce(orchestrator);
 
     const text = messages(spy).join("\n");
@@ -593,12 +604,12 @@ describe("worker liveness: reconciliation cannot latch silently", () => {
     await Promise.resolve();
 
     vi.setSystemTime(new Date(AT.getTime() + RECONCILIATION_STALL_MS + 1));
-    expect(isReconciliationHealthy()).toBe(false);
+    expect(reconciliationHealth().healthy).toBe(false);
 
     state.settleTick?.();
     await pending;
 
-    expect(isReconciliationHealthy()).toBe(true);
+    expect(reconciliationHealth().healthy).toBe(true);
     expect(reconciliationHealth().inFlight).toBe(false);
     expect(messages(spy).join("\n")).toContain("recovered after a stall");
 
@@ -637,7 +648,7 @@ describe("worker liveness: reconciliation cannot latch silently", () => {
     await Promise.resolve();
 
     vi.setSystemTime(new Date(AT.getTime() + RECONCILIATION_STALL_MS + 1));
-    expect(isReconciliationHealthy()).toBe(false);
+    expect(reconciliationHealth().healthy).toBe(false);
     await runReconciliationTickOnce(orchestrator);
     expect(messages(spy).join("\n")).toContain("STALLED");
 

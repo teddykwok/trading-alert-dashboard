@@ -1,5 +1,9 @@
 import { prisma } from "../../plugins/prisma";
-import { configuredExchangeClientOptions } from "../execution/exchange-runtime-binding";
+import {
+  exchangeClientOptionsOf,
+  profileProjectionOf,
+  type BoundExchangeRuntime,
+} from "../execution/exchange-runtime-binding";
 import { logger } from "../../config/logger";
 import { BinanceReadOnlyClient } from "../binance/binance.client";
 import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
@@ -90,12 +94,34 @@ let tickStartedAtMs: number | null = null;
 let tickLabel: string | null = null;
 let lastStallReportAtMs: number | null = null;
 
-/** Built once and reused; holds no per-execution state between calls. */
-export function createExecutionOrchestrator(): ExecutionOrchestrator {
-  // EXPLICIT credentials for the configured profile. The constructors would
-  // otherwise read them from the environment invisibly, which is exactly the
-  // ambient selection a second account would turn into a wrong-key dispatch.
-  const exchange = configuredExchangeClientOptions();
+/**
+ * Whether THIS process ever started orchestrating.
+ *
+ * Phase 11D made this necessary. Orchestration used to start at module load,
+ * so "no pass is in flight" could only ever mean the healthy idle gap between
+ * ticks. It now starts behind an account-binding barrier, and a process whose
+ * binding FAILED has no scheduler at all -- which also has no pass in flight,
+ * and would otherwise look identical to a healthy idle worker from outside.
+ *
+ * The attestation publisher consults `isReconciliationHealthy`, and an
+ * operator arms real trading over that answer. A worker that never bound an
+ * account must not be one of the fresh runtimes that answer permits.
+ */
+let orchestrationStarted = false;
+
+/**
+ * Built once and reused; holds no per-execution state between calls.
+ *
+ * Takes the BOUND RUNTIME rather than reaching for configuration itself, and
+ * that is the whole of 11D in one signature: the credentials below and the
+ * profile projection handed to the orchestrator are the two halves of ONE
+ * binding, so they cannot describe different accounts. Still synchronous --
+ * the asynchronous part is binding, which the caller has already done.
+ */
+export function createExecutionOrchestrator(
+  runtime: BoundExchangeRuntime
+): ExecutionOrchestrator {
+  const exchange = exchangeClientOptionsOf(runtime);
   const readOnly = new BinanceReadOnlyService(new BinanceReadOnlyClient(exchange));
   const mutations = new BinanceUsdMExecutionClient({ readOnlyClient: undefined, ...exchange });
   const alerts = new CriticalAlertService(prisma, async () => {
@@ -114,6 +140,8 @@ export function createExecutionOrchestrator(): ExecutionOrchestrator {
     // Durable execution rows and events. The orchestrator uses it for one
     // thing only: recording that reconciling an execution threw.
     executions: new ExecutionService(prisma),
+    // The non-secret half of the SAME runtime the clients above came from.
+    boundProfile: profileProjectionOf(runtime),
   });
 }
 
@@ -230,10 +258,17 @@ export function reconciliationHealth(nowMs: number = Date.now()): Reconciliation
  *
  * A worker whose reconciliation has stopped must not go on advertising itself
  * as a live runtime, because the whole purpose of that advertisement is to let
- * an operator arm new trading over it.
+ * an operator arm new trading over it. NOR may one that never started: since
+ * Phase 11D a failed account binding leaves this process running its
+ * non-account duties with no scheduler, and "no pass in flight" is true of
+ * that process exactly as it is of a healthy idle one.
+ *
+ * `reconciliationHealth` is deliberately unchanged: it answers the STALL
+ * question and is read by operators and logs. Only the readiness predicate
+ * gains the precondition, because only it is armed over.
  */
 export function isReconciliationHealthy(): boolean {
-  return reconciliationHealth().healthy;
+  return orchestrationStarted && reconciliationHealth().healthy;
 }
 
 /**
@@ -325,7 +360,10 @@ async function runSingleFlight(label: string, run: () => Promise<void>): Promise
 
 /** One bounded pass. Exported so tests can drive it without a timer. */
 export async function runReconciliationTickOnce(
-  orchestrator: ExecutionOrchestrator = createExecutionOrchestrator()
+  // REQUIRED. It used to default to building one, which meant this function
+  // could quietly compose an orchestrator of its own -- a second binding by
+  // another name. The caller owns the runtime and therefore the orchestrator.
+  orchestrator: ExecutionOrchestrator
 ): Promise<void> {
   await runSingleFlight("reconciliation tick", async () => {
     const result = await orchestrator.runExecutionReconciliationTick();
@@ -375,8 +413,11 @@ export async function runStartupRecoveryOnce(orchestrator: ExecutionOrchestrator
  * before anything else competes for it. A recovery failure does not prevent the
  * scheduler starting — the next tick simply tries again.
  */
-export function startExecutionOrchestrationScheduler(intervalMs = RECONCILIATION_INTERVAL_MS): NodeJS.Timeout {
-  const orchestrator = createExecutionOrchestrator();
+export function startExecutionOrchestrationScheduler(
+  runtime: BoundExchangeRuntime,
+  intervalMs = RECONCILIATION_INTERVAL_MS
+): NodeJS.Timeout {
+  const orchestrator = createExecutionOrchestrator(runtime);
 
   void runStartupRecoveryOnce(orchestrator).catch((error) =>
     logger.error(
@@ -388,6 +429,9 @@ export function startExecutionOrchestrationScheduler(intervalMs = RECONCILIATION
   const timer = setInterval(() => {
     void runReconciliationTickOnce(orchestrator);
   }, intervalMs);
+  // Set only here, and only after the interval exists: this process is now
+  // orchestrating for a bound account, which is what readiness asserts.
+  orchestrationStarted = true;
   timer.unref?.();
 
   logger.info({ intervalMs }, "Execution orchestration scheduler started");
@@ -398,6 +442,7 @@ export function startExecutionOrchestrationScheduler(intervalMs = RECONCILIATION
 export function resetOrchestrationTickGuardForTests(): void {
   tickInFlight = false;
   tickStartedAtMs = null;
+  orchestrationStarted = false;
   tickLabel = null;
   lastStallReportAtMs = null;
   // The telemetry is module state too, so it has to be cleared here or a test

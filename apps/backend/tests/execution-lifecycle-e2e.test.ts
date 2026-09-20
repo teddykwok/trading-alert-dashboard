@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ExecutionOrchestrator } from "../src/modules/execution/execution-orchestrator";
 import { SelectedPlanExecutor } from "../src/modules/execution/selected-plan-executor";
+import { testProfileProjection } from "./helpers/bound-runtime";
 
 /**
  * Phase 11 — full fake LONG and SHORT lifecycles through the production
@@ -141,7 +142,9 @@ function buildRuntime(scenario: Scenario, rows: Row[]) {
     } as never,
     entry: entry as never,
     protection: protection as never,
-    profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
+    // The profile this orchestrator OWNS, projected as production does
+    // from the runtime that also produced its clients' credentials.
+    boundProfile: testProfileProjection({ executionProfileId: "profile-1" }),
   });
 
   return { orchestrator, prisma };
@@ -208,7 +211,9 @@ async function runLifecycle(direction: Direction, closure: "TP" | "SL") {
       },
     } as never,
     orchestrator,
-    profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
+    // The profile this orchestrator OWNS, projected as production does
+    // from the runtime that also produced its clients' credentials.
+    boundProfile: testProfileProjection({ executionProfileId: "profile-1" }),
   });
 
   // --- the production entry point ------------------------------------------

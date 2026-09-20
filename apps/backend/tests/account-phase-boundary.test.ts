@@ -127,17 +127,32 @@ describe("Phase 10 mutation surface", () => {
 // ---------------------------------------------------------------------------
 
 describe("execution isolation", () => {
-  it("imports no Prisma client, so no execution row is expressible", () => {
+  it("expresses no execution row, whatever it may read to prove its account", () => {
+    // Phase 11D changed WHY these files may hold a Prisma client. Binding the
+    // configured exchange runtime proves which account a signed command acts
+    // as, and that proof is a database read of the ExecutionProfile row. So
+    // the boundary is no longer 'imports no Prisma' -- it is the property
+    // that boundary was protecting: no execution row is expressible here.
+    //
+    // The shared runtime client is still forbidden: these commands open a
+    // short-lived client of their own and release it, and must never reach
+    // for the worker's pool.
     for (const file of PHASE_10_FILES) {
-      const imports = [...readCode(file).matchAll(/from "([^"]+)"/g)].map((match) => match[1]);
-      for (const forbidden of ["@prisma/client", "plugins/prisma", "prisma"]) {
-        // The pure module imports Prisma.Decimal only — a namespace with no
-        // database access. Nothing else may touch Prisma at all.
-        if (file === PURE && forbidden === "@prisma/client") continue;
-        expect(
-          imports.some((entry) => entry === forbidden || entry.endsWith(`/${forbidden}`)),
-          `${path.basename(file)} imports ${forbidden}`
-        ).toBe(false);
+      const code = readCode(file);
+      const imports = [...code.matchAll(/from "([^"]+)"/g)].map((match) => match[1]);
+      expect(
+        imports.some((entry) => entry.endsWith("plugins/prisma")),
+        `${path.basename(file)} imports the shared runtime Prisma client`
+      ).toBe(false);
+
+      // And no execution model is named, however the client arrived.
+      for (const model of [
+        "tradeExecution",
+        "executionEvent",
+        "executionProtectionState",
+        "binanceOrder",
+      ]) {
+        expect(code, `${path.basename(file)} names ${model}`).not.toContain(model);
       }
     }
   });

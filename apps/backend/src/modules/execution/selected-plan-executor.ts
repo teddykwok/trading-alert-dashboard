@@ -7,7 +7,7 @@ import { isExactAuthorization } from "./canary-authorization.service";
 import { naturalWindowAdmitsDirection } from "./natural-authorization";
 import type { ExecutionService } from "./execution.service";
 import type { ExecutionOrchestrator } from "./execution-orchestrator";
-import { resolveExecutionProfile, type ProfileIdentity } from "./execution-profile.service";
+import type { BoundExecutionProfileProjection } from "./exchange-runtime-binding";
 
 /**
  * Phase 11A.1 — the production link from a SELECTED Extreme RR plan to a
@@ -60,7 +60,13 @@ export interface SelectedPlanExecutorDependencies {
   marginPlanner: BinanceMarginPlanService;
   executions: ExecutionService;
   orchestrator: ExecutionOrchestrator;
-  profileIdentity?: ProfileIdentity;
+  /**
+   * The profile this executor OWNS, projected from the same bound runtime
+   * that produced `marginPlanner`'s credentials. It used to resolve the
+   * configured profile itself, which was a second lookup that could in
+   * principle disagree with the account the planner signs as.
+   */
+  boundProfile: BoundExecutionProfileProjection;
 }
 
 /**
@@ -141,10 +147,9 @@ export class SelectedPlanExecutor {
       };
     }
 
-    const profile = await resolveExecutionProfile(this.deps.prisma, this.deps.profileIdentity);
-    if (!profile.ok) {
-      return { handled: false, reasonCode: "PROFILE_UNAVAILABLE", message: profile.message };
-    }
+    // No resolution here: the profile arrived with the runtime this executor
+    // was built from, alongside the credentials its planner signs with.
+    const executionProfileId = this.deps.boundProfile.executionProfileId;
 
     // --- Canary authorization (fail closed) --------------------------------
     // ANY authorization on record means this profile is authorization-
@@ -166,12 +171,12 @@ export class SelectedPlanExecutor {
     // here: this path can run for a plan that later fails margin planning, and
     // a claim is cumulative and never refunded.
     const authorizationsOnRecord = await this.deps.prisma.executionCanaryAuthorization.count({
-      where: { executionProfileId: profile.profile.id },
+      where: { executionProfileId: executionProfileId },
     });
     if (authorizationsOnRecord > 0) {
       const bound = await this.deps.prisma.executionCanaryAuthorization.findFirst({
         where: {
-          executionProfileId: profile.profile.id,
+          executionProfileId: executionProfileId,
           consumedAlertId: plan.alertId,
           revokedAt: null,
         },
@@ -181,7 +186,7 @@ export class SelectedPlanExecutor {
         const now = new Date();
         const window = await this.deps.prisma.executionCanaryAuthorization.findFirst({
           where: {
-            executionProfileId: profile.profile.id,
+            executionProfileId: executionProfileId,
             authorizationType: "NATURAL_WINDOW",
             revokedAt: null,
             expiresAt: { gt: now },
@@ -278,7 +283,7 @@ export class SelectedPlanExecutor {
     let created = false;
     try {
       const execution = await this.deps.executions.createExecutionFromReadyPlan({
-        executionProfileId: profile.profile.id,
+        executionProfileId: executionProfileId,
         alertId: plan.alertId,
         extremeRRPlanId: plan.id,
         plan: marginPlan,
@@ -304,7 +309,7 @@ export class SelectedPlanExecutor {
         // A concurrent worker or a redelivered job won the unique race. Adopt
         // its row rather than creating a second one.
         const existing = await this.deps.prisma.tradeExecution.findFirst({
-          where: { alertId: plan.alertId, executionProfileId: profile.profile.id },
+          where: { alertId: plan.alertId, executionProfileId: executionProfileId },
         });
         if (!existing) throw error;
         executionId = existing.id;

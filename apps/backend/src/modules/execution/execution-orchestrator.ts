@@ -10,12 +10,8 @@ import type { SafetyAdmissionService } from "./safety-admission.service";
 // soft-target decision here cannot drift from the one the safety engine makes.
 import { OPEN_POSITION_STATUSES } from "./capacity-status";
 import { mergeCapacityLimits } from "./safety-engine";
-import {
-  configuredProfileIdentity,
-  resolveExecutionProfile,
-  type ProfileIdentity,
-  type ProfileResolutionFailure,
-} from "./execution-profile.service";
+import type { ProfileResolutionFailure } from "./execution-profile.service";
+import type { BoundExecutionProfileProjection } from "./exchange-runtime-binding";
 
 /**
  * Phase 11A.1 — the production execution orchestrator.
@@ -141,8 +137,17 @@ export interface OrchestratorDependencies {
   protection: ProtectionLifecycleService;
   /** Owns durable execution rows and events; used here only for diagnostics. */
   executions: ExecutionService;
-  /** Defaults to the configured identity; injected in tests. */
-  profileIdentity?: ProfileIdentity;
+  /**
+   * The profile this orchestrator OWNS, projected from the same bound runtime
+   * that produced the credentials inside `readOnly`, `entry` and `protection`.
+   *
+   * REQUIRED, and a projection rather than an id: a bare string could come
+   * from anywhere, while a `BoundExecutionProfileProjection` can only be made
+   * by `profileProjectionOf` from a runtime that was actually bound. That is
+   * what makes "the rows I discover and the keys I dispatch with belong to the
+   * same account" a construction-time fact instead of a convention.
+   */
+  boundProfile: BoundExecutionProfileProjection;
 }
 
 export interface AdmitSignalInput {
@@ -264,30 +269,19 @@ export class ExecutionOrchestrator {
   constructor(private readonly deps: OrchestratorDependencies) {}
 
   /**
-   * The execution profile THIS PROCESS is configured as.
+   * The execution profile THIS ORCHESTRATOR OWNS.
    *
-   * Server-controlled and unparameterised on purpose: the identity comes from
-   * the same configuration the Binance credentials come from, so a caller
-   * cannot name a profile and have this process act on it with the account's
-   * keys. It is the SAME resolution `admitAndSubmit` has always used, so
-   * admission and reconciliation can never disagree about which profile this
-   * process is.
+   * Injected at construction and never re-derived. It used to be resolved from
+   * configuration on every tick, which was correct but was a SECOND lookup: a
+   * process whose clients were built from one binding could, in principle,
+   * discover rows from another. Now there is one binding, and both halves come
+   * from it.
    *
-   * Resolved per call rather than cached. Persisted state is the source of
-   * truth here exactly as it is for `profilesAtSoftOpenTarget`, and a cached
-   * id would be one more piece of process memory that a restart could
-   * disagree with.
+   * Not a parameter anywhere. No method accepts a profile id, so no caller --
+   * webhook, operator or job -- can aim this orchestrator at another account.
    */
-  private async boundProfileId(): Promise<
-    { ok: true; id: string } | { ok: false; reasonCode: ProfileResolutionFailure; message: string }
-  > {
-    const resolution = await resolveExecutionProfile(
-      this.deps.prisma,
-      this.deps.profileIdentity ?? configuredProfileIdentity()
-    );
-    return resolution.ok
-      ? { ok: true, id: resolution.profile.id }
-      : { ok: false, reasonCode: resolution.reasonCode, message: resolution.message };
+  private boundProfileId(): string {
+    return this.deps.boundProfile.executionProfileId;
   }
 
   // -------------------------------------------------------------------------
@@ -309,15 +303,13 @@ export class ExecutionOrchestrator {
   async admitAndSubmit(input: AdmitSignalInput): Promise<AdmitOutcome> {
     const evaluatedAt = input.evaluatedAt ?? new Date();
 
-    const profile = await resolveExecutionProfile(
-      this.deps.prisma,
-      this.deps.profileIdentity ?? configuredProfileIdentity()
-    );
-    if (!profile.ok) {
-      return { admitted: false, decision: null, reasonCode: profile.reasonCode, message: profile.message };
-    }
+    // The SAME bound profile reconciliation uses, and the same one whose
+    // credentials built the clients this orchestrator dispatches through.
+    // Admission and reconciliation cannot disagree about which account this
+    // process is, because there is one answer and it arrived at construction.
+    const boundProfileId = this.boundProfileId();
 
-    const recoveryPending = await this.countRecoveryRequired(profile.profile.id);
+    const recoveryPending = await this.countRecoveryRequired(boundProfileId);
     if (recoveryPending > 0) {
       return {
         admitted: false,
@@ -331,7 +323,7 @@ export class ExecutionOrchestrator {
     if (!execution) {
       return { admitted: false, decision: null, reasonCode: "EXECUTION_NOT_FOUND", message: "Unknown execution." };
     }
-    if (execution.executionProfileId !== profile.profile.id) {
+    if (execution.executionProfileId !== boundProfileId) {
       // Never trade an execution that belongs to a different profile than the
       // configured one — its capacity and limits are not the ones we checked.
       return {
@@ -420,22 +412,13 @@ export class ExecutionOrchestrator {
     const versionsBefore = new Map<string, number>();
 
     try {
-      // BIND FIRST. Nothing below may read an execution row, let alone reach
-      // the exchange, until this process knows which profile it is acting as:
-      // the Binance client it holds is authenticated for exactly one account,
-      // and a row belonging to another one must never reach it.
-      const bound = await this.boundProfileId();
-      if (!bound.ok) {
-        // FAIL CLOSED: no discovery, no exchange request, no state change.
-        result.failed = true;
-        logger.error(
-          { reasonCode: bound.reasonCode },
-          "Execution reconciliation refused — the configured execution profile could not be resolved"
-        );
-        return result;
-      }
+      // Already bound: this orchestrator could not have been constructed
+      // without a projection of the runtime that also produced its clients'
+      // credentials. Binding failure is handled ONCE, at startup, before any
+      // client exists -- not rediscovered on every tick.
+      const boundProfileId = this.boundProfileId();
 
-      const executions = await this.selectReconciliationBatch(batchSize, bound.id);
+      const executions = await this.selectReconciliationBatch(batchSize, boundProfileId);
 
       // Which profiles have already reached their SOFT open-position target.
       // Derived from persisted state every tick — no in-memory counter — so it
@@ -451,7 +434,7 @@ export class ExecutionOrchestrator {
         // loudly rather than skip quietly: nothing is inspected, nothing is
         // dispatched, and the tick reports itself failed so the next one is not
         // mistaken for a healthy pass.
-        if (execution.executionProfileId !== bound.id) {
+        if (execution.executionProfileId !== boundProfileId) {
           result.failed = true;
           result.rows.push({
             executionId: execution.id,
@@ -462,7 +445,7 @@ export class ExecutionOrchestrator {
           });
           // Ids only. Never an account identifier, a key or a payload.
           logger.error(
-            { executionId: execution.id, boundProfileId: bound.id },
+            { executionId: execution.id, boundProfileId },
             "Reconciliation refused an execution belonging to another profile — no exchange request was made"
           );
           continue;
@@ -534,7 +517,7 @@ export class ExecutionOrchestrator {
       // metric must never be able to abort the reconciliation it reports on.
       // A failure leaves the field null, which reads as unknown, not as zero.
       try {
-        result.reconcilableTotal = await this.countReconcilable(bound.id);
+        result.reconcilableTotal = await this.countReconcilable(boundProfileId);
       } catch (error) {
         logger.warn(
           { error: error instanceof Error ? error.message.slice(0, 300) : "unknown" },
@@ -542,7 +525,7 @@ export class ExecutionOrchestrator {
         );
       }
 
-      result.recoveryPending = await this.countRecoveryRequired(bound.id);
+      result.recoveryPending = await this.countRecoveryRequired(boundProfileId);
     } catch (error) {
       result.failed = true;
       logger.error(
@@ -1135,30 +1118,11 @@ export class ExecutionOrchestrator {
    * idempotent.
    */
   async runStartupRecovery(options: { batchSize?: number } = {}): Promise<ReconcileTickResult> {
-    const bound = await this.boundProfileId();
-    if (!bound.ok) {
-      // FAIL CLOSED, before the count and before the tick: a process that
-      // cannot say which account it is must not read, report or recover.
-      logger.error(
-        { reasonCode: bound.reasonCode },
-        "Execution startup recovery refused — the configured execution profile could not be resolved"
-      );
-      return {
-        inspected: 0,
-        advanced: 0,
-        progressed: 0,
-        mutationsDispatched: 0,
-        recoveryPending: 0,
-        reconcilableTotal: null,
-        cursorActive: false,
-        failed: true,
-        rows: [],
-      };
-    }
-
     // This profile's backlog, not the table's. A process for one account may
     // honestly report zero while another account has work it cannot touch.
-    const pending = await this.countRecoveryRequired(bound.id);
+    // No binding step: an unbindable process never reaches here, because the
+    // orchestrator cannot be constructed without a bound projection.
+    const pending = await this.countRecoveryRequired(this.boundProfileId());
     logger.info({ recoveryRequired: pending }, "Execution startup recovery beginning");
 
     const result = await this.runExecutionReconciliationTick({

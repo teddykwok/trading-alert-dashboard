@@ -1494,10 +1494,24 @@ describe("engine purity and safety", () => {
       const moduleCode = moduleSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|\s)\/\/.*$/gm, "");
       for (const forbidden of [
         "placeOrder", "cancelOrder", "changeLeverage", "changeMarginType", "changePositionMode",
-        "prisma", "@prisma/client", "extremeRRPlan", "selectedLeverage =", "sendTelegram",
+        "extremeRRPlan", "selectedLeverage =", "sendTelegram",
         "notifyExtremeRR", "enqueue", "visionAnalysisQueue",
       ]) {
         expect(moduleCode, `${file} contains ${forbidden}`).not.toContain(forbidden);
+      }
+
+      // Phase 11D: the two CLIs now open a SHORT-LIVED Prisma client, solely to
+      // bind the configured exchange runtime -- the proof of which account a
+      // signed margin read is made as. The planner service itself still touches
+      // no database at all, and neither CLI may name an execution model or
+      // reach the worker's shared pool.
+      if (file === "binance-margin-plan.service.ts") {
+        expect(moduleCode, `${file} contains prisma`).not.toContain("prisma");
+      } else {
+        expect(moduleCode).not.toContain("plugins/prisma");
+        for (const model of ["tradeExecution", "executionEvent", "binanceOrder"]) {
+          expect(moduleCode, `${file} names ${model}`).not.toContain(model);
+        }
       }
       expect(moduleCode).not.toMatch(/method:\s*["'](POST|PUT|PATCH|DELETE)["']/);
     }

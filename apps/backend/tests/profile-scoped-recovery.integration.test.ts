@@ -8,6 +8,7 @@ import { EntryRecoveryService } from "../src/modules/execution/entry-recovery.se
 import { ProtectionRecoveryService } from "../src/modules/execution/protection-recovery.service";
 import { ShutdownDrainService } from "../src/modules/execution/shutdown-drain.service";
 import type { ShutdownPosture } from "../src/modules/execution/shutdown-drain";
+import { testProfileProjection } from "./helpers/bound-runtime";
 
 /**
  * Phase 11C — one process, one account, and a database holding two.
@@ -170,7 +171,7 @@ function recorders() {
   };
 }
 
-function orchestratorBoundTo(accountIdentifier: string) {
+function orchestratorBoundTo(executionProfileId: string) {
   const parts = recorders();
   const orchestrator = new ExecutionOrchestrator({
     prisma: prisma!,
@@ -191,7 +192,9 @@ function orchestratorBoundTo(accountIdentifier: string) {
     entry: parts.entry,
     protection: parts.protection,
     executions: { recordReconciliationFailure: async () => undefined } as never,
-    profileIdentity: { accountIdentifier, environment: "TESTNET" },
+    // Bound as production binds: the projection of the runtime whose
+    // credentials would have built this orchestrator's clients.
+    boundProfile: testProfileProjection({ executionProfileId }),
   });
   return { orchestrator, touched: parts.touched };
 }
@@ -219,7 +222,7 @@ describe("periodic reconciliation sees only the bound profile", () => {
     const rowB = await makeExecution(b.id, "ENTRY_PENDING");
     const before = await snapshot(rowB.id);
 
-    const { orchestrator, touched } = orchestratorBoundTo(a.accountIdentifier);
+    const { orchestrator, touched } = orchestratorBoundTo(a.id);
     const result = await orchestrator.runExecutionReconciliationTick({ batchSize: 50 });
 
     expect(touched).toContain(rowA.id);
@@ -235,7 +238,7 @@ describe("periodic reconciliation sees only the bound profile", () => {
     const rowB = await makeExecution(b.id, "ENTRY_PENDING");
     const before = await snapshot(rowA.id);
 
-    const { orchestrator, touched } = orchestratorBoundTo(b.accountIdentifier);
+    const { orchestrator, touched } = orchestratorBoundTo(b.id);
     await orchestrator.runExecutionReconciliationTick({ batchSize: 50 });
 
     expect(touched).toContain(rowB.id);
@@ -254,7 +257,7 @@ describe("periodic reconciliation sees only the bound profile", () => {
     });
     const before = await snapshot(dangerous.id);
 
-    const { orchestrator, touched } = orchestratorBoundTo(a.accountIdentifier);
+    const { orchestrator, touched } = orchestratorBoundTo(a.id);
     const result = await orchestrator.runExecutionReconciliationTick({ batchSize: 50 });
 
     expect(touched).toHaveLength(0);
@@ -269,7 +272,7 @@ describe("periodic reconciliation sees only the bound profile", () => {
     await makeExecution(b.id, "MANUAL_INTERVENTION", { requiresManualIntervention: true });
     await makeExecution(b.id, "ENTRY_SUBMITTING");
 
-    const { orchestrator } = orchestratorBoundTo(a.accountIdentifier);
+    const { orchestrator } = orchestratorBoundTo(a.id);
 
     expect(await orchestrator.countRecoveryRequired(a.id)).toBe(0);
     expect(await orchestrator.countReconcilable(a.id)).toBe(0);
@@ -283,7 +286,7 @@ describe("periodic reconciliation sees only the bound profile", () => {
     const foreign = await makeExecution(b.id, "PLACING_PROTECTION");
     const before = await snapshot(foreign.id);
 
-    const { orchestrator, touched } = orchestratorBoundTo(a.accountIdentifier);
+    const { orchestrator, touched } = orchestratorBoundTo(a.id);
     const result = await orchestrator.runStartupRecovery();
 
     expect(result.recoveryPending).toBe(0);
@@ -357,7 +360,7 @@ describe("operator recovery refuses an execution from another profile", () => {
     const before = await snapshot(foreign.id);
 
     const probe = recordingExchange();
-    const service = new EntryRecoveryService(prisma!, probe.service, a.id);
+    const service = new EntryRecoveryService(prisma!, probe.service, testProfileProjection({ executionProfileId: a.id }));
 
     // Not returned by the candidate lookup at all, so not a candidate.
     expect(await service.evaluate(foreign.id)).toBeNull();
@@ -389,11 +392,11 @@ describe("operator recovery refuses an execution from another profile", () => {
     // The SAME service, the SAME status, the SAME instrument -- only the
     // owning profile differs, so the contrast isolates exactly one variable.
     const mine = recordingExchange();
-    expect(await new EntryRecoveryService(prisma!, mine.service, a.id).evaluate(own.id)).not.toBeNull();
+    expect(await new EntryRecoveryService(prisma!, mine.service, testProfileProjection({ executionProfileId: a.id })).evaluate(own.id)).not.toBeNull();
     expect(mine.reads()).toBeGreaterThan(0);
 
     const theirs = recordingExchange();
-    expect(await new EntryRecoveryService(prisma!, theirs.service, a.id).evaluate(foreign.id)).toBeNull();
+    expect(await new EntryRecoveryService(prisma!, theirs.service, testProfileProjection({ executionProfileId: a.id })).evaluate(foreign.id)).toBeNull();
     expect(theirs.reads()).toBe(0);
   });
 
@@ -406,7 +409,7 @@ describe("operator recovery refuses an execution from another profile", () => {
     const before = await snapshot(foreign.id);
 
     const probe = recordingExchange();
-    const service = new ProtectionRecoveryService(prisma!, probe.service, a.id);
+    const service = new ProtectionRecoveryService(prisma!, probe.service, testProfileProjection({ executionProfileId: a.id }));
 
     expect(await service.evaluate(foreign.id)).toBeNull();
 
@@ -431,13 +434,13 @@ describe("operator recovery refuses an execution from another profile", () => {
 
     const mine = recordingExchange();
     expect(
-      await new ProtectionRecoveryService(prisma!, mine.service, a.id).evaluate(own.id)
+      await new ProtectionRecoveryService(prisma!, mine.service, testProfileProjection({ executionProfileId: a.id })).evaluate(own.id)
     ).not.toBeNull();
     expect(mine.reads()).toBeGreaterThan(0);
 
     const theirs = recordingExchange();
     expect(
-      await new ProtectionRecoveryService(prisma!, theirs.service, a.id).evaluate(foreign.id)
+      await new ProtectionRecoveryService(prisma!, theirs.service, testProfileProjection({ executionProfileId: a.id })).evaluate(foreign.id)
     ).toBeNull();
     expect(theirs.reads()).toBe(0);
   });
@@ -452,12 +455,12 @@ describe("a missing execution stays distinguishable from a foreign one", () => {
     const a = await makeProfile("absent-a");
     const probe = recordingExchange();
 
-    const entry = await new EntryRecoveryService(prisma!, probe.service, a.id).recover(
+    const entry = await new EntryRecoveryService(prisma!, probe.service, testProfileProjection({ executionProfileId: a.id })).recover(
       "execution-that-does-not-exist"
     );
     expect(entry.outcome).toBe("NOT_APPLICABLE");
 
-    const protection = await new ProtectionRecoveryService(prisma!, probe.service, a.id).recover(
+    const protection = await new ProtectionRecoveryService(prisma!, probe.service, testProfileProjection({ executionProfileId: a.id })).recover(
       "execution-that-does-not-exist",
       {} as never
     );
@@ -467,26 +470,30 @@ describe("a missing execution stays distinguishable from a foreign one", () => {
 });
 
 describe("an unbindable process does no work at all", () => {
-  maybe()("an unknown configured identity fails the tick closed", async () => {
+  maybe()("a profile that owns nothing discovers nothing, and touches nothing", async () => {
+    // Phase 11D moved the unbindable case to the worker's startup barrier:
+    // an orchestrator cannot exist without a bound projection, so the
+    // closest thing an orchestrator can now be handed is a profile with no
+    // rows. It must still reach nothing and change nothing.
     const b = await makeProfile("unbound-b");
     const foreign = await makeExecution(b.id, "ENTRY_PENDING");
     const before = await snapshot(foreign.id);
 
-    const { orchestrator, touched } = orchestratorBoundTo(`${TAG}-does-not-exist`);
+    const { orchestrator, touched } = orchestratorBoundTo(`${TAG}-owns-nothing`);
     const result = await orchestrator.runExecutionReconciliationTick({ batchSize: 50 });
 
-    expect(result.failed).toBe(true);
+    expect(result.failed).toBe(false);
     expect(result.inspected).toBe(0);
     expect(result.rows).toEqual([]);
     expect(touched).toHaveLength(0);
     expect(await snapshot(foreign.id)).toEqual(before);
   });
 
-  maybe()("an unknown configured identity fails startup recovery closed", async () => {
-    const { orchestrator, touched } = orchestratorBoundTo(`${TAG}-also-missing`);
+  maybe()("startup recovery for such a profile reports an honest zero", async () => {
+    const { orchestrator, touched } = orchestratorBoundTo(`${TAG}-also-owns-nothing`);
     const result = await orchestrator.runStartupRecovery();
 
-    expect(result.failed).toBe(true);
+    expect(result.failed).toBe(false);
     expect(result.inspected).toBe(0);
     expect(result.recoveryPending).toBe(0);
     expect(touched).toHaveLength(0);
@@ -497,7 +504,7 @@ describe("an unbindable process does no work at all", () => {
     const b = await makeProfile("empty-b");
     await makeExecution(b.id, "MANUAL_INTERVENTION", { requiresManualIntervention: true });
 
-    const { orchestrator, touched } = orchestratorBoundTo(a.accountIdentifier);
+    const { orchestrator, touched } = orchestratorBoundTo(a.id);
     const result = await orchestrator.runExecutionReconciliationTick({ batchSize: 50 });
 
     expect(result.inspected).toBe(0);
@@ -514,6 +521,96 @@ describe("an unbindable process does no work at all", () => {
  * a foreign row, so the only way to prove the ownership assertion is still
  * load-bearing is to defeat the query and hand one over anyway.
  */
+/**
+ * Phase 11D — the bound context is the ONLY authority on environment.
+ *
+ * `gather` used to re-read the execution's ExecutionProfile row to discover
+ * which environment to judge the connector against. That was a second source
+ * of truth: a row edited after this process bound its runtime could move the
+ * judgement to another account's environment while the credentials stayed the
+ * same. The bound projection now answers, and the row is never consulted.
+ */
+describe("protection recovery judges the environment it was BOUND to", () => {
+  const EXECUTION = {
+    id: "env-authority-execution",
+    symbol: "BTCUSDT",
+    direction: "LONG",
+    positionSide: "LONG",
+    status: "ENTRY_FILLED",
+    version: 1,
+    executionProfileId: "the-bound-profile",
+    requiresManualIntervention: true,
+    filledQuantity: null,
+    // Decimals the evidence gather reads; only their string form matters here.
+    executableStopLoss: { toString: () => "95" },
+    plannedQuantity: { toString: () => "0.3" },
+  };
+
+  /**
+   * A prisma whose profile row CONTRADICTS the bound context, and which
+   * records whether anything asked it.
+   */
+  function contradictingPrisma(asked: string[]) {
+    return {
+      tradeExecution: {
+        findFirst: async () => EXECUTION,
+        count: async () => 1,
+      },
+      executionProtectionState: { findUnique: async () => null },
+      binanceOrder: { findMany: async () => [] },
+      executionProfile: {
+        findUnique: async () => {
+          asked.push("executionProfile.findUnique");
+          return { environment: "MAINNET" };
+        },
+      },
+    } as never;
+  }
+
+  it("never asks the profile row, even when one would answer differently", async () => {
+    const asked: string[] = [];
+    const probe = recordingExchange();
+    const service = new ProtectionRecoveryService(
+      contradictingPrisma(asked),
+      probe.service,
+      testProfileProjection({
+        executionProfileId: "the-bound-profile",
+        // The BOUND environment. The row above claims MAINNET.
+        environment: "TESTNET",
+      })
+    );
+
+    const evaluated = await service.evaluate(EXECUTION.id);
+    expect(evaluated).not.toBeNull();
+    // THE assertion: the contradicting row was never consulted at all.
+    expect(asked).toEqual([]);
+  });
+
+  it("judges the connector against the bound environment, not the row", async () => {
+    const probe = recordingExchange();
+
+    const boundToTestnet = new ProtectionRecoveryService(
+      contradictingPrisma([]),
+      probe.service,
+      testProfileProjection({ executionProfileId: "the-bound-profile", environment: "TESTNET" })
+    );
+    const boundToMainnet = new ProtectionRecoveryService(
+      contradictingPrisma([]),
+      probe.service,
+      testProfileProjection({ executionProfileId: "the-bound-profile", environment: "MAINNET" })
+    );
+
+    const asTestnet = await boundToTestnet.evaluate(EXECUTION.id);
+    const asMainnet = await boundToMainnet.evaluate(EXECUTION.id);
+
+    // Same row, same contradicting profile, same connector -- and a DIFFERENT
+    // verdict, which is only possible if the bound context is what decided.
+    expect(asTestnet?.evidence.environmentMatches).not.toEqual(
+      asMainnet?.evidence.environmentMatches
+    );
+  });
+});
+
 describe("a row smuggled past the query predicate is still refused", () => {
   const FOREIGN_ROW = {
     id: "smuggled-execution",
@@ -539,7 +636,7 @@ describe("a row smuggled past the query predicate is still refused", () => {
 
   it("entry recovery refuses it and reaches no exchange", async () => {
     const probe = recordingExchange();
-    const service = new EntryRecoveryService(leakyPrisma(), probe.service, "the-bound-profile");
+    const service = new EntryRecoveryService(leakyPrisma(), probe.service, testProfileProjection({ executionProfileId: "the-bound-profile" }));
 
     expect(await service.evaluate(FOREIGN_ROW.id)).toBeNull();
 
@@ -619,7 +716,7 @@ describe("the row identity assertion refuses what discovery cannot produce", () 
       } as never,
       protection: {} as never,
       executions: { recordReconciliationFailure: async () => undefined } as never,
-      profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
+      boundProfile: testProfileProjection({ executionProfileId: "profile-bound" }),
     });
 
     const result = await orchestrator.runExecutionReconciliationTick({ batchSize: 10 });

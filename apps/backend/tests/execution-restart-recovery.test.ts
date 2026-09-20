@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ExecutionOrchestrator } from "../src/modules/execution/execution-orchestrator";
+import { testProfileProjection } from "./helpers/bound-runtime";
 
 /**
  * Phase 11 — fresh-runtime crash/restart simulation.
@@ -161,7 +162,9 @@ function freshRuntime(
     } as never,
     entry: entry as never,
     protection: protection as never,
-    profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
+    // The profile this orchestrator OWNS, projected as production does
+    // from the runtime that also produced its clients' credentials.
+    boundProfile: testProfileProjection({ executionProfileId: "profile-1" }),
   });
 
   return { orchestrator };

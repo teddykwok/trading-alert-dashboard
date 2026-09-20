@@ -34,10 +34,11 @@ import {
   reconciliationAttestation,
   startExecutionOrchestrationScheduler,
 } from "./execution-orchestration.scheduler";
-import { BinanceMarginPlanService } from "../binance/binance-margin-plan.service";
-import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
-import { BinanceReadOnlyClient } from "../binance/binance.client";
-import { configuredExchangeClientOptions } from "../execution/exchange-runtime-binding";
+import { marginPlanServiceFromRuntime } from "../binance/binance-margin-plan.service";
+import {
+  bindConfiguredExchangeRuntime,
+  profileProjectionOf,
+} from "../execution/exchange-runtime-binding";
 import { ExecutionService } from "../execution/execution.service";
 import { SelectedPlanExecutor } from "../execution/selected-plan-executor";
 import { recordSelectedPlanOutcome } from "../execution/selected-plan-outcome.service";
@@ -209,8 +210,19 @@ async function processExtremeRRJob(job: Job<ExtremeRRJobData>): Promise<void> {
   // problem can never fail the plan job — the persisted PLAN_READY row is
   // recovered by the reconciliation scheduler regardless.
   try {
+    // An INVARIANT, not a readiness check. This queue is started inside the
+    // startup barrier, after the executor exists, so a null here would mean
+    // the barrier was bypassed. Throwing lets BullMQ retry the job; skipping
+    // it and hoping reconciliation notices would be a silent admission gap.
+    const executor = selectedPlanExecutor;
+    if (!executor) {
+      throw new Error(
+        "selected-plan execution reached before the account-bound runtime was established"
+      );
+    }
+
     const evaluatedAt = new Date();
-    const outcome = await selectedPlanExecutor.handleSelectedPlan(plan, alert.symbol);
+    const outcome = await executor.handleSelectedPlan(plan, alert.symbol);
     logger.info({ alertId, outcome: outcome.handled ? outcome.reasonCode : outcome.reasonCode }, "Selected plan execution handling completed");
 
     // Durable evidence of what was just decided, written AFTER the decision has
@@ -244,30 +256,27 @@ async function processExtremeRRJob(job: Job<ExtremeRRJobData>): Promise<void> {
 
 const extremeRRService = new ExtremeRRService(prisma);
 
-// Phase 11A.1 production signal -> execution link.
-const selectedPlanExecutor = new SelectedPlanExecutor({
-  prisma,
-  // Signed: the planner reads account summary and leverage brackets, so its
-  // read-only service gets the configured profile's credentials explicitly.
-  marginPlanner: new BinanceMarginPlanService(
-    new BinanceReadOnlyService(new BinanceReadOnlyClient(configuredExchangeClientOptions()))
-  ),
-  executions: new ExecutionService(prisma),
-  orchestrator: createExecutionOrchestrator(),
-});
+/**
+ * Phase 11D - everything account-specific lives behind the startup barrier.
+ *
+ * These four handles used to be module-level constants, each independently
+ * reaching for configuration: the executor built its own margin planner from
+ * ambient credentials, the scheduler built its own clients, and the
+ * orchestrator resolved its own profile. Three answers to one question.
+ *
+ * Now there is ONE binding, awaited once, and everything able to act as the
+ * account is constructed from it. They are null only BEFORE the barrier
+ * resolves, and the extreme-RR queue -- the only consumer of any of them --
+ * is not started until after, so no job can observe the null state.
+ */
+let selectedPlanExecutor: SelectedPlanExecutor | null = null;
+let extremeRRWorker: Worker<ExtremeRRJobData> | null = null;
+let orchestrationTimer: NodeJS.Timeout | null = null;
+let historicalFillRuntime: ReturnType<typeof startHistoricalFillWorkerRuntime> | null = null;
 
 const worker = new Worker<VisionAnalysisJobData>(VISION_ANALYSIS_QUEUE_NAME, processVisionAnalysisJob, {
   connection: bullConnection,
   concurrency: 2,
-});
-
-const extremeRRWorker = new Worker<ExtremeRRJobData>(EXTREME_RR_QUEUE_NAME, processExtremeRRJob, {
-  connection: bullConnection,
-  concurrency: 2,
-});
-
-extremeRRWorker.on("failed", (job, error) => {
-  logger.error({ jobId: job?.id, error }, "Extreme RR plan job failed");
 });
 
 worker.on("completed", (job) => {
@@ -293,23 +302,6 @@ const notificationTimer = startExecutionNotificationScheduler();
 // sweep would leave those alerts waiting for a restart that may never happen.
 const alertRecoveryTimer = startAlertQueueRecoveryScheduler();
 
-// Phase 11A.1: startup execution recovery, then bounded periodic reconciliation.
-// Every mutation still travels through the Phase 6/7 gates, so with the live
-// gates closed this registers work that dispatches nothing.
-const orchestrationTimer = startExecutionOrchestrationScheduler();
-
-// Phase 9: the ONLY production start call-site for historical fill ingestion.
-// Dormant unless EXECUTION_FILL_RUNTIME_ENABLED=true, and dormant means it
-// builds nothing at all -- no timer, no Prisma-backed service, no Binance
-// client -- so this worker is unaffected by it and never touches the
-// historical tables while the gate is closed.
-//
-// Several worker processes may each run one of these. There is deliberately no
-// leader election: window correctness comes from the claim CAS and its attempts
-// fencing token, and exchange request production is bounded across processes by
-// the shared Postgres weight budget.
-const historicalFillRuntime = startHistoricalFillWorkerRuntime();
-
 // Daily bounded-data-retention cleanup (03:00 Asia/Singapore by default).
 // Failure to schedule must never take down the vision worker.
 let retentionWorker: Awaited<ReturnType<typeof setupRetentionSchedule>> = null;
@@ -320,6 +312,83 @@ setupRetentionSchedule()
   .catch((error) => {
     logger.error({ error }, "Failed to set up data-retention schedule (worker continues)");
   });
+
+/**
+ * THE STARTUP BARRIER.
+ *
+ * One binding, awaited before anything able to act as the account exists.
+ * A failure here leaves this worker running its non-account duties -- alerts,
+ * screenshots, vision analysis, cleanup, notifications, alert-queue recovery,
+ * retention -- and starts NO exchange client, NO reconciliation and NO
+ * extreme-RR consumer. That is the fail-closed shape: a process that cannot
+ * prove which account it is does not get to trade as one.
+ *
+ * The extreme-RR queue is started INSIDE this function, last. Jobs enqueued
+ * before it starts wait in Redis and are consumed once binding succeeds -- a
+ * startup DELAY, never a window in which a trading job is consumed without a
+ * bound runtime.
+ */
+async function startAccountBoundRuntime(): Promise<void> {
+  const bound = await bindConfiguredExchangeRuntime(prisma);
+  if (!bound.ok) {
+    // The reason code only. Never a key, a secret or an account alias.
+    logger.error(
+      { reasonCode: bound.reasonCode },
+      "Account-bound runtime could not be established - execution, reconciliation and selected-plan handling are NOT started"
+    );
+    return;
+  }
+
+  const runtime = bound.runtime;
+
+  selectedPlanExecutor = new SelectedPlanExecutor({
+    prisma,
+    // Signed: the planner reads account summary and leverage brackets, so its
+    // read-only service takes the BOUND runtime's credentials.
+    marginPlanner: marginPlanServiceFromRuntime(runtime),
+    executions: new ExecutionService(prisma),
+    orchestrator: createExecutionOrchestrator(runtime),
+    boundProfile: profileProjectionOf(runtime),
+  });
+
+  // Phase 11A.1: startup execution recovery, then bounded periodic
+  // reconciliation. Every mutation still travels through the Phase 6/7 gates,
+  // so with the live gates closed this registers work that dispatches nothing.
+  orchestrationTimer = startExecutionOrchestrationScheduler(runtime);
+
+  // Phase 9: the ONLY production start call-site for historical fill ingestion.
+  // Dormant unless EXECUTION_FILL_RUNTIME_ENABLED=true, and dormant means it
+  // builds nothing at all -- no timer, no Prisma-backed service, no Binance
+  // client -- so this worker is unaffected by it and never touches the
+  // historical tables while the gate is closed.
+  //
+  // Several worker processes may each run one of these. There is deliberately no
+  // leader election: window correctness comes from the claim CAS and its attempts
+  // fencing token, and exchange request production is bounded across processes by
+  // the shared Postgres weight budget.
+  historicalFillRuntime = startHistoricalFillWorkerRuntime(runtime);
+
+  // LAST, and only now: the queue whose handler reaches the executor above.
+  extremeRRWorker = new Worker<ExtremeRRJobData>(EXTREME_RR_QUEUE_NAME, processExtremeRRJob, {
+    connection: bullConnection,
+    concurrency: 2,
+  });
+
+  extremeRRWorker.on("failed", (job, error) => {
+    logger.error({ jobId: job?.id, error }, "Extreme RR plan job failed");
+  });
+
+  logger.info(
+    "Account-bound runtime established - execution and selected-plan handling started"
+  );
+}
+
+void startAccountBoundRuntime().catch((error) => {
+  logger.error(
+    { error: error instanceof Error ? error.message.slice(0, 300) : "unknown" },
+    "Account-bound runtime bootstrap threw - execution handling is NOT started"
+  );
+});
 
 logger.info("vision-analysis worker started, waiting for jobs...");
 
@@ -366,14 +435,14 @@ process.on("SIGTERM", async () => {
   await attestationRedis.close();
   clearInterval(cleanupTimer);
   clearInterval(notificationTimer);
-  clearInterval(orchestrationTimer);
+  if (orchestrationTimer) clearInterval(orchestrationTimer);
   clearInterval(alertRecoveryTimer);
   // Before the shared Prisma client goes away below: this stops future
   // historical ticks and then waits for one already running, so a claim and its
   // transaction are never torn out mid-flight. Nothing is aborted.
-  await historicalFillRuntime.stop();
+  await historicalFillRuntime?.stop();
   await worker.close();
-  await extremeRRWorker.close();
+  await extremeRRWorker?.close();
   await retentionWorker?.close();
   await prisma.$disconnect();
   process.exit(0);

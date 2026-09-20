@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { PrismaClient } from "@prisma/client";
 
 import { connectTestDatabase } from "./helpers/test-database";
+import { testProfileProjection } from "./helpers/bound-runtime";
 
 /**
  * FINAL Phase 11A validation — REAL services, FAKE network only.
@@ -340,7 +341,7 @@ const exchange = new FakeExchange();
 // Fresh REAL runtime over surviving state
 // ---------------------------------------------------------------------------
 
-function freshRuntime(profileIdentity: { accountIdentifier: string; environment: "TESTNET" }) {
+function freshRuntime(boundProfileId: string) {
   // Real client; only its network is fake.
   const readOnlyClient = new BinanceReadOnlyClient({
     baseUrl: "https://fake.binance.test",
@@ -367,7 +368,8 @@ function freshRuntime(profileIdentity: { accountIdentifier: string; environment:
     admission: new SafetyAdmissionService(prisma!, readOnly),
     entry: new EntryLifecycleService(prisma!, readOnly, mutations, { reconcileMaxAttempts: 2, reconcileDelayMs: 1 }),
     protection: new ProtectionLifecycleService(prisma!, readOnly, mutations, alerts, { reconcileMaxAttempts: 2 }),
-    profileIdentity,
+    // Bound exactly as production binds: the id the rows belong to, projected.
+    boundProfile: testProfileProjection({ executionProfileId: boundProfileId }),
   });
 
   return { orchestrator, readOnly, mutations, executions: new ExecutionService(prisma!) };
@@ -416,7 +418,7 @@ async function createExecution(
       triggeredAt: new Date(Date.now() - 30_000),
     },
   });
-  const { executions } = freshRuntime(scenario.identity);
+  const { executions } = freshRuntime(scenario.profileId);
   const created = await executions.createExecutionFromReadyPlan({
     executionProfileId: scenario.profileId,
     alertId: alert.id,
@@ -770,7 +772,7 @@ describeDb("real services: admission and entry", () => {
     const scenario = await newScenario();
     await assertTestProfileIsQuiescent(scenario.profileId);
     const executionId = await createExecution("LONG", scenario);
-    const { orchestrator } = freshRuntime(scenario.identity);
+    const { orchestrator } = freshRuntime(scenario.profileId);
 
     const outcome = await orchestrator.admitAndSubmit({ executionId });
     expect(outcome.admitted, JSON.stringify(outcome)).toBe(true);
@@ -807,7 +809,7 @@ describeDb("real services: admission and entry", () => {
     const scenario = await newScenario();
     await assertTestProfileIsQuiescent(scenario.profileId);
     const executionId = await createExecution("LONG", scenario);
-    const { orchestrator } = freshRuntime(scenario.identity);
+    const { orchestrator } = freshRuntime(scenario.profileId);
     await orchestrator.admitAndSubmit({ executionId });
 
     const events = await prisma!.executionEvent.findMany({
@@ -830,14 +832,14 @@ describeDb("real services: restart recovery", () => {
     const scenario = await newScenario();
     await assertTestProfileIsQuiescent(scenario.profileId);
     const executionId = await createExecution("LONG", scenario);
-    const first = freshRuntime(scenario.identity);
+    const first = freshRuntime(scenario.profileId);
     await first.orchestrator.admitAndSubmit({ executionId });
 
     const order = await prisma!.binanceOrder.findFirstOrThrow({ where: { tradeExecutionId: executionId, role: "ENTRY" } });
     const submissionsBefore = exchange.requests.filter((r) => r.method === "POST" && r.path === "/fapi/v1/order").length;
 
     // --- PROCESS DEATH: everything below is a brand-new object graph -------
-    const second = freshRuntime(scenario.identity);
+    const second = freshRuntime(scenario.profileId);
     await second.orchestrator.runStartupRecovery();
 
     const posts = exchange.requests.filter((r) => r.method === "POST" && r.path === "/fapi/v1/order");
@@ -856,10 +858,10 @@ describeDb("real services: restart recovery", () => {
     const scenario = await newScenario();
     await assertTestProfileIsQuiescent(scenario.profileId);
     const executionId = await createExecution("LONG", scenario);
-    await freshRuntime(scenario.identity).orchestrator.admitAndSubmit({ executionId });
+    await freshRuntime(scenario.profileId).orchestrator.admitAndSubmit({ executionId });
 
     for (let restart = 0; restart < 3; restart += 1) {
-      await freshRuntime(scenario.identity).orchestrator.runStartupRecovery();
+      await freshRuntime(scenario.profileId).orchestrator.runStartupRecovery();
     }
 
     expect(exchange.acceptedEntryIds.size).toBe(1);
@@ -878,8 +880,8 @@ describeDb("real services: two-worker race", () => {
     const executionId = await createExecution("LONG", scenario);
 
     // Two entirely separate real service graphs over one database + exchange.
-    const workerA = freshRuntime(scenario.identity);
-    const workerB = freshRuntime(scenario.identity);
+    const workerA = freshRuntime(scenario.profileId);
+    const workerB = freshRuntime(scenario.profileId);
     await Promise.all([
       workerA.orchestrator.admitAndSubmit({ executionId }),
       workerB.orchestrator.admitAndSubmit({ executionId }),
@@ -913,10 +915,10 @@ describeDb("real services: failure paths", () => {
     const executionId = await createExecution("LONG", scenario);
     exchange.failNext = { path: "/fapi/v1/order", method: "POST", kind: "TIMEOUT" };
 
-    const { orchestrator } = freshRuntime(scenario.identity);
+    const { orchestrator } = freshRuntime(scenario.profileId);
     await orchestrator.admitAndSubmit({ executionId });
     // Recovery resolves the ambiguity with a GET on the same id.
-    await freshRuntime(scenario.identity).orchestrator.runStartupRecovery();
+    await freshRuntime(scenario.profileId).orchestrator.runStartupRecovery();
 
     const posts = exchange.requests.filter((r) => r.method === "POST" && r.path === "/fapi/v1/order");
     const gets = exchange.requests.filter((r) => r.method === "GET" && r.path === "/fapi/v1/order");
@@ -932,7 +934,7 @@ describeDb("real services: failure paths", () => {
     const executionId = await createExecution("LONG", scenario);
     exchange.failNext = { path: "/fapi/v1/order", method: "POST", kind: "REJECT" };
 
-    const { orchestrator } = freshRuntime(scenario.identity);
+    const { orchestrator } = freshRuntime(scenario.profileId);
     await orchestrator.admitAndSubmit({ executionId });
 
     const execution = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
@@ -951,8 +953,8 @@ describeDb("real services: observed request surface", () => {
     const scenario = await newScenario();
     await assertTestProfileIsQuiescent(scenario.profileId);
     const executionId = await createExecution("LONG", scenario);
-    await freshRuntime(scenario.identity).orchestrator.admitAndSubmit({ executionId });
-    await freshRuntime(scenario.identity).orchestrator.runStartupRecovery();
+    await freshRuntime(scenario.profileId).orchestrator.admitAndSubmit({ executionId });
+    await freshRuntime(scenario.profileId).orchestrator.runStartupRecovery();
 
     const mutations = exchange.requests.filter((r) => r.method !== "GET");
     for (const request of mutations) {
@@ -984,7 +986,7 @@ describeDb("real services: Phase 9 milestones from real history", () => {
     const scenario = await newScenario();
     await assertTestProfileIsQuiescent(scenario.profileId);
     const executionId = await createExecution("LONG", scenario);
-    await freshRuntime(scenario.identity).orchestrator.admitAndSubmit({ executionId });
+    await freshRuntime(scenario.profileId).orchestrator.admitAndSubmit({ executionId });
 
     const { ExecutionNotificationService } = await import("../src/modules/notifications/execution-notification.service");
     const service = new ExecutionNotificationService(prisma!, async () => ({ delivered: true, retryable: false, errorCode: null, sanitizedError: null }), {
@@ -1024,21 +1026,21 @@ async function runFullLifecycle(
   exchange.positionSide = direction;
   const executionId = await createExecution(direction, scenario);
 
-  await freshRuntime(scenario.identity).orchestrator.admitAndSubmit({ executionId });
+  await freshRuntime(scenario.profileId).orchestrator.admitAndSubmit({ executionId });
 
   // Partial fill -> real reconciliation + real protection for that exposure.
   exchange.fillEntry("0.020", false);
-  await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+  await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
   // Full fill -> real reconciliation + real full protection.
   exchange.fillEntry("0.037", true);
-  await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
-  await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+  await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
+  await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
   // The protection order triggers; the position goes flat.
   exchange.triggerProtection(closure);
-  await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
-  await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+  await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
+  await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
   return executionId;
 }
@@ -1135,15 +1137,15 @@ describeDb("real services: entry TTL", () => {
     const scenario = await newScenario();
     await assertTestProfileIsQuiescent(scenario.profileId);
     const executionId = await createExecution("LONG", scenario);
-    await freshRuntime(scenario.identity).orchestrator.admitAndSubmit({ executionId });
+    await freshRuntime(scenario.profileId).orchestrator.admitAndSubmit({ executionId });
 
     // Push the TTL into the past; the real Phase 6 rule decides from here.
     await prisma!.binanceOrder.updateMany({
       where: { tradeExecutionId: executionId, role: "ENTRY" },
       data: { entryOrderExpiresAt: new Date(Date.now() - 60_000) },
     });
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
     const protectionRows = await prisma!.binanceOrder.count({
       where: { tradeExecutionId: executionId, role: { in: ["STOP_LOSS", "TAKE_PROFIT"] } },
@@ -1158,15 +1160,15 @@ describeDb("real services: entry TTL", () => {
     const scenario = await newScenario();
     await assertTestProfileIsQuiescent(scenario.profileId);
     const executionId = await createExecution("LONG", scenario);
-    await freshRuntime(scenario.identity).orchestrator.admitAndSubmit({ executionId });
+    await freshRuntime(scenario.profileId).orchestrator.admitAndSubmit({ executionId });
 
     exchange.fillEntry("0.020", false);
     await prisma!.binanceOrder.updateMany({
       where: { tradeExecutionId: executionId, role: "ENTRY" },
       data: { entryOrderExpiresAt: new Date(Date.now() - 60_000) },
     });
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
     const execution = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
     // The Phase 6 rule, proven by the real service rather than encoded here.
@@ -1184,15 +1186,15 @@ describeDb("real services: restart after fill before protection", () => {
     const scenario = await newScenario();
     await assertTestProfileIsQuiescent(scenario.profileId);
     const executionId = await createExecution("LONG", scenario);
-    await freshRuntime(scenario.identity).orchestrator.admitAndSubmit({ executionId });
+    await freshRuntime(scenario.profileId).orchestrator.admitAndSubmit({ executionId });
     exchange.fillEntry("0.037", true);
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
     const entryAttemptsBefore = exchange.entryAttempts;
 
     // --- PROCESS DEATH: an entirely new real service graph -----------------
-    await freshRuntime(scenario.identity).orchestrator.runStartupRecovery();
-    await freshRuntime(scenario.identity).orchestrator.runStartupRecovery();
+    await freshRuntime(scenario.profileId).orchestrator.runStartupRecovery();
+    await freshRuntime(scenario.profileId).orchestrator.runStartupRecovery();
 
     expect(exchange.entryAttempts).toBe(entryAttemptsBefore);
     expect(await prisma!.binanceOrder.count({ where: { tradeExecutionId: executionId, role: "ENTRY" } })).toBe(1);
@@ -1208,7 +1210,7 @@ describeDb("real services: restart while protected", () => {
     const entryAttempts = exchange.entryAttempts;
 
     for (let restart = 0; restart < 3; restart += 1) {
-      await freshRuntime(scenario.identity).orchestrator.runStartupRecovery();
+      await freshRuntime(scenario.profileId).orchestrator.runStartupRecovery();
     }
 
     // Every protection identity is still at exactly one submission.
@@ -1227,13 +1229,13 @@ describeDb("real services: protection failure", () => {
     const scenario = await newScenario();
     await assertTestProfileIsQuiescent(scenario.profileId);
     const executionId = await createExecution("LONG", scenario);
-    await freshRuntime(scenario.identity).orchestrator.admitAndSubmit({ executionId });
+    await freshRuntime(scenario.profileId).orchestrator.admitAndSubmit({ executionId });
     exchange.fillEntry("0.037", true);
 
     // The protection POST lands but the reply is lost.
     exchange.failNext = { path: "/fapi/v1/algoOrder", method: "POST", kind: "TIMEOUT" };
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
     // No identity was submitted twice — the ambiguity is resolved by query.
     for (const [id, attempts] of exchange.algoAttempts) expect(`${id}:${attempts}`).toBe(`${id}:1`);
@@ -1303,7 +1305,7 @@ describeDb("real services: same-tick protection", () => {
     const scenario = await newScenario();
     await assertTestProfileIsQuiescent(scenario.profileId);
     const executionId = await createExecution("LONG", scenario);
-    await freshRuntime(scenario.identity).orchestrator.admitAndSubmit({ executionId });
+    await freshRuntime(scenario.profileId).orchestrator.admitAndSubmit({ executionId });
 
     const resting = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
     expect(resting.status).toBe("ENTRY_PENDING");
@@ -1315,7 +1317,7 @@ describeDb("real services: same-tick protection", () => {
   it("E1. a resting entry that filled is PROTECTED after ONE reconciliation pass", async () => {
     const { executionId, scenario } = await restingEntryThatFilled("0.037", true);
 
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
     const execution = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
     // Before this change the single pass left ENTRY_FILLED with no protection
@@ -1333,7 +1335,7 @@ describeDb("real services: same-tick protection", () => {
   it("E2. the STOP reaches the exchange before the take profit", async () => {
     const { scenario } = await restingEntryThatFilled("0.037", true);
 
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
     // Read from the transport log, not from our own ordering assumptions.
     const submitted = exchange.requests
@@ -1349,7 +1351,7 @@ describeDb("real services: same-tick protection", () => {
     // Planned 0.037; the exchange confirms 0.020.
     const { executionId, scenario } = await restingEntryThatFilled("0.020", false);
 
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
     const execution = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
     expect(execution.plannedQuantity.toFixed()).toBe("0.037");
@@ -1376,7 +1378,7 @@ describeDb("real services: same-tick protection", () => {
       data: { entryOrderExpiresAt: new Date(Date.now() - 60_000) },
     });
 
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
     const execution = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
     expect(execution.status).toBe("PROTECTED");
@@ -1392,13 +1394,13 @@ describeDb("real services: same-tick protection", () => {
   it("E5. a further pass adds no second generation and no duplicate submission", async () => {
     const { executionId, scenario } = await restingEntryThatFilled("0.037", true);
 
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
     const afterFirst = await prisma!.binanceOrder.count({ where: { tradeExecutionId: executionId } });
 
     // A second tick, and a THIRD from a completely fresh runtime — the restart
     // case. Neither may mint a new identity.
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
     expect(await prisma!.binanceOrder.count({ where: { tradeExecutionId: executionId } })).toBe(afterFirst);
     const generations = (await prisma!.binanceOrder.findMany({ where: { tradeExecutionId: executionId } }))
@@ -1417,7 +1419,7 @@ describeDb("real services: same-tick protection", () => {
     // 503 would be absorbed by its own backoff and prove nothing.
     exchange.failNext = { path: "/fapi/v3/positionRisk", method: "GET", kind: "REJECT" };
 
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
 
     const deferred = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
     // UNKNOWN is not ABSENT: nothing terminalized, nothing was parked for a
@@ -1427,7 +1429,7 @@ describeDb("real services: same-tick protection", () => {
     expect(exchange.acceptedAlgoIds.size).toBe(0);
 
     // The scheduler fallback still repairs it on the next pass.
-    await freshRuntime(scenario.identity).orchestrator.runExecutionReconciliationTick();
+    await freshRuntime(scenario.profileId).orchestrator.runExecutionReconciliationTick();
     const repaired = await prisma!.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
     expect(repaired.status).toBe("PROTECTED");
   });

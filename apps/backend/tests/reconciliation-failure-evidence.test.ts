@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
 import { connectTestDatabase } from "./helpers/test-database";
+import { testProfileProjection } from "./helpers/bound-runtime";
 
 /**
  * Durable evidence when reconciling ONE execution throws.
@@ -118,7 +119,9 @@ function orchestrator(overrides: Record<string, unknown> = {}) {
     // The real service: the recorder under test lives here, not in the
     // orchestrator, which writes nothing.
     executions: new ExecutionService(prisma!),
-    profileIdentity: { accountIdentifier: `${TAG}-account`, environment: "TESTNET" },
+    // The profile this orchestrator OWNS, projected as production does
+    // from the runtime that also produced its clients' credentials.
+    boundProfile: testProfileProjection({ executionProfileId: profileId }),
   });
 }
 

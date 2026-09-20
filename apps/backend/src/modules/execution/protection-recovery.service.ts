@@ -1,5 +1,7 @@
 import type { PrismaClient, TradeExecution } from "@prisma/client";
 
+import type { BoundExecutionProfileProjection } from "./exchange-runtime-binding";
+
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { connectorEnvironmentMatches } from "../binance/binance-environment";
 import { env } from "../../config/env";
@@ -95,7 +97,14 @@ export class ProtectionRecoveryService {
   constructor(
     private readonly prisma: PrismaClient,
     private readonly readOnly: BinanceReadOnlyService,
-    private readonly executionProfileId: string
+    /**
+     * The bound profile, IMMUTABLE and authoritative for the life of this
+     * service. It carries the environment too, which used to be rediscovered
+     * from the execution's profile row on every gather -- a second source of
+     * truth that could, if that row changed underneath a running process,
+     * silently move the environment judgement to a different account's.
+     */
+    private readonly boundProfile: BoundExecutionProfileProjection
   ) {}
 
   /**
@@ -156,7 +165,7 @@ export class ProtectionRecoveryService {
     // one, and a row that reached here mismatched means something bypassed it.
     if (!this.belongsToBoundProfile(execution)) {
       logger.error(
-        { executionId, boundExecutionProfileId: this.executionProfileId },
+        { executionId, boundExecutionProfileId: this.boundProfile.executionProfileId },
         "Protection recovery refused an execution that bypassed its profile-scoped query"
       );
       return this.result(
@@ -236,11 +245,6 @@ export class ProtectionRecoveryService {
       where: { tradeExecutionId: execution.id, role: { in: ["STOP_LOSS", "TAKE_PROFIT"] } },
     });
 
-    const profile = await this.prisma.executionProfile.findUnique({
-      where: { id: execution.executionProfileId },
-      select: { environment: true },
-    });
-
     const position = await this.fact(async () => {
       const found = await this.readOnly.getPositionForSide(execution.symbol, positionSide);
       if (!found) return "0";
@@ -283,9 +287,12 @@ export class ProtectionRecoveryService {
       protectionReasonCode: protectionRow?.reasonCode
         ? gathered(protectionRow.reasonCode)
         : unavailable("the protection row carries no reason code"),
-      environmentMatches: profile
-        ? gathered(connectorEnvironmentMatches(profile.environment, env.BINANCE_FUTURES_REST_BASE_URL))
-        : unavailable("the execution profile could not be read"),
+      // The BOUND environment, never a fresh read of the execution's profile
+      // row. A row edited after this process bound its runtime must not be
+      // able to move this judgement to another account's environment.
+      environmentMatches: gathered(
+        connectorEnvironmentMatches(this.boundProfile.environment, env.BINANCE_FUTURES_REST_BASE_URL)
+      ),
       positionQuantity: position,
       recordedFillQuantity: execution.filledQuantity
         ? gathered(execution.filledQuantity.toString())
@@ -342,7 +349,7 @@ export class ProtectionRecoveryService {
 
   private async loadStates(executionId: string) {
     const execution = await this.prisma.tradeExecution.findFirst({
-      where: { id: executionId, executionProfileId: this.executionProfileId },
+      where: { id: executionId, executionProfileId: this.boundProfile.executionProfileId },
       select: { status: true },
     });
     const protection = await this.prisma.executionProtectionState.findUnique({
@@ -368,7 +375,7 @@ export class ProtectionRecoveryService {
    */
   private async loadOwnedExecution(executionId: string): Promise<TradeExecution | null> {
     return this.prisma.tradeExecution.findFirst({
-      where: { id: executionId, executionProfileId: this.executionProfileId },
+      where: { id: executionId, executionProfileId: this.boundProfile.executionProfileId },
     });
   }
 
@@ -392,7 +399,7 @@ export class ProtectionRecoveryService {
    * supplied at construction, and no method accepts one.
    */
   get boundExecutionProfileId(): string {
-    return this.executionProfileId;
+    return this.boundProfile.executionProfileId;
   }
 
   /**
@@ -402,7 +409,7 @@ export class ProtectionRecoveryService {
    * consulted.
    */
   private belongsToBoundProfile(execution: TradeExecution): boolean {
-    return execution.executionProfileId === this.executionProfileId;
+    return execution.executionProfileId === this.boundProfile.executionProfileId;
   }
 
   private result(
@@ -436,6 +443,6 @@ type ExactTuple<A extends readonly unknown[], B extends readonly unknown[]> = [A
 
 const protectionRecoveryRequiresAProfile: ExactTuple<
   ConstructorParameters<typeof ProtectionRecoveryService>,
-  [PrismaClient, BinanceReadOnlyService, string]
+  [PrismaClient, BinanceReadOnlyService, BoundExecutionProfileProjection]
 > = true;
 void protectionRecoveryRequiresAProfile;

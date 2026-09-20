@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { Prisma, PrismaClient } from "@prisma/client";
 import { connectTestDatabase } from "./helpers/test-database";
 import type { DynamicLeveragePlan } from "@trading-alert-dashboard/shared";
+import { testProfileProjection } from "./helpers/bound-runtime";
 
 /**
  * Phase 6 integration tests against a real Postgres, with a FAKE mutation
@@ -2903,7 +2904,9 @@ describe("production creation path freezes exchange filters", () => {
           message: "Admission is driven by the test.",
         }),
       } as never,
-      profileIdentity: { accountIdentifier: `${SYNTHETIC_TAG}-account`, environment: "TESTNET" as const },
+      // The profile this orchestrator OWNS, projected as production does
+      // from the runtime that also produced its clients' credentials.
+      boundProfile: testProfileProjection({ executionProfileId: profileId }),
     });
   }
 

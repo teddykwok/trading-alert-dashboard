@@ -120,50 +120,66 @@ describe("every execution discovery query names a profile", () => {
 });
 
 describe("binding happens before discovery, and cannot be aimed", () => {
-  it("the orchestrator resolves the CONFIGURED identity and accepts no other", () => {
+  it("the orchestrator is GIVEN its profile and resolves none of its own", () => {
     const code = codeOf(ORCHESTRATOR);
-    expect(code).toContain("this.deps.profileIdentity ?? configuredProfileIdentity()");
+    // Phase 11D: injected at construction as a projection of the bound
+    // runtime that also produced its clients' credentials.
+    expect(code).toContain("boundProfile: BoundExecutionProfileProjection;");
+    expect(code).toContain("return this.deps.boundProfile.executionProfileId;");
+    // And there is nothing left that could re-resolve a different one.
+    expect(code).not.toContain("resolveExecutionProfile(");
+    expect(code).not.toContain("configuredProfileIdentity()");
     // No caller-supplied selector of any shape.
     for (const forbidden of ["profileId?:", "executionProfileId?:", "--profile-id"]) {
       expect(code).not.toContain(forbidden);
     }
   });
 
-  it("the tick binds before it selects a batch", () => {
+  it("the tick reads its bound profile before it selects a batch", () => {
     const code = codeOf(ORCHESTRATOR);
-    const bind = code.indexOf("const bound = await this.boundProfileId();");
+    const bind = code.indexOf("const boundProfileId = this.boundProfileId();");
     const select = code.indexOf("await this.selectReconciliationBatch(");
     expect(bind).toBeGreaterThan(-1);
     expect(select).toBeGreaterThan(-1);
     expect(bind).toBeLessThan(select);
   });
 
-  it("startup recovery binds before it counts or reconciles", () => {
+  it("startup recovery counts its own profile and no other", () => {
     const code = codeOf(ORCHESTRATOR);
     const startup = code.indexOf("async runStartupRecovery(");
-    const bind = code.indexOf("const bound = await this.boundProfileId();", startup);
-    const count = code.indexOf("this.countRecoveryRequired(", startup);
-    const tick = code.indexOf("this.runExecutionReconciliationTick(", startup);
-    expect(bind).toBeGreaterThan(startup);
-    expect(bind).toBeLessThan(count);
-    expect(bind).toBeLessThan(tick);
+    const count = code.indexOf(
+      "this.countRecoveryRequired(this.boundProfileId())",
+      startup
+    );
+    expect(count).toBeGreaterThan(startup);
   });
 
-  it("an unresolvable profile fails closed rather than falling through", () => {
-    const code = codeOf(ORCHESTRATOR);
-    // Both entry points refuse; neither continues with an undefined id.
-    expect(code.match(/if \(!bound\.ok\) \{/g)).toHaveLength(2);
-    expect(code).not.toMatch(/bound\.ok\s*\?\s*bound\.id\s*:/);
+  it("an unresolvable profile fails closed BEFORE an orchestrator exists", () => {
+    // Phase 11D moved this refusal to the worker's startup barrier: the
+    // orchestrator cannot be constructed without a bound projection, so
+    // there is no per-tick failure branch left to take.
+    const worker = codeOf("src/modules/jobs/vision-analysis.worker.ts");
+    const bind = worker.indexOf("const bound = await bindConfiguredExchangeRuntime(prisma);");
+    const refuse = worker.indexOf("if (!bound.ok) {", bind);
+    const build = worker.indexOf("createExecutionOrchestrator(runtime)");
+    expect(bind).toBeGreaterThan(-1);
+    expect(refuse).toBeGreaterThan(bind);
+    expect(refuse).toBeLessThan(build);
   });
 });
 
 describe("the row identity assertion exists and is unconditional", () => {
   it("reconciliation compares the row to the bound profile before acting", () => {
     const code = codeOf(ORCHESTRATOR);
-    expect(code).toContain("if (execution.executionProfileId !== bound.id) {");
+    expect(code).toContain("if (execution.executionProfileId !== boundProfileId) {");
     // Refused loudly, not skipped quietly.
-    const at = code.indexOf("if (execution.executionProfileId !== bound.id) {");
-    const block = code.slice(at, at + 900);
+    // The RECONCILIATION one, not admission's: both now compare against the
+    // same injected id, and only the loop's copy is indented inside the tick.
+    const at = code.indexOf(
+      "        if (execution.executionProfileId !== boundProfileId) {"
+    );
+    expect(at).toBeGreaterThan(-1);
+    const block = code.slice(at, at + 1200);
     expect(block).toContain("result.failed = true;");
     expect(block).toContain("PROFILE_MISMATCH_REASON_CODE");
     expect(block).toContain("continue;");
@@ -173,7 +189,9 @@ describe("the row identity assertion exists and is unconditional", () => {
     for (const module of [ENTRY_RECOVERY, PROTECTION_RECOVERY]) {
       const code = codeOf(module);
       expect(code).toContain("private belongsToBoundProfile(execution: TradeExecution): boolean {");
-      expect(code).toContain("execution.executionProfileId === this.executionProfileId");
+      expect(code).toContain(
+        "execution.executionProfileId === this.boundProfile.executionProfileId"
+      );
       // The check precedes the first evidence gather in the file.
       const check = code.indexOf("this.belongsToBoundProfile(execution)");
       const gather = code.indexOf("await this.gather(execution)");
@@ -213,7 +231,9 @@ describe("the operator recovery lookups name BOTH the id and the profile", () =>
       expect(at).toBeGreaterThan(-1);
       const body = code.slice(at, at + 400);
       expect(body).toContain("findFirst(");
-      expect(body).toContain("where: { id: executionId, executionProfileId: this.executionProfileId }");
+      expect(body).toContain(
+        "where: { id: executionId, executionProfileId: this.boundProfile.executionProfileId }"
+      );
     });
 
     it(`${description} has no row-addressed execution read left unscoped`, () => {
@@ -273,7 +293,7 @@ describe("the binding is construction-time and read-only", () => {
   it("no recovery service exposes a way to change or supply a profile", () => {
     for (const module of [ENTRY_RECOVERY, PROTECTION_RECOVERY, DRAIN]) {
       const code = codeOf(module);
-      expect(code).toContain("private readonly executionProfileId: string");
+      expect(code).toContain("executionProfileId");
       // A setter, or a method parameter, would reintroduce caller-chosen routing.
       expect(code).not.toMatch(/set\s+\w*[Pp]rofile\w*\s*\(/);
       expect(code).not.toMatch(/this\.executionProfileId\s*=/);
@@ -304,11 +324,32 @@ describe("every runner binds the configured profile before building a client", (
   ] as const;
 
   for (const [module, description] of RUNNERS) {
-    it(`${description} resolves the configured profile and refuses without one`, () => {
+    it(`${description} binds the canonical runtime and refuses without one`, () => {
       const code = codeOf(module);
-      expect(code).toContain("resolveExecutionProfile(prisma, configuredProfileIdentity())");
-      expect(code).toContain("if (!resolution.ok) {");
+      // Phase 11D: ONE binder, and it yields both the profile projection this
+      // command owns and the credentials its clients are built from.
+      expect(code).toContain("bindConfiguredExchangeRuntime(prisma)");
+      expect(code).toContain("if (!bound.ok) {");
       expect(code).toContain("process.exitCode = 1;");
+      // And no independent resolution survives alongside it.
+      expect(code).not.toContain("resolveExecutionProfile(");
+      expect(code).not.toContain("configuredProfileIdentity()");
+    });
+
+    it(`${description} builds no client before the binding succeeds`, () => {
+      const code = codeOf(module);
+      const refuse = code.indexOf("if (!bound.ok) {");
+      const firstClient = Math.min(
+        ...[
+          "new BinanceReadOnlyService(",
+          "new BinanceUsdMExecutionClient(",
+          "new BinanceReadOnlyClient(",
+        ]
+          .map((needle) => code.indexOf(needle))
+          .filter((at) => at > -1)
+      );
+      expect(refuse).toBeGreaterThan(-1);
+      expect(firstClient).toBeGreaterThan(refuse);
     });
 
     it(`${description} accepts no profile argument from the operator`, () => {
@@ -358,6 +399,35 @@ describe("no other production module reintroduces an unscoped execution scan", (
       "configuredExchangeClientOptions",
     ]) {
       expect(code).not.toContain(client);
+    }
+  });
+});
+
+/**
+ * Phase 11D — no service may keep a second source of profile truth.
+ */
+describe("the bound projection is the only profile authority in recovery", () => {
+  it("protection recovery reads no ExecutionProfile row at all", () => {
+    const code = codeOf(PROTECTION_RECOVERY);
+    expect(code).not.toContain("executionProfile.findUnique");
+    expect(code).not.toContain("executionProfile.findFirst");
+    expect(code).not.toContain("prisma.executionProfile");
+  });
+
+  it("its environment comes from the immutable bound projection", () => {
+    const code = codeOf(PROTECTION_RECOVERY);
+    expect(code).toContain("connectorEnvironmentMatches(this.boundProfile.environment");
+    // Construction-time and read-only: no setter, no reassignment.
+    expect(code).toContain("private readonly boundProfile: BoundExecutionProfileProjection");
+    expect(code).not.toMatch(/this\.boundProfile\s*=/);
+  });
+
+  it("neither recovery service resolves a configured profile of its own", () => {
+    for (const module of [ENTRY_RECOVERY, PROTECTION_RECOVERY]) {
+      const code = codeOf(module);
+      expect(code).not.toContain("resolveExecutionProfile(");
+      expect(code).not.toContain("configuredProfileIdentity()");
+      expect(code).not.toContain("bindConfiguredExchangeRuntime(");
     }
   });
 });

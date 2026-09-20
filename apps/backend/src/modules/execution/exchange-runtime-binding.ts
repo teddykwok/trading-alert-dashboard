@@ -68,6 +68,27 @@ export interface ExchangeCredentials {
   toJSON(): string;
 }
 
+/**
+ * The NON-SECRET half of a bound runtime, for the many services that need to
+ * know which profile this process owns and nothing else.
+ *
+ * `accountIdentifier` is deliberately ABSENT. Most consumers -- database
+ * discovery, recovery ownership, environment-dependent judgements -- need an
+ * id and at most an environment, and an operator alias that travels further
+ * than it must is one more thing that can end up in a log line. A service
+ * that genuinely needs the alias should take a narrower projection of its
+ * own rather than widen this one.
+ *
+ * Derived ONLY by `profileProjectionOf`, from an already-bound runtime, so a
+ * projection cannot describe a profile that was never proven.
+ */
+export interface BoundExecutionProfileProjection {
+  readonly executionProfileId: string;
+  readonly exchange: string;
+  readonly product: string;
+  readonly environment: "TESTNET" | "MAINNET";
+}
+
 export interface BoundExchangeRuntime {
   readonly [exchangeRuntimeBound]: true;
   /** The configured profile, with its environment already agreed. */
@@ -213,6 +234,41 @@ export async function bindConfiguredExchangeRuntime(
 }
 
 /**
+ * The non-secret view of a bound runtime.
+ *
+ * Takes the RUNTIME, never a profile id: a projection can only ever describe
+ * the profile this process actually bound, so a caller cannot manufacture one
+ * pointing somewhere else. Carries no credential, so it is safe to hand to a
+ * database-only service.
+ */
+export function profileProjectionOf(
+  runtime: BoundExchangeRuntime
+): BoundExecutionProfileProjection {
+  return {
+    executionProfileId: runtime.profile.executionProfileId,
+    exchange: runtime.profile.exchange,
+    product: runtime.profile.product,
+    environment: runtime.profile.environment,
+  };
+}
+
+/**
+ * The credential options a client constructor is handed, FROM A BOUND RUNTIME.
+ *
+ * This is the production composition surface. `configuredExchangeClientOptions`
+ * remains for the narrow synchronous cases that have no runtime to hand, but an
+ * account-specific production path should reach credentials through the runtime
+ * it also took its profile from -- that pairing is the whole point, and two
+ * independent lookups cannot be proven to agree.
+ */
+export function exchangeClientOptionsOf(runtime: BoundExchangeRuntime): {
+  apiKey: string;
+  apiSecret: string;
+} {
+  return { apiKey: runtime.credentials.apiKey, apiSecret: runtime.credentials.apiSecret };
+}
+
+/**
  * Both factories take exactly what they are allowed to take.
  *
  * Asserted in a typechecked source file rather than a test, because the test
@@ -243,3 +299,16 @@ const runtimeBindingTakesOnlyPrisma: ExactTuple<
   [PrismaClient]
 > = true;
 void runtimeBindingTakesOnlyPrisma;
+
+/** A projection and client options come from a RUNTIME, never from an id. */
+const projectionTakesOnlyARuntime: ExactTuple<
+  Parameters<typeof profileProjectionOf>,
+  [BoundExchangeRuntime]
+> = true;
+void projectionTakesOnlyARuntime;
+
+const clientOptionsTakeOnlyARuntime: ExactTuple<
+  Parameters<typeof exchangeClientOptionsOf>,
+  [BoundExchangeRuntime]
+> = true;
+void clientOptionsTakeOnlyARuntime;

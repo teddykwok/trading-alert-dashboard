@@ -7,6 +7,7 @@ import {
   RECOVERY_REQUIRED_STATUSES,
 } from "../src/modules/execution/execution-orchestrator";
 import { env } from "../src/config/env";
+import { testProfileProjection } from "./helpers/bound-runtime";
 
 /**
  * Phase 11A.1 orchestration tests.
@@ -178,7 +179,9 @@ function harness(options: {
       reconcileProtectionAndClosure: record("protection", "reconcileProtectionAndClosure"),
       attemptProtectionRecovery: record("protection", "attemptProtectionRecovery"),
     } as never,
-    profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
+    // The profile this orchestrator OWNS, projected as production does
+    // from the runtime that also produced its clients' credentials.
+    boundProfile: testProfileProjection({ executionProfileId: profileId }),
   });
 
   return { orchestrator, calls, profileId };
@@ -233,12 +236,19 @@ describe("signal admission", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("blocks when no profile is configured or found", async () => {
-    const { orchestrator, calls } = harness({ executions: [execution()], profile: { id: "x", found: false } });
-    const result = await orchestrator.admitAndSubmit({ executionId: "exec-1" });
-    expect(result.admitted).toBe(false);
-    expect(["PROFILE_NOT_FOUND", "PROFILE_NOT_CONFIGURED"]).toContain((result as { reasonCode: string }).reasonCode);
-    expect(calls).toHaveLength(0);
+  it("cannot even be constructed without a bound profile", () => {
+    // Phase 11D moved this failure EARLIER. Admission used to resolve the
+    // configured profile itself and could report PROFILE_NOT_FOUND; now the
+    // projection arrives at construction, from a runtime that was already
+    // bound, so a process that cannot bind never builds an orchestrator to
+    // ask. The refusal lives in the worker's startup barrier instead.
+    const source = readFileSync(
+      path.join(BACKEND, "src", "modules", "execution", "execution-orchestrator.ts"),
+      "utf8"
+    );
+    expect(source).toContain("boundProfile: BoundExecutionProfileProjection;");
+    expect(source).not.toContain("resolveExecutionProfile(");
+    expect(source).not.toContain("configuredProfileIdentity()");
   });
 
   it("refuses an execution belonging to a different profile", async () => {
@@ -498,7 +508,9 @@ describe("reconciliation routing", () => {
           return { mutationsDispatched: 0 };
         },
       } as never,
-      profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
+      // The profile this orchestrator OWNS, projected as production does
+      // from the runtime that also produced its clients' credentials.
+      boundProfile: testProfileProjection({ executionProfileId: "profile-1" }),
     });
 
     const result = await orchestrator.runExecutionReconciliationTick();
@@ -529,7 +541,9 @@ describe("reconciliation routing", () => {
       admission: {} as never,
       entry: {} as never,
       protection: {} as never,
-      profileIdentity: { accountIdentifier: "alias", environment: "TESTNET" },
+      // The profile this orchestrator OWNS, projected as production does
+      // from the runtime that also produced its clients' credentials.
+      boundProfile: testProfileProjection({ executionProfileId: "profile-1" }),
     });
     const result = await orchestrator.runExecutionReconciliationTick();
     expect(result.failed).toBe(true);
@@ -675,9 +689,13 @@ describe("orchestrator boundary", () => {
 
   it("is registered in the production worker with startup recovery first", () => {
     const worker = readFileSync(path.join(BACKEND, "src", "modules", "jobs", "vision-analysis.worker.ts"), "utf8");
-    expect(worker).toContain("startExecutionOrchestrationScheduler()");
-    expect(worker.match(/startExecutionOrchestrationScheduler\(\)/g)).toHaveLength(1);
-    expect(worker.slice(worker.indexOf('process.on("SIGTERM"'))).toContain("clearInterval(orchestrationTimer)");
+    // Phase 11D: started from the BOUND runtime, inside the startup barrier.
+    expect(worker).toContain("startExecutionOrchestrationScheduler(runtime)");
+    expect(worker.match(/startExecutionOrchestrationScheduler\(runtime\)/g)).toHaveLength(1);
+    expect(worker).toContain("bindConfiguredExchangeRuntime(prisma)");
+    expect(worker.slice(worker.indexOf('process.on("SIGTERM"'))).toContain(
+      "if (orchestrationTimer) clearInterval(orchestrationTimer)"
+    );
 
     const scheduler = readCode(SCHEDULER);
     // Recovery is kicked off before the interval is created.

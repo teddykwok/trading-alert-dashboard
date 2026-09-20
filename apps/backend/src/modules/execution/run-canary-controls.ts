@@ -37,7 +37,12 @@ import {
 import { validateCanarySymbol } from "./canary-symbol-validation";
 import { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { BinanceReadOnlyClient } from "../binance/binance.client";
-import { configuredExchangeClientOptions } from "./exchange-runtime-binding";
+import type { ExecutionProfile, ExecutionSafetyPolicy } from "@prisma/client";
+import {
+  bindConfiguredExchangeRuntime,
+  exchangeClientOptionsOf,
+  type BoundExchangeRuntime,
+} from "./exchange-runtime-binding";
 import { configuredProfileIdentity, resolveExecutionProfile } from "./execution-profile.service";
 
 /**
@@ -113,6 +118,42 @@ async function withPrisma<T>(run: (prisma: PrismaClient) => Promise<T>): Promise
  * everything is still safe. Keeps the profile disabled and its kill switch
  * engaged — preparing is not arming.
  */
+/**
+ * The profile this process is bound to, loaded by the id the binding proved.
+ *
+ * Phase 11D final gate. These commands change durable state for ONE account
+ * and gate that change on SIGNED exchange evidence -- a symbol's leverage
+ * brackets, an account health check inside the preflight. Establishing the
+ * two sides separately (resolve the profile here, bind a runtime there) meant
+ * a decision could in principle be made about one account's rows using
+ * another's exchange state. One binding answers both.
+ *
+ * Returns null AFTER printing the refusal, so callers read as they did before.
+ */
+async function boundProfileForControl(prisma: PrismaClient): Promise<{
+  runtime: BoundExchangeRuntime;
+  profile: ExecutionProfile & { safetyPolicy: ExecutionSafetyPolicy | null };
+} | null> {
+  const bound = await bindConfiguredExchangeRuntime(prisma);
+  if (!bound.ok) {
+    console.log(`BLOCKED — ${bound.reasonCode}: ${bound.message}`);
+    process.exitCode = 1;
+    return null;
+  }
+  const profile = await prisma.executionProfile.findUnique({
+    where: { id: bound.runtime.profile.executionProfileId },
+    include: { safetyPolicy: true },
+  });
+  if (!profile) {
+    // The binding just proved this row exists; losing it between the two
+    // reads is an invariant break, not an ordinary refusal.
+    console.log("BLOCKED — PROFILE_NOT_FOUND: the bound profile row disappeared.");
+    process.exitCode = 1;
+    return null;
+  }
+  return { runtime: bound.runtime, profile };
+}
+
 export async function prepareCanary(): Promise<void> {
   const symbol = (arg("symbol") ?? "").trim().toUpperCase();
   const direction = (arg("direction") ?? "").trim().toUpperCase();
@@ -133,18 +174,16 @@ export async function prepareCanary(): Promise<void> {
   }
 
   await withPrisma(async (prisma) => {
-    const identity = configuredProfileIdentity();
-    const resolution = await resolveExecutionProfile(prisma, identity);
-    if (!resolution.ok) {
-      console.log(`BLOCKED — ${resolution.reasonCode}: ${resolution.message}`);
-      process.exitCode = 1;
-      return;
-    }
-    const profile = resolution.profile;
+    // BIND ONCE: the profile whose rows this command mutates and the
+    // credentials its symbol validation signs with are the same runtime.
+    const control = await boundProfileForControl(prisma);
+    if (!control) return;
+    const { runtime, profile } = control;
 
     // --- Everything must still be SAFE -----------------------------------
     const blockers: string[] = [];
-    if (profile.environment !== "MAINNET") blockers.push(`profile environment is ${profile.environment}, not MAINNET`);
+    if (runtime.profile.environment !== "MAINNET")
+      blockers.push(`profile environment is ${runtime.profile.environment}, not MAINNET`);
     if (profile.isEnabled) blockers.push("profile is already enabled");
     if (profile.safetyPolicy?.killSwitchActive !== true) blockers.push("profile kill switch is already disengaged");
     if (!environmentIsStillSafe()) blockers.push("environment activation gates are not all still safe");
@@ -163,9 +202,12 @@ export async function prepareCanary(): Promise<void> {
     // Read-only exchange metadata, the same GETs the Phase 3 planner uses.
     // Nothing below this point can leave a half-applied state, because the
     // allowlist change and the authorization share one transaction.
+    // `leverageBracket` is SIGNED, so the validator is account-specific --
+    // and it signs with the credentials of the SAME runtime whose profile
+    // this command is about to mutate.
     const validation = await validateCanarySymbol(
       symbol,
-      new BinanceReadOnlyService(new BinanceReadOnlyClient(configuredExchangeClientOptions()))
+      new BinanceReadOnlyService(new BinanceReadOnlyClient(exchangeClientOptionsOf(runtime)))
     );
     if (!validation.ok) {
       console.log(`BLOCKED — ${validation.reasonCode}: ${validation.message}`);
@@ -296,13 +338,12 @@ export async function armCanary(): Promise<void> {
   console.log("");
 
   await withPrisma(async (prisma) => {
-    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
-    if (!resolution.ok) {
-      console.log(`BLOCKED — ${resolution.reasonCode}: ${resolution.message}`);
-      process.exitCode = 1;
-      return;
-    }
-    const profile = resolution.profile;
+    // BIND ONCE: this arm gates on a preflight that makes SIGNED account
+    // checks, so the profile it arms and the account those checks describe
+    // must come from one runtime.
+    const control = await boundProfileForControl(prisma);
+    if (!control) return;
+    const { profile } = control;
     const authorizations = new CanaryAuthorizationService(prisma);
     const active = await authorizations.findActive(profile.id);
     const activeCount = await authorizations.countActive(profile.id);
@@ -848,13 +889,12 @@ export async function armNaturalCanary(): Promise<void> {
   }
 
   await withPrisma(async (prisma) => {
-    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
-    if (!resolution.ok) {
-      console.log(`BLOCKED — ${resolution.reasonCode}: ${resolution.message}`);
-      process.exitCode = 1;
-      return;
-    }
-    const profile = resolution.profile;
+    // BIND ONCE: this arm gates on a preflight that makes SIGNED account
+    // checks, so the profile it arms and the account those checks describe
+    // must come from one runtime.
+    const control = await boundProfileForControl(prisma);
+    if (!control) return;
+    const { profile } = control;
     const policy = profile.safetyPolicy;
     if (!policy) {
       console.log("BLOCKED — the profile has no safety policy row; effective limits cannot be proven.");

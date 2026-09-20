@@ -1,5 +1,10 @@
 import { env } from "../../config/env";
 import { BinanceReadOnlyService } from "./binance-read-only.service";
+import { BinanceReadOnlyClient } from "./binance.client";
+import {
+  exchangeClientOptionsOf,
+  type BoundExchangeRuntime,
+} from "../execution/exchange-runtime-binding";
 import { BinanceError } from "./binance.errors";
 import {
   BinanceAccountSetupClient,
@@ -81,6 +86,59 @@ export interface TestOrderResult {
 
 /** Bounded: an ambiguous validation call is retried at most this many times. */
 export const TEST_ORDER_MAX_ATTEMPTS = 2;
+
+/**
+ * The ONLY way production should build this service.
+ *
+ * Every capability it exposes is signed: account health, position mode,
+ * margin type and the validation test order. Both clients therefore come
+ * from ONE bound runtime rather than each reaching into the environment.
+ * The option defaults in the constructor remain for tests.
+ */
+export function accountConnectionFromRuntime(
+  runtime: BoundExchangeRuntime
+): BinanceAccountConnectionService {
+  const exchange = exchangeClientOptionsOf(runtime);
+  return new BinanceAccountConnectionService({
+    readOnly: new BinanceReadOnlyService(new BinanceReadOnlyClient(exchange)),
+    setupClient: new BinanceAccountSetupClient(exchange),
+  });
+}
+
+/**
+ * The health of an account this process could not bind to.
+ *
+ * Everything false or null, with UNREADABLE rather than "safe": a preflight
+ * that cannot prove which account it is asking about has learned nothing,
+ * and nothing is exactly what it must report. No request is made to build
+ * this -- there is no client to make one with.
+ */
+export function unbindableAccountHealth(reasonCode: string): BinanceAccountHealthDto {
+  return {
+    connected: false,
+    serverTimeReachable: false,
+    signedRequestWorks: false,
+    futuresAccountReachable: false,
+    positionMode: null,
+    assetMode: null,
+    nonZeroPositionCount: null,
+    openOrderCount: null,
+    symbolConfigReachable: false,
+    leverageBracketReachable: false,
+    clockOffsetMs: null,
+    accountSetupSafe: false,
+    testOrderCapabilityConfigured: false,
+    accountSetupMutationsConfigured: false,
+    liveEntryEnabled: false,
+    protectionReady: false,
+    readinessCodes: [],
+    readinessState: "NOT_CONNECTED",
+    checkedAt: new Date().toISOString(),
+    warnings: [
+      `The configured exchange runtime could not be bound (${reasonCode}); no signed request was attempted.`,
+    ],
+  };
+}
 
 export class BinanceAccountConnectionService {
   private readonly readOnly: BinanceReadOnlyService;

@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
 import { connectTestDatabase } from "./helpers/test-database";
+import { testProfileProjection } from "./helpers/bound-runtime";
 
 /**
  * Whether the reconciliation batch can starve a row it never reaches.
@@ -159,7 +160,9 @@ function workerOrchestrator(visited: string[]) {
     entry: new EntryLifecycleService(prisma!, readOnlyStub as never, mutationStub as never),
     protection: spied as never,
     executions: new ExecutionService(prisma!),
-    profileIdentity: { accountIdentifier: `${TAG}-account`, environment: "TESTNET" },
+    // The profile this orchestrator OWNS, projected as production does
+    // from the runtime that also produced its clients' credentials.
+    boundProfile: testProfileProjection({ executionProfileId: profileId }),
   });
 }
 
