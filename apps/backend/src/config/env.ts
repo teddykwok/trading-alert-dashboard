@@ -1,4 +1,12 @@
-import "dotenv/config";
+// Phase 11F.1 -- NOT `import "dotenv/config"`.
+//
+// dotenv is no longer the first loader to touch this process: the generated
+// Prisma client loads the repository `.env` at ITS module initialization, and
+// neither loader overrides a key that is already set. Whichever ran first won,
+// which is how a process launched with DOTENV_CONFIG_PATH could end up holding
+// another account's identity and credentials. `runtime-env` owns that ordering
+// and is the only place the environment is materialised.
+import { ensureRuntimeEnvBootstrapped } from "./runtime-env";
 import { z } from "zod";
 // The CANONICAL Extreme-RR lookback vocabulary and its single membership
 // test. Imported rather than re-listed: a second copy of [50,100,200,300]
@@ -28,6 +36,14 @@ import {
   MAX_INGEST_HORIZON_DAYS,
   MIN_INGEST_HORIZON_DAYS,
 } from "../modules/execution/exchange-fill-day-roots";
+
+// Materialise the environment before a single variable is read from it.
+//
+// An entrypoint that declared a mode has already done this and gets the
+// memoised result; anything else -- a library, a test, an entrypoint not yet
+// migrated -- lands here and receives exactly what `import "dotenv/config"`
+// used to give it, plus a refusal in the one case that can be proven wrong.
+ensureRuntimeEnvBootstrapped();
 
 /**
  * Decimal-string config values. Validated as plain decimal literals and kept

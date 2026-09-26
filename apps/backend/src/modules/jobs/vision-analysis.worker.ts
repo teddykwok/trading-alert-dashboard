@@ -1,3 +1,11 @@
+// Phase 11F.1 -- MUST be the first import in this file.
+//
+// Static imports are hoisted and evaluated in source order, and the generated
+// Prisma client loads the repository `.env` at its own module initialization.
+// Anything imported above this line would let that happen first, and a generic
+// process would silently acquire the account credentials that file holds.
+import "../../config/bootstrap-generic";
+
 import path from "node:path";
 import { Worker, type Job } from "bullmq";
 import { EXTREME_RR_QUEUE_NAME, VISION_ANALYSIS_QUEUE_NAME } from "@trading-alert-dashboard/shared";

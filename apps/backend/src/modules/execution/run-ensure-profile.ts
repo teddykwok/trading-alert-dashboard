@@ -1,3 +1,12 @@
+// Phase 11F.1 -- MUST be the first import in this file.
+//
+// Static imports are hoisted and evaluated in source order. The generated
+// Prisma client loads the repository `.env` at its own module initialization,
+// and neither loader overrides what is already set -- so an import above this
+// line would hand this process the repository's account instead of the one
+// DOTENV_CONFIG_PATH names, with every log line reporting the wrong one.
+import "../../config/bootstrap-account";
+
 import { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { configuredProfileIdentity, ensureExecutionProfile } from "./execution-profile.service";
