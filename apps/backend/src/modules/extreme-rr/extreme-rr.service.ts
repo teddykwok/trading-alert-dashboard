@@ -27,10 +27,7 @@ import type { SnapshotCandle } from "../market-data/market-data.types";
 import { RiskTemplateRepository } from "../risk-template/risk-template.repository";
 import { inferMarketType } from "../../utils/symbol";
 import { NotFoundError, ValidationError } from "../../utils/errors";
-import {
-  configuredProfileIdentity,
-  resolveExecutionProfile,
-} from "../execution/execution-profile.service";
+import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import type { ExtremeRRSelectionInput } from "./extreme-rr.schema";
 
@@ -58,41 +55,35 @@ const defaultCandleFetcher: SnapshotCandleFetcher = (alert, cutoff, limit) => {
 /**
  * The INITIAL `selectedLookback` a NEW plan starts on.
  *
- * Read from the operator's durable policy on the configured execution
- * profile — the same single profile every other operator policy resolves to,
- * so there is no ambiguity about which one governs a plan.
+ * Phase 11F -- GLOBAL, because the plan it shapes is global.
  *
- * Two deliberate behaviours:
+ * Since 11E one ExtremeRRPlan is generated per alert and adopted
+ * INDEPENDENTLY by every account. An input that belonged to one account's
+ * ExecutionProfile therefore shaped a plan the other account would also
+ * trade -- and after the 11F split the generic processes hold no account at
+ * all, so reading a profile here would either fail or quietly mean
+ * 'whichever account this process happens to be'.
  *
- *   - a profile or policy that cannot be resolved yields the shipped default,
- *     because that is genuinely the pre-feature behaviour and an unconfigured
- *     system planned at 300 before this column existed;
- *   - a policy row that HOLDS an unsupported number THROWS. It is invalid
- *     configuration, not a request to fall back, and quietly planning at 300
- *     would build a trade from a window the operator never chose. Both
- *     callers already treat a throw as a recorded, non-fatal failure, so the
- *     alert still ingests and nothing is planned on a guess.
+ * So the value is deployment configuration, read by whichever process is
+ * generating: no profile, no database, no credentials.
+ *
+ * An unsupported value cannot reach here: `config/env` validates the key
+ * against the same canonical vocabulary at parse time, so a process holding
+ * one never starts. The check below is retained for two reasons that are
+ * both real -- it NARROWS `number` to `ExtremeRRLookback` for the type, and
+ * it keeps the refusal local to the exported, injectable resolver. It has
+ * never been a fallback: quietly planning at 300 would build a trade from a
+ * window the operator never chose.
  */
-export type InitialLookbackResolver = () => Promise<ExtremeRRLookback>;
+/** Injectable so a test can pin the window without touching configuration. */
+export type InitialLookbackResolver = () => ExtremeRRLookback | Promise<ExtremeRRLookback>;
 
-export async function resolveInitialLookback(prisma: PrismaClient): Promise<ExtremeRRLookback> {
-  let stored: unknown;
-  try {
-    const resolution = await resolveExecutionProfile(prisma, configuredProfileIdentity());
-    // No profile, or no policy row, is the PRE-FEATURE situation: nothing has
-    // ever expressed a preference, and the system planned at 300 before this
-    // column existed. Being unable to READ is not the same as holding a value
-    // nobody recognises, and only the latter is a misconfiguration.
-    if (!resolution.ok) return EXTREME_RR_DEFAULT_LOOKBACK;
-    stored = resolution.profile.safetyPolicy?.extremeRrLookbackCandles;
-  } catch {
-    return EXTREME_RR_DEFAULT_LOOKBACK;
-  }
-  if (stored === undefined || stored === null) return EXTREME_RR_DEFAULT_LOOKBACK;
+export function resolveInitialLookback(): ExtremeRRLookback {
+  const stored: unknown = env.EXTREME_RR_LOOKBACK_CANDLES;
   if (!isExtremeRRLookback(stored)) {
-    // Invalid configuration. Refusing here is the whole point: quietly using
-    // 300 would build a trade from a window the operator never chose, and both
-    // callers already record a throw as a non-fatal, visible failure.
+    // Unreachable through configuration -- `config/env` already refused it --
+    // and deliberately still here: it is what narrows the number to the
+    // vocabulary type, and a refusal is never a coercion.
     throw new Error(
       `The configured Extreme RR lookback (${stored}) is not one of ` +
         `${EXTREME_RR_LOOKBACKS.join(", ")}; refusing to plan on an unrecognised window.`
@@ -251,7 +242,7 @@ export class ExtremeRRService {
      * geometry be tested without a database, and lets a test state the policy
      * a plan was generated under instead of staging one.
      */
-    private readonly resolveLookback: InitialLookbackResolver = () => resolveInitialLookback(prisma)
+    private readonly resolveLookback: InitialLookbackResolver = resolveInitialLookback
   ) {
     this.riskTemplates = new RiskTemplateRepository(prisma);
   }

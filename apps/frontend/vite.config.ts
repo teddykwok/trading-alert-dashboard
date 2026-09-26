@@ -8,6 +8,13 @@ export default defineConfig(({ mode }) => {
   // hostname — without hardcoding it. Vite always allows localhost and IP
   // addresses on its own; this list only ADDS explicit extra hosts.
   const env = loadEnv(mode, process.cwd(), "VITE_");
+  // Where THIS dashboard sends operator control traffic. Deployment supplies
+  // it; there is deliberately no default, because a guessed port would either
+  // reach nothing or, worse, reach a different account's control plane. Unset
+  // means operator requests fall through to the generic backend and 404 --
+  // a loud, debuggable failure rather than a silent wrong target.
+  const accountControlUrl = (env.VITE_ACCOUNT_CONTROL_URL ?? "").trim();
+
   const allowedHosts = (env.VITE_DEV_ALLOWED_HOSTS ?? "")
     .split(",")
     .map((host) => host.trim())
@@ -40,6 +47,20 @@ export default defineConfig(({ mode }) => {
       //   /socket.io/*  -> Socket.IO (default path; ws:true for the upgrade)
       //   /screenshots/*-> Fastify static (used by ScreenshotPreview)
       proxy: {
+        // Phase 11F: LONGEST PREFIX FIRST. Vite matches proxy contexts in
+        // declaration order (`for (const context in proxies)` with
+        // `url.startsWith(context)`), so this entry must precede "/api" or the
+        // generic backend would swallow operator traffic.
+        //
+        // Operator control moved to a per-account process that holds that
+        // account's credentials; the generic backend no longer mounts those
+        // routes. The browser is unaffected: it still makes same-origin
+        // relative requests and still sends the operator token header.
+        // VITE_ACCOUNT_CONTROL_URL selects WHICH account this dashboard
+        // controls -- deployment configuration, never a request parameter.
+        ...(accountControlUrl
+          ? { "/api/operator": { target: accountControlUrl, changeOrigin: true } }
+          : {}),
         "/api": { target: "http://127.0.0.1:4000", changeOrigin: true },
         "/socket.io": { target: "http://127.0.0.1:4000", changeOrigin: true, ws: true },
         "/screenshots": { target: "http://127.0.0.1:4000", changeOrigin: true },

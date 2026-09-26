@@ -77,45 +77,81 @@ describe("rr lookback: the supported vocabulary", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Resolver: unreadable is NOT the same as invalid
+// Resolver: GLOBAL configuration, and invalid is still refused
 // ---------------------------------------------------------------------------
 
 describe("rr lookback: resolving the initial value for a NEW plan", () => {
-  const prismaWithPolicy = (extremeRrLookbackCandles: unknown) =>
-    ({
-      executionProfile: {
-        findMany: vi.fn().mockResolvedValue([
-          {
-            id: "profile-1",
-            isEnabled: false,
-            safetyPolicy: { extremeRrLookbackCandles },
-          },
-        ]),
-      },
-    }) as unknown as PrismaClient;
+  /**
+   * Phase 11F moved this input off the ExecutionProfile.
+   *
+   * Since 11E one ExtremeRRPlan is generated per alert and adopted
+   * INDEPENDENTLY by every account, so a window owned by one account's policy
+   * shaped a plan the other account would also trade. It is deployment
+   * configuration now, and the resolver takes no database at all.
+   *
+   * `env` is frozen at module import, so each case re-imports the module under
+   * a pinned environment rather than mutating a value already read.
+   */
+  async function resolveUnder(value: string | undefined) {
+    const previous = process.env.EXTREME_RR_LOOKBACK_CANDLES;
+    if (value === undefined) delete process.env.EXTREME_RR_LOOKBACK_CANDLES;
+    else process.env.EXTREME_RR_LOOKBACK_CANDLES = value;
+    vi.resetModules();
+    try {
+      const module = await import("../src/modules/extreme-rr/extreme-rr.service");
+      return module.resolveInitialLookback();
+    } finally {
+      if (previous === undefined) delete process.env.EXTREME_RR_LOOKBACK_CANDLES;
+      else process.env.EXTREME_RR_LOOKBACK_CANDLES = previous;
+      vi.resetModules();
+    }
+  }
 
-  it("falls back to 300 when NO profile or policy can be read", async () => {
+  it("uses the GLOBAL configured window", async () => {
+    await expect(resolveUnder("200")).resolves.toBe(200);
+    await expect(resolveUnder("50")).resolves.toBe(50);
+  });
+
+  it("falls back to 300 when nothing is configured", async () => {
     // The pre-feature situation: nothing has ever expressed a preference, and
-    // the system planned at 300 before the column existed.
-    const empty = {
-      executionProfile: { findMany: vi.fn().mockResolvedValue([]) },
-    } as unknown as PrismaClient;
-    await expect(resolveInitialLookback(empty)).resolves.toBe(300);
+    // the system planned at 300 before this was configurable.
+    await expect(resolveUnder(undefined)).resolves.toBe(300);
   });
 
-  it("falls back to 300 when the profile read THROWS", async () => {
-    const broken = {
-      executionProfile: { findMany: vi.fn().mockRejectedValue(new Error("db down")) },
-    } as unknown as PrismaClient;
-    await expect(resolveInitialLookback(broken)).resolves.toBe(300);
+  it("REFUSES an unsupported value at CONFIG PARSE, before any plan", async () => {
+    // The regression this closes: 500 used to pass startup, let all four
+    // processes become operational, and only fail when the first alert tried
+    // to generate a plan -- long after a rollout would have been accepted.
+    //
+    // `config/env` throws while the module graph loads, so the failure
+    // arrives here, at import, rather than at generation time.
+    await expect(resolveUnder("150")).rejects.toThrow(/Invalid environment variables/);
   });
 
-  it("REFUSES rather than coercing when the stored value is unsupported", async () => {
-    // Being unable to READ is not the same as holding a number nobody
-    // recognises. Only the latter is a misconfiguration, and it must not
-    // silently become 300.
-    await expect(resolveInitialLookback(prismaWithPolicy(150))).rejects.toThrow(/not one of/);
-    await expect(resolveInitialLookback(prismaWithPolicy(0))).rejects.toThrow(/refusing to plan/);
+  it("needs no database, no profile and no credentials", async () => {
+    // The generic runtimes hold none of those after the 11F split, and plan
+    // generation happens there.
+    const previous = { ...process.env };
+    for (const key of [
+      "EXECUTION_PROFILE_ACCOUNT_IDENTIFIER",
+      "BINANCE_API_KEY",
+      "BINANCE_API_SECRET",
+    ]) {
+      delete process.env[key];
+    }
+    process.env.EXTREME_RR_LOOKBACK_CANDLES = "100";
+    vi.resetModules();
+    try {
+      const module = await import("../src/modules/extreme-rr/extreme-rr.service");
+      // Synchronous, and takes no arguments: there is nothing to pass a
+      // PrismaClient to any more.
+      expect(module.resolveInitialLookback.length).toBe(0);
+      expect(module.resolveInitialLookback()).toBe(100);
+    } finally {
+      for (const key of Object.keys(process.env)) delete process.env[key];
+      Object.assign(process.env, previous);
+      vi.resetModules();
+    }
   });
 });
 
@@ -267,6 +303,168 @@ describe("rr lookback: existing plans are frozen", () => {
 // ---------------------------------------------------------------------------
 // B. Migration
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Phase 11F: the window is GLOBAL, and nothing may quietly re-own it
+// ---------------------------------------------------------------------------
+
+describe("rr lookback: global ownership cannot be taken back", () => {
+  const codeOf = (relative: string) =>
+    readFileSync(path.join(BACKEND, relative), "utf8")
+      .replace(/(^|[^:])\/\/.*$/gm, "$1")
+      .replace(/\/\*[\s\S]*?\*\//g, "");
+
+  const GENERATION = "src/modules/extreme-rr/extreme-rr.service.ts";
+  const OPERATOR = "src/modules/operator/extreme-rr-lookback.service.ts";
+  const ROUTES = "src/routes/operator.routes.ts";
+
+  it("plan generation resolves no account identity and no profile", () => {
+    // The whole point. Since 11E one plan is generated per alert and adopted
+    // independently by every account, so an input owned by one account's
+    // profile shaped a plan the other account would also trade. After the
+    // 11F split the generic runtimes hold no account at all, so reading a
+    // profile here would silently mean 'whichever account this process is'.
+    const code = codeOf(GENERATION);
+    for (const forbidden of [
+      "configuredProfileIdentity",
+      "resolveExecutionProfile",
+      "extremeRrLookbackCandles",
+      "execution-profile.service",
+    ]) {
+      expect(`${forbidden} in plan generation: ${code.includes(forbidden)}`).toBe(
+        `${forbidden} in plan generation: false`
+      );
+    }
+    expect(code).toContain("env.EXTREME_RR_LOOKBACK_CANDLES");
+  });
+
+  it("the resolver takes no arguments, so no caller can aim it at a profile", () => {
+    // A signature that still accepted a PrismaClient would leave the door
+    // open for a caller to hand it a per-account read again.
+    expect(resolveInitialLookback.length).toBe(0);
+  });
+
+  it("the operator control reports the global window and writes nothing", () => {
+    const code = codeOf(OPERATOR);
+    expect(code).toContain("env.EXTREME_RR_LOOKBACK_CANDLES");
+    // No write of the legacy column, and no profile resolution left.
+    for (const forbidden of [
+      "executionSafetyPolicy.update",
+      "extremeRrLookbackCandles: requested",
+      "configuredProfileIdentity",
+      "resolveExecutionProfile",
+    ]) {
+      expect(`${forbidden} in operator control: ${code.includes(forbidden)}`).toBe(
+        `${forbidden} in operator control: false`
+      );
+    }
+  });
+
+  it("both operator endpoints stay behind the operator auth boundary", () => {
+    // Moving a value to global configuration must not make reading or
+    // attempting to write it public. Both handlers keep the same preHandler
+    // every other operator route uses.
+    const routes = codeOf(ROUTES);
+    const block = routes.slice(
+      routes.indexOf('"/api/operator/trading-control/rr-lookback"'),
+      routes.indexOf('"/api/operator/trading-control/policy"')
+    );
+    expect(block.match(/requireOperatorAuth/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+  });
+
+  it("the legacy column is marked, and read by nothing that plans", () => {
+    const schema = readFileSync(path.join(BACKEND, "prisma/schema.prisma"), "utf8");
+    expect(schema).toContain("LEGACY_UNUSED since Phase 11F");
+    // Retained because dropping it needs a migration this slice does not
+    // carry -- but nothing may read it to shape a plan.
+    expect(schema).toContain("extremeRrLookbackCandles Int @default(300)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 11F: invalid configuration fails BEFORE runtime acceptance
+// ---------------------------------------------------------------------------
+
+describe("rr lookback: configuration is validated at parse time", () => {
+  /**
+   * Loads `config/env` under a pinned value and reports what happened.
+   *
+   * `env` is parsed once at module import and throws on a bad schema, so this
+   * is the same code path every process takes at startup: a rejection here is
+   * a process that never becomes operational.
+   */
+  async function parseUnder(value: string | undefined) {
+    const previous = process.env.EXTREME_RR_LOOKBACK_CANDLES;
+    if (value === undefined) delete process.env.EXTREME_RR_LOOKBACK_CANDLES;
+    else process.env.EXTREME_RR_LOOKBACK_CANDLES = value;
+    vi.resetModules();
+    try {
+      const module = await import("../src/config/env");
+      return { ok: true as const, value: module.env.EXTREME_RR_LOOKBACK_CANDLES };
+    } catch (error) {
+      return { ok: false as const, error: error as Error };
+    } finally {
+      if (previous === undefined) delete process.env.EXTREME_RR_LOOKBACK_CANDLES;
+      else process.env.EXTREME_RR_LOOKBACK_CANDLES = previous;
+      vi.resetModules();
+    }
+  }
+
+  it.each(EXTREME_RR_LOOKBACKS)("%i is accepted", async (supported) => {
+    const result = await parseUnder(String(supported));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value).toBe(supported);
+  });
+
+  it.each([500, 150, 301, 0, -1, -300])(
+    "%i is REFUSED at parse, so no process becomes operational",
+    async (unsupported) => {
+      const result = await parseUnder(String(unsupported));
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.message).toMatch(/Invalid environment variables/);
+    }
+  );
+
+  it("an unset value keeps the shipped default", async () => {
+    const result = await parseUnder(undefined);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value).toBe(300);
+  });
+
+  it("the GENERIC backend cannot reach a healthy start on a bad value", async () => {
+    // server.ts imports config/env at module load, so the throw happens before
+    // buildApp, before listen and before anything reports health. Proven by
+    // loading the same module the entrypoint loads first.
+    const result = await parseUnder("500");
+    expect(result.ok).toBe(false);
+
+    const server = readFileSync(path.join(BACKEND, "src/server.ts"), "utf8");
+    const envImport = server.indexOf('from "./config/env"');
+    expect(envImport).toBeGreaterThan(-1);
+    // Imported, not lazily required inside start(): a deferred read would let
+    // the process listen first and fail afterwards.
+    expect(server.indexOf("async function start(")).toBeGreaterThan(envImport);
+  });
+
+  it("validates against the canonical vocabulary, not a second copy", async () => {
+    // A literal [50, 100, 200, 300] in the env schema would be a second
+    // vocabulary, free to drift from the one the planner uses.
+    const raw = readFileSync(path.join(BACKEND, "src/config/env.ts"), "utf8");
+    // Comments may NAME the vocabulary; code may not re-declare it.
+    const source = raw
+      .replace(/(^|[^:])\/\/.*$/gm, "$1")
+      .replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(source).toContain("isExtremeRRLookback");
+    expect(source).toContain("EXTREME_RR_LOOKBACKS");
+    expect(source).toContain("refine(isExtremeRRLookback");
+    expect(`literal vocabulary in env schema: ${/\[\s*50\s*,\s*100\s*,\s*200\s*,\s*300\s*\]/.test(source)}`).toBe(
+      `literal vocabulary in env schema: false`
+    );
+  });
+});
 
 describe("rr lookback: the migration", () => {
   const migration = readFileSync(

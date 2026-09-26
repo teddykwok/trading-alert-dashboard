@@ -539,6 +539,12 @@ model ExecutionSafetyPolicy {
   // 300 is the pre-feature behaviour and therefore the default. A value
   // outside 50/100/200/300 is invalid configuration, not a request to fall
   // back: planning refuses rather than quietly using 300.
+  // LEGACY_UNUSED since Phase 11F. The Extreme-RR plan-generation window is
+  // GLOBAL deployment configuration (EXTREME_RR_LOOKBACK_CANDLES): one plan is
+  // generated per alert and adopted independently by every account, so the
+  // window that shapes it cannot belong to one account's profile. Nothing
+  // reads this column for planning; it is retained only because dropping it
+  // needs a migration, which 11F deliberately does not carry.
   extremeRrLookbackCandles Int @default(300)
 
   version   Int      @default(1)

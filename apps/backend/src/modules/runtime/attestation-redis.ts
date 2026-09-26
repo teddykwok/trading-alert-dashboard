@@ -59,8 +59,32 @@ export const ATTESTATION_REDIS_MAX_RETRIES_PER_REQUEST = 2;
  */
 export const ATTESTATION_REDIS_QUIT_TIMEOUT_MS = 1_000;
 
+/**
+ * How long the FIRST publish may wait for a writable link.
+ *
+ * Phase 11F. `enableOfflineQueue: false` is the right bias for a heartbeat
+ * -- fail fast rather than queue forever -- but it also means a command
+ * issued before the socket is ready is rejected immediately, with an error
+ * that carries no errno and therefore reads as a bare `Error` in the log.
+ * The publisher used to call `publishOnce()` the instant it started, racing
+ * a connection ioredis establishes asynchronously, so a perfectly healthy
+ * runtime logged a heartbeat failure on every boot.
+ *
+ * Waiting is bounded and generous relative to connecting (3s) while staying
+ * inside the 15s attestation TTL: a link that cannot become writable in this
+ * time is a real fault, and the correct outcome is no attestation at all.
+ */
+export const ATTESTATION_REDIS_READY_TIMEOUT_MS = 5_000;
+
 export interface AttestationRedisClient {
   redis: RuntimeAttestationRedis;
+  /**
+   * Resolves once the link can carry a command, rejects when it cannot.
+   *
+   * Bounded: a connection that never becomes ready must not hold a runtime's
+   * first heartbeat open indefinitely -- it must fail, and fail visibly.
+   */
+  waitUntilReady(timeoutMs?: number): Promise<void>;
   /** Closes the connection. Safe to call when it was never established. */
   close(): Promise<void>;
 }
@@ -104,6 +128,33 @@ export function createAttestationRedisClient(
 
   return {
     redis: client as unknown as RuntimeAttestationRedis,
+    async waitUntilReady(timeoutMs: number = ATTESTATION_REDIS_READY_TIMEOUT_MS) {
+      if (client.status === "ready") return;
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          client.off("ready", onReady);
+          client.off("error", onError);
+          if (error) reject(error);
+          else resolve();
+        };
+        const onReady = () => finish();
+        // The connection error is reported by TYPE only, exactly as every
+        // other failure here: ioredis puts the endpoint into the message and
+        // the endpoint is part of REDIS_URL.
+        const onError = (error: Error) => finish(error);
+        const timer = setTimeout(
+          () => finish(new Error("attestation redis did not become ready")),
+          timeoutMs
+        );
+        timer.unref?.();
+        client.once("ready", onReady);
+        client.once("error", onError);
+      });
+    },
     async close() {
       let timer: NodeJS.Timeout | undefined;
       try {

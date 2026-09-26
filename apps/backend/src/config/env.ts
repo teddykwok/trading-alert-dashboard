@@ -1,5 +1,18 @@
 import "dotenv/config";
 import { z } from "zod";
+// The CANONICAL Extreme-RR lookback vocabulary and its single membership
+// test. Imported rather than re-listed: a second copy of [50,100,200,300]
+// in this schema would be a second vocabulary, free to drift from the one
+// the planner actually uses.
+//
+// No cycle is possible: @trading-alert-dashboard/shared does not depend on
+// the backend. Its only runtime dependency is decimal.js, which every
+// backend process already loads through the modules that import shared
+// (queue.ts among them), so this changes load ORDER, not the load set.
+import {
+  EXTREME_RR_LOOKBACKS,
+  isExtremeRRLookback,
+} from "@trading-alert-dashboard/shared";
 // Dependency-free pure module: safe to import here, and the single home of the
 // role-specific protection working types.
 import {
@@ -71,6 +84,18 @@ const envSchema = z.object({
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
   REDIS_URL: z.string().min(1, "REDIS_URL is required"),
   BACKEND_PORT: z.coerce.number().int().positive().default(4000),
+  // Phase 11F -- the ACCOUNT CONTROL plane's listener.
+  //
+  // No default, on purpose. The generic backend owns 4000; an account
+  // control plane that defaulted anywhere would either fight it for the port
+  // or appear on one nobody chose. Deployment supplies it per account, from
+  // that account's own env file, and the entrypoint refuses to start without
+  // it. Optional in the schema so the generic processes are unaffected.
+  ACCOUNT_CONTROL_PORT: z.coerce.number().int().positive().optional(),
+  // Loopback by DEFAULT. This plane holds an account's credentials and
+  // performs signed reads; it must not become externally reachable just
+  // because it was given a port. Exposure is an explicit act.
+  ACCOUNT_CONTROL_HOST: z.string().min(1).default("127.0.0.1"),
   FRONTEND_URL: z.string().min(1).default("http://localhost:5173"),
   // OPTIONAL base URL for dashboard links shared OUTSIDE the app (e.g.
   // Telegram messages opened on a phone). Leave unset/empty when the
@@ -100,6 +125,33 @@ const envSchema = z.object({
     .transform((value) => value === "true"),
   AI_VISION_MAX_IMAGE_BYTES: z.coerce.number().int().positive().default(5_000_000),
   DUPLICATE_SUPPRESSION_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
+  // Phase 11F -- the GLOBAL Extreme-RR plan-generation lookback.
+  //
+  // Since 11E an ExtremeRRPlan is generated ONCE and adopted independently
+  // by every account, so the input that generates it cannot belong to an
+  // account. It used to be read from the configured ExecutionProfile's
+  // safety policy, which meant the shared plan was silently shaped by
+  // whichever account the generating process happened to be configured for.
+  //
+  // Validated against the canonical vocabulary HERE, at configuration parse,
+  // so an unsupported deployment value can never reach a running process.
+  //
+  // Without this a value like 500 passed startup, every process became
+  // operational, health and attestation proofs all succeeded, and the
+  // deployment only failed when the first alert tried to generate a plan --
+  // long after a rollout would have been accepted. Invalid configuration
+  // must fail before runtime acceptance, not during it.
+  //
+  // A refusal, never a coercion: silently planning at 300 would build trades
+  // from a window the operator never chose.
+  EXTREME_RR_LOOKBACK_CANDLES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(300)
+    .refine(isExtremeRRLookback, {
+      message: `must be one of ${EXTREME_RR_LOOKBACKS.join(", ")}`,
+    }),
   // --- Bounded data retention (see modules/retention) ---
   // The dashboard is a short-lived inspection window; Excel (outside this app)
   // is the permanent record. Retention deletes old screenshots first, then old
@@ -512,25 +564,23 @@ const envSchema = z.object({
     });
   }
 
-  // Credentials are only required once the read-only connector is switched
-  // on. With BINANCE_READ_ONLY_ENABLED=false (the default) the backend starts
-  // with no Binance keys at all.
-  if (value.BINANCE_READ_ONLY_ENABLED) {
-    if (!value.BINANCE_API_KEY) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["BINANCE_API_KEY"],
-        message: "BINANCE_API_KEY is required when BINANCE_READ_ONLY_ENABLED=true",
-      });
-    }
-    if (!value.BINANCE_API_SECRET) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["BINANCE_API_SECRET"],
-        message: "BINANCE_API_SECRET is required when BINANCE_READ_ONLY_ENABLED=true",
-      });
-    }
-  }
+  // Phase 11F -- credential presence is NOT a global configuration rule.
+  //
+  // This used to require BINANCE_API_KEY and BINANCE_API_SECRET whenever
+  // BINANCE_READ_ONLY_ENABLED was true, which was right while every backend
+  // process was account-bound. After the 11F split two processes are not:
+  // the generic backend and the generic analysis worker hold no account and
+  // build no exchange client, yet they parse this same schema -- so the rule
+  // stopped them booting on a credential they have no use for, while the
+  // safe posture (read-only enabled) is exactly what they should keep.
+  //
+  // Enforcement did not disappear; it belongs where the credential is
+  // actually consumed. `resolveConfiguredExchangeCredentials` refuses with
+  // EXCHANGE_CREDENTIALS_MISSING and `configuredExchangeClientOptions`
+  // throws, so no signed client can be constructed without one. Both
+  // account entrypoints reach that seam BEFORE they attest, listen as
+  // account-ready, or orchestrate -- which is strictly earlier than the
+  // first signed request this rule used to protect.
 });
 
 const parsed = envSchema.safeParse(process.env);

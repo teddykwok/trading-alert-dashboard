@@ -15,7 +15,13 @@ import {
 } from "../../features/operator/tradingControlActions";
 
 /**
- * The operator's Extreme RR lookback selector.
+ * The operator's GLOBAL Extreme RR lookback view.
+ *
+ * Phase 11F: one ExtremeRRPlan is generated per alert and adopted
+ * independently by every account, so the window that shapes it is global
+ * deployment configuration rather than one account's policy. The server
+ * refuses a save and says why; this panel renders that refusal with the
+ * same machinery it already used for every other blocked save.
  *
  * The value chooses how many closed candles a NEW plan searches for its
  * extreme — the highest high for a LONG, the lowest low for a SHORT. It is the
@@ -87,7 +93,7 @@ export function RrLookbackEditor({
   return (
     <Card className="space-y-3 p-4">
       <div>
-        <h2 className="text-sm font-semibold text-slate-100">Extreme RR lookback</h2>
+        <h2 className="text-sm font-semibold text-slate-100">Global Extreme RR lookback</h2>
         <p className="text-xs text-slate-400">
           How many closed candles a NEW plan searches for its extreme. Existing plans and
           executions keep the window they were built under. Editable only while SAFE OFF.
@@ -115,7 +121,7 @@ export function RrLookbackEditor({
       ) : (
         <>
           <fieldset className="flex flex-wrap gap-3" disabled={busy}>
-            <legend className="sr-only">Extreme RR lookback candles</legend>
+            <legend className="sr-only">Global Extreme RR lookback candles</legend>
             {supported.map((candles) => (
               <label key={candles} className="flex items-center gap-1.5 text-xs text-slate-200">
                 <input

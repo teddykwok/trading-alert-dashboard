@@ -32,6 +32,11 @@ apps/frontend/.env
 .env.test
 apps/backend/.env.test
 
+# Phase 11F: per-account environment files. One per account, never shared,
+# never committed -- each holds one account's Binance credentials.
+apps/backend/.env.account-*
+.env.account-*
+
 # TESTNET protection verifier crash-recovery state. Carries deterministic
 # order identities for an in-flight demo run — never credentials — and is
 # machine-local operational state, not source.

@@ -12,7 +12,6 @@ import { normalizeTradingSymbol } from "../../utils/symbol";
 import { UnauthorizedError, ValidationError } from "../../utils/errors";
 import { env } from "../../config/env";
 import { CanaryAuthorizationService } from "../execution/canary-authorization.service";
-import { resolveExecutionProfile } from "../execution/execution-profile.service";
 
 function normalizeAssetType(value: string): AssetType {
   const upper = value.toUpperCase();
@@ -170,23 +169,27 @@ export async function handleTradingViewWebhook(
   // execution path later checks. Strictly best-effort: a canary problem must
   // never reject an otherwise valid alert, and an unbound alert simply cannot
   // become the canary.
+  //
+  // Phase 11F: the ACCOUNT comes from the token, not from this process.
+  // Webhook ingestion is global and binds no account, so resolving the
+  // configured profile here would have meant 'whichever account the generic
+  // backend happens to be configured for' — Account A by accident. The
+  // authorization row already carries the profile an operator chose when they
+  // prepared it, and the executor re-checks that ownership before acting.
   if (payload.canaryAuthorization) {
     try {
-      const profile = await resolveExecutionProfile(prisma);
-      if (profile.ok) {
-        const outcome = await new CanaryAuthorizationService(prisma).consume({
-          token: payload.canaryAuthorization,
-          executionProfileId: profile.profile.id,
-          symbol: normalizedSymbol,
-          direction: signal,
-          alertId: alert.id,
-        });
-        // Reason code only — never the token, not even truncated.
-        logger.info(
-          { alertId: alert.id, canary: outcome.ok ? (outcome.replay ? "REPLAY" : "BOUND") : outcome.reasonCode },
-          "Canary authorization evaluated"
-        );
-      }
+      const outcome = await new CanaryAuthorizationService(prisma).consumeByToken({
+        token: payload.canaryAuthorization,
+        symbol: normalizedSymbol,
+        direction: signal,
+        alertId: alert.id,
+      });
+      // Reason code only — never the token, not even truncated, and never
+      // the profile the token resolved to.
+      logger.info(
+        { alertId: alert.id, canary: outcome.ok ? (outcome.replay ? "REPLAY" : "BOUND") : outcome.reasonCode },
+        "Canary authorization evaluated"
+      );
     } catch (error) {
       logger.warn(
         { alertId: alert.id, error: error instanceof Error ? error.message : "unknown" },

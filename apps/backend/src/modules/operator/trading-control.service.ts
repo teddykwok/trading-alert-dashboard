@@ -493,7 +493,10 @@ export class TradingControlService {
       runtimeAttestation: attestation,
       allowedSymbols: profileRow?.safetyPolicy?.allowedSymbols ?? [],
       sourceTimeframes: { ...storedSourceTimeframes, supported: [...SOURCE_TIMEFRAMES] },
-      rrLookback: describeStoredLookback(profileRow?.safetyPolicy?.extremeRrLookbackCandles),
+      // Phase 11F: the window that governs plan generation is GLOBAL
+      // deployment configuration, not this profile's legacy column. Reporting
+      // the column would show an operator a number nothing reads.
+      rrLookback: describeStoredLookback(env.EXTREME_RR_LOOKBACK_CANDLES),
       authorization,
       session: sessionDto,
       capacity,

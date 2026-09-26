@@ -129,6 +129,9 @@ async function startExecutionRuntime(): Promise<void> {
   const runtimeAttestation = createRuntimeAttestationPublisher({
     role: "WORKER",
     redis: attestationRedis.redis,
+    // Phase 11F: the first beat waits for a writable link instead of racing
+    // it. Without this a healthy worker logged a heartbeat failure on boot.
+    waitUntilReady: attestationRedis.waitUntilReady,
     // A worker whose reconciliation has stalled -- or which never started
     // orchestrating at all -- stops attesting, so the fail-closed interlock
     // refuses to arm over it. This gates NEW activation only.

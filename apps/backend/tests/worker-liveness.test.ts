@@ -411,7 +411,13 @@ describe("worker liveness: the attestation connection is isolated and bounded", 
   });
 
   it("neither runtime heartbeats over the BullMQ connection any more", () => {
-    for (const file of ["src/modules/jobs/execution.worker.ts", "src/server.ts"]) {
+    // Phase 11F: the BACKEND attestation moved off the generic server onto
+    // the account control plane, which is the only backend-side process that
+    // binds an account. The generic server now publishes none at all.
+    for (const file of [
+      "src/modules/jobs/execution.worker.ts",
+      "src/account-control.server.ts",
+    ]) {
       const source = readFileSync(path.join(BACKEND, file), "utf8");
       const publisher = source.slice(source.indexOf("createRuntimeAttestationPublisher({"));
       expect(`${file}:${publisher.includes("bullConnection")}`).toBe(`${file}:false`);

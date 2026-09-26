@@ -395,6 +395,63 @@ export class CanaryAuthorizationService {
    * token for the same alert is accepted as a replay (never a second binding)
    * while any other alert is refused.
    */
+  /**
+   * Phase 11F -- consumption for a caller that does NOT know an account.
+   *
+   * Webhook ingestion is global: after the 11F split the generic backend
+   * binds no account, so it cannot assert which profile a signal is for, and
+   * it must not invent one. Before this, it resolved the process's
+   * configured profile and passed that in -- which silently meant Account A
+   * simply because the generic process happened to be configured for A.
+   *
+   * The token already answers the question. `tokenHash` is UNIQUE, so one
+   * token identifies exactly one authorization row, and that row carries its
+   * own `executionProfileId`, written when an operator PREPARED it on that
+   * account's control plane. The account was chosen there, deliberately; the
+   * webhook only carries the token to it.
+   *
+   * Nothing is weakened. `consume` below is unchanged and still refuses a
+   * token belonging to another profile, which is what an account-scoped
+   * caller needs. And the executor independently re-checks ownership when it
+   * looks the binding up -- `findFirst({ executionProfileId, consumedAlertId
+   * })` -- so a binding written for one account can never authorize another.
+   *
+   * With one account the behaviour is identical: the only token in existence
+   * belongs to that account, and the profile check it used to pass trivially
+   * is now simply not asked.
+   */
+  async consumeByToken(input: {
+    token: string | null | undefined;
+    symbol: string;
+    direction: string;
+    alertId: string;
+    now?: Date;
+  }): Promise<ConsumeResult> {
+    if (!input.token || input.token.trim() === "") {
+      return {
+        ok: false,
+        reasonCode: "CANARY_AUTHORIZATION_MISSING",
+        message: "No canary authorization accompanied this signal.",
+      };
+    }
+
+    const owner = await this.prisma.executionCanaryAuthorization.findUnique({
+      where: { tokenHash: hashCanaryToken(input.token) },
+      select: { executionProfileId: true },
+    });
+    if (!owner) {
+      return {
+        ok: false,
+        reasonCode: "CANARY_AUTHORIZATION_UNKNOWN",
+        message: "The supplied canary authorization does not exist.",
+      };
+    }
+
+    // Every structural, identity and state rule below is then applied
+    // unchanged, against the profile the token itself names.
+    return this.consume({ ...input, executionProfileId: owner.executionProfileId });
+  }
+
   async consume(input: {
     token: string | null | undefined;
     executionProfileId: string;

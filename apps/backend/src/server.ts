@@ -1,10 +1,26 @@
 import { buildApp } from "./app";
 import { env } from "./config/env";
-import { createRuntimeAttestationPublisher } from "./modules/runtime/runtime-attestation";
-import {
-  createAttestationRedisClient,
-  describeRedisFailure,
-} from "./modules/runtime/attestation-redis";
+
+/**
+ * Phase 11F -- THE GENERIC/PUBLIC backend. Binds no account.
+ *
+ * It ingests the TradingView webhook, serves the dashboard's reads and
+ * produces queue jobs: work that belongs to no account and must happen
+ * exactly once however many accounts exist. A second ingester would
+ * duplicate Alert rows, vision jobs and plans.
+ *
+ * What it deliberately no longer does:
+ *
+ *   - mount the operator control routes. Those resolve their account from
+ *     process environment and reach signed Binance reads, so they belong to
+ *     an account-bound process (account-control.server.ts).
+ *   - publish a BACKEND runtime attestation. Activation requires a fresh
+ *     BACKEND and WORKER pair for ONE account identity; a process that binds
+ *     no account attesting as that account's BACKEND would let the interlock
+ *     count a runtime that cannot act. The generic worker has published none
+ *     since 11E, and this is the same rule applied to the same kind of
+ *     process.
+ */
 
 async function start(): Promise<void> {
   const app = await buildApp();
@@ -16,30 +32,11 @@ async function start(): Promise<void> {
     process.exit(1);
   }
 
-  // Phase 12.4D-A.1: only AFTER listen resolves, so the heartbeat never claims
-  // a backend is ready before it actually is. It republishes the gate snapshot
-  // this process parsed at import — an operator editing .env cannot change it
-  // without restarting this process, which is the whole point of the interlock.
-  // Its OWN bounded connection, never the BullMQ one: BullMQ requires
-  // maxRetriesPerRequest=null, which is exactly the option that lets a command
-  // wait forever rather than fail. See modules/runtime/attestation-redis.
-  const attestationRedis = createAttestationRedisClient({
-    onError: (detail) =>
-      app.log.error({ detail }, "Runtime attestation Redis connection error"),
-  });
-
-  const attestation = createRuntimeAttestationPublisher({
-    role: "BACKEND",
-    redis: attestationRedis.redis,
-    onError: (error) =>
-      app.log.error({ detail: describeRedisFailure(error) }, "Runtime attestation heartbeat failed"),
-  });
-  attestation.start();
-
-  // Best effort: TTL expiry remains the correctness mechanism after a crash.
-  const shutdown = async () => {
-    await attestation.stop();
-    await attestationRedis.close();
+  // No runtime attestation is published here. See the header: this process
+  // binds no account, so it has no account identity to attest to, and the
+  // BACKEND role now belongs to account-control.server.ts.
+  const shutdown = async (): Promise<void> => {
+    await app.close();
     process.exit(0);
   };
   process.on("SIGTERM", () => void shutdown());

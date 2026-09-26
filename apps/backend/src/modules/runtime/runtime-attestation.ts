@@ -267,6 +267,18 @@ export interface RuntimeAttestationPublisherOptions {
    * Omitted by roles that have no such condition to report.
    */
   healthy?: () => boolean;
+  /**
+   * Phase 11F: awaited BEFORE the first publish, never before later beats.
+   *
+   * The transport this runs on rejects a command issued while the socket is
+   * still connecting, so the initial `set` used to race the connection and
+   * lose on every boot. A rejection here means no attestation is published
+   * at all, which is the correct fail-closed outcome: an unreachable Redis
+   * must not produce a key, and it must not produce a silent one either.
+   *
+   * Optional so an injected fake transport -- every test's -- needs nothing.
+   */
+  waitUntilReady?: () => Promise<void>;
   /** Called once each time the publisher transitions into withdrawal. */
   onWithdraw?: () => void;
   /**
@@ -381,7 +393,13 @@ export function createRuntimeAttestationPublisher(
     publishOnce,
     start() {
       if (timer) return;
-      void publishOnce().catch((error) => options.onError?.(error));
+      // The FIRST beat waits for a writable link; the interval below does
+      // not, because by then the client is connected or is reporting why not,
+      // and a heartbeat that waited every time would stop being a heartbeat.
+      const ready = options.waitUntilReady ? options.waitUntilReady() : Promise.resolve();
+      void ready
+        .then(() => publishOnce())
+        .catch((error) => options.onError?.(error));
       timer = setInterval(() => {
         void publishOnce().catch((error) => options.onError?.(error));
       }, intervalMs);

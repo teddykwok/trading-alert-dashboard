@@ -683,6 +683,16 @@ describe("canary controls that combine both halves bind once", () => {
  * canonical binder itself. It is pinned literally so a module that later grows
  * an exchange client cannot quietly keep its direct resolution.
  */
+// Phase 11F also removed extreme-rr.service.ts and its operator counterpart
+// extreme-rr-lookback.service.ts. The plan-generation lookback
+// it used to read from a profile is GLOBAL deployment configuration now: one
+// plan is generated per alert and adopted independently by every account, so
+// the window that shapes it cannot belong to one account's policy.
+//
+// Phase 11F removed webhook.service.ts from this list. Webhook ingestion is
+// GLOBAL: the generic backend binds no account, so resolving the configured
+// profile there meant 'whichever account this process happens to be',
+// Account A by accident. The canary token names its own profile now.
 const DIRECT_PROFILE_RESOLUTION = [
   "src/modules/execution/binance-profile-binding.ts",
   "src/modules/execution/execution-profile.service.ts",
@@ -692,14 +702,11 @@ const DIRECT_PROFILE_RESOLUTION = [
   "src/modules/execution/run-canary-preflight.ts",
   "src/modules/execution/run-ensure-profile.ts",
   "src/modules/execution/run-set-policy.ts",
-  "src/modules/extreme-rr/extreme-rr.service.ts",
   "src/modules/operator/allowlist.service.ts",
-  "src/modules/operator/extreme-rr-lookback.service.ts",
   "src/modules/operator/policy-editor.service.ts",
   "src/modules/operator/source-timeframes.service.ts",
   "src/modules/operator/trading-control-actions.service.ts",
   "src/modules/operator/trading-control.service.ts",
-  "src/modules/webhook/webhook.service.ts",
 ] as const;
 
 describe("direct profile resolution survives only where it cannot reach the exchange", () => {
@@ -723,15 +730,12 @@ describe("direct profile resolution survives only where it cannot reach the exch
       "src/modules/execution/run-canary-preflight.ts",
       "src/modules/execution/run-ensure-profile.ts",
       "src/modules/execution/run-set-policy.ts",
-      "src/modules/extreme-rr/extreme-rr.service.ts",
-      "src/modules/operator/allowlist.service.ts",
-      "src/modules/operator/extreme-rr-lookback.service.ts",
-      "src/modules/operator/policy-editor.service.ts",
+          "src/modules/operator/allowlist.service.ts",
+          "src/modules/operator/policy-editor.service.ts",
       "src/modules/operator/source-timeframes.service.ts",
       "src/modules/operator/trading-control-actions.service.ts",
       "src/modules/operator/trading-control.service.ts",
-      "src/modules/webhook/webhook.service.ts",
-    ]);
+        ]);
   });
 
   it("every allowlisted module still resolves, so no exemption is dead", () => {
