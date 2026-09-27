@@ -551,11 +551,17 @@ export function normalizeAlgoOrder(payload: unknown): BinanceAlgoOrderDto {
  * exact symbol: a non-empty row about a different contract means we are not
  * reading the book we asked about.
  */
-export function normalizeOpenAlgoOrders(payload: unknown, symbol: string): BinanceAlgoOrderDto[] | null {
+/**
+ * The shared row reader for both open-algo listings.
+ *
+ * `wanted` is the symbol every row must carry, or null for the account-wide
+ * listing where rows legitimately span symbols. One reader so the two forms
+ * cannot drift on what counts as a readable row -- which matters, because
+ * both are used to assert that a book is EMPTY, and a laxer reader would
+ * report emptiness it had not established.
+ */
+function normalizeAlgoOrderRows(payload: unknown, wanted: string | null): BinanceAlgoOrderDto[] | null {
   if (!Array.isArray(payload)) return null;
-
-  const wanted = symbol.trim().toUpperCase();
-  if (wanted === "") return null;
 
   const orders: BinanceAlgoOrderDto[] = [];
   for (const raw of payload) {
@@ -565,13 +571,30 @@ export function normalizeOpenAlgoOrders(payload: unknown, symbol: string): Binan
     const order = normalizeAlgoOrder(raw);
     // Minimum identity for COUNTING an open algo order: it must say which
     // contract it belongs to, and it must be addressable by at least one id.
-    if (order.symbol === null || order.symbol.toUpperCase() !== wanted) return null;
+    if (order.symbol === null) return null;
+    if (wanted !== null && order.symbol.toUpperCase() !== wanted) return null;
     if (order.algoId === null && order.clientAlgoId === null) return null;
 
     orders.push(order);
   }
 
   return orders;
+}
+
+export function normalizeOpenAlgoOrders(payload: unknown, symbol: string): BinanceAlgoOrderDto[] | null {
+  const wanted = symbol.trim().toUpperCase();
+  if (wanted === "") return null;
+  return normalizeAlgoOrderRows(payload, wanted);
+}
+
+/**
+ * The ACCOUNT-WIDE open-algo listing: every symbol, no filter.
+ *
+ * Same row strictness, no symbol equality check -- rows spanning symbols are
+ * the expected shape here, not a sign the wrong book came back.
+ */
+export function normalizeOpenAlgoOrdersAccountWide(payload: unknown): BinanceAlgoOrderDto[] | null {
+  return normalizeAlgoOrderRows(payload, null);
 }
 
 /** Normalizes position-margin change history rows (ADD reconciliation only). */

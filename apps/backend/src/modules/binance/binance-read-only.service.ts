@@ -11,6 +11,7 @@ import {
   normalizeBalances,
   normalizeLeverageBrackets,
   normalizeOpenAlgoOrders,
+  normalizeOpenAlgoOrdersAccountWide,
   normalizeOpenOrders,
   normalizePositionMode,
   normalizePositions,
@@ -315,6 +316,35 @@ export class BinanceReadOnlyService {
         kind: "MALFORMED_RESPONSE",
         message: `Binance returned an unreadable open Algo order list for ${wanted}`,
         endpoint: "openAlgoOrders",
+      });
+    }
+    return orders;
+  }
+
+  /**
+   * GET /fapi/v1/openAlgoOrders with NO symbol — the whole conditional book.
+   *
+   * Takes no argument, deliberately: this is the account-wide form and there
+   * is no symbol it could be narrowed by. It goes out under its own endpoint
+   * descriptor, `openAlgoOrdersAccountWide`, whose declared weight is 40 --
+   * the price Binance actually charges for the all-symbols variant.
+   *
+   * This is the only read that can prove the conditional book EMPTY. A
+   * per-symbol sweep proves it empty for the symbols it asked about, which is
+   * a different and weaker claim: an orphan on a symbol nobody thought to ask
+   * about reads as absence.
+   *
+   * Throws MALFORMED_RESPONSE when the reply cannot be fully read, so a caller
+   * can always tell "no open orders" from "we could not see the book".
+   */
+  async getOpenAlgoOrdersAccountWide(): Promise<BinanceAlgoOrderDto[]> {
+    const payload = await this.client.request<unknown>("openAlgoOrdersAccountWide", {});
+    const orders = normalizeOpenAlgoOrdersAccountWide(payload);
+    if (orders === null) {
+      throw new BinanceError({
+        kind: "MALFORMED_RESPONSE",
+        message: "Binance returned an unreadable account-wide open Algo order list",
+        endpoint: "openAlgoOrdersAccountWide",
       });
     }
     return orders;

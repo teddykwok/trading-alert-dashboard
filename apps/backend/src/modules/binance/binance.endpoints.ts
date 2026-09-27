@@ -55,10 +55,25 @@ export const BINANCE_READ_ONLY_ENDPOINTS = {
   // Query Algo Order (Phase 7 protection). GET only — the mutation client
   // owns POST/DELETE on this path from a separate module.
   algoOrder: { path: "/fapi/v1/algoOrder", signed: true, weight: 1 },
-  // Current open Algo (conditional) orders. Weight 1 with a symbol, 40
-  // without. Read-only: it is how a baseline proves the conditional book is
-  // empty WITHOUT ever reaching for a cancel-all endpoint.
+  // Current open Algo (conditional) orders, for ONE symbol. Read-only: it is
+  // how a baseline proves the conditional book is empty WITHOUT ever reaching
+  // for a cancel-all endpoint.
   openAlgoOrders: { path: "/fapi/v1/openAlgoOrders", signed: true, weight: 1 },
+  // The SAME path with no symbol, which Binance charges at 40 rather than 1.
+  //
+  // A separate descriptor rather than a dynamic weight, because the weight is
+  // a property of the REQUEST and this table is how the connector states what
+  // each request costs. Routing an all-symbols read through the entry above
+  // would spend 40 while the budget line said 1 -- the rate-limit equivalent
+  // of a silent overdraft. Two names, two honest numbers, one path.
+  //
+  // It exists because a per-symbol sweep cannot prove the conditional book is
+  // EMPTY: it can only prove it empty for the symbols it thought to ask about.
+  openAlgoOrdersAccountWide: {
+    path: "/fapi/v1/openAlgoOrders",
+    signed: true,
+    weight: 40,
+  },
   // Position margin change history, used only to reconcile an ambiguous ADD.
   positionMarginHistory: { path: "/fapi/v1/positionMargin/history", signed: true, weight: 1 },
   // --- Historical evidence, used ONLY to prove absence -------------------

@@ -17,6 +17,7 @@
     "retention:dry-run": "tsx src/modules/retention/run-retention.ts",
     "retention:apply": "tsx src/modules/retention/run-retention.ts --apply",
     "binance:read-only-check": "tsx src/modules/binance/run-read-only-check.ts",
+    "binance:pre-shutdown-check": "tsx src/modules/binance/run-pre-shutdown-exchange-check.ts",
     "binance:margin-plan": "tsx src/modules/binance/run-margin-plan.ts",
     "binance:liquidation-check": "tsx src/modules/binance/run-liquidation-validation.ts",
     "binance:account-health": "tsx src/modules/binance/run-account-health.ts",
