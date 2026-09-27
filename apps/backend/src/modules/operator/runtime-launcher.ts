@@ -305,7 +305,10 @@ export type OwnershipVerdict =
  * program is not.
  */
 export function verifyOwnership(
-  record: OwnedProcess,
+  // Only the identity fields are read, so the dual-account launcher can pass
+  // its own six-role record without either model having to know the other's
+  // role vocabulary. Widening, not weakening: all three checks are unchanged.
+  record: Pick<OwnedProcess, "pid" | "startedAtMs">,
   probe: ProcessProbe | null,
   repoRoot: string
 ): OwnershipVerdict {

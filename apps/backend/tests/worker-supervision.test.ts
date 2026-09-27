@@ -858,31 +858,41 @@ describe("the launcher exposes supervision and keeps its existing guards", () =>
     "utf8"
   );
 
-  it("offers it as its own menu entry, without displacing Exit", () => {
-    expect(CLI).toContain("5. Supervise Worker");
-    expect(CLI).toContain("6. Exit");
-    expect(CLI).toContain('else if (choice === "5") await superviseWorker(ask);');
-    expect(CLI).toContain('else if (choice === "6") break;');
+  it("offers one entry PER ACCOUNT, without displacing Exit", () => {
+    // Phase 11I: supervision is account-explicit. One button that restarts
+    // "the worker" is meaningless when two accounts each have one.
+    expect(CLI).toContain("5. Supervise Account A Worker");
+    expect(CLI).toContain("6. Supervise Account B Worker");
+    expect(CLI).toContain("7. Exit");
+    expect(CLI).toContain('else if (choice === "5") await superviseAccountWorker("ACCOUNT_A", ask);');
+    expect(CLI).toContain('else if (choice === "6") await superviseAccountWorker("ACCOUNT_B", ask);');
+    expect(CLI).toContain('else if (choice === "7") break;');
   });
 
-  it("spawns the replacement in the RECORDED mode, never a chosen one", () => {
-    // Both arguments come from the RECORDED state: the mode, and the take-profit
-    // modality that runtime was started with. A supervised restart reproduces
-    // the runtime it is replacing and never re-decides either.
-    expect(CLI).toContain('spawnRole("worker", state.mode, standardLimitTakeProfitOf(state))');
-    // No second spawn path and no gate write was introduced.
-    expect(CLI.match(/spawnRole\(/g) ?? []).toHaveLength(3); // definition, whole-stack start, supervision
+  it("spawns the replacement for the SAME account, never the other one", () => {
+    // The role is fixed at the top of the supervision pass from the account
+    // being supervised, and the plan derives the env file from the role. A
+    // restart therefore cannot change which account the worker is.
+    expect(CLI).toContain("dualSpawnPlan(workerRole, REPO_ROOT)");
+    expect(CLI).toContain(
+      'const workerRole: DualRole = account === "ACCOUNT_A" ? "account-a-worker" : "account-b-worker";'
+    );
+    // No gate write was introduced anywhere in the tool.
+    expect(`applyGates:${CLI.includes("applyGates")}`).toBe("applyGates:false");
   });
 
   it("runs every pass under the single-flight guard", () => {
-    expect(CLI).toContain("runSupervisionSingleFlight(() => superviseWorkerOnce(budget))");
+    expect(CLI).toContain("await runSupervisionSingleFlight(async () => {");
   });
 
-  it("derives health from the SAME helpers the status screen uses", () => {
+  it("derives health from the SAME projection the status screen uses", () => {
     // Two definitions of "is the worker healthy" would eventually disagree, and
     // the operator would be shown one while supervision acted on the other.
-    expect(CLI).toContain("judgeRoleHealth(running(\"worker\")");
-    expect(CLI).toContain("judgeRoleHealth(running(\"backend\")");
+    // Both screens read `projectTopology`, and supervision reads the role rows
+    // out of it rather than judging attestation a second time.
+    expect(CLI).toContain("const status = projectTopology({");
+    expect(CLI).toContain("status.roles.find((entry) => entry.role === workerRole)");
+    expect(CLI).toContain("status.roles.find((entry) => entry.role === controlRole)");
   });
 
   it("tells the operator the honest scope before it starts", () => {
@@ -892,14 +902,14 @@ describe("the launcher exposes supervision and keeps its existing guards", () =>
 
   it("stops entirely once recovery has failed", () => {
     expect(CLI).toContain('pass.result.decision.state === "WORKER_RECOVERY_FAILED"');
-    expect(CLI).toContain("Automatic worker recovery has STOPPED.");
+    expect(CLI).toContain("has STOPPED. Nothing further will be restarted.");
   });
 
-  it("the existing whole-stack guards are untouched", () => {
+  it("the whole-stack guards are untouched", () => {
     // Supervision must not have quietly weakened the second-stack refusal or
-    // the shutdown safety check.
-    expect(CLI).toContain("evaluateStartPreconditions({");
-    expect(CLI).toContain('evaluateDurableSafety(await readDurableState(), "SHUTDOWN")');
+    // the shutdown safety check. Both are now dual-account.
+    expect(CLI).toContain("evaluateDualStartPreconditions({");
+    expect(CLI).toContain("evaluateDualShutdownSafety(states)");
   });
 });
 

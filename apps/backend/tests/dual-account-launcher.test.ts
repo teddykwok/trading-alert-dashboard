@@ -1,0 +1,1223 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+import { ACCOUNT_IDENTITY_KEYS } from "../src/config/account-env";
+import {
+  ACCOUNT_SENSITIVE_KEYS,
+  DUAL_ROLES,
+  LIVE_READY_UNAVAILABLE,
+  ROLE_CONTRACTS,
+  RUNTIME_ACCOUNTS,
+  SAFE_GATE_CONTRACT,
+  accountIdentitiesAreDistinct,
+  censusOf,
+  describeEnvFileFailure,
+  classifyEntrypoint,
+  dualSpawnPlan,
+  envFilePathFor,
+  evaluateAccountProfileProof,
+  evaluateDualShutdownSafety,
+  evaluateDualStartPreconditions,
+  evaluateSafeGatePosture,
+  projectTopology,
+  sanitizedChildEnv,
+  parseEnvFileStrict,
+  validateEnvFiles,
+  verifyDualTopology,
+  type AccountAttestationView,
+  type AccountProfileProof,
+  type AccountShutdownState,
+  type DualRole,
+  type EnvFileVerdict,
+  type ObservedListener,
+  type ObservedProcess,
+} from "../src/modules/operator/dual-account-topology";
+
+/**
+ * Phase 11I -- the launcher understands two accounts, or it is not allowed to
+ * act.
+ *
+ * The defect that opened this phase was a reporting one: six healthy processes
+ * read as six OFF lines, because the tool asked its own state file and nothing
+ * else. The dangerous half is quieter. A launcher that cannot tell Account A
+ * from Account B can stop A's worker while A holds exposure, hand B's worker
+ * A's credentials, or restart "the worker" and mean the wrong one -- and every
+ * one of those looks like success on the screen.
+ *
+ * So these tests are mostly about DISTINCTION: which account a role belongs to,
+ * which file it may read, which process the tool is allowed to kill, and which
+ * account must answer before anything stops.
+ */
+
+const BACKEND_ROOT = process.cwd().endsWith(path.join("apps", "backend"))
+  ? process.cwd()
+  : path.join(process.cwd(), "apps", "backend");
+
+const CLI = readFileSync(
+  path.join(BACKEND_ROOT, "src/modules/operator/run-runtime-launcher.ts"),
+  "utf8"
+);
+const MODULE = readFileSync(
+  path.join(BACKEND_ROOT, "src/modules/operator/dual-account-topology.ts"),
+  "utf8"
+);
+
+/** A synthetic machine: no real LOCALAPPDATA, no real files, no real secrets. */
+const FAKE_ENV: NodeJS.ProcessEnv = {
+  LOCALAPPDATA: path.join("C:", "fake", "AppData", "Local"),
+  ComSpec: "cmd.exe",
+  PATH: "/usr/bin",
+};
+
+const REPO = path.join("C:", "repo");
+
+function processOn(entrypoint: string, pid: number): ObservedProcess {
+  return {
+    pid,
+    startedAtMs: 1_000,
+    commandLine: `"C:\\\\Program Files\\\\nodejs\\\\node.exe" --require preflight.cjs ${entrypoint}`,
+  };
+}
+
+function listener(port: number, address: string, pid: number): ObservedListener {
+  return { port, address, pid };
+}
+
+const HEALTHY: AccountAttestationView = {
+  backendFresh: 1,
+  backendStale: 0,
+  workerFresh: 1,
+  workerStale: 0,
+  effectiveGates: { globalKillSwitch: true, liveEntryEnabled: false, protectionReady: false },
+};
+
+/** The six-role topology as it actually runs in production, none of it owned. */
+function externalSixRoleCensus() {
+  return censusOf(
+    [
+      processOn("src/server.ts", 11),
+      processOn("src/modules/jobs/vision-analysis.worker.ts", 12),
+      processOn("src/account-control.server.ts", 13),
+      processOn("src/account-control.server.ts", 14),
+      processOn("src/modules/jobs/execution.worker.ts", 15),
+      processOn("src/modules/jobs/execution.worker.ts", 16),
+    ],
+    [listener(4000, "0.0.0.0", 11), listener(4001, "127.0.0.1", 13), listener(4002, "127.0.0.1", 14)]
+  );
+}
+
+const SAFE_ACCOUNT = (account: "ACCOUNT_A" | "ACCOUNT_B"): AccountShutdownState => ({
+  account,
+  present: true,
+  systemState: "SAFE_OFF",
+  activeExecutions: 0,
+  manualIntervention: 0,
+  warnings: [],
+});
+
+// ===========================================================================
+// 1-4, 18. The spawn plan, and the file each role is allowed to read
+// ===========================================================================
+
+describe("the six-role SAFE spawn plan", () => {
+  it("1. names exactly six roles, generic first and each control before its worker", () => {
+    expect([...DUAL_ROLES]).toEqual([
+      "generic-backend",
+      "generic-analysis",
+      "account-a-control",
+      "account-a-worker",
+      "account-b-control",
+      "account-b-worker",
+    ]);
+  });
+
+  it("2. gives both generic roles generic.env", () => {
+    for (const role of ["generic-backend", "generic-analysis"] as const) {
+      const plan = dualSpawnPlan(role, REPO, FAKE_ENV);
+      expect(`${role} -> ${path.basename(String(plan.options.env.DOTENV_CONFIG_PATH))}`).toBe(
+        `${role} -> generic.env`
+      );
+    }
+  });
+
+  it("3. gives both Account A roles account-a.env", () => {
+    for (const role of ["account-a-control", "account-a-worker"] as const) {
+      const plan = dualSpawnPlan(role, REPO, FAKE_ENV);
+      expect(`${role} -> ${path.basename(String(plan.options.env.DOTENV_CONFIG_PATH))}`).toBe(
+        `${role} -> account-a.env`
+      );
+    }
+  });
+
+  it("4. gives both Account B roles account-b.env", () => {
+    for (const role of ["account-b-control", "account-b-worker"] as const) {
+      const plan = dualSpawnPlan(role, REPO, FAKE_ENV);
+      expect(`${role} -> ${path.basename(String(plan.options.env.DOTENV_CONFIG_PATH))}`).toBe(
+        `${role} -> account-b.env`
+      );
+    }
+  });
+
+  it("5. passes no account credential to a generic role, whatever the shell holds", () => {
+    const contaminated: NodeJS.ProcessEnv = {
+      ...FAKE_ENV,
+      BINANCE_API_KEY: "shell-key",
+      BINANCE_API_SECRET: "shell-secret",
+      EXECUTION_PROFILE_ACCOUNT_IDENTIFIER: "shell-account",
+      EXECUTION_PROFILE_ENVIRONMENT: "MAINNET",
+    };
+    for (const role of ["generic-backend", "generic-analysis"] as const) {
+      const plan = dualSpawnPlan(role, REPO, contaminated);
+      for (const key of ACCOUNT_IDENTITY_KEYS) {
+        expect(`${role}/${key} -> ${plan.options.env[key] === undefined ? "absent" : "PRESENT"}`).toBe(
+          `${role}/${key} -> absent`
+        );
+      }
+    }
+  });
+
+  it("6 and 7. never lets one account's inherited values follow the other's role", () => {
+    // The shell holds Account A's values; a B role is started from it. Neither
+    // dotenv nor Prisma overwrites a key that is already set, so leaving them
+    // in place is exactly how a process runs as the wrong account.
+    const holdingA: NodeJS.ProcessEnv = {
+      ...FAKE_ENV,
+      BINANCE_API_KEY: "a-key",
+      EXECUTION_PROFILE_ACCOUNT_IDENTIFIER: "account-a",
+    };
+    for (const role of ["account-b-control", "account-b-worker"] as const) {
+      const plan = dualSpawnPlan(role, REPO, holdingA);
+      expect(plan.options.env.BINANCE_API_KEY).toBeUndefined();
+      expect(plan.options.env.EXECUTION_PROFILE_ACCOUNT_IDENTIFIER).toBeUndefined();
+      expect(path.basename(String(plan.options.env.DOTENV_CONFIG_PATH))).toBe("account-b.env");
+    }
+    const holdingB: NodeJS.ProcessEnv = {
+      ...FAKE_ENV,
+      BINANCE_API_KEY: "b-key",
+      EXECUTION_PROFILE_ACCOUNT_IDENTIFIER: "account-b",
+    };
+    for (const role of ["account-a-control", "account-a-worker"] as const) {
+      const plan = dualSpawnPlan(role, REPO, holdingA ? holdingB : holdingB);
+      expect(plan.options.env.BINANCE_API_KEY).toBeUndefined();
+      expect(path.basename(String(plan.options.env.DOTENV_CONFIG_PATH))).toBe("account-a.env");
+    }
+  });
+
+  it("18. derives the env file from the ROLE, so a restart cannot change account", () => {
+    // Supervision restarts by role. There is no parameter it could get wrong.
+    expect(path.basename(envFilePathFor("account-a-worker", FAKE_ENV))).toBe("account-a.env");
+    expect(path.basename(envFilePathFor("account-b-worker", FAKE_ENV))).toBe("account-b.env");
+    expect(CLI).toContain("dualSpawnPlan(workerRole, REPO_ROOT)");
+  });
+
+  it("strips exactly the bootstrap's own account key list, not a second copy", () => {
+    expect([...ACCOUNT_SENSITIVE_KEYS]).toEqual([...ACCOUNT_IDENTITY_KEYS]);
+    expect(MODULE).toContain('import { ACCOUNT_IDENTITY_KEYS } from "../../config/account-env"');
+  });
+
+  it("uses the proven cmd shape and never a shell string", () => {
+    const plan = dualSpawnPlan("generic-backend", REPO, FAKE_ENV);
+    expect(plan.args.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
+    expect(plan.args).toContain("-C");
+    expect(plan.args).toContain(REPO);
+    expect(JSON.stringify(plan.options)).not.toContain('"shell"');
+  });
+});
+
+// ===========================================================================
+// 8-10, 24. Refusing to start over something that already exists
+// ===========================================================================
+
+describe("start preconditions", () => {
+  const OK_FILES: EnvFileVerdict = { ok: true, failures: [], parsed: new Map() };
+  const DISTINCT = { ok: true } as const;
+
+  function preconditions(over: {
+    processes?: ObservedProcess[];
+    listeners?: ObservedListener[];
+    owned?: DualRole[];
+    attestation?: Record<string, AccountAttestationView | null>;
+    envFiles?: EnvFileVerdict;
+    identities?: { ok: true } | { ok: false; reasons: string[] };
+  }) {
+    const status = projectTopology({
+      census: censusOf(over.processes ?? [], over.listeners ?? []),
+      ownedRoles: over.owned ?? [],
+      attestation: over.attestation ?? {},
+    });
+    return evaluateDualStartPreconditions({
+      status,
+      envFiles: over.envFiles ?? OK_FILES,
+      ownedAliveCount: 0,
+      identities: over.identities ?? DISTINCT,
+    });
+  }
+
+  it("accepts a genuinely empty machine", () => {
+    expect(preconditions({})).toEqual({ ok: true });
+  });
+
+  it("8. refuses when 4001 is already held", () => {
+    const verdict = preconditions({ listeners: [listener(4001, "127.0.0.1", 99)] });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("4001");
+  });
+
+  it("8. refuses when 4002 is already held", () => {
+    const verdict = preconditions({ listeners: [listener(4002, "127.0.0.1", 99)] });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("4002");
+  });
+
+  it("9. refuses an account control plane bound beyond loopback", () => {
+    const verdict = preconditions({ listeners: [listener(4001, "0.0.0.0", 99)] });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("beyond loopback");
+  });
+
+  it("10. refuses when a role is already running, owned or not", () => {
+    const verdict = preconditions({ processes: [processOn("src/server.ts", 21)] });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("Generic Backend is already running");
+  });
+
+  it("10. refuses a duplicate attestation before starting anything", () => {
+    const verdict = preconditions({
+      attestation: { ACCOUNT_A: { ...HEALTHY, workerFresh: 2 } },
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("DUPLICATE");
+  });
+
+  it("refuses an environment file that did not validate", () => {
+    const verdict = preconditions({
+      envFiles: {
+        ok: false,
+        failures: [{ alias: "account-b", reasonCode: "ENV_FILE_MALFORMED", detail: "line 7" }],
+        parsed: new Map(),
+      },
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("account-b.env: ENV_FILE_MALFORMED");
+  });
+
+  it("24. refuses when both account files name the SAME account", () => {
+    const same = accountIdentitiesAreDistinct(() => ({
+      accountIdentifier: "the-same-account",
+      environment: "MAINNET",
+    }));
+    expect(same.ok).toBe(false);
+    expect(same.ok === false && same.reasons.join(" ")).toContain("attestation keys would collide");
+    // And the refusal reaches the start path.
+    const verdict = preconditions({ identities: same });
+    expect(verdict.ok).toBe(false);
+  });
+
+  it("24. accepts two genuinely different accounts, and never returns an identifier", () => {
+    const verdict = accountIdentitiesAreDistinct((role) => ({
+      accountIdentifier: role === "account-a-control" ? "alpha" : "beta",
+      environment: "MAINNET",
+    }));
+    expect(verdict).toEqual({ ok: true });
+    expect(JSON.stringify(verdict)).not.toContain("alpha");
+  });
+
+  it("24. refuses an identity it could not read, rather than assuming distinctness", () => {
+    const verdict = accountIdentitiesAreDistinct(() => ({
+      accountIdentifier: null,
+      environment: null,
+    }));
+    expect(verdict.ok).toBe(false);
+  });
+});
+
+// ===========================================================================
+// 11-12. Status: the defect that opened the phase
+// ===========================================================================
+
+describe("status over a manually started topology", () => {
+  it("11. reports all six roles ON when none of them is launcher-owned", () => {
+    const status = projectTopology({
+      census: externalSixRoleCensus(),
+      ownedRoles: [],
+      attestation: { ACCOUNT_A: HEALTHY, ACCOUNT_B: HEALTHY },
+    });
+    for (const role of status.roles) {
+      expect(`${role.label} -> ${role.presence}`).toBe(`${role.label} -> DETECTED`);
+    }
+    // This is the regression that opened Phase 11I.
+    expect(status.roles.some((role) => role.presence === "OFF")).toBe(false);
+  });
+
+  it("12. keeps OWNED and DETECTED apart, because only one of them may be stopped", () => {
+    const status = projectTopology({
+      census: externalSixRoleCensus(),
+      ownedRoles: ["generic-backend"],
+      attestation: { ACCOUNT_A: HEALTHY, ACCOUNT_B: HEALTHY },
+    });
+    const byRole = Object.fromEntries(status.roles.map((role) => [role.role, role.presence]));
+    expect(byRole["generic-backend"]).toBe("OWNED");
+    expect(byRole["account-a-worker"]).toBe("DETECTED");
+    expect(status.anyExternal).toBe(true);
+  });
+
+  it("11. tells the two accounts apart by attestation, not by command line", () => {
+    // Both control planes run the SAME entrypoint, and both workers do too.
+    // Only the identity each publishes distinguishes them.
+    const status = projectTopology({
+      census: externalSixRoleCensus(),
+      ownedRoles: [],
+      attestation: { ACCOUNT_A: HEALTHY, ACCOUNT_B: null },
+    });
+    const byRole = Object.fromEntries(status.roles.map((role) => [role.role, role.attestation]));
+    expect(byRole["account-a-worker"]).toBe("HEALTHY");
+    // B's reading failed, so B is UNKNOWN -- never silently healthy.
+    expect(byRole["account-b-worker"]).toBe("UNKNOWN");
+  });
+
+  it("does not mistake a pnpm or tsx supervisor for the role it wraps", () => {
+    expect(classifyEntrypoint("node pnpm.cjs --filter backend dev src/server.ts")).toBeNull();
+    expect(classifyEntrypoint("node .../tsx/dist/cli.mjs watch src/server.ts")).toBeNull();
+    expect(classifyEntrypoint("node --require preflight.cjs src/server.ts")).toBe("src/server.ts");
+  });
+
+  it("23. reads A and B attestation independently", () => {
+    const status = projectTopology({
+      census: externalSixRoleCensus(),
+      ownedRoles: [],
+      attestation: { ACCOUNT_A: HEALTHY, ACCOUNT_B: { ...HEALTHY, workerFresh: 0 } },
+    });
+    const byRole = Object.fromEntries(status.roles.map((role) => [role.role, role.attestation]));
+    expect(byRole["account-a-worker"]).toBe("HEALTHY");
+    expect(byRole["account-b-worker"]).toBe("STALE");
+    // One account being unhealthy never changes the other's verdict.
+    expect(byRole["account-a-control"]).toBe("HEALTHY");
+  });
+});
+
+describe("topology verification after a start", () => {
+  it("passes on exactly six roles with both accounts attesting", () => {
+    const status = projectTopology({
+      census: externalSixRoleCensus(),
+      ownedRoles: [...DUAL_ROLES],
+      attestation: { ACCOUNT_A: HEALTHY, ACCOUNT_B: HEALTHY },
+    });
+    expect(verifyDualTopology(status)).toEqual({ ok: true });
+  });
+
+  it("refuses a third execution worker", () => {
+    const census = censusOf(
+      [
+        processOn("src/server.ts", 11),
+        processOn("src/modules/jobs/vision-analysis.worker.ts", 12),
+        processOn("src/account-control.server.ts", 13),
+        processOn("src/account-control.server.ts", 14),
+        processOn("src/modules/jobs/execution.worker.ts", 15),
+        processOn("src/modules/jobs/execution.worker.ts", 16),
+        processOn("src/modules/jobs/execution.worker.ts", 17),
+      ],
+      [listener(4000, "0.0.0.0", 11), listener(4001, "127.0.0.1", 13), listener(4002, "127.0.0.1", 14)]
+    );
+    const status = projectTopology({
+      census,
+      ownedRoles: [...DUAL_ROLES],
+      attestation: { ACCOUNT_A: HEALTHY, ACCOUNT_B: HEALTHY },
+    });
+    const verdict = verifyDualTopology(status);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("3 execution worker processes");
+  });
+
+  it("never treats an unreadable attestation as healthy", () => {
+    const status = projectTopology({
+      census: externalSixRoleCensus(),
+      ownedRoles: [...DUAL_ROLES],
+      attestation: { ACCOUNT_A: HEALTHY, ACCOUNT_B: null },
+    });
+    const verdict = verifyDualTopology(status);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("could not be read");
+  });
+});
+
+// ===========================================================================
+// 14-16. Shutdown must satisfy BOTH accounts
+// ===========================================================================
+
+describe("shutdown safety across both accounts", () => {
+  it("14. allows a stop only when every live account reports SAFE OFF and clean", () => {
+    expect(evaluateDualShutdownSafety([SAFE_ACCOUNT("ACCOUNT_A"), SAFE_ACCOUNT("ACCOUNT_B")])).toEqual({
+      ok: true,
+    });
+  });
+
+  it("15. lets an unsafe Account A block the stop even though B is safe", () => {
+    const verdict = evaluateDualShutdownSafety([
+      { ...SAFE_ACCOUNT("ACCOUNT_A"), activeExecutions: 1 },
+      SAFE_ACCOUNT("ACCOUNT_B"),
+    ]);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("ACCOUNT_A");
+    expect(verdict.ok === false && verdict.reasons.join(" ")).not.toContain("ACCOUNT_B");
+  });
+
+  it("16. lets an unsafe Account B block the stop even though A is safe", () => {
+    const verdict = evaluateDualShutdownSafety([
+      SAFE_ACCOUNT("ACCOUNT_A"),
+      { ...SAFE_ACCOUNT("ACCOUNT_B"), manualIntervention: 2 },
+    ]);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("ACCOUNT_B");
+  });
+
+  it("refuses when an account could not be read, rather than assuming it is quiet", () => {
+    const verdict = evaluateDualShutdownSafety([
+      SAFE_ACCOUNT("ACCOUNT_A"),
+      { account: "ACCOUNT_B", present: true, systemState: null, activeExecutions: null, manualIntervention: null, warnings: null },
+    ]);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("could not be read");
+  });
+
+  it("refuses when an account was not evaluated at all", () => {
+    const verdict = evaluateDualShutdownSafety([SAFE_ACCOUNT("ACCOUNT_A")]);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("not evaluated");
+  });
+
+  it("skips an account that has no runtime at all, because there is nothing to stop", () => {
+    const verdict = evaluateDualShutdownSafety([
+      SAFE_ACCOUNT("ACCOUNT_A"),
+      { account: "ACCOUNT_B", present: false, systemState: null, activeExecutions: null, manualIntervention: null, warnings: null },
+    ]);
+    expect(verdict).toEqual({ ok: true });
+  });
+
+  it("treats recovery warnings as outstanding work", () => {
+    const verdict = evaluateDualShutdownSafety([
+      { ...SAFE_ACCOUNT("ACCOUNT_A"), warnings: ["FILLED_WITHOUT_VERIFIED_PROTECTION"] },
+      SAFE_ACCOUNT("ACCOUNT_B"),
+    ]);
+    expect(verdict.ok).toBe(false);
+  });
+
+  it("ignores warnings that merely describe a runtime being down", () => {
+    const verdict = evaluateDualShutdownSafety([
+      { ...SAFE_ACCOUNT("ACCOUNT_A"), warnings: ["RUNTIME_ATTESTATION_BLOCKED", "NATURAL_AUTHORIZATION_EXPIRED"] },
+      SAFE_ACCOUNT("ACCOUNT_B"),
+    ]);
+    expect(verdict).toEqual({ ok: true });
+  });
+});
+
+// ===========================================================================
+// 13, 17, 25. What the CLI is allowed to touch
+// ===========================================================================
+
+describe("the CLI's ownership and rollback fences", () => {
+  it("13. terminates only after proving ownership, and never by process name", () => {
+    expect(CLI).toContain('"/PID"');
+    for (const forbidden of ["/IM", "Stop-Process -Name", "taskkill /f /im"]) {
+      expect(`${forbidden}:${CLI.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+    // Every terminateTree call site is preceded by an ownership check in the
+    // same block. There are three: rollback, stop, and supervision.
+    expect((CLI.match(/terminateTree\(/g) ?? []).length).toBe(4); // 1 definition + 3 call sites
+    for (const block of ["const rollback =", "async function stopRuntime", "TERMINATE_THEN_RESTART"]) {
+      const from = CLI.indexOf(block);
+      const kill = CLI.indexOf("terminateTree(", from);
+      const proof = CLI.lastIndexOf("verifyOwnership(", kill);
+      expect(`${block}: ownership proved before kill -> ${proof > from}`).toBe(
+        `${block}: ownership proved before kill -> true`
+      );
+    }
+  });
+
+  it("13. stops only launcher-owned roles, never a detected one", () => {
+    const stop = CLI.slice(CLI.indexOf("async function stopRuntime"), CLI.indexOf("async function superviseAccountWorker"));
+    // The stop loop iterates `alive`, which is built from the state file and
+    // filtered through verifyOwnership. A DETECTED role is never in it.
+    expect(stop).toContain("alive.filter((entry) => entry.role === role)");
+    expect(stop).toContain("will not terminate them");
+  });
+
+  it("25. rolls back only what THIS start spawned, newest first", () => {
+    const start = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
+    expect(start).toContain("[...started].reverse()");
+    expect(start).toContain("Rolling back ONLY the roles this action started");
+    // Rollback re-proves ownership for each PID rather than trusting the list.
+    expect(start.indexOf("verifyOwnership(record")).toBeLessThan(start.indexOf("terminateTree("));
+  });
+
+  it("17. supervises one named account at a time", () => {
+    expect(CLI).toContain(
+      'const workerRole: DualRole = account === "ACCOUNT_A" ? "account-a-worker" : "account-b-worker";'
+    );
+    expect(CLI).toContain('await superviseAccountWorker("ACCOUNT_A", ask)');
+    expect(CLI).toContain('await superviseAccountWorker("ACCOUNT_B", ask)');
+  });
+});
+
+// ===========================================================================
+// 19, 22. The launcher can no longer arm anything
+// ===========================================================================
+
+describe("LIVE-READY is gone, not merely hidden", () => {
+  it("19. has no path that could load live gates for either account", () => {
+    for (const forbidden of [
+      "applyGates",
+      "LIVE_READY_GATES",
+      "gatesFor(",
+      "isLiveReadyConfirmed",
+      "writeEnvText",
+      "startLiveReady",
+    ]) {
+      expect(`${forbidden}:${CLI.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+  });
+
+  it("19. explains the refusal instead of silently dropping the feature", () => {
+    expect(CLI).toContain("LIVE_READY_UNAVAILABLE");
+    expect(LIVE_READY_UNAVAILABLE.join(" ")).toContain(
+      "Account-scoped LIVE-READY requires the dedicated account arming workflow"
+    );
+  });
+
+  it("22. writes no environment file, so SAFE start cannot enable anything", () => {
+    // One writeFileSync, and it is the launcher's own state file.
+    expect((CLI.match(/writeFileSync\(/g) ?? []).length).toBe(1);
+    expect(CLI).toContain("writeFileSync(temporary, JSON.stringify(state, null, 2)");
+  });
+
+  it("22. touches no execution profile and no exchange", () => {
+    for (const forbidden of [
+      "executionProfile",
+      "CanaryPreflightService",
+      "readReadiness",
+      "binance",
+      "armNaturalWindow",
+      "safeOff(",
+    ]) {
+      expect(`${forbidden}:${CLI.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+  });
+});
+
+// ===========================================================================
+// 20, 21. What the operator is shown, and what the tool assumes
+// ===========================================================================
+
+describe("the surface the operator sees", () => {
+  it("20. never renders a value out of an environment file", () => {
+    // `envValue` is the single reader, and every call site asks for a key whose
+    // value is used as a header, a port or a Redis key segment -- never printed.
+    const readers = CLI.match(/envValue\(/g) ?? [];
+    expect(readers.length).toBeGreaterThan(0);
+    for (const match of CLI.matchAll(/console\.log\([^\n]*envValue\(/g)) {
+      expect(`envValue printed at ${match.index} -> should never happen`).toBe("never");
+    }
+    // The status line reports gate BOOLEANS, which are safe, and nothing else.
+    expect(CLI).toContain('kill=${show("EXECUTION_GLOBAL_KILL_SWITCH")} ');
+    for (const secret of ["BINANCE_API_SECRET", "OPERATOR_API_TOKEN}", "accountIdentifier}"]) {
+      expect(`${secret} in a log line:${CLI.includes("console.log(`" + secret)}`).toBe(
+        `${secret} in a log line:false`
+      );
+    }
+  });
+
+  it("20. state records carry an alias, never an account identifier", () => {
+    expect(CLI).toContain("envAlias: string;");
+    expect(CLI).toContain("/** The ALIAS of the env file this role was started with.");
+    const state = CLI.slice(CLI.indexOf("interface OwnedRole"), CLI.indexOf("function readState"));
+    expect(`identifier persisted:${state.includes("accountIdentifier")}`).toBe("identifier persisted:false");
+  });
+
+  it("21. assumes no frontend runtime, because the six-role contract has none", () => {
+    expect(DUAL_ROLES.some((role) => role.includes("frontend"))).toBe(false);
+    expect(`frontend in the launcher:${CLI.includes("frontend")}`).toBe("frontend in the launcher:false");
+    expect(`5173 in the launcher:${CLI.includes("5173")}`).toBe("5173 in the launcher:false");
+  });
+
+  it("names every role, every port and every account exactly once", () => {
+    expect(DUAL_ROLES.length).toBe(6);
+    expect(new Set(DUAL_ROLES).size).toBe(6);
+    const ports = DUAL_ROLES.map((role) => ROLE_CONTRACTS[role].port).filter((port) => port !== null);
+    expect(ports).toEqual([4000, 4001, 4002]);
+    expect([...RUNTIME_ACCOUNTS]).toEqual(["ACCOUNT_A", "ACCOUNT_B"]);
+    for (const role of ["account-a-control", "account-b-control"] as const) {
+      expect(`${role} loopback:${ROLE_CONTRACTS[role].loopbackOnly}`).toBe(`${role} loopback:true`);
+    }
+  });
+
+  it("validates all three env files, and reports every failure at once", () => {
+    // Presence alone is not enough: sanitation needs the file to parse
+    // COMPLETELY, so validation reads and parses each one.
+    const seen: string[] = [];
+    const verdict = validateEnvFiles(FAKE_ENV, (candidate) => {
+      seen.push(path.basename(candidate));
+      if (candidate.endsWith("generic.env")) return "A=1\n";
+      if (candidate.endsWith("account-a.env")) return "this is not an assignment\n";
+      const missing = new Error("no such file") as NodeJS.ErrnoException;
+      missing.code = "ENOENT";
+      throw missing;
+    });
+    expect(seen).toEqual(["generic.env", "account-a.env", "account-b.env"]);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.failures.map((failure) => `${failure.alias}:${failure.reasonCode}`)).toEqual([
+      "account-a:ENV_FILE_MALFORMED",
+      "account-b:ENV_FILE_MISSING",
+    ]);
+    // The one good file is still parsed and available to the caller.
+    expect(verdict.parsed.get("generic")?.keys).toEqual(["A"]);
+  });
+});
+
+
+// ===========================================================================
+// Review finding 1: the selected file is authoritative over the whole shell
+// ===========================================================================
+
+describe("child environment sanitation", () => {
+  /** The key names a file declares, injected so no real file is read. */
+  const declares = (...keys: string[]) => () => keys;
+
+  const STALE_SHELL: NodeJS.ProcessEnv = {
+    ...FAKE_ENV,
+    EXECUTION_GLOBAL_KILL_SWITCH: "false",
+    EXECUTION_LIVE_ENTRY_ENABLED: "true",
+    EXECUTION_PROTECTION_READY: "true",
+    OPERATOR_API_TOKEN: "stale-account-a-token",
+    ACCOUNT_CONTROL_PORT: "4001",
+    DATABASE_URL: "postgresql://stale/shell",
+    REDIS_URL: "redis://stale-shell:6379",
+    EXECUTION_MAX_OPEN_POSITIONS: "99",
+    PATH: "/usr/bin",
+  };
+
+  it("clears every key the selected file declares, so the file wins", () => {
+    // Runtime env application is NON-OVERRIDING at every layer, so any key the
+    // shell still holds beats the file. Clearing the file's own key set is what
+    // makes "the selected file decides" true rather than aspirational.
+    const child = sanitizedChildEnv(
+      "account-b-control",
+      STALE_SHELL,
+      declares(
+        "EXECUTION_GLOBAL_KILL_SWITCH",
+        "EXECUTION_LIVE_ENTRY_ENABLED",
+        "EXECUTION_PROTECTION_READY",
+        "OPERATOR_API_TOKEN",
+        "ACCOUNT_CONTROL_PORT",
+        "DATABASE_URL",
+        "REDIS_URL",
+        "EXECUTION_MAX_OPEN_POSITIONS"
+      )
+    );
+    for (const key of [
+      "EXECUTION_GLOBAL_KILL_SWITCH",
+      "EXECUTION_LIVE_ENTRY_ENABLED",
+      "EXECUTION_PROTECTION_READY",
+      "OPERATOR_API_TOKEN",
+      "ACCOUNT_CONTROL_PORT",
+      "DATABASE_URL",
+      "REDIS_URL",
+      "EXECUTION_MAX_OPEN_POSITIONS",
+    ]) {
+      expect(`${key} -> ${child[key] === undefined ? "cleared" : "LEAKED"}`).toBe(`${key} -> cleared`);
+    }
+  });
+
+  it("a stale globalKill=false cannot outrank a file that says true", () => {
+    const child = sanitizedChildEnv("account-a-worker", STALE_SHELL, declares("EXECUTION_GLOBAL_KILL_SWITCH"));
+    expect(child.EXECUTION_GLOBAL_KILL_SWITCH).toBeUndefined();
+  });
+
+  it("a stale liveEntry=true cannot outrank a file that says false", () => {
+    const child = sanitizedChildEnv("account-a-worker", STALE_SHELL, declares("EXECUTION_LIVE_ENTRY_ENABLED"));
+    expect(child.EXECUTION_LIVE_ENTRY_ENABLED).toBeUndefined();
+  });
+
+  it("a stale protectionReady=true cannot outrank a file that says false", () => {
+    const child = sanitizedChildEnv("account-a-worker", STALE_SHELL, declares("EXECUTION_PROTECTION_READY"));
+    expect(child.EXECUTION_PROTECTION_READY).toBeUndefined();
+  });
+
+  it("Account A's operator token cannot leak into an Account B process", () => {
+    const child = sanitizedChildEnv("account-b-control", STALE_SHELL, declares("OPERATOR_API_TOKEN"));
+    expect(child.OPERATOR_API_TOKEN).toBeUndefined();
+    expect(JSON.stringify(child)).not.toContain("stale-account-a-token");
+  });
+
+  it("Account A's control port cannot leak into an Account B process", () => {
+    // Otherwise Control B would try to bind 4001 and collide with Control A.
+    const child = sanitizedChildEnv("account-b-control", STALE_SHELL, declares("ACCOUNT_CONTROL_PORT"));
+    expect(child.ACCOUNT_CONTROL_PORT).toBeUndefined();
+  });
+
+  it("a stale DATABASE_URL or REDIS_URL cannot outrank the file that declares one", () => {
+    const child = sanitizedChildEnv("generic-backend", STALE_SHELL, declares("DATABASE_URL", "REDIS_URL"));
+    expect(child.DATABASE_URL).toBeUndefined();
+    expect(child.REDIS_URL).toBeUndefined();
+  });
+
+  it("clears the account identity keys even when the file omits them", () => {
+    // A truncated or malformed file must not become a way to smuggle an
+    // inherited account in: the bootstrap's integrity contract is fail-closed
+    // and this keeps it that way.
+    const holdingA: NodeJS.ProcessEnv = {
+      ...FAKE_ENV,
+      BINANCE_API_KEY: "a-key",
+      BINANCE_API_SECRET: "a-secret",
+      EXECUTION_PROFILE_ACCOUNT_IDENTIFIER: "account-a",
+      EXECUTION_PROFILE_ENVIRONMENT: "MAINNET",
+    };
+    const child = sanitizedChildEnv("account-b-worker", holdingA, declares());
+    for (const key of ACCOUNT_IDENTITY_KEYS) {
+      expect(`${key} -> ${child[key] === undefined ? "cleared" : "LEAKED"}`).toBe(`${key} -> cleared`);
+    }
+  });
+
+  it("keeps variables the file does not mention, because a child needs them", () => {
+    const child = sanitizedChildEnv("generic-backend", STALE_SHELL, declares("DATABASE_URL"));
+    expect(child.PATH).toBe("/usr/bin");
+    expect(child.ComSpec).toBe("cmd.exe");
+  });
+
+  it("pins DOTENV_CONFIG_PATH last, so clearing can never remove it", () => {
+    const child = sanitizedChildEnv(
+      "account-b-worker",
+      STALE_SHELL,
+      declares("DOTENV_CONFIG_PATH", "DATABASE_URL")
+    );
+    expect(path.basename(String(child.DOTENV_CONFIG_PATH))).toBe("account-b.env");
+  });
+
+  it("never mutates the parent environment", () => {
+    const parent: NodeJS.ProcessEnv = { ...STALE_SHELL };
+    sanitizedChildEnv("account-b-worker", parent, declares("OPERATOR_API_TOKEN", "DATABASE_URL"));
+    expect(parent.OPERATOR_API_TOKEN).toBe("stale-account-a-token");
+    expect(parent.DATABASE_URL).toBe("postgresql://stale/shell");
+  });
+
+  it("the spawn plan uses the sanitised environment", () => {
+    const plan = dualSpawnPlan("account-b-worker", REPO, STALE_SHELL, declares("OPERATOR_API_TOKEN"));
+    expect(plan.options.env.OPERATOR_API_TOKEN).toBeUndefined();
+    expect(path.basename(String(plan.options.env.DOTENV_CONFIG_PATH))).toBe("account-b.env");
+  });
+
+  it("reads key NAMES only, and the launcher never prints an env value", () => {
+    expect(MODULE).toContain("const parsed = parseEnvFileStrict(envFilePathFor(role, env));");
+    expect(MODULE).toContain("return parsed.ok ? parsed.keys : [];");
+    // The single value reader exists, and no log line interpolates it.
+    for (const match of CLI.matchAll(/console\.log\([^\n]*envValue\(/g)) {
+      expect(`envValue printed at ${match.index}`).toBe("never");
+    }
+    // Nor is any value persisted: state holds an alias.
+    const state = CLI.slice(CLI.indexOf("interface OwnedRole"), CLI.indexOf("function readState"));
+    for (const forbidden of ["token", "apiKey", "secret", "accountIdentifier"]) {
+      expect(`${forbidden} persisted:${state.includes(forbidden)}`).toBe(`${forbidden} persisted:false`);
+    }
+  });
+});
+
+// ===========================================================================
+// Review finding 2: Start SAFE must prove SAFE
+// ===========================================================================
+
+describe("the SAFE deployment posture", () => {
+  const SAFE_DECLARED: Record<string, string> = {
+    EXECUTION_GLOBAL_KILL_SWITCH: "true",
+    EXECUTION_LIVE_ENTRY_ENABLED: "false",
+    EXECUTION_PROTECTION_READY: "false",
+  };
+
+  it("takes its contract from the attested gate snapshot, not from invention", () => {
+    expect(SAFE_GATE_CONTRACT.map((gate) => gate.key)).toEqual([
+      "EXECUTION_GLOBAL_KILL_SWITCH",
+      "EXECUTION_LIVE_ENTRY_ENABLED",
+      "EXECUTION_PROTECTION_READY",
+      "BINANCE_ACCOUNT_SETUP_MUTATIONS_ENABLED",
+      "BINANCE_TEST_ORDER_ENABLED",
+      "EXECUTION_AUTO_ADD_MARGIN_ENABLED",
+      "EXECUTION_EMERGENCY_CLOSE_MODE",
+    ]);
+    // Gates that are NOT part of the attested snapshot stay out of it.
+    for (const invented of ["BINANCE_READ_ONLY_ENABLED", "EXECUTION_FILL_RUNTIME_ENABLED"]) {
+      expect(`${invented} required:${SAFE_GATE_CONTRACT.some((gate) => gate.key === invented)}`).toBe(
+        `${invented} required:false`
+      );
+    }
+  });
+
+  it("accepts a file that declares the SAFE posture", () => {
+    expect(evaluateSafeGatePosture("account-a", SAFE_DECLARED)).toEqual({ ok: true });
+  });
+
+  it("blocks an unsafe Account A file before anything is spawned", () => {
+    const verdict = evaluateSafeGatePosture("account-a", {
+      ...SAFE_DECLARED,
+      EXECUTION_GLOBAL_KILL_SWITCH: "false",
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("account-a.env declares");
+  });
+
+  it("blocks an unsafe Account B file before anything is spawned", () => {
+    const verdict = evaluateSafeGatePosture("account-b", {
+      ...SAFE_DECLARED,
+      EXECUTION_LIVE_ENTRY_ENABLED: "true",
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("EXECUTION_LIVE_ENTRY_ENABLED");
+  });
+
+  it("blocks a protectionReady that is open", () => {
+    const verdict = evaluateSafeGatePosture("account-b", {
+      ...SAFE_DECLARED,
+      EXECUTION_PROTECTION_READY: "true",
+    });
+    expect(verdict.ok).toBe(false);
+  });
+
+  it("requires the three operator gates to be DECLARED, not merely absent", () => {
+    const verdict = evaluateSafeGatePosture("account-a", {});
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons).toHaveLength(3);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("does not declare");
+  });
+
+  it("allows the four defaulted gates to be absent, but not to be wrong", () => {
+    expect(evaluateSafeGatePosture("account-a", SAFE_DECLARED)).toEqual({ ok: true });
+    const verdict = evaluateSafeGatePosture("account-a", {
+      ...SAFE_DECLARED,
+      EXECUTION_EMERGENCY_CLOSE_MODE: "ON_UNVERIFIED_STOP",
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("EXECUTION_EMERGENCY_CLOSE_MODE");
+  });
+
+  it("runs the posture check before any spawn in the CLI", () => {
+    const start = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
+    expect(start.indexOf("evaluateSafeGatePosture(")).toBeLessThan(start.indexOf("spawn(plan.command"));
+    expect(start.indexOf("evaluateSafeGatePosture(")).toBeLessThan(start.indexOf("await collectStatus()"));
+  });
+});
+
+describe("proving an account is dormant before its worker starts", () => {
+  const DORMANT: AccountProfileProof = {
+    account: "ACCOUNT_A",
+    healthOk: true,
+    surface: "ACCOUNT_CONTROL",
+    isEnabled: false,
+    killSwitchActive: true,
+  };
+
+  it("accepts a control plane that proves both facts", () => {
+    expect(evaluateAccountProfileProof(DORMANT)).toEqual({ ok: true });
+  });
+
+  it("blocks Worker A when Account A's profile is ENABLED", () => {
+    const verdict = evaluateAccountProfileProof({ ...DORMANT, isEnabled: true });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("ACCOUNT_A: execution profile is ENABLED");
+  });
+
+  it("blocks Worker A when Account A's kill switch is not active", () => {
+    const verdict = evaluateAccountProfileProof({ ...DORMANT, killSwitchActive: false });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("kill switch is NOT active");
+  });
+
+  it("blocks Worker B when Account B's profile is ENABLED", () => {
+    const verdict = evaluateAccountProfileProof({ ...DORMANT, account: "ACCOUNT_B", isEnabled: true });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("ACCOUNT_B");
+  });
+
+  it("blocks Worker B when Account B's kill switch is not active", () => {
+    const verdict = evaluateAccountProfileProof({
+      ...DORMANT,
+      account: "ACCOUNT_B",
+      killSwitchActive: false,
+    });
+    expect(verdict.ok).toBe(false);
+  });
+
+  it("refuses an unknown rather than assuming dormancy", () => {
+    for (const unknown of [
+      { isEnabled: null },
+      { killSwitchActive: null },
+      { healthOk: false },
+      { surface: null },
+      { surface: "SOMETHING_ELSE" },
+    ]) {
+      const verdict = evaluateAccountProfileProof({ ...DORMANT, ...unknown });
+      expect(`${JSON.stringify(unknown)} -> ${verdict.ok}`).toBe(`${JSON.stringify(unknown)} -> false`);
+    }
+  });
+
+  it("is run after the control plane and BEFORE that account's worker", () => {
+    const start = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
+    // The proof sits inside the per-role loop, guarded on the attesting role,
+    // so the loop cannot advance to the worker without it.
+    expect(start).toContain('if (contract.attests === "BACKEND") {');
+    expect(start).toContain("await proveAccountProfileDormant(account)");
+    expect(start.indexOf("proveAccountProfileDormant")).toBeLessThan(start.indexOf("verifyDualTopology("));
+    // A failed proof rolls back and RETURNS; the success line is only reached
+    // when the verdict held.
+    const proofBlock = start.slice(start.indexOf('if (contract.attests === "BACKEND") {'));
+    const rollback = proofBlock.indexOf("rollback(");
+    const success = proofBlock.indexOf("control plane ACCOUNT_CONTROL, profile disabled");
+    expect(rollback).toBeGreaterThan(-1);
+    expect(rollback).toBeLessThan(success);
+    expect(proofBlock.slice(rollback, success)).toContain("return;");
+  });
+
+  it("never prints the raw operator response, a token or an identifier", () => {
+    const prover = CLI.slice(
+      CLI.indexOf("async function proveAccountProfileDormant"),
+      CLI.indexOf("// Attestation, per account")
+    );
+    expect(`logs in the prover:${prover.includes("console.log")}`).toBe("logs in the prover:false");
+    expect(`json logged:${prover.includes("JSON.stringify")}`).toBe("json logged:false");
+    // The status DTO it reads carries environment and two booleans; the account
+    // identifier never leaves the server, so there is nothing to redact.
+    expect(prover).toContain("status.profile?.isEnabled");
+    expect(prover).toContain("status.profile?.killSwitchActive");
+    expect(`identifier read:${prover.includes("accountIdentifier")}`).toBe("identifier read:false");
+  });
+
+  it("rollback after a failed proof stays ownership-scoped", () => {
+    const start = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
+    expect(start).toContain("[...started].reverse()");
+    expect(start.indexOf("verifyOwnership(record")).toBeLessThan(start.indexOf("terminateTree("));
+  });
+});
+
+// ===========================================================================
+// Review findings 3 and 4: wording that matches behaviour
+// ===========================================================================
+
+describe("the menu and the status say what is true", () => {
+  it("names the stop action for what it does: it requires SAFE, it does not cause it", () => {
+    expect(CLI).toContain('console.log("4. Stop Runtime (requires SAFE)");');
+    expect(`old wording:${CLI.includes("Stop Runtime & Return SAFE")}`).toBe("old wording:false");
+    // And the success line says the same thing.
+    expect(CLI).toContain("Nothing was transitioned INTO safe");
+  });
+
+  it("labels file-derived gates CONFIGURED and runtime-derived gates EFFECTIVE", () => {
+    expect(CLI).toContain("CONFIGURED gates — what each account FILE declares");
+    expect(CLI).toContain("EFFECTIVE gates — what each RUNNING control plane attests it loaded");
+    expect(CLI).toContain("It is NOT necessarily what a running process has");
+  });
+
+  it("carries the effective gates from the attestation, never from a file", () => {
+    const reader = CLI.slice(
+      CLI.indexOf("async function readAccountAttestation"),
+      CLI.indexOf("async function readAllAttestation")
+    );
+    expect(reader).toContain("const gates = status.backend.gates;");
+    expect(reader).toContain("effectiveGates:");
+    // The reader touches no file.
+    expect(`reads a file:${reader.includes("readFileSync")}`).toBe("reads a file:false");
+  });
+
+  it("reports EFFECTIVE as unavailable rather than falling back to the file", () => {
+    expect(CLI).toContain('"not attesting (no running control plane, or unreadable)"');
+  });
+});
+
+
+// ===========================================================================
+// Final review: env files must fail closed BEFORE any spawn
+// ===========================================================================
+
+describe("the strict env-file parser", () => {
+  const read = (text: string) => () => text;
+  const throwing = (code?: string) => () => {
+    const error = new Error("boom") as NodeJS.ErrnoException;
+    if (code !== undefined) error.code = code;
+    throw error;
+  };
+
+  it("accepts the ordinary shapes: assignments, comments, blanks and quotes", () => {
+    const parsed = parseEnvFileStrict(
+      "any",
+      read(["# a comment", "", "A=1", 'B="two"', "C='three'", "D=", "  E=5  "].join("\n"))
+    );
+    expect(parsed.ok).toBe(true);
+    expect(parsed.ok === true && parsed.keys).toEqual(["A", "B", "C", "D", "E"]);
+    expect(parsed.ok === true && parsed.values.get("B")).toBe("two");
+    expect(parsed.ok === true && parsed.values.get("D")).toBe("");
+  });
+
+  it("reports ENV_FILE_MISSING for ENOENT and ENV_FILE_UNREADABLE otherwise", () => {
+    const missing = parseEnvFileStrict("any", throwing("ENOENT"));
+    expect(missing.ok === false && missing.reasonCode).toBe("ENV_FILE_MISSING");
+    const unreadable = parseEnvFileStrict("any", throwing("EACCES"));
+    expect(unreadable.ok === false && unreadable.reasonCode).toBe("ENV_FILE_UNREADABLE");
+  });
+
+  it("refuses a malformed line and names only its NUMBER", () => {
+    const parsed = parseEnvFileStrict("any", read("A=1\nthis is not an assignment\nB=2\n"));
+    expect(parsed.ok === false && parsed.reasonCode).toBe("ENV_FILE_MALFORMED");
+    expect(parsed.ok === false && parsed.detail).toBe("line 2");
+  });
+
+  it("refuses an empty key", () => {
+    const parsed = parseEnvFileStrict("any", read("=orphaned\n"));
+    expect(parsed.ok === false && parsed.reasonCode).toBe("ENV_FILE_MALFORMED");
+    expect(parsed.ok === false && parsed.detail).toBe("line 1");
+  });
+
+  it("refuses a duplicate key and names only the KEY", () => {
+    const parsed = parseEnvFileStrict("any", read("A=1\nB=2\nA=3\n"));
+    expect(parsed.ok === false && parsed.reasonCode).toBe("ENV_FILE_DUPLICATE_KEY");
+    expect(parsed.ok === false && parsed.detail).toBe("A");
+  });
+
+  it("refuses an unterminated quote, which a line parser cannot represent", () => {
+    const parsed = parseEnvFileStrict("any", read('A="starts but never ends\nB=2\n'));
+    expect(parsed.ok === false && parsed.reasonCode).toBe("ENV_FILE_MALFORMED");
+  });
+
+  it("refuses shapes it cannot sanitise against, rather than skipping them", () => {
+    for (const line of ["export A=1", "A B=1", "A.B=1", "1A=2", "just-a-word"]) {
+      const parsed = parseEnvFileStrict("any", read(`${line}\n`));
+      expect(`${line} -> ${parsed.ok ? "ACCEPTED" : parsed.reasonCode}`).toBe(
+        `${line} -> ENV_FILE_MALFORMED`
+      );
+    }
+  });
+
+  it("strips a byte-order mark instead of folding it into the first key", () => {
+    const parsed = parseEnvFileStrict("any", read("\ufeffA=1\n"));
+    expect(parsed.ok === true && parsed.keys).toEqual(["A"]);
+  });
+
+  it("never puts a value in a failure", () => {
+    const secret = "super-secret-value";
+    for (const text of [`A=1\nA=${secret}\n`, `bad line with ${secret}\n`, `="${secret}"\n`]) {
+      const parsed = parseEnvFileStrict("any", read(text));
+      expect(parsed.ok).toBe(false);
+      expect(JSON.stringify(parsed)).not.toContain(secret);
+    }
+  });
+
+  it("is the ONE parser: validation, key names and value lookup all use it", () => {
+    // Three subtly different parsers would eventually disagree about what a
+    // file says, and the disagreement would be a key that sanitation misses.
+    expect(MODULE).toContain("export function parseEnvFileStrict(");
+    expect(MODULE).toContain("const parsed = parseEnvFileStrict(envFilePathFor(role, env));");
+    expect(MODULE).toContain("parseEnvFileStrict(join(runtimeEnvDir(env), `${alias}.env`), readFile)");
+    expect(CLI).toContain("const parsed = parseEnvFileStrict(envFilePathFor(role));");
+    // And no second parser survives in the launcher.
+    for (const forbidden of ['from "dotenv"', "readGates("]) {
+      expect(`${forbidden} in the CLI:${CLI.includes(forbidden)}`).toBe(`${forbidden} in the CLI:false`);
+    }
+  });
+});
+
+describe("Start SAFE refuses a bad env file before it spawns anything", () => {
+  function verdictFor(broken: "generic" | "account-a" | "account-b", text: string) {
+    return validateEnvFiles(FAKE_ENV, (candidate) => {
+      if (candidate.endsWith(`${broken}.env`)) return text;
+      return "EXECUTION_GLOBAL_KILL_SWITCH=true\n";
+    });
+  }
+
+  it("refuses a malformed generic.env", () => {
+    const verdict = verdictFor("generic", "A=1\nnot an assignment\n");
+    expect(verdict.ok).toBe(false);
+    expect(verdict.failures[0]).toEqual({
+      alias: "generic",
+      reasonCode: "ENV_FILE_MALFORMED",
+      detail: "line 2",
+    });
+  });
+
+  it("refuses a malformed account-a.env", () => {
+    const verdict = verdictFor("account-a", "oops\n");
+    expect(verdict.ok).toBe(false);
+    expect(verdict.failures.map((failure) => failure.alias)).toEqual(["account-a"]);
+  });
+
+  it("refuses a malformed account-b.env", () => {
+    const verdict = verdictFor("account-b", "oops\n");
+    expect(verdict.ok).toBe(false);
+    expect(verdict.failures.map((failure) => failure.alias)).toEqual(["account-b"]);
+  });
+
+  it("refuses a duplicate key in any of the three", () => {
+    const verdict = verdictFor("account-b", "A=1\nA=2\n");
+    expect(verdict.ok).toBe(false);
+    expect(verdict.failures[0].reasonCode).toBe("ENV_FILE_DUPLICATE_KEY");
+  });
+
+  it("refuses an unreadable file", () => {
+    const verdict = validateEnvFiles(FAKE_ENV, (candidate) => {
+      if (candidate.endsWith("account-a.env")) {
+        const error = new Error("locked") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return "A=1\n";
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.failures[0].reasonCode).toBe("ENV_FILE_UNREADABLE");
+  });
+
+  it("validates ALL THREE files before the first spawn, and returns on failure", () => {
+    const start = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
+    const validate = start.indexOf("validateEnvFiles()");
+    const spawnAt = start.indexOf("spawn(plan.command");
+    expect(validate).toBeGreaterThan(-1);
+    expect(validate).toBeLessThan(spawnAt);
+    // Everything else that could refuse also precedes the spawn.
+    for (const gate of [
+      "evaluateSafeGatePosture(",
+      "accountIdentitiesAreDistinct(",
+      "evaluateDualStartPreconditions({",
+    ]) {
+      expect(`${gate} before spawn: ${start.indexOf(gate) < spawnAt}`).toBe(`${gate} before spawn: true`);
+    }
+    // The validation failure path returns rather than falling through.
+    const block = start.slice(validate, start.indexOf("const validatedKeyNames"));
+    expect(block).toContain("if (!envFiles.ok) {");
+    expect(block).toContain("return;");
+  });
+
+  it("spawns with the key names VALIDATION produced, not a second read", () => {
+    // No window in which a file could change between being approved and used.
+    const start = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
+    expect(start).toContain("const validatedKeyNames: EnvKeyNameReader = (role) =>");
+    expect(start).toContain("envFiles.parsed.get(ROLE_CONTRACTS[role].envAlias)?.keys ?? []");
+    expect(start).toContain("dualSpawnPlan(role, REPO_ROOT, process.env, validatedKeyNames)");
+  });
+
+  it("prints reason codes only, never a line's contents", () => {
+    const start = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
+    expect(start).toContain("describeEnvFileFailure(failure)");
+    expect(describeEnvFileFailure({ alias: "account-b", reasonCode: "ENV_FILE_DUPLICATE_KEY", detail: "A" })).toBe(
+      "account-b.env: ENV_FILE_DUPLICATE_KEY (A)"
+    );
+  });
+
+  it("still produces the exact six-role spawn plan when all three files are valid", () => {
+    const keys = () => ["DATABASE_URL"];
+    const planned = DUAL_ROLES.map((role) => {
+      const plan = dualSpawnPlan(role, REPO, FAKE_ENV, keys);
+      return `${role} -> ${path.basename(String(plan.options.env.DOTENV_CONFIG_PATH))}`;
+    });
+    expect(planned).toEqual([
+      "generic-backend -> generic.env",
+      "generic-analysis -> generic.env",
+      "account-a-control -> account-a.env",
+      "account-a-worker -> account-a.env",
+      "account-b-control -> account-b.env",
+      "account-b-worker -> account-b.env",
+    ]);
+  });
+});

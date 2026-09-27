@@ -1,116 +1,171 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createConnection } from "node:net";
-import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import path from "node:path";
 
 import {
-  BACKEND_PORT,
-  FRONTEND_PORT,
-  FileStateStore,
-  LAUNCHER_ROLES,
-  LIVE_READY_CONFIRMATION,
-  STANDARD_LIMIT_TAKE_PROFIT_CONFIRMATION,
-  isStandardLimitTakeProfitConfirmed,
-  applyGates,
-  classifyDiskMode,
   defaultStatePath,
-  evaluateDurableSafety,
-  evaluateStartPreconditions,
-  gatesFor,
-  isLiveReadyConfirmed,
-  operatorTokenState,
-  presentStatus,
-  readGates,
-  renderStatus,
-  cleanupAfterModeMismatch,
   expectedGateSnapshotFor,
   verifyOwnership,
-  verifyRuntimeMode,
-  windowsSpawnPlan,
-  standardLimitTakeProfitOf,
-  type DiskMode,
-  type LauncherRole,
-  type OwnedProcess,
-  type AttestationRoleView,
-  type AttestationStatusView,
-  type DurableTradingState,
-  judgeRoleHealth,
   type ProcessProbe,
-  type RoleHealth,
-  type RuntimeState,
 } from "./runtime-launcher";
 import {
+  ACCOUNT_SENSITIVE_KEYS,
+  DUAL_ROLES,
+  SAFE_GATE_CONTRACT,
+  accountIdentitiesAreDistinct,
+  LIVE_READY_UNAVAILABLE,
+  ROLE_CONTRACTS,
+  RUNTIME_ACCOUNTS,
+  censusOf,
+  dualSpawnPlan,
+  envFilePathFor,
+  evaluateAccountProfileProof,
+  evaluateDualShutdownSafety,
+  evaluateDualStartPreconditions,
+  evaluateSafeGatePosture,
+  describeEnvFileFailure,
+  projectTopology,
+  parseEnvFileStrict,
+  validateEnvFiles,
+  verifyDualTopology,
+  type AccountAttestationView,
+  type AccountProfileProof,
+  type AccountShutdownState,
+  type DualRole,
+  type EnvKeyNameReader,
+  type GateTriple,
+  type ObservedListener,
+  type ObservedProcess,
+  type RuntimeAccount,
+  type TopologyStatus,
+} from "./dual-account-topology";
+import {
   EMPTY_RESTART_BUDGET,
-  WORKER_RESTART_STABILIZATION_MS,
   WORKER_SUPERVISION_INTERVAL_MS,
   decideWorkerSupervision,
-  executeWorkerRestart,
   observeWorkerHealth,
   recordRestartAttempt,
   renderSupervisionState,
   runSupervisionSingleFlight,
-  withReplacedWorker,
   type RestartBudget,
-  type SupervisionDecision,
 } from "./worker-supervision";
 
 /**
- * The local Windows runtime launcher — CLI and adapters.
+ * Phase 11I — the local Windows runtime launcher for the DUAL-ACCOUNT topology.
  *
  *   pnpm --filter @trading-alert-dashboard/backend runtime:launcher
  *
  * or double-click `Trading Runtime Launcher.cmd` at the repository root.
  *
- * This file holds only the parts that must touch the machine: reading the real
- * `.env`, probing PIDs, spawning and terminating the repo's own dev processes.
- * Every decision it makes comes from `runtime-launcher.ts`, which is pure and
- * tested.
+ * This file holds only the parts that must touch the machine: probing PIDs,
+ * opening sockets, spawning and terminating this repository's own processes,
+ * and asking each account control plane about its own durable state. Every
+ * DECISION comes from `dual-account-topology.ts`, which is pure and tested.
  *
- * It is a DEPLOYMENT tool. It cannot arm, cannot create an authorization
- * window, cannot reach Binance and never touches the execution profile. Even
- * LIVE-READY only loads the process prerequisites; the durable ARM stays in the
- * authenticated Trading Control page where it is confirmed and audited.
+ * It is a DEPLOYMENT tool and nothing more. It cannot arm, cannot create an
+ * authorization window, cannot reach Binance, never writes an environment file
+ * and never touches an execution profile. Since 11I it cannot even load
+ * live-entry gates: see `LIVE_READY_UNAVAILABLE`.
  */
 
 const REPO_ROOT = path.resolve(__dirname, "../../../../..");
-const BACKEND_DIR = path.join(REPO_ROOT, "apps", "backend");
-const ENV_PATH = path.join(BACKEND_DIR, ".env");
-const store = new FileStateStore(defaultStatePath());
+const STATE_PATH = `${defaultStatePath()}.dual.json`;
+
+// ---------------------------------------------------------------------------
+// Launcher state — six independent role records, no secrets
+// ---------------------------------------------------------------------------
+
+interface OwnedRole {
+  role: DualRole;
+  pid: number;
+  /** Milliseconds since epoch. Defeats PID reuse: a recycled PID starts later. */
+  startedAtMs: number;
+  /** The ALIAS of the env file this role was started with. Never a value from it. */
+  envAlias: string;
+  port: number | null;
+}
+
+interface DualRuntimeState {
+  repoRoot: string;
+  startedAtMs: number;
+  processes: OwnedRole[];
+}
+
+function readState(): DualRuntimeState | null {
+  try {
+    const parsed = JSON.parse(readFileSync(STATE_PATH, "utf8")) as DualRuntimeState;
+    return Array.isArray(parsed.processes) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeState(state: DualRuntimeState): void {
+  mkdirSync(path.dirname(STATE_PATH), { recursive: true });
+  const temporary = `${STATE_PATH}.tmp`;
+  writeFileSync(temporary, JSON.stringify(state, null, 2), "utf8");
+  renameSync(temporary, STATE_PATH);
+}
+
+function clearState(): void {
+  try {
+    writeState({ repoRoot: REPO_ROOT, startedAtMs: Date.now(), processes: [] });
+  } catch {
+    // A state file we cannot rewrite is reported by the next status read.
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Machine adapters
 // ---------------------------------------------------------------------------
 
-function readEnvText(): string {
-  return readFileSync(ENV_PATH, "utf8");
-}
-
-/** Atomic replace, so a failed write can never leave a truncated `.env`. */
-function writeEnvText(text: string): void {
-  const temporary = `${ENV_PATH}.tmp`;
-  writeFileSync(temporary, text, "utf8");
-  renameSync(temporary, ENV_PATH);
-}
-
-/** One PowerShell round-trip for every recorded PID. */
-function probeProcesses(pids: number[]): Map<number, ProcessProbe> {
-  const found = new Map<number, ProcessProbe>();
-  if (pids.length === 0) return found;
+/** One PowerShell round-trip for every node process on the machine. */
+function observeProcesses(): ObservedProcess[] {
   const script =
-    `Get-CimInstance Win32_Process -Filter "${pids.map((pid) => `ProcessId=${pid}`).join(" OR ")}" | ` +
-    `ForEach-Object { '{0}|{1}|{2}' -f $_.ProcessId, ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds(), ($_.CommandLine -replace '\\|',' ') }`;
+    "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
+    "ForEach-Object { '{0}|{1}|{2}' -f $_.ProcessId, " +
+    "([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds(), ($_.CommandLine -replace '\\|',' ') }";
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
     encoding: "utf8",
   });
+  const observed: ObservedProcess[] = [];
   for (const line of (result.stdout ?? "").split(/\r?\n/)) {
     const [pid, startedAtMs, commandLine] = line.trim().split("|");
     if (!pid || !startedAtMs) continue;
-    found.set(Number(pid), {
+    observed.push({
       pid: Number(pid),
       startedAtMs: Number(startedAtMs),
       commandLine: commandLine ?? "",
     });
+  }
+  return observed;
+}
+
+/** Listening sockets on the three contracted ports, with their bind address. */
+function observeListeners(): ObservedListener[] {
+  const script =
+    "Get-NetTCPConnection -State Listen -LocalPort 4000,4001,4002 -ErrorAction SilentlyContinue | " +
+    "ForEach-Object { '{0}|{1}|{2}' -f $_.LocalPort, $_.LocalAddress, $_.OwningProcess }";
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+  });
+  const listeners: ObservedListener[] = [];
+  for (const line of (result.stdout ?? "").split(/\r?\n/)) {
+    const [port, address, pid] = line.trim().split("|");
+    if (!port || !address) continue;
+    listeners.push({ port: Number(port), address, pid: Number(pid) });
+  }
+  return listeners;
+}
+
+function probeProcesses(pids: number[]): Map<number, ProcessProbe> {
+  const found = new Map<number, ProcessProbe>();
+  if (pids.length === 0) return found;
+  const wanted = new Set(pids);
+  for (const observed of observeProcesses()) {
+    if (wanted.has(observed.pid)) found.set(observed.pid, observed);
   }
   return found;
 }
@@ -129,108 +184,6 @@ function portOpen(port: number): Promise<boolean> {
   });
 }
 
-/**
- * Asks whether this runtime should place take profits as resting LIMIT orders.
- *
- * Off unless the operator types the phrase. The choice lives for exactly one
- * runtime: it is pinned into the children's environment and recorded in the
- * launcher state, never written to .env, so the next launch asks again.
- */
-async function askStandardLimitTakeProfit(ask: (question: string) => Promise<string>): Promise<boolean> {
-  console.log("");
-  console.log("Take profits are placed as conditional TAKE_PROFIT_MARKET orders by default.");
-  console.log("Enabling the resting LIMIT modality affects NEW executions only: an execution");
-  console.log("that already has a take profit keeps the modality it started with.");
-  const typed = await ask(`Type ${STANDARD_LIMIT_TAKE_PROFIT_CONFIRMATION} to enable it, or press Enter to leave it off: `);
-  const enabled = isStandardLimitTakeProfitConfirmed(typed);
-  console.log(enabled ? "Standard LIMIT take profit will be ENABLED for this runtime." : "Standard LIMIT take profit stays DISABLED.");
-  return enabled;
-}
-
-/**
- * Starts one role. The command shape lives in `windowsSpawnPlan`, which is pure
- * and tested; this only performs the spawn.
- */
-function spawnRole(
-  role: LauncherRole,
-  mode: "SAFE" | "LIVE_READY",
-  standardLimitTakeProfit: boolean
-): ChildProcess {
-  const plan = windowsSpawnPlan(role, REPO_ROOT, mode, process.env, standardLimitTakeProfit);
-  return spawn(plan.command, plan.args, plan.options);
-}
-
-/**
- * Reads the runtime attestation both roles publish, with a bounded wait.
- *
- * Heartbeats are periodic, so the first read after startup can legitimately
- * find nothing. This waits a bounded number of cycles and then gives up: it
- * never retries forever, and a timeout is a refusal, not a shrug.
- */
-async function readRuntimeModeAttestation(
-  mode: "SAFE" | "LIVE_READY"
-): Promise<AttestationStatusView | null> {
-  // DEPLOYMENT reader, not the arming interlock: this asks whether the
-  // processes loaded the mode that was just requested. SAFE is a valid answer,
-  // and the arming reader refuses SAFE by design.
-  const { configuredRuntimeIdentity, readRuntimeDeploymentAttestationStatusOnce } = await import(
-    "../runtime/runtime-attestation"
-  );
-  const expected = expectedGateSnapshotFor(mode);
-  // Heartbeat is 5s and the TTL is 15s, so ~30s covers a slow cold start
-  // without turning a failure into an indefinite wait.
-  for (let attempt = 0; attempt < 15; attempt += 1) {
-    try {
-      const status = await readRuntimeDeploymentAttestationStatusOnce({
-        identity: configuredRuntimeIdentity(),
-        expected,
-      });
-      if (verifyRuntimeMode(status, mode).ok) return status;
-      // Keep the LAST reading so the refusal can name what was actually seen.
-      if (attempt === 14) return status;
-    } catch {
-      // Message deliberately dropped: it can carry a Redis endpoint.
-      if (attempt === 14) return null;
-    }
-    await sleep(2000);
-  }
-  return null;
-}
-
-/**
- * ONE attestation reading for the status screen.
- *
- * Single shot, unlike the post-start verification loop: the status menu is
- * asking what is true now, not waiting for something to become true. The
- * reader owns a short-lived client with a bounded connect timeout and always
- * disconnects, so an unreachable Redis costs seconds and reports UNKNOWN
- * rather than blocking the menu.
- *
- * `expected` only affects the overall verdict, which this caller ignores; the
- * per-role fresh counts it reads are reported regardless of gate agreement.
- */
-async function readAttestationRoles(
-  diskMode: DiskMode
-): Promise<{ backend: AttestationRoleView; worker: AttestationRoleView } | null> {
-  try {
-    const { configuredRuntimeIdentity, readRuntimeDeploymentAttestationStatusOnce } = await import(
-      "../runtime/runtime-attestation"
-    );
-    const status = await readRuntimeDeploymentAttestationStatusOnce({
-      identity: configuredRuntimeIdentity(),
-      expected: expectedGateSnapshotFor(diskMode === "LIVE_READY" ? "LIVE_READY" : "SAFE"),
-    });
-    // A Redis we could not read reports zero fresh instances for every role,
-    // which is indistinguishable from a silent runtime by count alone. Saying
-    // UNKNOWN points at the actual fault instead of blaming the processes.
-    if (status.reasonCode === "RUNTIME_ATTESTATION_UNAVAILABLE") return null;
-    return { backend: status.backend, worker: status.worker };
-  } catch {
-    // Message deliberately dropped: it can carry a Redis endpoint.
-    return null;
-  }
-}
-
 /** taskkill /T on ONE verified repo-owned root. Never a name-based sweep. */
 function terminateTree(pid: number): boolean {
   const result = spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { encoding: "utf8" });
@@ -239,14 +192,224 @@ function terminateTree(pid: number): boolean {
 
 const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 
+/**
+ * Reads ONE value out of a role's environment file.
+ *
+ * Every caller below asks only for a non-secret scalar — an account identifier
+ * used to build a Redis key pattern, a loopback port, or an operator token used
+ * as a request header. None of them is ever printed, and this function returns
+ * a value to exactly one caller at a time rather than handing out the file.
+ */
+function envValue(role: DualRole, key: string): string | null {
+  const parsed = parseEnvFileStrict(envFilePathFor(role));
+  if (!parsed.ok) return null;
+  const value = parsed.values.get(key);
+  return value === undefined || value === "" ? null : value;
+}
+
+/**
+ * The gate values a role's env file DECLARES.
+ *
+ * Booleans and one enum, named by `SAFE_GATE_CONTRACT`. Nothing else in the
+ * file is read, so no credential can reach a caller.
+ */
+function declaredGateValues(role: DualRole): Record<string, string | undefined> {
+  const declared: Record<string, string | undefined> = {};
+  for (const gate of SAFE_GATE_CONTRACT) {
+    declared[gate.key] = envValue(role, gate.key) ?? undefined;
+  }
+  return declared;
+}
+
+/**
+ * Asks ONE account's control plane to prove its profile is dormant.
+ *
+ * Two calls, both read-only, both loopback: `/health` for the surface, and the
+ * operator status for the profile. The status DTO carries the environment and
+ * two booleans and never the account identifier, so nothing here could print
+ * one even by mistake -- and the raw response is parsed into four fields and
+ * then dropped rather than logged.
+ */
+async function proveAccountProfileDormant(
+  account: Exclude<RuntimeAccount, "GENERIC">
+): Promise<AccountProfileProof> {
+  const controlRole: DualRole =
+    account === "ACCOUNT_A" ? "account-a-control" : "account-b-control";
+  const port = ROLE_CONTRACTS[controlRole].port;
+  const token = envValue(controlRole, "OPERATOR_API_TOKEN");
+  const unknown: AccountProfileProof = {
+    account,
+    healthOk: false,
+    surface: null,
+    isEnabled: null,
+    killSwitchActive: null,
+  };
+  if (port === null || token === null) return unknown;
+
+  let healthOk = false;
+  let surface: string | null = null;
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/health`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    healthOk = response.ok;
+    const body = (await response.json()) as { surface?: string };
+    surface = body.surface ?? null;
+  } catch {
+    return unknown;
+  }
+
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${port}/api/operator/trading-control/status`,
+      { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(8000) }
+    );
+    if (!response.ok) return { ...unknown, healthOk, surface };
+    const status = (await response.json()) as {
+      profile?: { isEnabled?: boolean | null; killSwitchActive?: boolean | null } | null;
+    };
+    return {
+      account,
+      healthOk,
+      surface,
+      isEnabled: status.profile?.isEnabled ?? null,
+      killSwitchActive: status.profile?.killSwitchActive ?? null,
+    };
+  } catch {
+    // Message deliberately dropped: it can carry a token or an endpoint.
+    return { ...unknown, healthOk, surface };
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Shared helpers
+// Attestation, per account
 // ---------------------------------------------------------------------------
 
-function liveProcesses(state: RuntimeState | null): { alive: OwnedProcess[]; disowned: string[] } {
+/**
+ * One account's attestation reading.
+ *
+ * The identity comes from that account's OWN env file, so A and B are read
+ * through different key prefixes and cannot be confused for one another. The
+ * identifier is used to build the scan pattern and is never logged.
+ */
+async function readAccountAttestation(
+  account: Exclude<RuntimeAccount, "GENERIC">
+): Promise<AccountAttestationView | null> {
+  const controlRole: DualRole = account === "ACCOUNT_A" ? "account-a-control" : "account-b-control";
+  const accountIdentifier = envValue(controlRole, "EXECUTION_PROFILE_ACCOUNT_IDENTIFIER");
+  const environment = envValue(controlRole, "EXECUTION_PROFILE_ENVIRONMENT");
+  if (accountIdentifier === null || environment === null) return null;
+
+  try {
+    const { readRuntimeDeploymentAttestationStatusOnce } = await import("../runtime/runtime-attestation");
+    const status = await readRuntimeDeploymentAttestationStatusOnce({
+      identity: { accountIdentifier, environment },
+      expected: expectedGateSnapshotFor("SAFE"),
+    });
+    // A Redis we could not read reports zero fresh instances for every role,
+    // which is indistinguishable from a silent runtime by count alone. Saying
+    // UNKNOWN points at the actual fault instead of blaming the processes.
+    if (status.reasonCode === "RUNTIME_ATTESTATION_UNAVAILABLE") return null;
+    // The gates the CONTROL PLANE actually loaded. Reported as EFFECTIVE,
+        // never merged with anything read off disk.
+    const gates = status.backend.gates;
+    return {
+      backendFresh: status.backend.freshCount,
+      backendStale: status.backend.staleCount,
+      workerFresh: status.worker.freshCount,
+      workerStale: status.worker.staleCount,
+      effectiveGates:
+        gates === null
+          ? null
+          : {
+              globalKillSwitch: gates.globalKillSwitch,
+              liveEntryEnabled: gates.liveEntryEnabled,
+              protectionReady: gates.protectionReady,
+            },
+    };
+  } catch {
+    // Message deliberately dropped: it can carry a Redis endpoint.
+    return null;
+  }
+}
+
+async function readAllAttestation(): Promise<Partial<Record<RuntimeAccount, AccountAttestationView | null>>> {
+  const [a, b] = await Promise.all([
+    readAccountAttestation("ACCOUNT_A"),
+    readAccountAttestation("ACCOUNT_B"),
+  ]);
+  return { ACCOUNT_A: a, ACCOUNT_B: b };
+}
+
+// ---------------------------------------------------------------------------
+// Durable shutdown state, asked of each account control plane
+// ---------------------------------------------------------------------------
+
+/**
+ * Asks ONE account whether it is safe to stop.
+ *
+ * Over its own loopback control plane rather than from a database read in this
+ * process, because `TradingControlService` resolves the profile from the
+ * PROCESS environment: a launcher-side read can only ever describe whichever
+ * account the launcher itself resolves, which is exactly the single-account
+ * assumption 11I removes. The account-bound process is the only thing that can
+ * answer for its own account.
+ *
+ * Every field falls to null on any failure, and null refuses.
+ */
+async function readAccountShutdownState(
+  account: Exclude<RuntimeAccount, "GENERIC">,
+  present: boolean
+): Promise<AccountShutdownState> {
+  const unknown: AccountShutdownState = {
+    account,
+    present,
+    systemState: null,
+    activeExecutions: null,
+    manualIntervention: null,
+    warnings: null,
+  };
+  if (!present) return { ...unknown, present: false };
+
+  const controlRole: DualRole = account === "ACCOUNT_A" ? "account-a-control" : "account-b-control";
+  const port = ROLE_CONTRACTS[controlRole].port;
+  const token = envValue(controlRole, "OPERATOR_API_TOKEN");
+  if (port === null || token === null) return unknown;
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/operator/trading-control/status`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!response.ok) return unknown;
+    const status = (await response.json()) as {
+      systemState?: string;
+      capacity?: { totalActive?: number };
+      manualIntervention?: { count?: number };
+      warnings?: { code?: string }[];
+    };
+    return {
+      account,
+      present,
+      systemState: status.systemState ?? null,
+      activeExecutions: status.capacity?.totalActive ?? null,
+      manualIntervention: status.manualIntervention?.count ?? null,
+      warnings: (status.warnings ?? []).map((warning) => warning.code ?? "UNKNOWN"),
+    };
+  } catch {
+    // Message deliberately dropped: it can carry a token or an endpoint.
+    return unknown;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Status
+// ---------------------------------------------------------------------------
+
+function ownedRolesAlive(state: DualRuntimeState | null): { alive: OwnedRole[]; disowned: string[] } {
   if (!state) return { alive: [], disowned: [] };
   const probes = probeProcesses(state.processes.map((entry) => entry.pid));
-  const alive: OwnedProcess[] = [];
+  const alive: OwnedRole[] = [];
   const disowned: string[] = [];
   for (const record of state.processes) {
     const verdict = verifyOwnership(record, probes.get(record.pid) ?? null, state.repoRoot);
@@ -258,176 +421,410 @@ function liveProcesses(state: RuntimeState | null): { alive: OwnedProcess[]; dis
   return { alive, disowned };
 }
 
-async function currentStatus(): Promise<{ lines: string[]; diskMode: DiskMode; aliveCount: number }> {
-  const envText = readEnvText();
-  const gates = readGates(envText);
-  const diskMode: DiskMode = gates.ok ? classifyDiskMode(gates.values) : "INVALID";
-  const state = store.read();
-  const { alive, disowned } = liveProcesses(state);
-  const running = Object.fromEntries(
-    LAUNCHER_ROLES.map((role) => [role, alive.some((entry) => entry.role === role)])
-  ) as Record<LauncherRole, boolean>;
-
-  const [backendPortOpen, frontendPortOpen, attestationRoles] = await Promise.all([
-    portOpen(BACKEND_PORT),
-    portOpen(FRONTEND_PORT),
-    // Only worth asking when we believe something of ours is running; with
-    // nothing owned, OFF is already the whole answer.
-    alive.length > 0 ? readAttestationRoles(diskMode) : Promise.resolve(null),
-  ]);
-
-  const view = presentStatus({
-    diskMode,
-    running,
-    backendPortOpen,
-    frontendPortOpen,
-    operatorToken: operatorTokenState(envText),
-    attestationRoles,
-  });
-
-  const lines = renderStatus(view);
-  if (!gates.ok) lines.push("", `  Gate file problem: ${gates.reason}`);
-  for (const note of disowned) lines.push("", `  ${note}`);
-  return { lines, diskMode, aliveCount: alive.length };
-}
-
-/**
- * ONE supervision observation: ownership plus health, for both roles.
- *
- * Reuses `liveProcesses`, `readAttestationRoles` and `judgeRoleHealth` exactly
- * as the status screen does, so supervision can never disagree with what the
- * operator is being shown.
- */
-async function observeRuntimeForSupervision(): Promise<{
-  state: RuntimeState | null;
-  workerRecord: OwnedProcess | null;
-  workerHealth: RoleHealth;
-  backendHealth: RoleHealth;
+async function collectStatus(): Promise<{
+  status: TopologyStatus;
+  alive: OwnedRole[];
+  disowned: string[];
+  effectiveGates: Partial<Record<RuntimeAccount, GateTriple | null>>;
 }> {
-  const state = store.read();
-  const { alive } = liveProcesses(state);
-  const running = (role: LauncherRole) => alive.some((entry) => entry.role === role);
-
-  const envText = readEnvText();
-  const gates = readGates(envText);
-  const diskMode: DiskMode = gates.ok ? classifyDiskMode(gates.values) : "INVALID";
-  const roles = alive.length > 0 ? await readAttestationRoles(diskMode) : null;
-
+  const state = readState();
+  const { alive, disowned } = ownedRolesAlive(state);
+  const census = censusOf(observeProcesses(), observeListeners());
+  const attestation = await readAllAttestation();
+  const status = projectTopology({
+    census,
+    ownedRoles: alive.map((entry) => entry.role),
+    attestation,
+  });
   return {
-    state,
-    workerRecord: state?.processes.find((entry) => entry.role === "worker") ?? null,
-    workerHealth: judgeRoleHealth(running("worker"), roles?.worker ?? null),
-    backendHealth: judgeRoleHealth(running("backend"), roles?.backend ?? null),
+    status,
+    alive,
+    disowned,
+    effectiveGates: {
+      ACCOUNT_A: attestation.ACCOUNT_A?.effectiveGates ?? null,
+      ACCOUNT_B: attestation.ACCOUNT_B?.effectiveGates ?? null,
+    },
   };
 }
 
-/**
- * ONE supervision pass: observe, decide, and act only if the decision says so.
- *
- * Held under the single-flight guard so two overlapping passes cannot each
- * conclude "no worker" and each start one.
- *
- * The launcher deliberately spawns the replacement with the mode already
- * RECORDED in runtime state. Restarting a worker is infrastructure recovery,
- * not an operator decision to trade: no gate is written, no `.env` byte moves,
- * and a SAFE runtime comes back SAFE.
- */
-async function superviseWorkerOnce(budget: RestartBudget): Promise<{
-  budget: RestartBudget;
-  decision: SupervisionDecision;
-}> {
-  const observed = await observeRuntimeForSupervision();
-  const nowMs = Date.now();
-  const observedBudget = observeWorkerHealth(budget, observed.workerHealth, nowMs);
-
-  const decision = decideWorkerSupervision({
-    record: observed.workerRecord,
-    ownership: observed.workerRecord
-      ? verifyOwnership(
-          observed.workerRecord,
-          probeProcesses([observed.workerRecord.pid]).get(observed.workerRecord.pid) ?? null,
-          observed.state?.repoRoot ?? REPO_ROOT
-        )
-      : null,
-    workerHealth: observed.workerHealth,
-    backendHealth: observed.backendHealth,
-    budget: observedBudget,
-    nowMs,
-    hasRuntimeState: observed.state !== null,
-  });
-
-  if (decision.action === "NONE" || !observed.state) {
-    return { budget: observedBudget, decision };
-  }
-
-  const state = observed.state;
-  const attemptNumber = observedBudget.attempts + 1;
-  const result = executeWorkerRestart(decision, state, attemptNumber, {
-    probe: (pid) => probeProcesses([pid]).get(pid) ?? null,
-    terminate: (pid) => terminateTree(pid),
-    spawnWorker: () => {
-      // The RECORDED mode and the RECORDED take-profit modality, never a fresh
-      // choice of either. `windowsSpawnPlan` pins the three gates and the
-      // modality switch into the child environment, so this reproduces exactly
-      // the posture the stack was started in.
-      const child = spawnRole("worker", state.mode, standardLimitTakeProfitOf(state));
-      if (typeof child.pid !== "number") return null;
-      child.unref();
-      return child.pid;
-    },
-    log: (line) => console.log(`  ${line}`),
-  });
-
-  // Only the worker record is replaced; the backend and frontend records are
-  // left exactly as they were, so the launcher can still stop them.
-  if (result.outcome === "RESTARTED" && result.record) {
-    store.write(withReplacedWorker(state, result.record));
-  }
-
-  return { budget: recordRestartAttempt(observedBudget, nowMs), decision };
+/** The three deployment gates each account file declares. Booleans only. */
+function gateLine(role: DualRole): string {
+  const parsed = parseEnvFileStrict(envFilePathFor(role));
+  if (!parsed.ok) return `gates unavailable (${parsed.reasonCode})`;
+  const show = (key: string): string => parsed.values.get(key) ?? "<absent>";
+  return (
+    `kill=${show("EXECUTION_GLOBAL_KILL_SWITCH")} ` +
+    `entry=${show("EXECUTION_LIVE_ENTRY_ENABLED")} ` +
+    `protection=${show("EXECUTION_PROTECTION_READY")}`
+  );
 }
 
-/**
- * The supervision loop.
- *
- * ## Scope, stated plainly
- *
- * This supervises the worker for as long as the launcher is running it. It is
- * NOT a Windows service and it does not survive this console closing. That is
- * a deliberate limit: the launcher is what owns the process records, and a new
- * always-on daemon is a bigger change than this fix is allowed to make.
- *
- * The loop is interruptible with Ctrl+C and reports every tick, so an operator
- * can watch a recovery happen rather than trusting that one did.
- */
-async function superviseWorker(ask: (question: string) => Promise<string>): Promise<void> {
+function renderTopology(
+  status: TopologyStatus,
+  disowned: string[],
+  effectiveGates: Partial<Record<RuntimeAccount, GateTriple | null>> = {}
+): string[] {
+  const lines: string[] = ["", "Runtime:"];
+  let lastAccount: RuntimeAccount | null = null;
+  for (const role of status.roles) {
+    const contract = ROLE_CONTRACTS[role.role];
+    if (lastAccount !== null && contract.account !== lastAccount) lines.push("");
+    lastAccount = contract.account;
+    const presence =
+      role.presence === "OWNED" ? "ON  (launcher-owned)" : role.presence === "DETECTED" ? "ON  (external)" : "OFF";
+    const port =
+      role.port === null
+        ? ""
+        : `   port ${role.port} ${role.portOpen ? "open" : "closed"}${
+            role.portLoopbackOk === false ? " NOT-LOOPBACK" : ""
+          }`;
+    const attestation = role.attestation === "NOT_APPLICABLE" ? "" : `   attestation ${role.attestation}`;
+    lines.push(`  ${contract.label.padEnd(28)} ${presence.padEnd(21)}${port}${attestation}`);
+  }
+
+  lines.push("");
+  lines.push("CONFIGURED gates — what each account FILE declares. This is what the");
+  lines.push("next start would load. It is NOT necessarily what a running process has:");
+  lines.push(`  account-a   CONFIGURED  ${gateLine("account-a-control")}`);
+  lines.push(`  account-b   CONFIGURED  ${gateLine("account-b-control")}`);
+
+  lines.push("");
+  lines.push("EFFECTIVE gates — what each RUNNING control plane attests it loaded:");
+  for (const [account, alias] of [
+    ["ACCOUNT_A", "account-a"],
+    ["ACCOUNT_B", "account-b"],
+  ] as const) {
+    const effective = effectiveGates[account] ?? null;
+    lines.push(
+      `  ${alias}   EFFECTIVE   ` +
+        (effective === null
+          ? "not attesting (no running control plane, or unreadable)"
+          : `kill=${effective.globalKillSwitch} entry=${effective.liveEntryEnabled} protection=${effective.protectionReady}`)
+    );
+  }
+
+  if (status.anyExternal) {
+    lines.push("");
+    lines.push("Some roles are EXTERNAL: running, but not started by this launcher.");
+    lines.push("They are reported and never terminated. Stop them the way they were started.");
+  }
+  for (const line of disowned) lines.push(`  ${line}`);
+  return lines;
+}
+
+// ---------------------------------------------------------------------------
+// Start SAFE
+// ---------------------------------------------------------------------------
+
+async function startSafe(): Promise<void> {
   console.log("");
-  console.log("Worker supervision watches the WORKER role only.");
+  console.log("Starting the SAFE dual-account topology: six roles, three environment files.");
+  console.log("This never enables trading. It writes no environment file and arms nothing.");
+
+  // FIRST, and for all three files, before a single process is spawned.
+  //
+  // Sanitation works by deleting every name the selected file declares from
+  // the child environment, so a file that cannot be parsed COMPLETELY cannot
+  // be sanitised against: an under-reported key set is a key the stale shell
+  // value survives into. Refusing here is the only honest answer.
+  const envFiles = validateEnvFiles();
+  if (!envFiles.ok) {
+    console.log("");
+    console.log("BLOCKED — nothing was started:");
+    for (const failure of envFiles.failures) console.log(`  - ${describeEnvFileFailure(failure)}`);
+    return;
+  }
+
+  // The key names every spawn below will clear come from THAT validation, not
+  // from a second read: there is no window in which a file could change
+  // between being approved and being used.
+  const validatedKeyNames: EnvKeyNameReader = (role) =>
+    envFiles.parsed.get(ROLE_CONTRACTS[role].envAlias)?.keys ?? [];
+
+  // SAFE must MEAN safe. Both account files are required to declare the SAFE
+  // deployment posture before a single process is spawned -- otherwise
+  // "Start SAFE" would only mean "start whatever the files currently say".
+  const gatePosture = [
+    evaluateSafeGatePosture("account-a", declaredGateValues("account-a-control")),
+    evaluateSafeGatePosture("account-b", declaredGateValues("account-b-control")),
+  ];
+  const gateReasons = gatePosture.flatMap((verdict) => (verdict.ok ? [] : verdict.reasons));
+  if (gateReasons.length > 0) {
+    console.log("");
+    console.log("BLOCKED — nothing was started:");
+    for (const reason of gateReasons) console.log(`  - ${reason}`);
+    return;
+  }
+
+  const { status, alive } = await collectStatus();
+  // Identifiers are compared inside the guard and never returned here.
+  const identities = accountIdentitiesAreDistinct((role) => ({
+    accountIdentifier: envValue(role, "EXECUTION_PROFILE_ACCOUNT_IDENTIFIER"),
+    environment: envValue(role, "EXECUTION_PROFILE_ENVIRONMENT"),
+  }));
+  const verdict = evaluateDualStartPreconditions({
+    status,
+    envFiles,
+    ownedAliveCount: alive.length,
+    identities,
+  });
+  if (!verdict.ok) {
+    console.log("");
+    console.log("BLOCKED — nothing was started:");
+    for (const reason of verdict.reasons) console.log(`  - ${reason}`);
+    return;
+  }
+
+  const started: OwnedRole[] = [];
+  const rollback = (why: string): void => {
+    console.log("");
+    console.log(`PARTIAL START — ${why}`);
+    console.log("Rolling back ONLY the roles this action started, newest first.");
+    for (const record of [...started].reverse()) {
+      const probes = probeProcesses([record.pid]);
+      const owned = verifyOwnership(record, probes.get(record.pid) ?? null, REPO_ROOT);
+      if (!owned.owned) {
+        console.log(`  ${record.role}: ${owned.reason} — NOT terminated`);
+        continue;
+      }
+      console.log(`  ${record.role}: ${terminateTree(record.pid) ? "terminated" : "TERMINATION FAILED"}`);
+    }
+    clearState();
+  };
+
+  for (const role of DUAL_ROLES) {
+    const contract = ROLE_CONTRACTS[role];
+    console.log(`Starting ${contract.label} (${contract.envAlias}.env)…`);
+    const plan = dualSpawnPlan(role, REPO_ROOT, process.env, validatedKeyNames);
+    const child = spawn(plan.command, plan.args, plan.options);
+    if (child.pid === undefined) {
+      rollback(`${contract.label} could not be spawned.`);
+      return;
+    }
+    child.unref();
+    const probes = probeProcesses([child.pid]);
+    started.push({
+      role,
+      pid: child.pid,
+      startedAtMs: probes.get(child.pid)?.startedAtMs ?? Date.now(),
+      envAlias: contract.envAlias,
+      port: contract.port,
+    });
+    writeState({ repoRoot: REPO_ROOT, startedAtMs: Date.now(), processes: started });
+
+    if (contract.port !== null) {
+      let open = false;
+      for (let attempt = 0; attempt < 30 && !open; attempt += 1) {
+        await sleep(1000);
+        open = await portOpen(contract.port);
+      }
+      if (!open) {
+        rollback(`an expected port did not open (${contract.port}, ${contract.label}).`);
+        return;
+      }
+    }
+
+    // A control plane is inert -- it binds no orchestration and adopts no
+    // plan -- so it is asked to prove its account dormant BEFORE that
+    // account's worker exists. The worker is the process that would begin
+    // adopting within seconds of starting, and after it exists the proof is
+    // no longer a precondition, only an observation.
+    if (contract.attests === "BACKEND") {
+      const account = contract.account as Exclude<RuntimeAccount, "GENERIC">;
+      console.log(`Proving ${account} is dormant before its worker starts…`);
+      const proof = await proveAccountProfileDormant(account);
+      const verdict = evaluateAccountProfileProof(proof);
+      if (!verdict.ok) {
+        for (const reason of verdict.reasons) console.log(`  - ${reason}`);
+        rollback(`${account} could not prove its execution profile is dormant.`);
+        return;
+      }
+      console.log(
+        `  ${account}: control plane ACCOUNT_CONTROL, profile disabled, kill switch active.`
+      );
+    }
+  }
+
+  // Heartbeat is 5s and the TTL is 15s; a first beat plus a margin.
+  console.log("");
+  console.log("Waiting for the expected ports and attestations to settle…");
+  await sleep(20_000);
+
+  const after = await collectStatus();
+  const topology = verifyDualTopology(after.status);
+  if (!topology.ok) {
+    console.log("");
+    console.log("Topology verification FAILED:");
+    for (const reason of topology.reasons) console.log(`  - ${reason}`);
+    rollback("the six-role topology did not verify.");
+    return;
+  }
+
+  console.log("");
+  console.log("SAFE topology verified: six roles, both accounts attesting one BACKEND and one WORKER.");
+  for (const line of renderTopology(after.status, after.disowned, after.effectiveGates)) {
+    console.log(line);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stop
+// ---------------------------------------------------------------------------
+
+async function stopRuntime(): Promise<void> {
+  const { status, alive, disowned } = await collectStatus();
+
+  if (alive.length === 0) {
+    console.log("");
+    console.log("This launcher owns no running processes, so there is nothing for it to stop.");
+    if (status.anyExternal) {
+      console.log("Roles ARE running that this launcher did not start. It will not terminate them.");
+    }
+    return;
+  }
+
+  // Every account with a live runtime must answer for itself.
+  const presence: Record<string, boolean> = {};
+  for (const role of status.roles) {
+    const contract = ROLE_CONTRACTS[role.role];
+    if (contract.account === "GENERIC") continue;
+    presence[contract.account] = presence[contract.account] === true || role.presence !== "OFF";
+  }
+  const states = await Promise.all(
+    RUNTIME_ACCOUNTS.map((account) => readAccountShutdownState(account, presence[account] === true))
+  );
+  const safety = evaluateDualShutdownSafety(states);
+  if (!safety.ok) {
+    console.log("");
+    console.log("BLOCKED — nothing was stopped:");
+    for (const reason of safety.reasons) console.log(`  - ${reason}`);
+    console.log("");
+    console.log("This tool is a deployment launcher; it never disarms, revokes or closes anything.");
+    console.log("Use Trading Control on the account's own control plane, then try again.");
+    return;
+  }
+
+  console.log("");
+  console.log("Both accounts report SAFE OFF with nothing outstanding. Stopping owned roles…");
+  const order = [...DUAL_ROLES].reverse();
+  const remaining: OwnedRole[] = [];
+  for (const role of order) {
+    for (const record of alive.filter((entry) => entry.role === role)) {
+      const probes = probeProcesses([record.pid]);
+      const owned = verifyOwnership(record, probes.get(record.pid) ?? null, REPO_ROOT);
+      if (!owned.owned) {
+        console.log(`  ${record.role}: ${owned.reason} — NOT terminated`);
+        continue;
+      }
+      const stopped = terminateTree(record.pid);
+      console.log(`  ${record.role}: ${stopped ? "terminated" : "TERMINATION FAILED"}`);
+      if (!stopped) remaining.push(record);
+    }
+  }
+  for (const line of disowned) console.log(`  ${line}`);
+
+  writeState({ repoRoot: REPO_ROOT, startedAtMs: Date.now(), processes: remaining });
+  console.log("");
+  console.log(
+    "Stopped. Nothing was transitioned INTO safe: this tool verifies that both " +
+      "accounts are already SAFE and then stops. No environment file was written " +
+      "and no profile was changed."
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Supervision, per account
+// ---------------------------------------------------------------------------
+
+async function superviseAccountWorker(
+  account: Exclude<RuntimeAccount, "GENERIC">,
+  ask: (question: string) => Promise<string>
+): Promise<void> {
+  const workerRole: DualRole = account === "ACCOUNT_A" ? "account-a-worker" : "account-b-worker";
+  const controlRole: DualRole = account === "ACCOUNT_A" ? "account-a-control" : "account-b-control";
+  const label = ROLE_CONTRACTS[workerRole].label;
+
+  console.log("");
+  console.log(`Worker supervision watches ${label} ONLY.`);
   console.log("It never changes a deployment gate, never arms, and never touches an");
   console.log("authorization window. A SAFE runtime stays SAFE.");
   console.log("");
   console.log("It runs only while this launcher is open. Press Ctrl+C to stop it.");
   console.log("");
-  const answer = (await ask("Start supervising the worker? (y/N) ")).trim().toLowerCase();
-  if (answer !== "y") {
+  if ((await ask(`Start supervising ${label}? (y/N) `)).trim().toLowerCase() !== "y") {
     console.log("Nothing was changed.");
     return;
   }
 
-  let budget = EMPTY_RESTART_BUDGET;
+  let budget: RestartBudget = EMPTY_RESTART_BUDGET;
   for (;;) {
-    const pass = await runSupervisionSingleFlight(() => superviseWorkerOnce(budget));
+    const pass = await runSupervisionSingleFlight(async () => {
+      const state = readState();
+      const { alive } = ownedRolesAlive(state);
+      const record = alive.find((entry) => entry.role === workerRole) ?? null;
+      const attestation = await readAccountAttestation(account);
+      const status = projectTopology({
+        census: censusOf(observeProcesses(), observeListeners()),
+        ownedRoles: alive.map((entry) => entry.role),
+        attestation: { [account]: attestation },
+      });
+      const workerView = status.roles.find((entry) => entry.role === workerRole);
+      const controlView = status.roles.find((entry) => entry.role === controlRole);
+      const nowMs = Date.now();
+      budget = observeWorkerHealth(budget, workerView?.attestation === "HEALTHY" ? "HEALTHY" : "STALE", nowMs);
+
+      // The decision ladder is the tested one. Its record type names the legacy
+      // single-stack role; only `pid` is read from it, and the role this pass
+      // is about is fixed above — so an A pass can never act on B's process.
+      const decision = decideWorkerSupervision({
+        record: record === null ? null : { role: "worker", pid: record.pid, startedAtMs: record.startedAtMs },
+        ownership: record === null ? null : { owned: true },
+        workerHealth: workerView?.attestation === "HEALTHY" ? "HEALTHY" : workerView?.presence === "OFF" ? "OFF" : "STALE",
+        backendHealth: controlView?.attestation === "HEALTHY" ? "HEALTHY" : controlView?.presence === "OFF" ? "OFF" : "STALE",
+        budget,
+        nowMs,
+        hasRuntimeState: state !== null,
+      });
+
+      if (decision.action === "TERMINATE_THEN_RESTART" && decision.terminatePid !== null) {
+        const probes = probeProcesses([decision.terminatePid]);
+        const owned =
+          record !== null && verifyOwnership(record, probes.get(decision.terminatePid) ?? null, REPO_ROOT).owned;
+        if (owned) terminateTree(decision.terminatePid);
+      }
+      if (decision.action === "RESTART" || decision.action === "TERMINATE_THEN_RESTART") {
+        // The SAME role, so the SAME env file. A restart cannot change account.
+        const plan = dualSpawnPlan(workerRole, REPO_ROOT);
+        const child = spawn(plan.command, plan.args, plan.options);
+        if (child.pid !== undefined) {
+          child.unref();
+          const probes = probeProcesses([child.pid]);
+          const next = readState() ?? { repoRoot: REPO_ROOT, startedAtMs: Date.now(), processes: [] };
+          next.processes = [
+            ...next.processes.filter((entry) => entry.role !== workerRole),
+            {
+              role: workerRole,
+              pid: child.pid,
+              startedAtMs: probes.get(child.pid)?.startedAtMs ?? Date.now(),
+              envAlias: ROLE_CONTRACTS[workerRole].envAlias,
+              port: null,
+            },
+          ];
+          writeState(next);
+        }
+        budget = recordRestartAttempt(budget, nowMs);
+      }
+      return { decision, budget };
+    });
+
     if (pass.ran) {
-      budget = pass.result.budget;
       const stamp = new Date().toISOString().slice(11, 19);
-      for (const line of renderSupervisionState(pass.result.decision, budget)) {
-        console.log(`[${stamp}] ${line}`);
+      for (const line of renderSupervisionState(pass.result.decision, pass.result.budget)) {
+        console.log(`[${stamp}] ${label}: ${line}`);
       }
       if (pass.result.decision.state === "WORKER_RECOVERY_FAILED") {
         console.log("");
-        console.log("Automatic worker recovery has STOPPED. Nothing further will be restarted.");
-        console.log("Investigate the worker before starting anything else, and do NOT start a");
-        console.log("second stack while this runtime is still owned.");
+        console.log(`Automatic recovery for ${label} has STOPPED. Nothing further will be restarted.`);
         return;
       }
     }
@@ -435,298 +832,40 @@ async function superviseWorker(ask: (question: string) => Promise<string>): Prom
   }
 }
 
-/**
- * The DURABLE trading state, through the SAME read-only service the dashboard
- * uses. No second definition of "is anything still running", no readiness
- * engine and no Binance call: this is the cheap DB/Redis status path.
- *
- * Every field falls to null on any failure, and null refuses.
- */
-async function readDurableState(): Promise<DurableTradingState> {
-  const unknown: DurableTradingState = {
-    systemState: null,
-    activeExecutions: null,
-    manualIntervention: null,
-    authorizationState: null,
-    warnings: null,
-  };
-  try {
-    const { PrismaClient } = await import("@prisma/client");
-    const { TradingControlService } = await import("./trading-control.service");
-    const prisma = new PrismaClient();
-    try {
-      const status = await new TradingControlService(prisma).readStatus();
-      return {
-        systemState: status.systemState,
-        activeExecutions: status.capacity.totalActive,
-        manualIntervention: status.manualIntervention.count,
-        authorizationState: status.authorization?.state ?? null,
-        warnings: status.warnings.map((warning) => warning.code),
-      };
-    } finally {
-      await prisma.$disconnect();
-    }
-  } catch {
-    // Message deliberately dropped: it can carry a connection string.
-    return unknown;
-  }
-}
-
-/** Prints the refusal both flows share, so the wording cannot drift. */
-function reportDurableRefusal(reason: string, what: string): void {
-  console.log("");
-  console.log(`BLOCKED — ${reason}`);
-  console.log(`${what} This tool is a deployment launcher; it never disarms, revokes or closes anything.`);
-}
-
-async function waitForPorts(): Promise<{ backend: boolean; frontend: boolean }> {
-  // Dev servers take a few seconds; give them a bounded window rather than
-  // declaring failure immediately or waiting forever.
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const [backend, frontend] = await Promise.all([portOpen(BACKEND_PORT), portOpen(FRONTEND_PORT)]);
-    if (backend && frontend) return { backend, frontend };
-    await sleep(1000);
-  }
-  const [backend, frontend] = await Promise.all([portOpen(BACKEND_PORT), portOpen(FRONTEND_PORT)]);
-  return { backend, frontend };
-}
-
-// ---------------------------------------------------------------------------
-// Actions
-// ---------------------------------------------------------------------------
-
-async function startRuntime(
-  mode: "SAFE" | "LIVE_READY",
-  standardLimitTakeProfit = false
-): Promise<void> {
-  const state = store.read();
-  const { alive } = liveProcesses(state);
-  const [backendPortOpen, frontendPortOpen] = await Promise.all([
-    portOpen(BACKEND_PORT),
-    portOpen(FRONTEND_PORT),
-  ]);
-  const precondition = evaluateStartPreconditions({
-    recordedProcessesAlive: alive.length,
-    backendPortOpen,
-    frontendPortOpen,
-  });
-  if (!precondition.ok) {
-    console.log(`BLOCKED — ${precondition.reason}`);
-    return;
-  }
-
-  // --- Write the gates BEFORE spawning, so the new processes load them ------
-  const envText = readEnvText();
-  const rewritten = applyGates(envText, gatesFor(mode));
-  if (!rewritten.ok) {
-    console.log(`BLOCKED — the deployment gates could not be rewritten: ${rewritten.reason}`);
-    console.log("Nothing was started and .env was not modified.");
-    return;
-  }
-  writeEnvText(rewritten.text);
-  console.log(`Deployment gates written: ${mode}`);
-  // The SAME value handed to every child below, never a second read of the
-  // environment: what is printed is what the runtime will run with.
-  console.log(`Standard LIMIT take profit: ${standardLimitTakeProfit ? "ENABLED" : "DISABLED"}`);
-
-  const started: OwnedProcess[] = [];
-  for (const role of LAUNCHER_ROLES) {
-    const child = spawnRole(role, mode, standardLimitTakeProfit);
-    if (typeof child.pid !== "number") {
-      console.log(`FAILED — ${role} could not be started.`);
-      break;
-    }
-    child.unref();
-    // Read the OS's own creation time so the ownership check compares like
-    // with like when this PID is verified later.
-    const probe = probeProcesses([child.pid]).get(child.pid);
-    started.push({ role, pid: child.pid, startedAtMs: probe?.startedAtMs ?? Date.now() });
-  }
-
-  store.write({
-    repoRoot: REPO_ROOT,
-    mode,
-    startedAtMs: Date.now(),
-    processes: started,
-    standardLimitTakeProfit,
-  });
-
-  if (started.length !== LAUNCHER_ROLES.length) {
-    console.log("");
-    console.log("PARTIAL START — not every process launched.");
-    console.log("Run 'Stop Runtime & Return SAFE' to clean up before trying again.");
-    return;
-  }
-
-  console.log("Waiting for the expected ports…");
-  const ports = await waitForPorts();
-  console.log("");
-  for (const line of (await currentStatus()).lines) console.log(line);
-
-  if (!ports.backend || !ports.frontend) {
-    console.log("");
-    console.log("WARNING — an expected port did not open. The stack may be starting slowly, or it failed.");
-    console.log("Check the spawned windows, then use 'Stop Runtime & Return SAFE' if needed.");
-    return;
-  }
-
-  // --- The running processes must ATTEST the requested mode ---------------
-  // Open ports and a rewritten file prove only that this tool did its part.
-  // Nothing may be reported as active before the runtime itself agrees.
-  console.log("");
-  console.log("Verifying the running runtime attested the requested mode…");
-  const verification = verifyRuntimeMode(await readRuntimeModeAttestation(mode), mode);
-  if (!verification.ok) {
-    console.log("");
-    console.log(`BLOCKED — runtime did not attest the requested deployment mode: ${verification.reason}`);
-    // A mismatch means the running configuration is not the one that was asked
-    // for, and it may be the MORE permissive one. Refusing to print success is
-    // not enough: the untrusted runtime is taken back down here.
-    console.log("Shutting the unverified runtime back down…");
-    const cleanup = cleanupAfterModeMismatch(store.read() ?? { repoRoot: REPO_ROOT, mode, startedAtMs: Date.now(), processes: started }, {
-      probe: (pid) => probeProcesses([pid]).get(pid) ?? null,
-      terminate: (pid) => terminateTree(pid),
-      restoreSafeGates: () => {
-        const restored = applyGates(readEnvText(), gatesFor("SAFE"));
-        if (!restored.ok) return false;
-        writeEnvText(restored.text);
-        return true;
-      },
-      clearState: () => store.clear(),
-      log: (line) => console.log(line),
-    });
-
-    console.log("");
-    console.log(cleanup.safeGatesRestored ? "Deployment gates restored: SAFE" : "WARNING — the deployment gates could NOT be restored to SAFE.");
-    if (cleanup.unresolved.length > 0) {
-      console.log("");
-      console.log("OPERATOR RECOVERY REQUIRED — these roots are not provably stopped:");
-      for (const entry of cleanup.unresolved) console.log(`  ${entry.role} pid ${entry.pid}: ${entry.outcome}`);
-      console.log("Launcher ownership state was KEPT so 'Stop Runtime & Return SAFE' can still find them.");
-    } else {
-      console.log("The unverified runtime was stopped and launcher state was cleared.");
-    }
-    console.log("Nothing was armed and no durable trading state was changed.");
-    return;
-  }
-  console.log(`Runtime attested ${mode}.`);
-
-  if (mode === "LIVE_READY") {
-    console.log("");
-    console.log("The runtime is LIVE-READY. NOTHING IS ARMED and no order was placed.");
-    console.log("Open Trading Control, press 'Check Readiness', then arm there if you intend to trade.");
-  }
-}
-
-async function startLiveReady(ask: (question: string) => Promise<string>): Promise<void> {
-  console.log("");
-  console.log("LIVE-READY DOES NOT START A TRADE.");
-  console.log("");
-  console.log("It only loads the runtime prerequisites that allow the authenticated");
-  console.log("Trading Control page to ARM later. This tool never creates an authorization");
-  console.log("window, never arms, never sends a webhook and never calls Binance.");
-  console.log("");
-
-  // The durable state is checked BEFORE the confirmation prompt, and therefore
-  // long before any gate is written or any process is spawned. A profile still
-  // ARMED, or holding an AVAILABLE window, would become executable again the
-  // moment a live-ready worker started - with no fresh Start Trading action.
-  console.log("Reading the durable Trading Control state...");
-  const verdict = evaluateDurableSafety(await readDurableState(), "LIVE_READY");
-  if (!verdict.safe) {
-    reportDurableRefusal(verdict.reason, "No deployment gate was changed and nothing was started.");
-    return;
-  }
-  console.log("Durable state: SAFE OFF and clean.");
-  console.log("");
-
-  const typed = await ask(`Type ${LIVE_READY_CONFIRMATION} to continue: `);
-  if (!isLiveReadyConfirmed(typed)) {
-    console.log("Cancelled. Nothing was changed.");
-    return;
-  }
-  await startRuntime("LIVE_READY", await askStandardLimitTakeProfit(ask));
-}
-
-async function stopRuntime(): Promise<void> {
-  const state = store.read();
-  const { alive, disowned } = liveProcesses(state);
-  for (const note of disowned) console.log(`  ${note}`);
-
-  if (alive.length > 0) {
-    // The worker protects and reconciles open positions, and an armed profile
-    // with an open window can admit one at any moment. "Zero active
-    // executions" is NOT "durably disarmed", so the authoritative durable state
-    // is what decides — checked BEFORE any process is terminated.
-    const verdict = evaluateDurableSafety(await readDurableState(), "SHUTDOWN");
-    if (!verdict.safe) {
-      reportDurableRefusal(verdict.reason, "The runtime was NOT stopped and no deployment gate was changed.");
-      return;
-    }
-  }
-
-  for (const record of alive) {
-    const ok = terminateTree(record.pid);
-    console.log(`  ${record.role} pid ${record.pid}: ${ok ? "stopped" : "could not be stopped"}`);
-  }
-  store.clear();
-
-  // Restore SAFE only after the processes are gone, so no running process is
-  // left believing a mode the file no longer states.
-  const envText = readEnvText();
-  const rewritten = applyGates(envText, gatesFor("SAFE"));
-  if (!rewritten.ok) {
-    console.log("");
-    console.log(`WARNING — the deployment gates could NOT be restored to SAFE: ${rewritten.reason}`);
-    console.log("Inspect the deployment configuration before starting the runtime again.");
-    return;
-  }
-  writeEnvText(rewritten.text);
-
-  console.log("");
-  for (const line of (await currentStatus()).lines) console.log(line);
-}
-
 // ---------------------------------------------------------------------------
 // Menu
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  if (!existsSync(ENV_PATH)) {
-    console.log("BLOCKED — the backend .env was not found. Nothing was changed.");
-    process.exitCode = 1;
-    return;
-  }
-
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const ask = (question: string) =>
-    new Promise<string>((done) => rl.question(question, (answer) => done(answer)));
+  const ask = (question: string): Promise<string> =>
+    new Promise((done) => rl.question(question, (answer) => done(answer)));
 
   try {
     for (;;) {
-      const status = await currentStatus();
-      console.log("");
-      console.log("================================================");
-      console.log("TRADING RUNTIME LAUNCHER");
-      console.log("================================================");
-      console.log("");
-      for (const line of status.lines) console.log(line);
+      const { status, disowned, effectiveGates } = await collectStatus();
+      for (const line of renderTopology(status, disowned, effectiveGates)) console.log(line);
+
       console.log("");
       console.log("1. Show Status");
-      console.log("2. Start SAFE");
-      console.log("3. Start LIVE-READY");
-      console.log("4. Stop Runtime & Return SAFE");
-      console.log("5. Supervise Worker (auto-restart the worker role)");
-      console.log("6. Exit");
+      console.log("2. Start SAFE (six-role dual-account topology)");
+      console.log("3. Prepare LIVE-READY (unavailable — see why)");
+      console.log("4. Stop Runtime (requires SAFE)");
+      console.log("5. Supervise Account A Worker");
+      console.log("6. Supervise Account B Worker");
+      console.log("7. Exit");
       console.log("");
 
       const choice = (await ask("Choose: ")).trim();
       if (choice === "1") continue;
-      else if (choice === "2") await startRuntime("SAFE", await askStandardLimitTakeProfit(ask));
-      else if (choice === "3") await startLiveReady(ask);
-      else if (choice === "4") await stopRuntime();
-      else if (choice === "5") await superviseWorker(ask);
-      else if (choice === "6") break;
+      else if (choice === "2") await startSafe();
+      else if (choice === "3") {
+        console.log("");
+        for (const line of LIVE_READY_UNAVAILABLE) console.log(line);
+      } else if (choice === "4") await stopRuntime();
+      else if (choice === "5") await superviseAccountWorker("ACCOUNT_A", ask);
+      else if (choice === "6") await superviseAccountWorker("ACCOUNT_B", ask);
+      else if (choice === "7") break;
       else console.log("Unrecognised choice. Nothing was changed.");
     }
   } finally {
@@ -734,8 +873,4 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
-  // Never the raw error: it can carry a path or a connection string.
-  console.error(`Launcher failed: ${error instanceof Error ? error.message : "unknown error"}`);
-  process.exitCode = 1;
-});
+void main();

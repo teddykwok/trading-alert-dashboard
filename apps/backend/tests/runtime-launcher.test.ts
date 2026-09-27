@@ -496,11 +496,17 @@ describe("runtime launcher: the Windows spawn shape", () => {
       path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"),
       "utf8"
     );
-    expect(source).toContain("windowsSpawnPlan(role, REPO_ROOT, mode, process.env, standardLimitTakeProfit)");
+    // Phase 11I: the plan is per ROLE and carries that role's env file, so
+    // there is no mode argument left to get wrong.
+    // The start path hands it the key names VALIDATION produced, so the spawn
+    // sanitises against the file that was actually approved.
+    expect(source).toContain("dualSpawnPlan(role, REPO_ROOT, process.env, validatedKeyNames)");
+    expect(source).toContain("dualSpawnPlan(workerRole, REPO_ROOT)");
     expect(source).not.toContain("pnpm.cmd");
     expect(source).not.toContain("shell: true");
-    // One spawn call site for roles; the probe/kill adapters use spawnSync.
-    expect((source.match(/(?<!\w)spawn\(/g) ?? []).length).toBe(1);
+    // Two spawn call sites: the six-role start, and the supervised restart.
+    // The probe/kill adapters use spawnSync.
+    expect((source.match(/(?<!\w)spawn\(/g) ?? []).length).toBe(2);
   });
 });
 
@@ -742,42 +748,41 @@ describe("runtime launcher: success is never announced before verification", () 
   const cli = () =>
     readFileSync(path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"), "utf8");
 
-  it("verifies the attested mode BEFORE printing any success", () => {
-    // Ports and a rewritten file are not proof. If this ordering is ever
-    // inverted, the tool can report LIVE-READY for a SAFE runtime again.
+  it("verifies the topology BEFORE printing any success", () => {
+    // Ports alone are not proof. If this ordering is ever inverted, the tool
+    // can report a healthy six-role runtime over a duplicate attestation.
     const start = cli();
-    const body = start.slice(start.indexOf("async function startRuntime"), start.indexOf("async function startLiveReady"));
-    const verify = body.indexOf("verifyRuntimeMode(");
-    const attested = body.indexOf("Runtime attested");
-    const liveBanner = body.indexOf("The runtime is LIVE-READY");
+    const body = start.slice(start.indexOf("async function startSafe"), start.indexOf("async function stopRuntime"));
+    const verify = body.indexOf("verifyDualTopology(");
+    const success = body.indexOf("SAFE topology verified");
     expect(verify).toBeGreaterThan(-1);
-    expect(attested).toBeGreaterThan(verify);
-    expect(liveBanner).toBeGreaterThan(verify);
-    // And the ports check still precedes the verification.
-    expect(body.indexOf("waitForPorts()")).toBeLessThan(verify);
+    expect(success).toBeGreaterThan(verify);
+    // And the per-role port wait still precedes the verification.
+    expect(body.indexOf("await portOpen(contract.port)")).toBeLessThan(verify);
   });
 
   it("records ownership BEFORE verification, so a refusal can still clean up", () => {
     // The recovery contract: a failed verification must never strand processes
-    // the launcher can no longer identify or stop.
+    // the launcher can no longer identify or stop. Ownership is now recorded
+    // after EVERY role, so a rollback can reach even the last one spawned.
     const start = cli();
-    const body = start.slice(start.indexOf("async function startRuntime"), start.indexOf("async function startLiveReady"));
-    expect(body.indexOf("store.write(")).toBeLessThan(body.indexOf("verifyRuntimeMode("));
+    const body = start.slice(start.indexOf("async function startSafe"), start.indexOf("async function stopRuntime"));
+    expect(body.indexOf("writeState({")).toBeLessThan(body.indexOf("verifyDualTopology("));
   });
 
-  it("reaches store.clear() and termination ONLY through the cleanup routine", () => {
-    // Cleanup decides whether clearing is safe; the startup path must never
-    // clear ownership or kill a process on its own.
+  it("clears state and terminates ONLY through the rollback routine", () => {
+    // The startup path must never clear ownership or kill a process on its
+    // own: rollback decides what it is allowed to touch, and re-proves
+    // ownership of each PID before terminating it.
     const start = cli();
-    const body = start.slice(start.indexOf("async function startRuntime"), start.indexOf("async function startLiveReady"));
-    const clears = (body.match(/store\.clear\(\)/g) ?? []).length;
-    const kills = (body.match(/terminateTree\(/g) ?? []).length;
-    expect(clears).toBe(1);
-    expect(kills).toBe(1);
-    // Both appear as injected adapters handed to the cleanup routine, after it.
-    const cleanup = body.indexOf("cleanupAfterModeMismatch(");
-    expect(body.indexOf("store.clear()")).toBeGreaterThan(cleanup);
-    expect(body.indexOf("terminateTree(")).toBeGreaterThan(cleanup);
+    const body = start.slice(start.indexOf("async function startSafe"), start.indexOf("async function stopRuntime"));
+    expect((body.match(/clearState\(\)/g) ?? []).length).toBe(1);
+    expect((body.match(/terminateTree\(/g) ?? []).length).toBe(1);
+    const rollback = body.indexOf("const rollback =");
+    expect(body.indexOf("clearState()")).toBeGreaterThan(rollback);
+    expect(body.indexOf("terminateTree(")).toBeGreaterThan(rollback);
+    // Rollback proves ownership first, every time.
+    expect(body.indexOf("verifyOwnership(record")).toBeLessThan(body.indexOf("terminateTree("));
   });
 
   it("uses no preflight, exchange or trading path to verify", () => {
@@ -792,23 +797,22 @@ describe("runtime launcher: success is never announced before verification", () 
     expect(source.includes("readRuntimeAttestationStatusOnce(")).toBe(false);
   });
 
-  it("announces success for SAFE as well as LIVE_READY", () => {
+  it("announces SAFE success only, because LIVE-READY no longer exists here", () => {
     const source = cli();
-    // The success line is parameterised by mode, so a verified SAFE start
-    // prints "Runtime attested SAFE." instead of being unreachable. Whether a
-    // SAFE pair actually verifies is proven against the real attestation
-    // reader in runtime-attestation.test.ts.
-    expect(source).toContain("Runtime attested ${mode}.");
-    expect(source).not.toContain('Runtime attested LIVE_READY."');
+    // Phase 11I removed arming from this tool entirely. There is one success
+    // banner and it names the only thing this tool can produce.
+    expect(source).toContain("SAFE topology verified");
+    expect(source).not.toContain("The runtime is LIVE-READY");
+    expect(source).not.toContain("isLiveReadyConfirmed");
+    expect(source).toContain("LIVE_READY_UNAVAILABLE");
   });
 
-  it("bounds the wait instead of retrying forever", () => {
+  it("bounds every wait instead of retrying forever", () => {
     const source = cli();
-    const fn = source.slice(source.indexOf("async function readRuntimeModeAttestation"), source.indexOf("const sleep ="));
-    const bounded = source.slice(source.indexOf("async function readRuntimeModeAttestation"));
-    expect(bounded).toContain("attempt < 15");
-    expect(bounded).not.toContain("while (true)");
-    expect(fn.length + bounded.length).toBeGreaterThan(0);
+    // The per-role port wait is the only loop that waits on the machine, and
+    // it is bounded. A timeout is a refusal that rolls back, not a shrug.
+    expect(source).toContain("attempt < 30");
+    expect(source).not.toContain("while (true)");
   });
 });
 
@@ -989,21 +993,19 @@ describe("runtime launcher: a runtime that did not attest the requested mode is 
 });
 
 describe("runtime launcher: G. a verified runtime is left alone", () => {
-  it("performs no cleanup on the success path", () => {
-    // Cleanup must be reachable ONLY from the mismatch branch.
+  it("performs no rollback on the success path", () => {
+    // Rollback must be reachable ONLY from a failure branch.
     const cli = readFileSync(
       path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"),
       "utf8"
     );
-    const body = cli.slice(cli.indexOf("async function startRuntime"), cli.indexOf("async function startLiveReady"));
-    const verify = body.indexOf("verifyRuntimeMode(");
-    const cleanup = body.indexOf("cleanupAfterModeMismatch(");
-    const attested = body.indexOf("Runtime attested");
-    expect(cleanup).toBeGreaterThan(verify);
-    // Cleanup sits inside the failure branch, before the success line.
-    expect(cleanup).toBeLessThan(attested);
-    // Exactly one call site.
-    expect((body.match(/cleanupAfterModeMismatch\(/g) ?? []).length).toBe(1);
+    const body = cli.slice(cli.indexOf("async function startSafe"), cli.indexOf("async function stopRuntime"));
+    const success = body.indexOf("SAFE topology verified");
+    // Every rollback CALL sits before the success banner, i.e. in a branch
+    // that returns rather than reaching it.
+    for (const match of body.matchAll(/rollback\(/g)) {
+      expect(match.index).toBeLessThan(success);
+    }
   });
 
   it("still reports success only after verification", () => {
@@ -1011,9 +1013,8 @@ describe("runtime launcher: G. a verified runtime is left alone", () => {
       path.join(process.cwd(), "src/modules/operator/run-runtime-launcher.ts"),
       "utf8"
     );
-    const body = cli.slice(cli.indexOf("async function startRuntime"), cli.indexOf("async function startLiveReady"));
-    expect(body.indexOf("verifyRuntimeMode(")).toBeLessThan(body.indexOf("Runtime attested"));
-    expect(body.indexOf("verifyRuntimeMode(")).toBeLessThan(body.indexOf("The runtime is LIVE-READY"));
+    const body = cli.slice(cli.indexOf("async function startSafe"), cli.indexOf("async function stopRuntime"));
+    expect(body.indexOf("verifyDualTopology(")).toBeLessThan(body.indexOf("SAFE topology verified"));
   });
 
   it("leaves the unrelated partial-start and port-failure paths unchanged", () => {
@@ -1388,39 +1389,40 @@ describe("runtime launcher: structural guarantees", () => {
     const source = cli();
     expect(source).toContain("verifyOwnership");
     expect(source).toContain('"/PID"');
-    for (const forbidden of ["/IM", "node.exe", "Stop-Process -Name", "taskkill /f /im"]) {
+    for (const forbidden of ["/IM", "Stop-Process -Name", "taskkill /f /im"]) {
       expect(`${forbidden}:${source.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+    // Phase 11I names node.exe to ENUMERATE candidate processes, which is how
+    // an externally started role is detected at all. That is an observation,
+    // not a target list: every occurrence must sit in a CIM query, and the
+    // only terminator remains taskkill with an explicit PID.
+    for (const line of source.split("\n").filter((candidate) => candidate.includes("node.exe"))) {
+      expect(`${line.trim().slice(0, 40)} -> ${line.includes("Get-CimInstance")}`).toBe(
+        `${line.trim().slice(0, 40)} -> true`
+      );
     }
   });
 
-  it("checks the durable state BEFORE writing a gate or spawning anything", () => {
-    // Ordering is the whole point: a refusal that arrives after .env has been
-    // rewritten, or after the worker is live, has already done the damage.
+  it("writes no environment file at all, so no gate can be loaded by starting", () => {
+    // Phase 11I: the launcher stopped owning deployment gates. Each runtime
+    // takes them from its own account file, which this tool only ever READS.
+    // A launcher that cannot write a gate cannot arm anything by accident.
     const source = cli();
-    const liveReady = source.slice(
-      source.indexOf("async function startLiveReady"),
-      source.indexOf("async function stopRuntime")
-    );
-    expect(liveReady.length).toBeGreaterThan(0);
-    const guard = liveReady.indexOf("evaluateDurableSafety");
-    expect(guard).toBeGreaterThan(-1);
-    // Before the typed confirmation, and therefore before startRuntime, which
-    // is the only place a gate is written or a process is spawned.
-    expect(guard).toBeLessThan(liveReady.indexOf("isLiveReadyConfirmed"));
-    expect(guard).toBeLessThan(liveReady.indexOf("startRuntime("));
-    // And startRuntime itself never consults it, so the check cannot be
-    // "satisfied" by a later call.
-    const start = source.slice(source.indexOf("async function startRuntime"), source.indexOf("async function startLiveReady"));
-    expect(start).not.toContain("evaluateDurableSafety");
+    for (const forbidden of ["applyGates", "writeEnvText", "gatesFor(", "LIVE_READY_GATES"]) {
+      expect(`${forbidden}:${source.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+    // The single writeFileSync is the launcher's own state file, never an env file.
+    expect((source.match(/writeFileSync\(/g) ?? []).length).toBe(1);
+    expect(source).toContain("writeFileSync(temporary, JSON.stringify(state, null, 2)");
   });
 
-  it("checks the durable state BEFORE terminating any process", () => {
+  it("checks BOTH accounts' durable state BEFORE terminating any process", () => {
     const source = cli();
-    const stop = source.slice(source.indexOf("async function stopRuntime"), source.indexOf("async function main"));
+    const stop = source.slice(source.indexOf("async function stopRuntime"), source.indexOf("async function superviseAccountWorker"));
     expect(stop.length).toBeGreaterThan(0);
-    expect(stop.indexOf("evaluateDurableSafety")).toBeLessThan(stop.indexOf("terminateTree("));
-    // And the gates are only restored after the processes are gone.
-    expect(stop.indexOf("terminateTree(")).toBeLessThan(stop.indexOf("applyGates("));
+    expect(stop.indexOf("evaluateDualShutdownSafety(")).toBeLessThan(stop.indexOf("terminateTree("));
+    // Every account is asked, not merely the one this process resolves.
+    expect(stop).toContain("RUNTIME_ACCOUNTS.map(");
   });
 
   it("reads the durable state without a preflight or an exchange call", () => {
@@ -1431,12 +1433,18 @@ describe("runtime launcher: structural guarantees", () => {
     }
   });
 
-  it("checks outstanding work through the existing read-only service", () => {
-    // Not a second definition of "is anything still running".
+  it("checks outstanding work through each account's own read-only route", () => {
+    // Not a second definition of "is anything still running" -- and not a
+    // launcher-side database read either. `TradingControlService` resolves the
+    // profile from the PROCESS environment, so a read here could only ever
+    // describe whichever account the launcher itself is. Each account is asked
+    // over its own loopback control plane instead.
     const source = cli();
-    expect(source).toContain("TradingControlService");
-    expect(source).toContain("readStatus()");
-    expect(source).toContain("evaluateDurableSafety");
+    expect(source).toContain("/api/operator/trading-control/status");
+    expect(source).toContain("evaluateDualShutdownSafety");
+    expect(`launcher-side service:${source.includes("new TradingControlService")}`).toBe(
+      "launcher-side service:false"
+    );
   });
 
   it("adds no HTTP surface", () => {
