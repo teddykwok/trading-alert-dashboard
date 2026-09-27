@@ -8,6 +8,7 @@ import {
   defaultStatePath,
   expectedGateSnapshotFor,
   verifyOwnership,
+  type RoleHealth,
   type ProcessProbe,
 } from "./runtime-launcher";
 import {
@@ -38,6 +39,7 @@ import {
   type GateTriple,
   type ObservedListener,
   type ObservedProcess,
+  type RoleStatus,
   type RuntimeAccount,
   type TopologyStatus,
 } from "./dual-account-topology";
@@ -478,7 +480,14 @@ function renderTopology(
         : `   port ${role.port} ${role.portOpen ? "open" : "closed"}${
             role.portLoopbackOk === false ? " NOT-LOOPBACK" : ""
           }`;
-    const attestation = role.attestation === "NOT_APPLICABLE" ? "" : `   attestation ${role.attestation}`;
+    // ABSENT is the ordinary state of a role that is not running, so it reads
+    // as plain english rather than as a fault code.
+    const attestation =
+      role.attestation === "NOT_APPLICABLE"
+        ? ""
+        : role.attestation === "ABSENT"
+          ? "   not attesting"
+          : `   attestation ${role.attestation}`;
     lines.push(`  ${contract.label.padEnd(28)} ${presence.padEnd(21)}${port}${attestation}`);
   }
 
@@ -771,7 +780,18 @@ async function superviseAccountWorker(
       const workerView = status.roles.find((entry) => entry.role === workerRole);
       const controlView = status.roles.find((entry) => entry.role === controlRole);
       const nowMs = Date.now();
-      budget = observeWorkerHealth(budget, workerView?.attestation === "HEALTHY" ? "HEALTHY" : "STALE", nowMs);
+      // The same mapping the decision ladder is given below, so the restart
+      // budget and the decision cannot disagree about what they are watching.
+      const health = (view: RoleStatus | undefined): RoleHealth => {
+        if (view?.attestation === "HEALTHY") return "HEALTHY";
+        if (view === undefined) return "OFF";
+        // A role that is not running and publishes nothing is OFF. Routing it
+        // through the STALE fallback would describe an absent runtime as a
+        // faulty one, and supervision would act on the difference.
+        if (view.presence === "OFF") return "OFF";
+        return view.attestation === "ABSENT" ? "OFF" : "STALE";
+      };
+      budget = observeWorkerHealth(budget, health(workerView), nowMs);
 
       // The decision ladder is the tested one. Its record type names the legacy
       // single-stack role; only `pid` is read from it, and the role this pass
@@ -779,8 +799,8 @@ async function superviseAccountWorker(
       const decision = decideWorkerSupervision({
         record: record === null ? null : { role: "worker", pid: record.pid, startedAtMs: record.startedAtMs },
         ownership: record === null ? null : { owned: true },
-        workerHealth: workerView?.attestation === "HEALTHY" ? "HEALTHY" : workerView?.presence === "OFF" ? "OFF" : "STALE",
-        backendHealth: controlView?.attestation === "HEALTHY" ? "HEALTHY" : controlView?.presence === "OFF" ? "OFF" : "STALE",
+        workerHealth: health(workerView),
+        backendHealth: health(controlView),
         budget,
         nowMs,
         hasRuntimeState: state !== null,

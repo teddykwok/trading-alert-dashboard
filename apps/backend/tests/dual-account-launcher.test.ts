@@ -384,10 +384,16 @@ describe("status over a manually started topology", () => {
   });
 
   it("23. reads A and B attestation independently", () => {
+    // B's worker has a record that has gone quiet: fresh 0 WITH a stale count.
+    // That is what STALE means; fresh 0 with stale 0 is ABSENT and is covered
+    // separately below.
     const status = projectTopology({
       census: externalSixRoleCensus(),
       ownedRoles: [],
-      attestation: { ACCOUNT_A: HEALTHY, ACCOUNT_B: { ...HEALTHY, workerFresh: 0 } },
+      attestation: {
+        ACCOUNT_A: HEALTHY,
+        ACCOUNT_B: { ...HEALTHY, workerFresh: 0, workerStale: 1 },
+      },
     });
     const byRole = Object.fromEntries(status.roles.map((role) => [role.role, role.attestation]));
     expect(byRole["account-a-worker"]).toBe("HEALTHY");
@@ -1219,5 +1225,194 @@ describe("Start SAFE refuses a bad env file before it spawns anything", () => {
       "account-b-control -> account-b.env",
       "account-b-worker -> account-b.env",
     ]);
+  });
+});
+
+
+// ===========================================================================
+// First-start regression: a drained machine must read as OFF, not as STALE
+// ===========================================================================
+
+describe("a fully drained machine", () => {
+  /** No attestation records at all: the ordinary state before a first start. */
+  const NONE: AccountAttestationView = {
+    backendFresh: 0,
+    backendStale: 0,
+    workerFresh: 0,
+    workerStale: 0,
+    effectiveGates: null,
+  };
+  /** A record that exists and has gone quiet. A fault, not an absence. */
+  const STALE_BACKEND: AccountAttestationView = { ...NONE, backendStale: 2 };
+  const STALE_WORKER: AccountAttestationView = { ...NONE, workerStale: 2 };
+
+  const EMPTY = censusOf([], []);
+
+  function drained(attestation: Record<string, AccountAttestationView | null> = {}) {
+    return projectTopology({
+      census: EMPTY,
+      ownedRoles: [],
+      attestation: { ACCOUNT_A: NONE, ACCOUNT_B: NONE, ...attestation },
+    });
+  }
+
+  const verdictOf = (status: ReturnType<typeof projectTopology>) =>
+    Object.fromEntries(status.roles.map((role) => [role.role, role.attestation]));
+  const presenceOf = (status: ReturnType<typeof projectTopology>) =>
+    Object.fromEntries(status.roles.map((role) => [role.role, role.presence]));
+
+  it("1. a BACKEND with no record, no process and a closed port is ABSENT and OFF", () => {
+    const status = drained();
+    expect(verdictOf(status)["account-a-control"]).toBe("ABSENT");
+    expect(presenceOf(status)["account-a-control"]).toBe("OFF");
+    // The role has a port, and it is reported closed rather than unknown.
+    const role = status.roles.find((entry) => entry.role === "account-a-control");
+    expect(role?.portOpen).toBe(false);
+  });
+
+  it("2. a WORKER with no record and no process is ABSENT and OFF", () => {
+    const status = drained();
+    expect(verdictOf(status)["account-b-worker"]).toBe("ABSENT");
+    expect(presenceOf(status)["account-b-worker"]).toBe("OFF");
+  });
+
+  it("8. all six roles read OFF, and nothing is reported as external", () => {
+    const status = drained();
+    for (const role of status.roles) {
+      expect(`${role.label} -> ${role.presence}`).toBe(`${role.label} -> OFF`);
+    }
+    expect(status.anyExternal).toBe(false);
+  });
+
+  it("3. a stale BACKEND record is STALE, and does NOT imply presence", () => {
+    const status = drained({ ACCOUNT_A: STALE_BACKEND });
+    expect(verdictOf(status)["account-a-control"]).toBe("STALE");
+    // A record that went quiet is a fault worth blocking over, but it is not
+    // evidence that a process is running now.
+    expect(presenceOf(status)["account-a-control"]).toBe("OFF");
+  });
+
+  it("4. a stale WORKER record is STALE, and does NOT imply presence", () => {
+    const status = drained({ ACCOUNT_B: STALE_WORKER });
+    expect(verdictOf(status)["account-b-worker"]).toBe("STALE");
+    expect(presenceOf(status)["account-b-worker"]).toBe("OFF");
+  });
+
+  it("3 and 4. a stale record still BLOCKS Start SAFE", () => {
+    for (const [label, attestation] of [
+      ["BACKEND", { ACCOUNT_A: STALE_BACKEND }],
+      ["WORKER", { ACCOUNT_B: STALE_WORKER }],
+    ] as const) {
+      const verdict = evaluateDualStartPreconditions({
+        status: drained(attestation),
+        envFiles: { ok: true, failures: [], parsed: new Map() },
+        ownedAliveCount: 0,
+        identities: { ok: true },
+      });
+      expect(`${label} blocks: ${verdict.ok === false}`).toBe(`${label} blocks: true`);
+      expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("STALE");
+    }
+  });
+
+  it("5. exactly one fresh external BACKEND is DETECTED", () => {
+    const status = projectTopology({
+      census: censusOf(
+        [processOn("src/account-control.server.ts", 31)],
+        [listener(4001, "127.0.0.1", 31)]
+      ),
+      ownedRoles: [],
+      attestation: { ACCOUNT_A: { ...NONE, backendFresh: 1 }, ACCOUNT_B: NONE },
+    });
+    expect(verdictOf(status)["account-a-control"]).toBe("HEALTHY");
+    expect(presenceOf(status)["account-a-control"]).toBe("DETECTED");
+    expect(status.anyExternal).toBe(true);
+  });
+
+  it("6. exactly one fresh external WORKER is DETECTED, with no port to help", () => {
+    // The worker holds no port and shares its command line with the other
+    // account's worker, so a fresh attestation is the ONLY thing that can
+    // attribute it. It must still count.
+    const status = projectTopology({
+      census: censusOf([processOn("src/modules/jobs/execution.worker.ts", 32)], []),
+      ownedRoles: [],
+      attestation: { ACCOUNT_A: NONE, ACCOUNT_B: { ...NONE, workerFresh: 1 } },
+    });
+    expect(verdictOf(status)["account-b-worker"]).toBe("HEALTHY");
+    expect(presenceOf(status)["account-b-worker"]).toBe("DETECTED");
+    // And the OTHER account's worker is not claimed by it.
+    expect(presenceOf(status)["account-a-worker"]).toBe("OFF");
+  });
+
+  it("7. permits a clean start: no records, no ports, no census, no ownership", () => {
+    // The regression this whole block exists for. Before the fix this returned
+    // eight refusals on a machine with nothing running at all.
+    const verdict = evaluateDualStartPreconditions({
+      status: drained(),
+      envFiles: { ok: true, failures: [], parsed: new Map() },
+      ownedAliveCount: 0,
+      identities: { ok: true },
+    });
+    expect(verdict).toEqual({ ok: true });
+  });
+
+  it("9. ABSENT FAILS final topology verification, because a started role must attest", () => {
+    // Same verdict, opposite meaning either side of a spawn: before a start it
+    // is the expected state, after one it means the role never came up.
+    const started = projectTopology({
+      census: externalSixRoleCensus(),
+      ownedRoles: [...DUAL_ROLES],
+      attestation: { ACCOUNT_A: HEALTHY, ACCOUNT_B: { ...NONE, backendFresh: 1 } },
+    });
+    const verdict = verifyDualTopology(started);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain(
+      "Account B Execution Worker is not attesting"
+    );
+  });
+
+  it("9. a fully attesting six-role topology still verifies", () => {
+    const started = projectTopology({
+      census: externalSixRoleCensus(),
+      ownedRoles: [...DUAL_ROLES],
+      attestation: { ACCOUNT_A: HEALTHY, ACCOUNT_B: HEALTHY },
+    });
+    expect(verifyDualTopology(started)).toEqual({ ok: true });
+  });
+
+  it("10. renders ABSENT as plain english, and never as external", () => {
+    expect(CLI).toContain('role.attestation === "ABSENT"');
+    expect(CLI).toContain('"   not attesting"');
+    // Presence and the attestation label are rendered from separate fields, so
+    // an absent record cannot produce an ON line.
+    expect(CLI).toContain('role.presence === "OWNED" ? "ON  (launcher-owned)"');
+  });
+
+  it("a count it could not read is UNKNOWN, never ABSENT", () => {
+    // Both counts are required to tell absence from staleness, so an
+    // unreadable EITHER makes the verdict unknown. Reading a missing stale
+    // count as zero would report "nothing here" on no evidence.
+    for (const [label, view] of [
+      ["stale unreadable", { ...NONE, backendStale: null }],
+      ["fresh unreadable", { ...NONE, backendFresh: null }],
+      ["both unreadable", { ...NONE, backendFresh: null, backendStale: null }],
+    ] as const) {
+      const status = drained({ ACCOUNT_A: view });
+      expect(`${label} -> ${verdictOf(status)["account-a-control"]}`).toBe(`${label} -> UNKNOWN`);
+      // And an unknown is not presence either.
+      expect(`${label} presence -> ${presenceOf(status)["account-a-control"]}`).toBe(
+        `${label} presence -> OFF`
+      );
+    }
+  });
+
+  it("11. supervision maps ABSENT on an OFF role to OFF, not through STALE", () => {
+    const supervision = CLI.slice(CLI.indexOf("const health = (view: RoleStatus | undefined)"));
+    expect(supervision).toContain('if (view?.attestation === "HEALTHY") return "HEALTHY";');
+    expect(supervision).toContain('if (view.presence === "OFF") return "OFF";');
+    expect(supervision).toContain('return view.attestation === "ABSENT" ? "OFF" : "STALE";');
+    // Both health inputs come from that one mapping.
+    expect(CLI).toContain("workerHealth: health(workerView),");
+    expect(CLI).toContain("backendHealth: health(controlView),");
+    expect(CLI).toContain("budget = observeWorkerHealth(budget, health(workerView), nowMs);");
   });
 });

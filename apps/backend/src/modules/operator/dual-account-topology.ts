@@ -717,8 +717,22 @@ export interface RoleStatus {
   readonly port: number | null;
   readonly portOpen: boolean | null;
   readonly portLoopbackOk: boolean | null;
-  /** HEALTHY / STALE / DUPLICATE / UNKNOWN / n-a, from this ACCOUNT's attestation. */
-  readonly attestation: "HEALTHY" | "STALE" | "DUPLICATE" | "UNKNOWN" | "NOT_APPLICABLE";
+  /**
+   * What this ACCOUNT's attestation says about this role.
+   *
+   * ABSENT and STALE are deliberately different answers. Absent means no
+   * record exists at all -- the ordinary state of a drained machine, and the
+   * state every first start begins from. Stale means a record exists and has
+   * gone quiet, which is a fault. Collapsing them made a clean machine report
+   * four stale runtimes and refuse to start.
+   */
+  readonly attestation:
+    | "HEALTHY"
+    | "STALE"
+    | "DUPLICATE"
+    | "ABSENT"
+    | "UNKNOWN"
+    | "NOT_APPLICABLE";
 }
 
 export interface TopologyStatus {
@@ -728,6 +742,18 @@ export interface TopologyStatus {
   readonly anyExternal: boolean;
 }
 
+/**
+ * What one account's attestation says about one role.
+ *
+ * Both counts are read, because `freshCount` alone cannot tell the two
+ * zero-fresh cases apart. The reader already distinguishes them -- it returns
+ * RUNTIME_ATTESTATION_MISSING for nothing at all and RUNTIME_ATTESTATION_STALE
+ * for a record that has gone quiet -- and an earlier version of this function
+ * threw that distinction away by branching on `fresh` alone. On a fully
+ * drained machine every account role then read STALE, which `projectTopology`
+ * counted as presence, so the launcher reported four external runtimes that
+ * did not exist and refused the first Start SAFE.
+ */
 function judgeAttestation(
   contract: RoleContract,
   view: AccountAttestationView | null
@@ -735,9 +761,12 @@ function judgeAttestation(
   if (contract.attests === null) return "NOT_APPLICABLE";
   if (view === null) return "UNKNOWN";
   const fresh = contract.attests === "BACKEND" ? view.backendFresh : view.workerFresh;
-  if (fresh === null) return "UNKNOWN";
+  const stale = contract.attests === "BACKEND" ? view.backendStale : view.workerStale;
+  // A count we could not obtain is never read as a count of zero.
+  if (fresh === null || stale === null) return "UNKNOWN";
   if (fresh === 1) return "HEALTHY";
-  return fresh > 1 ? "DUPLICATE" : "STALE";
+  if (fresh > 1) return "DUPLICATE";
+  return stale > 0 ? "STALE" : "ABSENT";
 }
 
 /**
@@ -769,9 +798,16 @@ export function projectTopology(input: {
     const portOpen = contract.port === null ? null : listener !== null;
 
     // Evidence that THIS role is present, in order of strength: we own it; its
-    // account attests to it; or its port is held. A generic role has no
+    // account attests FRESHLY to it; or its port is held. A generic role has no
     // attestation, so a process of its entrypoint is the only evidence there is.
-    const attested = attestation === "HEALTHY" || attestation === "DUPLICATE" || attestation === "STALE";
+    //
+    // Only a FRESH attestation counts. A stale record says a runtime was here
+    // within the TTL and has gone quiet -- which is a fault worth blocking a
+    // start over, and `evaluateDualStartPreconditions` still does -- but it is
+    // not evidence that a process is there now. An absent record is not
+    // evidence of anything at all. Treating either as presence is what made a
+    // drained machine unstartable.
+    const attested = attestation === "HEALTHY" || attestation === "DUPLICATE";
     const processPresent = (input.census.counts[contract.entrypoint] ?? 0) > 0;
     const present = owned.has(role) || attested || portOpen === true || (contract.attests === null && processPresent);
 
@@ -879,6 +915,13 @@ export function verifyDualTopology(status: TopologyStatus): DualVerdict {
     if (role.attestation === "STALE") reasons.push(`${role.label} attestation is STALE.`);
     if (role.attestation === "UNKNOWN") {
       reasons.push(`${role.label} attestation could not be read; it is not assumed healthy.`);
+    }
+    // ABSENT is the correct answer BEFORE a start and a failure AFTER one: this
+    // runs only once every role has been spawned, so a role still publishing
+    // nothing has not come up. Without this the ABSENT verdict introduced for
+    // the drained-machine case would have opened a hole here.
+    if (role.attestation === "ABSENT") {
+      reasons.push(`${role.label} is not attesting; it started but never reported.`);
     }
   }
   // Two execution workers share an entrypoint, so the count is the only place a
