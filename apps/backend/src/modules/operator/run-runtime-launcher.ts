@@ -16,6 +16,7 @@ import {
   DUAL_ROLES,
   SAFE_GATE_CONTRACT,
   accountIdentitiesAreDistinct,
+  buildProcessProbeQuery,
   LIVE_READY_UNAVAILABLE,
   ROLE_CONTRACTS,
   RUNTIME_ACCOUNTS,
@@ -27,6 +28,7 @@ import {
   evaluateDualStartPreconditions,
   evaluateSafeGatePosture,
   describeEnvFileFailure,
+  parseProcessProbeRows,
   projectTopology,
   parseEnvFileStrict,
   validateEnvFiles,
@@ -162,13 +164,23 @@ function observeListeners(): ObservedListener[] {
   return listeners;
 }
 
+/**
+ * Asks Windows about SPECIFIC PIDs, whatever executable they are.
+ *
+ * Deliberately NOT the node-only census: the PID this resolves is the
+ * `cmd.exe` that `spawn` returned and that heads each role's process tree, so
+ * a query restricted to `node.exe` can never find it. Building the query and
+ * parsing its rows both live in the pure module, which is what makes that
+ * constraint testable without spawning anything.
+ */
 function probeProcesses(pids: number[]): Map<number, ProcessProbe> {
   const found = new Map<number, ProcessProbe>();
-  if (pids.length === 0) return found;
-  const wanted = new Set(pids);
-  for (const observed of observeProcesses()) {
-    if (wanted.has(observed.pid)) found.set(observed.pid, observed);
-  }
+  const script = buildProcessProbeQuery(pids);
+  if (script === null) return found;
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+  });
+  for (const row of parseProcessProbeRows(result.stdout ?? "")) found.set(row.pid, row);
   return found;
 }
 

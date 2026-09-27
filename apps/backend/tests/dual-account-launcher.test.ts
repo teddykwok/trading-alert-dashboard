@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { ACCOUNT_IDENTITY_KEYS } from "../src/config/account-env";
+import { verifyOwnership } from "../src/modules/operator/runtime-launcher";
 import {
   ACCOUNT_SENSITIVE_KEYS,
   DUAL_ROLES,
@@ -12,6 +13,7 @@ import {
   RUNTIME_ACCOUNTS,
   SAFE_GATE_CONTRACT,
   accountIdentitiesAreDistinct,
+  buildProcessProbeQuery,
   censusOf,
   describeEnvFileFailure,
   classifyEntrypoint,
@@ -21,6 +23,7 @@ import {
   evaluateDualShutdownSafety,
   evaluateDualStartPreconditions,
   evaluateSafeGatePosture,
+  parseProcessProbeRows,
   projectTopology,
   sanitizedChildEnv,
   parseEnvFileStrict,
@@ -1414,5 +1417,216 @@ describe("a fully drained machine", () => {
     expect(CLI).toContain("workerHealth: health(workerView),");
     expect(CLI).toContain("backendHealth: health(controlView),");
     expect(CLI).toContain("budget = observeWorkerHealth(budget, health(workerView), nowMs);");
+  });
+});
+
+
+// ===========================================================================
+// Ownership: a launcher-started tree must stay verifiably ours
+// ===========================================================================
+
+describe("the ownership PID probe", () => {
+  it("3. asks for the requested PIDs and restricts nothing else", () => {
+    // The whole defect in one assertion. The census asks `Name='node.exe'`,
+    // which is right for finding runtime ROLES; ownership asks about a
+    // specific PID, and that PID is the cmd.exe `spawn` returned. Reusing the
+    // node-only census here made every ownership probe come back empty.
+    const query = buildProcessProbeQuery([7352, 15588]);
+    expect(query).not.toBeNull();
+    expect(query).toContain("ProcessId=7352");
+    expect(query).toContain("ProcessId=15588");
+    expect(query).toContain("Get-CimInstance Win32_Process -Filter");
+    expect(`Name filter present: ${/Name=/.test(query ?? "")}`).toBe("Name filter present: false");
+  });
+
+  it("3. never issues an empty filter, which would match every process", () => {
+    expect(buildProcessProbeQuery([])).toBeNull();
+  });
+
+  it("3. asks about each PID once, and only about integral non-negative PIDs", () => {
+    const query = buildProcessProbeQuery([7352, 7352, -1, 1.5, 15588]) ?? "";
+    expect((query.match(/ProcessId=/g) ?? [])).toHaveLength(2);
+    expect(query).not.toContain("ProcessId=-1");
+    expect(query).not.toContain("ProcessId=1.5");
+  });
+
+  it("2. resolves a NON-node.exe process, which is the anchor's actual type", () => {
+    // The recorded anchor is `cmd.exe /d /s /c pnpm …`. Parsing must carry it
+    // through unchanged so `verifyOwnership` can check the repo path on it.
+    const rows = parseProcessProbeRows(
+      "7352|1790497694208|cmd.exe /d /s /c pnpm -C C:\\repo --filter pkg dev\r\n"
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].pid).toBe(7352);
+    expect(rows[0].startedAtMs).toBe(1790497694208);
+    expect(rows[0].commandLine).toContain("cmd.exe");
+    expect(rows[0].commandLine).toContain("C:\\repo");
+  });
+
+  it("2. ignores blank and unparseable rows rather than inventing a probe", () => {
+    expect(parseProcessProbeRows("")).toEqual([]);
+    expect(parseProcessProbeRows("\r\n  \r\n")).toEqual([]);
+    expect(parseProcessProbeRows("notanumber|alsonot|x")).toEqual([]);
+  });
+});
+
+describe("ownership verification over the Windows wrapper chain", () => {
+  const REPO = path.join("C:", "repo");
+  const ANCHOR = { role: "account-a-worker", pid: 5080, startedAtMs: 1_790_497_710_779 };
+  const probe = (over: Partial<{ pid: number; startedAtMs: number; commandLine: string }> = {}) => ({
+    pid: ANCHOR.pid,
+    startedAtMs: ANCHOR.startedAtMs,
+    commandLine: `cmd.exe /d /s /c pnpm -C ${REPO} --filter pkg execution-worker`,
+    ...over,
+  });
+
+  it("1 and 13. a live cmd.exe anchor from the launcher verifies as OWNED", () => {
+    // cmd -> pnpm -> tsx watch -> node: the anchor is the cmd at the head, and
+    // it outlives every reload beneath it.
+    expect(verifyOwnership(ANCHOR, probe(), REPO)).toEqual({ owned: true });
+  });
+
+  it("4. an anchor that is genuinely gone stays GONE, however alive its children are", () => {
+    // A surviving descendant is not ownership: the launcher recorded the
+    // anchor, and only the anchor can prove the tree is still the one it made.
+    expect(verifyOwnership(ANCHOR, null, REPO)).toEqual({ owned: false, reason: "GONE" });
+  });
+
+  it("10. a recycled PID is rejected on creation time", () => {
+    expect(verifyOwnership(ANCHOR, probe({ startedAtMs: ANCHOR.startedAtMs + 5_000 }), REPO)).toEqual({
+      owned: false,
+      reason: "PID_REUSED",
+    });
+    // The existing tolerance is unchanged: a sub-second difference still passes.
+    expect(verifyOwnership(ANCHOR, probe({ startedAtMs: ANCHOR.startedAtMs - 750 }), REPO).owned).toBe(true);
+  });
+
+  it("11. a process from another checkout is rejected", () => {
+    const foreign = probe({ commandLine: "cmd.exe /d /s /c pnpm -C C:\\other-repo --filter pkg execution-worker" });
+    expect(verifyOwnership(ANCHOR, foreign, REPO)).toEqual({ owned: false, reason: "NOT_THIS_REPO" });
+  });
+});
+
+describe("Start SAFE verification requires ownership", () => {
+  const HEALTHY_BOTH = { ACCOUNT_A: HEALTHY, ACCOUNT_B: HEALTHY };
+
+  function verified(ownedRoles: DualRole[]) {
+    return verifyDualTopology(
+      projectTopology({ census: externalSixRoleCensus(), ownedRoles, attestation: HEALTHY_BOTH })
+    );
+  }
+
+  it("5. six OWNED roles with healthy attestations and correct ports PASS", () => {
+    expect(verified([...DUAL_ROLES])).toEqual({ ok: true });
+  });
+
+  it("6. five OWNED and one DETECTED FAILS, naming that role", () => {
+    const verdict = verified(DUAL_ROLES.filter((role) => role !== "account-b-worker"));
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain(
+      "Account B Execution Worker is running but this launcher does not own it"
+    );
+    // The five it does own raise nothing.
+    expect(verdict.ok === false && verdict.reasons).toHaveLength(1);
+  });
+
+  it("7. six DETECTED roles FAIL even though everything else looks perfect", () => {
+    // The exact state the first real Start SAFE produced: right ports, four
+    // healthy attestations, six processes — and not one of them ours.
+    const verdict = verified([]);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons).toHaveLength(6);
+    for (const reason of verdict.ok === false ? verdict.reasons : []) {
+      expect(reason).toContain("does not own it");
+    }
+  });
+
+  it("4. a role whose anchor vanished cannot pass final verification", () => {
+    // Ownership was lost between spawn and verification: the role is still
+    // running and attesting, but the launcher can no longer prove it started
+    // it — which is exactly when it must not report success.
+    const verdict = verified(DUAL_ROLES.filter((role) => role !== "account-a-control"));
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("Account A Control is running but");
+  });
+
+  it("an OFF role still reports as not running, not as unowned", () => {
+    const verdict = verifyDualTopology(
+      projectTopology({ census: censusOf([], []), ownedRoles: [], attestation: HEALTHY_BOTH })
+    );
+    expect(verdict.ok).toBe(false);
+    // Generic roles publish no attestation and have no process, so they are OFF.
+    expect(verdict.ok === false && verdict.reasons.join(" ")).toContain("Generic Backend is not running.");
+    expect(verdict.ok === false && verdict.reasons.join(" ")).not.toContain("Generic Backend is running but");
+  });
+});
+
+describe("ownership is never inferred", () => {
+  it("8. a detected external role is never promoted to OWNED", () => {
+    const status = projectTopology({
+      census: externalSixRoleCensus(),
+      ownedRoles: [],
+      attestation: { ACCOUNT_A: HEALTHY, ACCOUNT_B: HEALTHY },
+    });
+    for (const role of status.roles) {
+      expect(`${role.label} -> ${role.presence}`).toBe(`${role.label} -> DETECTED`);
+    }
+    // Healthy attestation and a held port are presence evidence, never title.
+    expect(status.anyExternal).toBe(true);
+  });
+
+  it("8. there is no adoption path from detection to ownership", () => {
+    // A substring ban on the word would be meaningless here -- plan ADOPTION is
+    // a legitimate domain concept elsewhere in the launcher's prose. What must
+    // not exist is a MECHANISM that grants ownership to something the launcher
+    // did not start.
+    for (const forbidden of [/function\s+adopt/, /claimExisting/, /adoptRole/, /claimRole/]) {
+      expect(`${forbidden.source}:${forbidden.test(CLI + MODULE)}`).toBe(`${forbidden.source}:false`);
+    }
+    // OWNED is assigned in exactly one place, from the ownership set alone.
+    expect(MODULE).toContain('if (owned.has(role)) presence = "OWNED";');
+    expect((MODULE.match(/presence = "OWNED"/g) ?? [])).toHaveLength(1);
+    expect(`OWNED assigned in the CLI:${/presence = "OWNED"/.test(CLI)}`).toBe(
+      "OWNED assigned in the CLI:false"
+    );
+  });
+
+  it("9. stop and rollback act only on verified-owned roots", () => {
+    const stop = CLI.slice(CLI.indexOf("async function stopRuntime"), CLI.indexOf("async function superviseAccountWorker"));
+    expect(stop).toContain("alive.filter((entry) => entry.role === role)");
+    expect(stop.indexOf("verifyOwnership(record")).toBeLessThan(stop.indexOf("terminateTree("));
+    const start = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
+    expect(start).toContain("[...started].reverse()");
+    expect(start.indexOf("verifyOwnership(record")).toBeLessThan(start.indexOf("terminateTree("));
+    // A record that cannot be proved is reported, never killed.
+    expect(start).toContain("NOT terminated");
+    expect(stop).toContain("NOT terminated");
+  });
+
+  it("12. an A worker record cannot be satisfied by B's worker process", () => {
+    // Ownership is keyed by ROLE and anchored to one PID. The two workers share
+    // a command line, so nothing else could tell them apart.
+    const repo = path.join("C:", "repo");
+    const aRecord = { role: "account-a-worker", pid: 5080, startedAtMs: 1_000_000 };
+    const bProbe = {
+      pid: 24744,
+      startedAtMs: 1_000_000,
+      commandLine: `cmd.exe /d /s /c pnpm -C ${repo} --filter pkg execution-worker`,
+    };
+    // The launcher only ever probes the recorded PID; B's PID is not it.
+    const probes = new Map([[bProbe.pid, bProbe]]);
+    expect(verifyOwnership(aRecord, probes.get(aRecord.pid) ?? null, repo)).toEqual({
+      owned: false,
+      reason: "GONE",
+    });
+    // And the state record carries the role, so a B process cannot fill an A slot.
+    const status = projectTopology({
+      census: censusOf([], []),
+      ownedRoles: ["account-b-worker"],
+      attestation: {},
+    });
+    const byRole = Object.fromEntries(status.roles.map((role) => [role.role, role.presence]));
+    expect(byRole["account-b-worker"]).toBe("OWNED");
+    expect(byRole["account-a-worker"]).toBe("OFF");
   });
 });

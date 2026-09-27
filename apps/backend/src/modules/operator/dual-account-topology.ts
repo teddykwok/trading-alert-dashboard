@@ -630,6 +630,58 @@ export interface ObservedListener {
   readonly pid: number;
 }
 
+/**
+ * The CIM query that asks about SPECIFIC PIDs, whatever they are running.
+ *
+ * ## Why this is not the census query
+ *
+ * `observeProcesses` enumerates `Name='node.exe'`, which is right for asking
+ * WHICH RUNTIME ROLES exist: the roles are node processes, and a machine-wide
+ * scan of everything would be wasteful and noisy.
+ *
+ * Ownership asks a different question -- IS THIS PARTICULAR PID STILL MINE --
+ * and the PID it asks about is the `cmd.exe` that `spawn` returned. Reusing
+ * the node-only census to answer it meant every ownership probe came back
+ * empty, `verifyOwnership` saw no process and returned GONE, and six
+ * launcher-started roles reported themselves as external. So this query names
+ * the PIDs and constrains nothing else.
+ *
+ * Returns null for an empty set, so a caller never issues a query with an
+ * empty filter -- which in CIM would match EVERY process on the machine.
+ *
+ * Only integral, non-negative PIDs reach the filter. They are formatted, never
+ * interpolated from unvalidated text, so nothing an operator types can reach
+ * the query.
+ */
+export function buildProcessProbeQuery(pids: readonly number[]): string | null {
+  const wanted = [...new Set(pids)].filter((pid) => Number.isInteger(pid) && pid >= 0);
+  if (wanted.length === 0) return null;
+  const filter = wanted.map((pid) => `ProcessId=${pid}`).join(" OR ");
+  return (
+    `Get-CimInstance Win32_Process -Filter "${filter}" | ` +
+    "ForEach-Object { '{0}|{1}|{2}' -f $_.ProcessId, " +
+    "([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds(), ($_.CommandLine -replace '\\|',' ') }"
+  );
+}
+
+/**
+ * Parses the probe rows. Shape only -- nothing is logged from here, and the
+ * command line it carries exists solely so `verifyOwnership` can confirm the
+ * process belongs to this repository.
+ */
+export function parseProcessProbeRows(stdout: string): ObservedProcess[] {
+  const rows: ObservedProcess[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const [pid, startedAtMs, commandLine] = line.trim().split("|");
+    if (!pid || !startedAtMs) continue;
+    const parsedPid = Number(pid);
+    const parsedStartedAt = Number(startedAtMs);
+    if (!Number.isFinite(parsedPid) || !Number.isFinite(parsedStartedAt)) continue;
+    rows.push({ pid: parsedPid, startedAtMs: parsedStartedAt, commandLine: commandLine ?? "" });
+  }
+  return rows;
+}
+
 export function isLoopback(address: string): boolean {
   return address === "127.0.0.1" || address === "::1";
 }
@@ -905,6 +957,17 @@ export function verifyDualTopology(status: TopologyStatus): DualVerdict {
   const reasons: string[] = [];
   for (const role of status.roles) {
     if (role.presence === "OFF") reasons.push(`${role.label} is not running.`);
+    // Running is not the same as OURS. This verification is the last step of a
+    // Start SAFE that claims to have started these six roles, so a role it
+    // merely DETECTED is a failure however healthy it looks: the launcher
+    // cannot later stop what it cannot prove it started, and reporting success
+    // over someone else's topology is how that gap stays invisible.
+    else if (role.presence !== "OWNED") {
+      reasons.push(
+        `${role.label} is running but this launcher does not own it ` +
+          `(${role.presence.toLowerCase()}). A start it did not perform is not a start.`
+      );
+    }
     if (role.port !== null && role.portOpen !== true) {
       reasons.push(`${role.label} is not listening on ${role.port}.`);
     }
