@@ -1,10 +1,19 @@
+// Phase 11F.1 -- MUST be the first import in this file.
+//
+// Static imports are hoisted and evaluated in source order. The generated
+// Prisma client loads the repository `.env` at its own module initialization,
+// and neither loader overrides what is already set -- so an import above this
+// line would hand this process the repository's account instead of the one
+// DOTENV_CONFIG_PATH names, with every log line reporting the wrong one.
+import "../../config/bootstrap-account";
+
 import { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env";
 import { CanaryPreflightService } from "./canary-preflight.service";
 import { CANARY_VALIDATED_LIMITS, effectiveCanaryLimits } from "./canary-readiness";
 import { CanaryAuthorizationService, describeAuthorizationWindow } from "./canary-authorization.service";
 import { describeNaturalWindow } from "./natural-authorization";
-import type { CanaryAuthorizationMode } from "./canary-readiness";
+import { resolveMode } from "./canary-preflight-mode";
 import {
   currentProcessGateSnapshot,
   configuredRuntimeIdentity,
@@ -33,55 +42,6 @@ function line(label: string, value: string | number | boolean | null | undefined
 function section(title: string): void {
   console.log("");
   console.log(title);
-}
-
-/** The only spellings `--mode` accepts. Case-sensitive, so there is one answer. */
-const MODE_VALUES: Record<string, CanaryAuthorizationMode> = {
-  exact: "EXACT_SIGNAL",
-  EXACT_SIGNAL: "EXACT_SIGNAL",
-  natural: "NATURAL_WINDOW",
-  NATURAL_WINDOW: "NATURAL_WINDOW",
-};
-
-export type ModeResolution =
-  | { ok: true; mode: CanaryAuthorizationMode }
-  | { ok: false; message: string };
-
-/**
- * Resolves `--mode`, FAIL CLOSED.
- *
- * Absent means EXACT_SIGNAL, which is the historical behaviour every existing
- * caller depends on. But an explicitly SUPPLIED value must be recognized
- * exactly: the first version of this parser matched `natural` and fell through
- * to EXACT_SIGNAL for anything else, so `--mode=natrual` printed a full,
- * confident EXACT readiness report while the operator believed they were
- * reading NATURAL readiness. On a command whose entire purpose is deciding
- * whether real money may trade, a typo must never answer a different question
- * than the one that was asked.
- *
- * A repeated `--mode` is refused rather than resolved by precedence: with
- * `--mode=natural --mode=exact` there is no defensible "winner", and guessing
- * one produces exactly the same misreading.
- */
-export function resolveMode(argv: readonly string[]): ModeResolution {
-  const supplied = argv.filter((entry) => entry === "--mode" || entry.startsWith("--mode="));
-  if (supplied.length === 0) return { ok: true, mode: "EXACT_SIGNAL" };
-  if (supplied.length > 1) {
-    return { ok: false, message: `--mode was supplied ${supplied.length} times; supply it at most once.` };
-  }
-
-  const [only] = supplied;
-  const value = only === "--mode" ? "" : only.slice("--mode=".length);
-  const resolved = MODE_VALUES[value];
-  if (resolved === undefined) {
-    return {
-      ok: false,
-      message:
-        `--mode=${value} is not a known mode. Use one of: ${Object.keys(MODE_VALUES).join(", ")}. ` +
-        "Omit --mode entirely for the default (EXACT_SIGNAL).",
-    };
-  }
-  return { ok: true, mode: resolved };
 }
 
 async function main(): Promise<void> {

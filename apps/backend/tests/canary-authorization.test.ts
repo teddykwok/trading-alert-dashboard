@@ -1011,6 +1011,12 @@ describe("natural authorization: runtime boundary", () => {
     "src/modules/execution/run-show-authorization.ts",
     "src/modules/execution/run-revoke-natural-window.ts",
     "src/modules/execution/run-canary-preflight.ts",
+    // The `--mode` parser lifted out of run-canary-preflight.ts so a unit test
+    // can import it without loading an ACCOUNT ENTRYPOINT (which bootstraps an
+    // account and runs main() at module scope). Same vocabulary, same code,
+    // relocated -- and the module is pure: one erased type import, no Prisma,
+    // no env, no authorization capability of any kind.
+    "src/modules/execution/canary-preflight-mode.ts",
     // PRIVILEGED OPERATOR ACTIVATION (Phase 12.4C). These are a DIFFERENT
     // category from everything above: arming opens a real-money profile for
     // admission, so it is a state-changing control, NOT an inspection one. It

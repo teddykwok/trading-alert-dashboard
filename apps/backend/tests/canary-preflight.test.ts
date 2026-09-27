@@ -12,7 +12,7 @@ import {
   type CanaryPolicyLimits,
   type CanaryPreflightInput,
 } from "../src/modules/execution/canary-readiness";
-import { resolveMode } from "../src/modules/execution/run-canary-preflight";
+import { resolveMode } from "../src/modules/execution/canary-preflight-mode";
 import {
   CanaryPreflightService,
   detectExecutionOrchestration,
@@ -1242,5 +1242,81 @@ describe("natural readiness progression", () => {
     });
     expect(armed.ready).toBe(true);
     expect(armed.summary).toBe("CANARY_READY");
+  });
+});
+
+
+// ===========================================================================
+// Account binding: every canary entrypoint must bootstrap before Prisma
+// ===========================================================================
+
+describe("the canary commands bind to an explicit account", () => {
+  const BACKEND = process.cwd().endsWith(path.join("apps", "backend"))
+    ? process.cwd()
+    : path.join(process.cwd(), "apps", "backend");
+
+  const codeOf = (relative: string): string => readFileSync(path.join(BACKEND, relative), "utf8");
+  const withoutComments = (source: string): string =>
+    source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  const firstImportOf = (relative: string): string => {
+    const match = /(?:^|\n)\s*import\s+(?:[\s\S]*?from\s*)??["']([^"']+)["']/.exec(
+      withoutComments(codeOf(relative))
+    );
+    return match === null ? "<none>" : match[1];
+  };
+
+  /**
+   * The two files that actually load Prisma. The other three canary commands
+   * are thin wrappers whose first import is `run-canary-controls`, so fixing
+   * the shared path covers them -- which is asserted below rather than assumed.
+   */
+  const PRISMA_LOADERS = [
+    "src/modules/execution/run-canary-preflight.ts",
+    "src/modules/execution/run-canary-controls.ts",
+  ];
+  const WRAPPERS = [
+    "src/modules/execution/run-prepare-canary.ts",
+    "src/modules/execution/run-arm-canary.ts",
+    "src/modules/execution/run-close-canary-window.ts",
+    "src/modules/execution/run-disarm-canary.ts",
+  ];
+
+  it("bootstraps the account BEFORE Prisma, so DOTENV_CONFIG_PATH is honoured", () => {
+    // Without this the generated Prisma client loads the repository `.env`
+    // first, the runtime bootstrap refuses with
+    // PRISMA_LOADED_BEFORE_ENV_BOOTSTRAP, and none of these commands can be
+    // pointed at a specific account at all.
+    for (const relative of PRISMA_LOADERS) {
+      expect(`${relative} -> ${firstImportOf(relative)}`).toBe(
+        `${relative} -> ../../config/bootstrap-account`
+      );
+      const source = withoutComments(codeOf(relative));
+      expect(source.indexOf('"../../config/bootstrap-account"')).toBeLessThan(
+        source.indexOf('from "@prisma/client"')
+      );
+      expect(source.indexOf('"../../config/bootstrap-account"')).toBeLessThan(
+        source.indexOf('from "../../config/env"')
+      );
+    }
+  });
+
+  it("reaches that bootstrap from every wrapper entrypoint", () => {
+    for (const relative of WRAPPERS) {
+      expect(`${relative} -> ${firstImportOf(relative)}`).toBe(`${relative} -> ./run-canary-controls`);
+      // And the wrapper itself pulls in nothing ahead of it.
+      const source = withoutComments(codeOf(relative));
+      expect(source.indexOf('"./run-canary-controls"')).toBeLessThan(
+        source.includes('from "@prisma/client"') ? source.indexOf('from "@prisma/client"') : Infinity
+      );
+    }
+  });
+
+  it("uses the shared bootstrap, not a second mechanism", () => {
+    for (const relative of PRISMA_LOADERS) {
+      const source = codeOf(relative);
+      expect(source).toContain('import "../../config/bootstrap-account";');
+      // No hand-rolled dotenv call was introduced alongside it.
+      expect(`dotenv in ${relative}: ${/from "dotenv"/.test(source)}`).toBe(`dotenv in ${relative}: false`);
+    }
   });
 });
