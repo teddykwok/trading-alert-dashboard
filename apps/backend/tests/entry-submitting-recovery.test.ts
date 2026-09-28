@@ -10,6 +10,8 @@ import {
   type EntryAbsenceEvidence,
 } from "../src/modules/execution/entry-absence-evidence";
 import { EntryRecoveryService } from "../src/modules/execution/entry-recovery.service";
+import { applySessionAccountingForStatus } from "../src/modules/execution/trading-session.service";
+import { releasesSessionSlot } from "../src/modules/execution/trading-session";
 import type { BinanceReadOnlyService } from "../src/modules/binance/binance-read-only.service";
 import { testProfileProjection } from "./helpers/bound-runtime";
 
@@ -209,8 +211,27 @@ const EXECUTION = {
   positionSide: "SHORT",
   status: "ENTRY_SUBMITTING",
   version: 3,
+  // NULL, not absent. Prisma returns null for an unset nullable column, and
+  // `releasesSessionSlot` tests `firstFillAt !== null` -- a double that left
+  // this undefined would take the OPENED branch and quietly describe a
+  // never-filled entry as a trade that happened.
+  firstFillAt: null as Date | null,
   createdAt: new Date("2026-08-24T14:01:06.736Z"),
 };
+
+/** The session row and the one slot this execution reserved at admission. */
+const SESSION_ID = "session-1";
+const SLOT_ID = "slot-1";
+
+interface SlotRow {
+  id: string;
+  tradingSessionId: string;
+  tradeExecutionId: string;
+  state: "RESERVED" | "OPENED" | "RELEASED";
+  openedAt: Date | null;
+  releasedAt: Date | null;
+  releaseReason: string | null;
+}
 
 function harness(options: {
   status?: string;
@@ -225,8 +246,33 @@ function harness(options: {
   executedQuantity?: string;
   protectionRows?: number;
   updateCount?: number;
+  /** Omit the slot entirely: an execution admitted before sessions existed. */
+  withoutSlot?: boolean;
 } = {}) {
-  const state = { status: options.status ?? EXECUTION.status, updates: 0, events: 0, orderUpdates: 0 };
+  const state = {
+    status: options.status ?? EXECUTION.status,
+    updates: 0,
+    events: 0,
+    orderUpdates: 0,
+    /** Ordered trace, so 'in the same transaction' is an assertion, not a claim. */
+    log: [] as string[],
+    insideTransaction: false,
+    /** Whether the FIRST slot write happened with the transaction open. */
+    slotWrittenInsideTransaction: null as boolean | null,
+  };
+
+  const slot: SlotRow | null = options.withoutSlot
+    ? null
+    : {
+        id: SLOT_ID,
+        tradingSessionId: SESSION_ID,
+        tradeExecutionId: EXECUTION.id,
+        state: "RESERVED",
+        openedAt: null,
+        releasedAt: null,
+        releaseReason: null,
+      };
+  const session = { id: SESSION_ID, reservedCount: 1, openedCount: 0, version: 1 };
 
   const prisma = {
     tradeExecution: {
@@ -244,6 +290,7 @@ function harness(options: {
         if (count > 0) {
           state.status = "FAILED";
           state.updates += 1;
+          state.log.push("execution:FAILED");
         }
         return { count };
       }),
@@ -256,17 +303,86 @@ function harness(options: {
       })),
       updateMany: vi.fn(async () => {
         state.orderUpdates += 1;
+        state.log.push("order:CANCELED");
         return { count: 1 };
       }),
     },
     executionEvent: {
       create: vi.fn(async () => {
         state.events += 1;
+        state.log.push("event:FAILURE_RECORDED");
         return {};
       }),
     },
     executionProtectionState: { count: vi.fn(async () => options.protectionRows ?? 0) },
-    $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(prisma)),
+
+    // The session store behaves like the real one: every write is CONDITIONAL,
+    // which is what makes a second pass a no-op rather than a second refund. A
+    // double that just recorded calls could not tell those apart.
+    tradingSessionSlot: {
+      findUnique: vi.fn(async (args: { where: { tradeExecutionId: string } }) =>
+        slot !== null && slot.tradeExecutionId === args.where.tradeExecutionId ? { ...slot } : null
+      ),
+      updateMany: vi.fn(
+        async (args: {
+          where: { id: string; state: "RESERVED" };
+          data: Partial<SlotRow>;
+        }) => {
+          if (state.slotWrittenInsideTransaction === null) {
+            state.slotWrittenInsideTransaction = state.insideTransaction;
+          }
+          if (slot === null || slot.id !== args.where.id || slot.state !== args.where.state) {
+            return { count: 0 };
+          }
+          state.log.push("slot:" + String(args.data.state));
+          slot.state = args.data.state ?? slot.state;
+          slot.releasedAt = args.data.releasedAt ?? slot.releasedAt;
+          slot.releaseReason = args.data.releaseReason ?? slot.releaseReason;
+          slot.openedAt = args.data.openedAt ?? slot.openedAt;
+          return { count: 1 };
+        }
+      ),
+      // Releasing must never MAKE a slot. Throwing says so loudly rather than
+      // letting a silent creation look like a pass.
+      create: vi.fn(async () => {
+          throw new Error("the recovery path must never create a session slot");
+      }),
+    },
+    tradingSession: {
+      updateMany: vi.fn(
+        async (args: {
+          where: { id: string; reservedCount?: { gt: number } };
+          data: {
+            reservedCount?: { decrement: number };
+            openedCount?: { increment: number };
+            version?: { increment: number };
+          };
+        }) => {
+          if (args.where.id !== session.id) return { count: 0 };
+          const floor = args.where.reservedCount?.gt;
+          if (floor !== undefined && !(session.reservedCount > floor)) return { count: 0 };
+          if (args.data.reservedCount) {
+            session.reservedCount -= args.data.reservedCount.decrement;
+            state.log.push("session:reserved--");
+          }
+          if (args.data.openedCount) {
+            session.openedCount += args.data.openedCount.increment;
+            state.log.push("session:opened++");
+          }
+          if (args.data.version) session.version += args.data.version.increment;
+          return { count: 1 };
+        }
+      ),
+    },
+
+    $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
+      state.insideTransaction = true;
+      try {
+        return await fn(prisma);
+      } finally {
+        state.insideTransaction = false;
+      }
+    }),
   } as unknown as PrismaClient;
 
   const readOnly = {
@@ -291,6 +407,8 @@ function harness(options: {
     prisma,
     readOnly,
     state,
+    slot,
+    session,
   };
 }
 
@@ -452,5 +570,158 @@ describe("entry recovery: ambiguous submissions are not re-sent", () => {
     // `advanced: 1` every 30s read as healthy activity while nothing moved.
     expect(scheduler).toContain("attempted: result.advanced");
     expect(scheduler).toContain("progressed: result.progressed");
+  });
+});
+
+
+// ===========================================================================
+// S. The session slot a proven-absent entry gives back
+//
+// A real Account B recovery terminalised a 1000PEPEUSDT LONG to FAILED and left
+// its TradingSessionSlot RESERVED forever: the panel reported a reserved trade
+// that could never open, and the session's budget was permanently one short.
+// `recover` wrote the execution, the order and the event, and called no session
+// accounting at all -- exactly the leak `markSubmissionRejected`'s own comment
+// warns about for any terminal path that skips the hook.
+// ===========================================================================
+
+describe("entry recovery: session accounting", () => {
+  it("S1. releases the reserved slot when absence is proven", async () => {
+    const { service, slot, session } = harness();
+    const before = new Date();
+
+    const result = await service.recover(EXECUTION.id);
+
+    expect(result.outcome).toBe("RECOVERED");
+    expect(result.status).toBe("FAILED");
+    expect(slot?.state).toBe("RELEASED");
+    expect(slot?.releasedAt).toBeInstanceOf(Date);
+    expect((slot?.releasedAt as Date).getTime()).toBeGreaterThanOrEqual(before.getTime());
+    // The helper records the STATUS that caused the release, which is what an
+    // operator reading the row later needs to see.
+    expect(slot?.releaseReason).toBe("FAILED");
+    // Exactly one slot back in the budget.
+    expect(session.reservedCount).toBe(0);
+    // A trade that never filled never opened. This counter is monotonic and
+    // must not move: it is the number of trades that obtained exposure.
+    expect(session.openedCount).toBe(0);
+    expect(slot?.openedAt).toBeNull();
+  });
+
+  it("S2. releases in the SAME transaction as the terminal write, and after it", async () => {
+    // The slot is released BECAUSE the row became terminal. A commit that did
+    // one without the other is the state this service must not be able to
+    // produce, so the release is not allowed to sit outside the transaction.
+    const { service, state } = harness();
+    await service.recover(EXECUTION.id);
+
+    expect(state.slotWrittenInsideTransaction).toBe(true);
+    expect(state.log).toEqual([
+      "execution:FAILED",
+      "slot:RELEASED",
+      "session:reserved--",
+      "order:CANCELED",
+      "event:FAILURE_RECORDED",
+    ]);
+  });
+
+  it("S3. a stale CAS releases nothing — the slot and the counter are untouched", async () => {
+    // The conditional execution write matched nothing, so the transaction
+    // returns before the row is re-read. Releasing a slot for a row somebody
+    // else moved would be a refund against a trade that may still be live.
+    const { service, slot, session, state } = harness({ updateCount: 0 });
+    const result = await service.recover(EXECUTION.id);
+
+    expect(result.outcome).toBe("BLOCKED");
+    expect(slot?.state).toBe("RESERVED");
+    expect(slot?.releasedAt).toBeNull();
+    expect(session.reservedCount).toBe(1);
+    expect(state.log).toEqual([]);
+  });
+
+  it("S4. unproven absence releases nothing", async () => {
+    // Evidence gates the session refund exactly as it gates the terminal write:
+    // there is one decision, and the slot follows it.
+    for (const options of [
+      { history: [{ clientOrderId: "tad-en-1-96a827efbf2e" }] },
+      { trades: [{ positionSide: "SHORT", qty: "0.77" }] },
+      { position: { positionAmt: "-0.77" } },
+      { executedQuantity: "0.77" },
+      { protectionRows: 1 },
+    ]) {
+      const { service, slot, session } = harness(options);
+      const result = await service.recover(EXECUTION.id);
+      expect(`${JSON.stringify(options)}:${result.outcome}`).toBe(`${JSON.stringify(options)}:BLOCKED`);
+      expect(`${JSON.stringify(options)}:${slot?.state}`).toBe(`${JSON.stringify(options)}:RESERVED`);
+      expect(session.reservedCount).toBe(1);
+    }
+  });
+
+  it("S5. an execution that never held a slot recovers, and none is created", async () => {
+    const { service, prisma, session } = harness({ withoutSlot: true });
+
+    const result = await service.recover(EXECUTION.id);
+
+    expect(result.outcome).toBe("RECOVERED");
+    expect(prisma.tradingSessionSlot.create).not.toHaveBeenCalled();
+    expect(prisma.tradingSession.updateMany).not.toHaveBeenCalled();
+    expect(session.reservedCount).toBe(1);
+  });
+
+  it("S6. repeated accounting does not decrement a second time", async () => {
+    const { service, prisma, slot, session } = harness();
+    await service.recover(EXECUTION.id);
+    expect(session.reservedCount).toBe(0);
+
+    // The REAL helper, run again against the same store. The slot is no longer
+    // RESERVED, so the conditional write matches nothing and the counter holds.
+    await applySessionAccountingForStatus(prisma, {
+      tradeExecutionId: EXECUTION.id,
+      status: "FAILED",
+      firstFillAt: null,
+      now: new Date(),
+    });
+
+    expect(slot?.state).toBe("RELEASED");
+    expect(session.reservedCount).toBe(0);
+    expect(session.openedCount).toBe(0);
+  });
+
+  it("S7. a second recover finds it already resolved and touches no counter", async () => {
+    // End-to-end idempotency: the status guard returns before the transaction,
+    // so the second call cannot reach the accounting at all.
+    const { service, slot, session } = harness();
+    await service.recover(EXECUTION.id);
+
+    const again = await service.recover(EXECUTION.id);
+
+    expect(again.outcome).toBe("ALREADY_RESOLVED");
+    expect(slot?.state).toBe("RELEASED");
+    expect(session.reservedCount).toBe(0);
+    expect(session.openedCount).toBe(0);
+  });
+
+  it("S8. a filled entry would never be refunded — the release condition owns that", async () => {
+    // Belt and braces on the rule this path relies on rather than restates: a
+    // partially filled entry that later terminalises keeps its opened trade.
+    // `recover` cannot reach FAILED with a fill anyway (E8 proves the evidence
+    // refuses), so this pins the condition the hook is trusting.
+    expect(releasesSessionSlot("FAILED", null)).toBe(true);
+    expect(releasesSessionSlot("FAILED", new Date())).toBe(false);
+  });
+
+  it("S9. the release goes through the shared helper, not a hand-rolled counter", async () => {
+    // A future edit that decremented `reservedCount` here directly would drift
+    // from the three-hook model and would not be conditional.
+    const { readFileSync } = await import("node:fs");
+    const path = await import("node:path");
+    const source = readFileSync(
+      path.join(process.cwd(), "src/modules/execution/entry-recovery.service.ts"),
+      "utf8"
+    );
+    expect(source).toContain("applySessionAccountingForStatus(tx, {");
+    for (const forbidden of ["reservedCount", "openedCount", "tradingSessionSlot.update", "state: \"RELEASED\""]) {
+      expect(`${forbidden}:${source.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
   });
 });

@@ -5,6 +5,7 @@ import type { BoundExecutionProfileProjection } from "./exchange-runtime-binding
 import { logger } from "../../config/logger";
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
 import { classifyMutationOutcome, type MutationFailureShape } from "./entry-lifecycle";
+import { applySessionAccountingForStatus } from "./trading-session.service";
 import {
   gathered,
   judgeEntryAbsence,
@@ -196,6 +197,10 @@ export class EntryRecoveryService {
       );
     }
 
+    // ONE timestamp for the whole commit. The slot's `releasedAt` and the
+    // terminal row it belongs to should not disagree by however long the
+    // transaction happened to take.
+    const recoveredAt = new Date();
     const committed = await this.prisma.$transaction(async (tx) => {
       // Conditional on status AND version: whatever else raced us, this write
       // lands at most once for the state that was actually evaluated.
@@ -218,6 +223,39 @@ export class EntryRecoveryService {
       const next = await tx.tradeExecution.findFirstOrThrow({
         where: { id: execution.id, executionProfileId: this.boundProfile.executionProfileId },
       });
+
+      /**
+       * --- Session accounting --------------------------------------------
+       *
+       * An entry that is proven never to have reached the order book never
+       * obtained exposure, so the session slot it reserved at admission goes
+       * back to the budget. `FAILED` with a null `firstFillAt` is exactly the
+       * release condition `releasesSessionSlot` already defines -- this adds no
+       * rule and writes no counter itself.
+       *
+       * This is the SECOND terminal path that does not funnel through
+       * `reconcileEntryOrder`; `markSubmissionRejected` is the first, and its
+       * comment warns that such a path leaks a slot for the life of the session
+       * without this hook. It did: a real recovery left a RESERVED slot behind
+       * a FAILED execution, and the panel reported a reserved trade that could
+       * never open.
+       *
+       * Inside the transaction on purpose. The slot is only released BECAUSE
+       * the row became terminal, so a commit that terminalises without
+       * releasing -- or releases without terminalising -- is a state this
+       * service must not be able to produce.
+       *
+       * Reads the COMMITTED row rather than the pre-CAS one, and is internally
+       * conditional on the slot still being RESERVED, so a repeated pass and an
+       * execution that never held a slot both move nothing.
+       */
+      await applySessionAccountingForStatus(tx, {
+        tradeExecutionId: execution.id,
+        status: next.status,
+        firstFillAt: next.firstFillAt,
+        now: recoveredAt,
+      });
+
       // The local intent is closed out too, so nothing later mistakes a
       // SUBMITTING row for work still in flight.
       await tx.binanceOrder.updateMany({
