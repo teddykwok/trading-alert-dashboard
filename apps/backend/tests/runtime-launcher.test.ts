@@ -502,11 +502,17 @@ describe("runtime launcher: the Windows spawn shape", () => {
     // sanitises against the file that was actually approved.
     expect(source).toContain("dualSpawnPlan(role, REPO_ROOT, process.env, validatedKeyNames)");
     expect(source).toContain("dualSpawnPlan(workerRole, REPO_ROOT)");
+    // The generic analysis supervisor uses the SAME plan builder, named for
+    // its own role, so its replacement loads generic.env like every other
+    // start of that role.
+    expect(source).toContain("dualSpawnPlan(GENERIC_ANALYSIS_ROLE, REPO_ROOT)");
     expect(source).not.toContain("pnpm.cmd");
     expect(source).not.toContain("shell: true");
-    // Two spawn call sites: the six-role start, and the supervised restart.
-    // The probe/kill adapters use spawnSync.
-    expect((source.match(/(?<!\w)spawn\(/g) ?? []).length).toBe(2);
+    // Three spawn call sites: the six-role start, the supervised ACCOUNT
+    // worker restart, and the supervised GENERIC ANALYSIS restart. Each
+    // supervisor owns exactly one, which is what keeps the singleton argument
+    // per role readable. The probe/kill adapters use spawnSync.
+    expect((source.match(/(?<!\w)spawn\(/g) ?? []).length).toBe(3);
   });
 });
 

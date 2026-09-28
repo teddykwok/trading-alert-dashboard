@@ -55,6 +55,12 @@ import {
   runSupervisionSingleFlight,
   type RestartBudget,
 } from "./worker-supervision";
+import {
+  GENERIC_ANALYSIS_ROLE,
+  decideGenericAnalysisSupervision,
+  genericAnalysisHealth,
+  renderGenericAnalysisSupervision,
+} from "./generic-analysis-supervision";
 
 /**
  * Phase 11I — the local Windows runtime launcher for the DUAL-ACCOUNT topology.
@@ -864,6 +870,129 @@ async function superviseAccountWorker(
   }
 }
 
+/**
+ * Supervises the GENERIC ANALYSIS role, and nothing else.
+ *
+ * Deliberately its own menu action rather than a silent addition to Account
+ * A/B supervision: an operator who starts supervision should know exactly
+ * which role is being watched and which one may therefore be restarted.
+ *
+ * It never changes a deployment gate, never arms, never touches an
+ * authorization window and never opens a database, Redis or Binance client. A
+ * SAFE runtime stays SAFE, and both accounts are untouched.
+ */
+async function superviseGenericAnalysis(ask: (question: string) => Promise<string>): Promise<void> {
+  const label = ROLE_CONTRACTS[GENERIC_ANALYSIS_ROLE].label;
+
+  console.log("");
+  console.log(`Supervision watches ${label} ONLY.`);
+  console.log("It restarts no other role: not the generic backend, and neither account's");
+  console.log("control plane or execution worker.");
+  console.log("");
+  console.log("It acts only on a tree THIS launcher started and can still prove it owns.");
+  console.log("An analysis runtime somebody else started is reported and left alone.");
+  console.log("");
+  console.log("It runs only while this launcher is open. Press Ctrl+C to stop it.");
+  console.log("");
+  if ((await ask(`Start supervising ${label}? (y/N) `)).trim().toLowerCase() !== "y") {
+    console.log("Nothing was changed.");
+    return;
+  }
+
+  let budget: RestartBudget = EMPTY_RESTART_BUDGET;
+  for (;;) {
+    const pass = await runSupervisionSingleFlight(async () => {
+      const state = readState();
+      const { alive } = ownedRolesAlive(state);
+      const record = alive.find((entry) => entry.role === GENERIC_ANALYSIS_ROLE) ?? null;
+      // No attestation is read: a generic role publishes none, and inventing a
+      // health signal it does not emit is exactly what this must not do.
+      const status = projectTopology({
+        census: censusOf(observeProcesses(), observeListeners()),
+        ownedRoles: alive.map((entry) => entry.role),
+        attestation: {},
+      });
+      const nowMs = Date.now();
+      // The SAME health function the decision is given below, so the restart
+      // budget and the decision cannot disagree about what they are watching.
+      const health = genericAnalysisHealth({ status, ownedRootAlive: record !== null });
+      budget = observeWorkerHealth(budget, health, nowMs);
+
+      const decision = decideGenericAnalysisSupervision({
+        record: record === null ? null : { pid: record.pid, startedAtMs: record.startedAtMs },
+        ownership: record === null ? null : { owned: true },
+        status,
+        budget,
+        nowMs,
+        hasRuntimeState: state !== null,
+      });
+
+      if (decision.action === "TERMINATE_THEN_RESTART" && decision.terminatePid !== null) {
+        // Re-prove ownership immediately before the kill, never on the reading
+        // the decision was made from: between then and now the process could
+        // have exited and its PID been recycled.
+        const probes = probeProcesses([decision.terminatePid]);
+        const proven =
+          record !== null && verifyOwnership(record, probes.get(decision.terminatePid) ?? null, REPO_ROOT);
+        if (proven && proven.owned) {
+          terminateTree(decision.terminatePid);
+        } else if (proven && proven.reason !== "GONE") {
+          // It stopped looking like ours between the decision and now. Refuse
+          // the whole attempt: starting a replacement beside a tree we cannot
+          // prove we own is how a second consumer appears on the queue.
+          console.log(
+            `  ${label}: the recorded tree is no longer provably ours (${proven.reason}) — NOT terminated, nothing started.`
+          );
+          return { decision, budget };
+        }
+      }
+
+      if (decision.action === "RESTART" || decision.action === "TERMINATE_THEN_RESTART") {
+        // The SAME role, so the SAME env file, through the same reviewed spawn
+        // plan every start uses. A restart cannot change which environment the
+        // replacement loads.
+        const plan = dualSpawnPlan(GENERIC_ANALYSIS_ROLE, REPO_ROOT);
+        const child = spawn(plan.command, plan.args, plan.options);
+        if (child.pid !== undefined) {
+          child.unref();
+          const probes = probeProcesses([child.pid]);
+          const next = readState() ?? { repoRoot: REPO_ROOT, startedAtMs: Date.now(), processes: [] };
+          next.processes = [
+            ...next.processes.filter((entry) => entry.role !== GENERIC_ANALYSIS_ROLE),
+            {
+              role: GENERIC_ANALYSIS_ROLE,
+              pid: child.pid,
+              startedAtMs: probes.get(child.pid)?.startedAtMs ?? Date.now(),
+              envAlias: ROLE_CONTRACTS[GENERIC_ANALYSIS_ROLE].envAlias,
+              port: null,
+            },
+          ];
+          writeState(next);
+        }
+        budget = recordRestartAttempt(budget, nowMs);
+      }
+      return { decision, budget };
+    });
+
+    if (pass.ran) {
+      const stamp = new Date().toISOString().slice(11, 19);
+      for (const line of renderGenericAnalysisSupervision(pass.result.decision, pass.result.budget)) {
+        console.log(`[${stamp}] ${line}`);
+      }
+      // The replacement is VERIFIED by the next pass, not by a bespoke wait:
+      // after the stabilization window the leaf count decides again, and a
+      // replacement that never produced a runtime simply spends another
+      // attempt until the reviewed budget is exhausted.
+      if (pass.result.decision.state === "WORKER_RECOVERY_FAILED") {
+        console.log("");
+        console.log(`Automatic recovery for ${label} has STOPPED. Nothing further will be restarted.`);
+        return;
+      }
+    }
+    await sleep(WORKER_SUPERVISION_INTERVAL_MS);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Menu
 // ---------------------------------------------------------------------------
@@ -885,7 +1014,8 @@ async function main(): Promise<void> {
       console.log("4. Stop Runtime (requires SAFE)");
       console.log("5. Supervise Account A Worker");
       console.log("6. Supervise Account B Worker");
-      console.log("7. Exit");
+      console.log("7. Supervise Generic Analysis");
+      console.log("8. Exit");
       console.log("");
 
       const choice = (await ask("Choose: ")).trim();
@@ -897,7 +1027,8 @@ async function main(): Promise<void> {
       } else if (choice === "4") await stopRuntime();
       else if (choice === "5") await superviseAccountWorker("ACCOUNT_A", ask);
       else if (choice === "6") await superviseAccountWorker("ACCOUNT_B", ask);
-      else if (choice === "7") break;
+      else if (choice === "7") await superviseGenericAnalysis(ask);
+      else if (choice === "8") break;
       else console.log("Unrecognised choice. Nothing was changed.");
     }
   } finally {

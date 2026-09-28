@@ -858,15 +858,22 @@ describe("the launcher exposes supervision and keeps its existing guards", () =>
     "utf8"
   );
 
-  it("offers one entry PER ACCOUNT, without displacing Exit", () => {
+  it("offers one entry PER SUPERVISED ROLE, without displacing Exit", () => {
     // Phase 11I: supervision is account-explicit. One button that restarts
     // "the worker" is meaningless when two accounts each have one.
+    //
+    // The generic analysis role joined them after a dead generic worker went
+    // unnoticed for fifty minutes. It gets its OWN entry for the same reason
+    // the accounts do: an operator starting supervision must know which role
+    // may therefore be restarted. Exit moves down; it is not displaced.
     expect(CLI).toContain("5. Supervise Account A Worker");
     expect(CLI).toContain("6. Supervise Account B Worker");
-    expect(CLI).toContain("7. Exit");
+    expect(CLI).toContain("7. Supervise Generic Analysis");
+    expect(CLI).toContain("8. Exit");
     expect(CLI).toContain('else if (choice === "5") await superviseAccountWorker("ACCOUNT_A", ask);');
     expect(CLI).toContain('else if (choice === "6") await superviseAccountWorker("ACCOUNT_B", ask);');
-    expect(CLI).toContain('else if (choice === "7") break;');
+    expect(CLI).toContain('else if (choice === "7") await superviseGenericAnalysis(ask);');
+    expect(CLI).toContain('else if (choice === "8") break;');
   });
 
   it("spawns the replacement for the SAME account, never the other one", () => {

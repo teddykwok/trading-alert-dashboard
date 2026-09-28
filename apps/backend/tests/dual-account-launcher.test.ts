@@ -532,9 +532,15 @@ describe("the CLI's ownership and rollback fences", () => {
       expect(`${forbidden}:${CLI.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
     // Every terminateTree call site is preceded by an ownership check in the
-    // same block. There are three: rollback, stop, and supervision.
-    expect((CLI.match(/terminateTree\(/g) ?? []).length).toBe(4); // 1 definition + 3 call sites
-    for (const block of ["const rollback =", "async function stopRuntime", "TERMINATE_THEN_RESTART"]) {
+    // same block. There are four: rollback, stop, account-worker supervision
+    // and generic-analysis supervision.
+    expect((CLI.match(/terminateTree\(/g) ?? []).length).toBe(5); // 1 definition + 4 call sites
+    for (const block of [
+      "const rollback =",
+      "async function stopRuntime",
+      "TERMINATE_THEN_RESTART",
+      "async function superviseGenericAnalysis",
+    ]) {
       const from = CLI.indexOf(block);
       const kill = CLI.indexOf("terminateTree(", from);
       const proof = CLI.lastIndexOf("verifyOwnership(", kill);
