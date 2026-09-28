@@ -279,6 +279,11 @@ describe("account and generic entrypoints", () => {
     "src/modules/jobs/execution.worker.ts",
     "src/modules/binance/run-read-only-check.ts",
     "src/modules/execution/run-ensure-profile.ts",
+    // Stuck-entry recovery binds an exchange runtime and writes one
+    // profile's rows, so it is as account-bound as the arming commands. It
+    // reached `@prisma/client` on its very first line and therefore refused
+    // with PRISMA_LOADED_BEFORE_ENV_BOOTSTRAP under DOTENV_CONFIG_PATH.
+    "src/modules/execution/run-entry-recovery.ts",
   ];
   const GENERIC_ENTRYPOINTS = ["src/server.ts", "src/modules/jobs/vision-analysis.worker.ts"];
 
@@ -293,6 +298,12 @@ describe("account and generic entrypoints", () => {
       );
       expect(result.status).toBe(0);
       expect(result.stdout).toContain("IDENTITY_MATCHES_EXPECTED true");
+      // The refusal this boundary exists to make impossible. An entrypoint
+      // that reaches the generated client first cannot bootstrap honestly
+      // afterwards, and the bootstrap says so instead of guessing.
+      expect(`${result.stderr}${result.stdout}`).not.toContain(
+        "PRISMA_LOADED_BEFORE_ENV_BOOTSTRAP"
+      );
     }, PROBE_TIMEOUT_MS);
   }
 
