@@ -4,6 +4,11 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   judgeRoleHealth,
+  classifySpawnResult,
+  executeRollback,
+  firstObservationFailure,
+  judgeOwnedTree,
+  parseProcessRows,
   verifyOwnership,
   type OwnedProcess,
   type OwnershipVerdict,
@@ -117,23 +122,55 @@ function input(overrides: Partial<WorkerSupervisionInput> = {}): WorkerSupervisi
 }
 
 /** A fake machine. Records every side effect so refusals are provable. */
-function machine(options: { processes?: Map<number, ProcessProbe>; spawnPid?: number | null } = {}) {
+function machine(
+  options: {
+    processes?: Map<number, ProcessProbe>;
+    spawnPid?: number | null;
+    /** What the FRESH pre-spawn census reports. Null = unreadable. */
+    unaccounted?: number | null;
+    /** Makes `terminate` a no-op, so the old tree survives the kill. */
+    terminationFails?: boolean;
+    /** Runs just before the pre-spawn census, to stage a late arrival. */
+    beforeCensus?: () => void;
+    /**
+     * The machine cannot be observed at all -- PowerShell missing, a non-zero
+     * exit, unparseable output. NOT the same as observing an empty machine.
+     */
+    unobservable?: boolean;
+  } = {}
+) {
   const processes = options.processes ?? new Map<number, ProcessProbe>();
   const terminated: number[] = [];
   const spawned: number[] = [];
   const logs: string[] = [];
+  const censusCalls: number[] = [];
+  let unaccounted = options.unaccounted === undefined ? 0 : options.unaccounted;
   let nextPid = options.spawnPid === undefined ? 9001 : options.spawnPid;
   return {
     processes,
     terminated,
     spawned,
     logs,
+    censusCalls,
+    setUnaccounted: (value: number | null) => {
+      unaccounted = value;
+    },
     adapters: {
-      probe: (pid: number) => processes.get(pid) ?? null,
+      probe: (pid: number) =>
+        options.unobservable
+          ? ({ observed: false } as const)
+          : ({ observed: true, process: processes.get(pid) ?? null } as const),
       terminate: (pid: number) => {
         terminated.push(pid);
-        processes.delete(pid);
+        // A kill that does not actually remove the process is the case the
+        // post-kill proof exists for.
+        if (!options.terminationFails) processes.delete(pid);
         return true;
+      },
+      unaccountedLeaves: () => {
+        options.beforeCensus?.();
+        censusCalls.push(spawned.length);
+        return unaccounted;
       },
       spawnWorker: () => {
         if (nextPid === null) return null;
@@ -245,7 +282,9 @@ describe("B. an exited worker is restarted once", () => {
     expect(result.record!.role).toBe("worker");
     expect(result.record!.startedAtMs).toBe(NOW);
     // The new record must pass the SAME ownership check used everywhere else.
-    expect(verifyOwnership(result.record!, box.adapters.probe(result.newPid!), REPO).owned).toBe(true);
+    const seen = box.adapters.probe(result.newPid!);
+    expect(seen.observed).toBe(true);
+    expect(verifyOwnership(result.record!, seen.observed ? seen.process : null, REPO).owned).toBe(true);
   });
 
   it("a spawn that fails is reported, not retried inside the same attempt", () => {
@@ -873,14 +912,25 @@ describe("the launcher exposes supervision and keeps its existing guards", () =>
     expect(CLI).toContain('else if (choice === "5") await superviseAccountWorker("ACCOUNT_A", ask);');
     expect(CLI).toContain('else if (choice === "6") await superviseAccountWorker("ACCOUNT_B", ask);');
     expect(CLI).toContain('else if (choice === "7") await superviseGenericAnalysis(ask);');
-    expect(CLI).toContain('else if (choice === "8") break;');
+    // Exit is handled BEFORE the dispatch guard, so leaving the launcher can
+    // never be blocked by a machine it cannot observe.
+    expect(CLI).toContain('if (choice === "8") break;');
+    const dispatch = CLI.slice(CLI.indexOf('const choice = (await ask("Choose: ")).trim();'));
+    expect(dispatch.indexOf('if (choice === "8") break;')).toBeLessThan(dispatch.indexOf('try {'));
   });
 
   it("spawns the replacement for the SAME account, never the other one", () => {
     // The role is fixed at the top of the supervision pass from the account
     // being supervised, and the plan derives the env file from the role. A
     // restart therefore cannot change which account the worker is.
-    expect(CLI).toContain("dualSpawnPlan(workerRole, REPO_ROOT)");
+    //
+    // Both supervisors now hand that role to ONE shared restart path, so the
+    // binding is asserted where the spawn actually happens: there is exactly
+    // one `dualSpawnPlan` call site left in the tool, and it is named for the
+    // role it was given.
+    expect(CLI).toContain("const plan = dualSpawnPlan(role, REPO_ROOT);");
+    expect((CLI.match(/dualSpawnPlan\(/g) ?? [])).toHaveLength(2); // start + shared restart
+    expect(CLI).toContain("restartOwnedRole(decision, workerRole, budget.attempts + 1)");
     expect(CLI).toContain(
       'const workerRole: DualRole = account === "ACCOUNT_A" ? "account-a-worker" : "account-b-worker";'
     );
@@ -943,5 +993,675 @@ describe("supervision reuses the launcher's health model", () => {
     expect(stale.action).toBe("TERMINATE_THEN_RESTART");
     expect(exited.terminatePid).toBeNull();
     expect(stale.terminatePid).not.toBeNull();
+  });
+});
+
+
+// ===========================================================================
+// Restart fencing: the sequence between "replace it" and a process existing
+//
+// Three defects, all of them about the window AFTER a decision is made:
+//   1. a failed ownership re-proof skipped the kill and spawned anyway
+//   2. nothing proved the terminated tree had actually gone
+//   3. the census behind the decision was older than the kill that followed it
+// ===========================================================================
+
+describe("restart fencing: the pre-kill ownership re-proof", () => {
+  const staleDecision = () => decideWorkerSupervision(input({ workerHealth: "STALE" }));
+
+  it("1/2. a non-GONE re-proof terminates NOTHING and spawns NOTHING", () => {
+    // PID_REUSED and NOT_THIS_REPO both mean the recorded pid may now belong to
+    // somebody else's program. The recorded worker may ALSO still be alive, so
+    // a replacement would be the second one for this account.
+    const record = workerRecord();
+    for (const [label, stranger] of [
+      ["PID_REUSED", { pid: record.pid, startedAtMs: NOW, commandLine: probeOf(record).commandLine }],
+      ["NOT_THIS_REPO", { pid: record.pid, startedAtMs: record.startedAtMs, commandLine: "cmd.exe /c pnpm -C C:\\other worker" }],
+    ] as const) {
+      const box = machine({ processes: new Map([[record.pid, stranger as ProcessProbe]]) });
+      const result = executeWorkerRestart(staleDecision(), runtimeState(), 1, box.adapters);
+
+      expect(`${label}:${result.outcome}`).toBe(`${label}:OWNERSHIP_LOST`);
+      expect(`${label}:terminated=${box.terminated.length}`).toBe(`${label}:terminated=0`);
+      expect(`${label}:spawned=${box.spawned.length}`).toBe(`${label}:spawned=0`);
+      // It never even reached the census, because it never got near a spawn.
+      expect(`${label}:census=${box.censusCalls.length}`).toBe(`${label}:census=0`);
+    }
+  });
+});
+
+describe("restart fencing: the post-kill exit proof", () => {
+  it("4. a tree that survives the kill is TERMINATION_FAILED and spawns nothing", () => {
+    // `taskkill` returning is not proof of disappearance. The old tree is
+    // re-probed, still verifies as ours, and the replacement is refused.
+    const record = workerRecord();
+    const box = machine({
+      processes: new Map([[record.pid, probeOf(record)]]),
+      terminationFails: true,
+    });
+
+    const result = executeWorkerRestart(
+      decideWorkerSupervision(input({ workerHealth: "STALE" })),
+      runtimeState(),
+      1,
+      box.adapters
+    );
+
+    expect(result.outcome).toBe("TERMINATION_FAILED");
+    expect(box.terminated).toEqual([record.pid]);
+    expect(box.spawned).toEqual([]);
+    expect(box.censusCalls).toEqual([]);
+  });
+
+  it("5. a tree proven gone after the kill yields exactly ONE replacement", () => {
+    const record = workerRecord();
+    const box = machine({ processes: new Map([[record.pid, probeOf(record)]]) });
+
+    const result = executeWorkerRestart(
+      decideWorkerSupervision(input({ workerHealth: "STALE" })),
+      runtimeState(),
+      1,
+      box.adapters
+    );
+
+    expect(result.outcome).toBe("RESTARTED");
+    expect(box.terminated).toEqual([record.pid]);
+    expect(box.spawned).toHaveLength(1);
+    // The census ran BEFORE the spawn, not after it.
+    expect(box.censusCalls).toEqual([0]);
+  });
+});
+
+describe("restart fencing: the fresh pre-spawn census", () => {
+  it("6. a tree already gone before the kill spawns one, and kills nothing", () => {
+    const box = machine();
+    const result = executeWorkerRestart(
+      decideWorkerSupervision(input({ workerHealth: "STALE" })),
+      runtimeState(),
+      1,
+      box.adapters
+    );
+
+    expect(result.outcome).toBe("RESTARTED");
+    expect(box.terminated).toEqual([]);
+    expect(box.spawned).toHaveLength(1);
+  });
+
+  it("7. THE RACE: an external runtime appears after the kill -> NO spawn", () => {
+    // The decision was made from a census taken before the kill. An operator
+    // starting a worker by hand in that window must not be joined by this
+    // replacement. This is the exact race the pre-spawn census exists for, and
+    // nothing else in the sequence can see it.
+    const record = workerRecord();
+    const box = machine({
+      processes: new Map([[record.pid, probeOf(record)]]),
+      unaccounted: 0,
+    });
+    // Stage the late arrival at the moment the census is taken.
+    const staged = machine({
+      processes: new Map([[record.pid, probeOf(record)]]),
+      unaccounted: 1,
+    });
+
+    const result = executeWorkerRestart(
+      decideWorkerSupervision(input({ workerHealth: "STALE" })),
+      runtimeState(),
+      1,
+      staged.adapters
+    );
+
+    expect(result.outcome).toBe("DUPLICATE_PRESENT");
+    // The old tree was still terminated -- it was provably ours and unhealthy.
+    expect(staged.terminated).toEqual([record.pid]);
+    // But NO second runtime was created.
+    expect(staged.spawned).toEqual([]);
+    expect(box.spawned).toEqual([]);
+  });
+
+  it("7. the same refusal on the no-kill path", () => {
+    const box = machine({ unaccounted: 2 });
+    const result = executeWorkerRestart(
+      decideWorkerSupervision(input({ workerHealth: "OFF", ownership: { owned: false, reason: "GONE" } })),
+      runtimeState(),
+      1,
+      box.adapters
+    );
+    expect(result.outcome).toBe("DUPLICATE_PRESENT");
+    expect(box.terminated).toEqual([]);
+    expect(box.spawned).toEqual([]);
+  });
+
+  it("an unreadable census is refused, never read as absence", () => {
+    const box = machine({ unaccounted: null });
+    const result = executeWorkerRestart(
+      decideWorkerSupervision(input({ workerHealth: "OFF", ownership: { owned: false, reason: "GONE" } })),
+      runtimeState(),
+      1,
+      box.adapters
+    );
+    expect(result.outcome).toBe("CENSUS_UNAVAILABLE");
+    expect(box.spawned).toEqual([]);
+  });
+
+  it("9. a healthy worker is a NOOP: no probe, no kill, no census, no spawn", () => {
+    const box = machine();
+    const result = executeWorkerRestart(decideWorkerSupervision(input()), runtimeState(), 1, box.adapters);
+    expect(result.outcome).toBe("NOT_ATTEMPTED");
+    expect(box.terminated).toEqual([]);
+    expect(box.spawned).toEqual([]);
+    expect(box.censusCalls).toEqual([]);
+  });
+});
+
+describe("restart fencing: the role being replaced", () => {
+  it("selects the record for the NAMED role and records the replacement as it", () => {
+    // The dual launcher passes its own role. A pass for one role must not find
+    // or replace another role's record.
+    const generic = { role: "generic-analysis", pid: 7777, startedAtMs: NOW - 60_000 };
+    const state = {
+      repoRoot: REPO,
+      processes: [
+        { role: "account-a-worker", pid: 5555, startedAtMs: NOW - 60_000 },
+        generic,
+      ],
+    };
+    const box = machine({
+      processes: new Map([
+        [generic.pid, { pid: generic.pid, startedAtMs: generic.startedAtMs, commandLine: `cmd.exe /d /s /c pnpm -C ${REPO} --filter pkg worker` }],
+      ]),
+    });
+
+    const decision = decideWorkerSupervision(
+      input({ record: { role: "worker", pid: generic.pid, startedAtMs: generic.startedAtMs }, workerHealth: "STALE" })
+    );
+    const result = executeWorkerRestart(decision, state, 1, box.adapters, "generic-analysis");
+
+    expect(result.outcome).toBe("RESTARTED");
+    expect(box.terminated).toEqual([generic.pid]);
+    expect(result.record?.role).toBe("generic-analysis");
+  });
+
+  it("finds nothing when the named role is not the recorded one", () => {
+    // Same pid, wrong role: the lookup is by role AND pid, so this must not
+    // terminate a record it was not asked about.
+    const state = {
+      repoRoot: REPO,
+      processes: [{ role: "account-b-worker", pid: 4242, startedAtMs: NOW - 60_000 }],
+    };
+    const box = machine();
+    const decision = decideWorkerSupervision(
+      input({ record: { role: "worker", pid: 4242, startedAtMs: NOW - 60_000 }, workerHealth: "STALE" })
+    );
+    const result = executeWorkerRestart(decision, state, 1, box.adapters, "generic-analysis");
+
+    expect(result.outcome).toBe("OWNERSHIP_LOST");
+    expect(box.terminated).toEqual([]);
+    expect(box.spawned).toEqual([]);
+  });
+});
+
+
+// ===========================================================================
+// Observation failure: "I could not look" is never "there is nothing there"
+//
+// `spawnSync` does not throw when PowerShell cannot be run. It returns a result
+// carrying `error` or a non-zero `status` and empty stdout. Reading that as an
+// empty process list made a blind launcher confident: every recorded pid looked
+// GONE, every leaf count looked zero, and a replacement was authorised.
+// ===========================================================================
+
+describe("the process-observation result model", () => {
+  it("classifies a successful command, empty output included", () => {
+    // An empty answer from a working command is a REAL answer: nothing running.
+    expect(classifySpawnResult({ status: 0, stdout: "" })).toEqual({ ok: true, value: "" });
+    expect(classifySpawnResult({ status: 0, stdout: "1|2|x" })).toEqual({ ok: true, value: "1|2|x" });
+  });
+
+  it("A. rejects a command that could not be run", () => {
+    expect(classifySpawnResult({ error: new Error("ENOENT"), status: null, stdout: "" })).toEqual({
+      ok: false,
+      reason: "COMMAND_FAILED",
+    });
+  });
+
+  it("B. rejects a non-zero exit status", () => {
+    expect(classifySpawnResult({ status: 1, stdout: "" })).toEqual({ ok: false, reason: "EXIT_STATUS" });
+    expect(classifySpawnResult({ status: null, stdout: "" })).toEqual({ ok: false, reason: "EXIT_STATUS" });
+  });
+
+  it("keeps PROVEN ABSENT and COULD NOT OBSERVE distinguishable", () => {
+    const absent = classifySpawnResult({ status: 0, stdout: "" });
+    const blind = classifySpawnResult({ status: 1, stdout: "" });
+    expect(absent.ok).toBe(true);
+    expect(blind.ok).toBe(false);
+  });
+});
+
+describe("restart fencing: an unobservable machine", () => {
+  const staleDecision = () => decideWorkerSupervision(input({ workerHealth: "STALE" }));
+  const exitedDecision = () =>
+    decideWorkerSupervision(input({ workerHealth: "OFF", ownership: { owned: false, reason: "GONE" } }));
+
+  it("D. a pre-kill probe that could not be made is NOT treated as GONE", () => {
+    // The whole defect in one case: without this, the unobservable probe reads
+    // as "the process is gone", which authorises a spawn with no kill.
+    const record = workerRecord();
+    const box = machine({ processes: new Map([[record.pid, probeOf(record)]]), unobservable: true });
+
+    const result = executeWorkerRestart(staleDecision(), runtimeState(), 1, box.adapters);
+
+    expect(result.outcome).toBe("OBSERVATION_UNAVAILABLE");
+    expect(box.terminated).toEqual([]);
+    expect(box.spawned).toEqual([]);
+    expect(box.censusCalls).toEqual([]);
+  });
+
+  it("A/B. the same refusal whether the command failed or exited non-zero", () => {
+    // Both arrive at the adapter as `observed: false`; the primitive does not
+    // care which, only that nothing was seen.
+    for (const label of ["COMMAND_FAILED", "EXIT_STATUS"] as const) {
+      const record = workerRecord();
+      const box = machine({ processes: new Map([[record.pid, probeOf(record)]]), unobservable: true });
+      const result = executeWorkerRestart(staleDecision(), runtimeState(), 1, box.adapters);
+      expect(`${label}:${result.outcome}`).toBe(`${label}:OBSERVATION_UNAVAILABLE`);
+      expect(`${label}:spawned=${box.spawned.length}`).toBe(`${label}:spawned=0`);
+    }
+  });
+
+  it("C. a census that could not be read refuses the spawn", () => {
+    const box = machine({ unaccounted: null });
+    const result = executeWorkerRestart(exitedDecision(), runtimeState(), 1, box.adapters);
+    expect(result.outcome).toBe("CENSUS_UNAVAILABLE");
+    expect(box.spawned).toEqual([]);
+  });
+
+  it("a post-kill probe that could not be made refuses the spawn", () => {
+    // The kill was issued; whether it worked is now unknowable, so the old tree
+    // cannot be assumed gone.
+    const record = workerRecord();
+    const processes = new Map([[record.pid, probeOf(record)]]);
+    let calls = 0;
+    const terminated: number[] = [];
+    const spawned: number[] = [];
+    const adapters = {
+      // First probe (pre-kill) succeeds; the second (post-kill) cannot be made.
+      probe: (pid: number) => {
+        calls += 1;
+        return calls === 1
+          ? ({ observed: true, process: processes.get(pid) ?? null } as const)
+          : ({ observed: false } as const);
+      },
+      terminate: (pid: number) => {
+        terminated.push(pid);
+        return true;
+      },
+      unaccountedLeaves: () => 0,
+      spawnWorker: () => {
+        spawned.push(9001);
+        return 9001;
+      },
+      log: () => undefined,
+    };
+
+    const result = executeWorkerRestart(staleDecision(), runtimeState(), 1, adapters);
+
+    expect(result.outcome).toBe("OBSERVATION_UNAVAILABLE");
+    expect(terminated).toEqual([record.pid]);
+    expect(spawned).toEqual([]);
+  });
+
+  it("E. a SUCCESSFUL empty observation still means genuinely absent", () => {
+    // The guard must not be so broad that it blocks legitimate recovery: an
+    // observed-empty machine is proof, and a replacement may start.
+    const box = machine({ unaccounted: 0 });
+    const result = executeWorkerRestart(staleDecision(), runtimeState(), 1, box.adapters);
+    expect(result.outcome).toBe("RESTARTED");
+    expect(box.spawned).toHaveLength(1);
+  });
+
+  it("F. a healthy observed machine is unchanged", () => {
+    const box = machine();
+    const result = executeWorkerRestart(decideWorkerSupervision(input()), runtimeState(), 1, box.adapters);
+    expect(result.outcome).toBe("NOT_ATTEMPTED");
+    expect(box.terminated).toEqual([]);
+    expect(box.spawned).toEqual([]);
+  });
+});
+
+describe("the launcher's own observation plumbing", () => {
+  const SRC = readFileSync(
+    path.resolve(__dirname, "../src/modules/operator/run-runtime-launcher.ts"),
+    "utf8"
+  );
+
+  it("G. every process observation is classified, never read raw", () => {
+    // The bug was `result.stdout ?? ""` with no check of `error` or `status`.
+    // Both observers must go through the shared classifier.
+    expect((SRC.match(/classifySpawnResult\(result\)/g) ?? [])).toHaveLength(2);
+    expect(SRC).not.toContain("parseProcessProbeRows(result.stdout");
+    // Both PROCESS observers parse the classified value, never raw stdout.
+    // Both observers hand the classified output to the ONE strict parser.
+    expect((SRC.match(/parseProcessRows\(classified\.value\)/g) ?? [])).toHaveLength(2);
+    // `observeListeners` is deliberately NOT in scope: a listener feeds port
+    // presence, never an ownership or absence verdict, so it cannot authorise
+    // a spawn. Pinned so the exemption stays a decision, not an oversight.
+    const listeners = SRC.slice(SRC.indexOf("function observeListeners"), SRC.indexOf("function buildProcessProbeQuery"));
+    expect(listeners).toContain("result.stdout");
+  });
+
+  it("G. account, generic and status paths all consume the observation", () => {
+    // Every consumer handles the failure branch explicitly rather than
+    // destructuring a value that might not exist.
+    expect((SRC.match(/if \(!ownership\.ok\)/g) ?? []).length).toBeGreaterThanOrEqual(2);
+    expect((SRC.match(/if \(!processes\.ok\)/g) ?? []).length).toBeGreaterThanOrEqual(2);
+    expect(SRC).toContain("if (!probed.ok)");
+    // Stop Runtime keeping an unobservable record is proven BEHAVIOURALLY by
+    // `judgeOwnedTree` above; here we only pin that the CLI honours the flag.
+    expect(SRC).toContain("if (action.retainRecord) remaining.push(record);");
+  });
+});
+
+
+// ===========================================================================
+// Stop Runtime, Start SAFE rollback and Show Status, at their decision seams
+//
+// All three used to read a failed process observation as "the tree is GONE".
+// For the two stop paths that meant skipping the kill -- harmless -- and, for
+// Stop Runtime, DROPPING the ownership record, which leaves a live tree the
+// launcher can never stop again. For Show Status it meant drawing six OFF
+// roles, which looks exactly like a genuinely idle machine.
+// ===========================================================================
+
+describe("the shared stop decision for one owned tree", () => {
+  const REPO_ROOT = REPO;
+  const record = workerRecord();
+  const ours = probeOf(record);
+  const seen = (entries: [number, ProcessProbe][]) =>
+    ({ ok: true, value: new Map(entries) }) as const;
+
+  it("terminates a tree it can still prove it owns", () => {
+    expect(judgeOwnedTree(record, seen([[record.pid, ours]]), REPO_ROOT)).toEqual({ act: "TERMINATE" });
+  });
+
+  // Named for what it actually covers: the DECISION. The rollback's own
+  // retention is proven end-to-end by `executeRollback` below, because a
+  // correct decision that the caller discards is worth nothing.
+  it("the decision for an UNOBSERVABLE tree is SKIP with retainRecord", () => {
+    // The approved semantics: UNKNOWN must not become ABSENT. The record stays
+    // owned, so a later pass can still stop the tree.
+    for (const reason of ["COMMAND_FAILED", "EXIT_STATUS", "UNPARSEABLE"] as const) {
+      const action = judgeOwnedTree(record, { ok: false, reason }, REPO_ROOT);
+      expect(`${reason}:${action.act}`).toBe(`${reason}:SKIP`);
+      expect(action.act === "SKIP" && action.retainRecord).toBe(true);
+      expect(action.act === "SKIP" && action.reason).toContain(reason);
+    }
+  });
+
+  it("Start SAFE rollback: an unobservable tree is NOT reported as GONE", () => {
+    // The precise regression: the reason string must name the observation
+    // failure, never the ownership verdict that was never reached.
+    const action = judgeOwnedTree(record, { ok: false, reason: "EXIT_STATUS" }, REPO_ROOT);
+    expect(action.act).toBe("SKIP");
+    expect(action.act === "SKIP" && action.reason).not.toContain("GONE");
+    expect(action.act === "SKIP" && action.reason).toContain("could not be observed");
+  });
+
+  it("a PROVEN-absent or foreign tree is skipped AND its record dropped", () => {
+    // Unchanged behaviour, pinned so the retain rule cannot quietly widen: a
+    // record that provably names nothing of ours is not worth keeping.
+    const gone = judgeOwnedTree(record, seen([]), REPO_ROOT);
+    expect(gone).toEqual({ act: "SKIP", reason: "GONE", retainRecord: false });
+
+    const recycled = judgeOwnedTree(record, seen([[record.pid, { ...ours, startedAtMs: NOW }]]), REPO_ROOT);
+    expect(recycled).toEqual({ act: "SKIP", reason: "PID_REUSED", retainRecord: false });
+
+    const foreign = judgeOwnedTree(
+      record,
+      seen([[record.pid, { ...ours, commandLine: "cmd.exe /c pnpm -C C:\\other worker" }]]),
+      REPO_ROOT
+    );
+    expect(foreign).toEqual({ act: "SKIP", reason: "NOT_THIS_REPO", retainRecord: false });
+  });
+
+  it("never terminates on anything but a proven-owned tree", () => {
+    const inputs = [
+      { ok: false, reason: "COMMAND_FAILED" } as const,
+      seen([]),
+      seen([[record.pid, { ...ours, startedAtMs: NOW }]]),
+    ];
+    for (const probed of inputs) {
+      expect(judgeOwnedTree(record, probed, REPO_ROOT).act).toBe("SKIP");
+    }
+  });
+});
+
+describe("Show Status refuses to render an unobservable machine", () => {
+  const ok = { ok: true, value: [] } as const;
+
+  it("reports nothing to refuse when every observation succeeded", () => {
+    expect(firstObservationFailure(ok, ok)).toBeNull();
+  });
+
+  it("refuses when EITHER the ownership or the process read failed", () => {
+    // Both are required to draw a topology. Either one missing means there is
+    // no topology -- not an empty one.
+    expect(firstObservationFailure({ ok: false, reason: "COMMAND_FAILED" }, ok)).toBe("COMMAND_FAILED");
+    expect(firstObservationFailure(ok, { ok: false, reason: "EXIT_STATUS" })).toBe("EXIT_STATUS");
+    expect(firstObservationFailure(ok, { ok: false, reason: "UNPARSEABLE" })).toBe("UNPARSEABLE");
+  });
+
+  it("reports the FIRST failure, so the message names a real cause", () => {
+    expect(
+      firstObservationFailure({ ok: false, reason: "COMMAND_FAILED" }, { ok: false, reason: "EXIT_STATUS" })
+    ).toBe("COMMAND_FAILED");
+  });
+});
+
+describe("the launcher wires those decisions where they matter", () => {
+  const SRC = readFileSync(
+    path.resolve(__dirname, "../src/modules/operator/run-runtime-launcher.ts"),
+    "utf8"
+  );
+
+  it("Stop Runtime and the rollback share ONE stop decision", () => {
+    // Stop Runtime calls the decision directly; the rollback reaches the same
+    // decision through `executeRollback`, which is where its retention lives.
+    expect((SRC.match(/judgeOwnedTree\(/g) ?? [])).toHaveLength(1);
+    expect(SRC).toContain("executeRollback([...started].reverse(), REPO_ROOT, {");
+    expect(SRC).toContain("if (action.retainRecord) remaining.push(record);");
+  });
+
+  it("the rollback persists what it could not resolve, instead of clearing", () => {
+    const start = SRC.slice(SRC.indexOf("async function startSafe"), SRC.indexOf("async function stopRuntime"));
+    // `clearState()` is now conditional on nothing being left unresolved.
+    expect(start).toContain("if (complete) {");
+    expect(start.indexOf("clearState();")).toBeGreaterThan(start.indexOf("if (complete) {"));
+    expect(start).toContain("processes: retained });");
+    expect(start).toContain("ROLLBACK INCOMPLETE");
+  });
+
+  it("Show Status throws rather than rendering, and the menu recovers", () => {
+    expect(SRC).toContain("firstObservationFailure(ownership, processes)");
+    expect(SRC).toContain("throw new ProcessObservationError(");
+    expect(SRC).toContain("RUNTIME STATE UNKNOWN");
+    // Control returns to the operator: retry, or leave.
+    expect(SRC).toContain('if ((await ask("Retry? (y/N) ")).trim().toLowerCase() === "y") continue;');
+    // And the refusal is never drawn as a topology.
+    const menu = SRC.slice(SRC.indexOf("RUNTIME STATE UNKNOWN"));
+    expect(menu.indexOf("renderTopology(")).toBeGreaterThan(menu.indexOf("break;"));
+  });
+});
+
+
+// ===========================================================================
+// BLOCKER 1: a rollback must not forget a tree it deliberately did not kill
+//
+// The rollback ended with an unconditional `clearState()`. A started role that
+// could not be observed was correctly left alive -- and then had its ownership
+// record deleted, leaving a possibly-running account runtime with no owner, no
+// supervisor and no way for the launcher to stop it. UNKNOWN became ABSENT at
+// the very last step.
+// ===========================================================================
+
+describe("Start SAFE rollback: unresolved trees keep their ownership", () => {
+  const REPO_ROOT = REPO;
+  const roleRecord = (role: string, pid: number) => ({ role, pid, startedAtMs: NOW - 60_000 });
+  const ours = (pid: number, startedAtMs: number) => ({
+    pid,
+    startedAtMs,
+    commandLine: `cmd.exe /d /s /c pnpm -C ${REPO} --filter pkg dev`,
+  });
+
+  /** A machine where some pids answer and some cannot be observed at all. */
+  function machineFor(answers: Map<number, ProcessProbe>, blind: Set<number> = new Set()) {
+    const terminated: number[] = [];
+    const logs: string[] = [];
+    return {
+      terminated,
+      logs,
+      adapters: {
+        probe: (pid: number) =>
+          blind.has(pid)
+            ? ({ ok: false, reason: "EXIT_STATUS" } as const)
+            : ({ ok: true, value: new Map(answers.has(pid) ? [[pid, answers.get(pid)!]] : []) } as const),
+        terminate: (pid: number) => {
+          terminated.push(pid);
+          return true;
+        },
+        log: (line: string) => logs.push(line),
+      },
+    };
+  }
+
+  it("A. one role terminates, one is UNOBSERVABLE -> only the unresolved one is retained", () => {
+    const stopped = roleRecord("account-a-control", 101);
+    const blind = roleRecord("account-a-worker", 202);
+    const box = machineFor(new Map([[stopped.pid, ours(stopped.pid, stopped.startedAtMs)]]), new Set([blind.pid]));
+
+    const result = executeRollback([blind, stopped], REPO_ROOT, box.adapters);
+
+    // The observable one was stopped and is gone from the state.
+    expect(box.terminated).toEqual([stopped.pid]);
+    // The unobservable one was NOT killed and IS still owned.
+    expect(result.retained).toEqual([blind]);
+    expect(result.complete).toBe(false);
+    expect(box.logs.join(" ")).toContain("still recorded");
+  });
+
+  it("B. everything terminated or proven gone -> state may be cleared", () => {
+    const live = roleRecord("generic-backend", 303);
+    const gone = roleRecord("generic-analysis", 404);
+    // `gone` answers with no row: proven absent, not unobservable.
+    const box = machineFor(new Map([[live.pid, ours(live.pid, live.startedAtMs)]]));
+
+    const result = executeRollback([live, gone], REPO_ROOT, box.adapters);
+
+    expect(box.terminated).toEqual([live.pid]);
+    expect(result.retained).toEqual([]);
+    expect(result.complete).toBe(true);
+  });
+
+  it("C. several unobservable roles -> ALL of their records are retained", () => {
+    const a = roleRecord("account-a-worker", 11);
+    const b = roleRecord("account-b-worker", 22);
+    const c = roleRecord("generic-analysis", 33);
+    const box = machineFor(new Map(), new Set([a.pid, b.pid, c.pid]));
+
+    const result = executeRollback([a, b, c], REPO_ROOT, box.adapters);
+
+    expect(box.terminated).toEqual([]);
+    expect(result.retained).toEqual([a, b, c]);
+    expect(result.complete).toBe(false);
+  });
+
+  it("D. retained records stay identifiable for a later stop or supervision pass", () => {
+    // They must survive with the exact identity fields ownership is proved
+    // from, or a later pass would see them as fresh/unknown rather than ours.
+    const blind = roleRecord("account-b-control", 77);
+    const box = machineFor(new Map(), new Set([blind.pid]));
+
+    const { retained } = executeRollback([blind], REPO_ROOT, box.adapters);
+
+    expect(retained[0].pid).toBe(blind.pid);
+    expect(retained[0].startedAtMs).toBe(blind.startedAtMs);
+    expect(retained[0].role).toBe("account-b-control");
+    // And that record still verifies as ours once the machine can be seen again.
+    const probe = ours(blind.pid, blind.startedAtMs);
+    expect(verifyOwnership(retained[0], probe, REPO_ROOT).owned).toBe(true);
+  });
+
+  it("a tree that is provably not ours is dropped, not retained", () => {
+    // Unchanged: retention is for UNKNOWN only, never for a proven verdict.
+    const foreign = roleRecord("generic-backend", 99);
+    const box = machineFor(
+      new Map([[foreign.pid, { ...ours(foreign.pid, foreign.startedAtMs), commandLine: "cmd.exe /c pnpm -C C:\\other dev" }]])
+    );
+    const result = executeRollback([foreign], REPO_ROOT, box.adapters);
+    expect(box.terminated).toEqual([]);
+    expect(result.retained).toEqual([]);
+    expect(result.complete).toBe(true);
+  });
+});
+
+// ===========================================================================
+// BLOCKER 2: a census is all of the rows, or none of them
+// ===========================================================================
+
+describe("the process-row parser is all-or-nothing", () => {
+  const row = (pid: number, ts: number, cmd = "node worker") => `${pid}|${ts}|${cmd}`;
+
+  it("F. multiple valid rows are all returned", () => {
+    const out = parseProcessRows([row(1, 1000, "a"), row(2, 2000, "b"), row(3, 3000, "c")].join("\r\n"));
+    expect(out.ok).toBe(true);
+    expect(out.ok && out.value).toHaveLength(3);
+    expect(out.ok && out.value[1]).toEqual({ pid: 2, startedAtMs: 2000, commandLine: "b" });
+  });
+
+  it("I. a truly empty observation is still ABSENT, so recovery stays possible", () => {
+    for (const empty of ["", "\r\n", "   \r\n  \r\n"]) {
+      const out = parseProcessRows(empty);
+      expect(out.ok).toBe(true);
+      expect(out.ok && out.value).toEqual([]);
+    }
+  });
+
+  it("E. one valid row + one malformed row -> UNPARSEABLE, subset discarded", () => {
+    // The undercount this exists to prevent: returning just the valid row would
+    // hide a process, and a hidden process is one a spawn can be started beside.
+    const out = parseProcessRows([row(1, 1000, "a"), "this is not a row"].join("\r\n"));
+    expect(out).toEqual({ ok: false, reason: "UNPARSEABLE" });
+  });
+
+  it("G. a truncated row poisons the whole census", () => {
+    for (const bad of ["4096|", "4096", "|1000|x"]) {
+      const out = parseProcessRows([row(1, 1000, "a"), bad].join("\r\n"));
+      expect(`${bad} -> ${out.ok ? "ok" : out.reason}`).toBe(`${bad} -> UNPARSEABLE`);
+    }
+  });
+
+  it("H. unexpected text mixed with valid rows -> UNPARSEABLE", () => {
+    const noise = "Get-CimInstance : Access is denied.";
+    expect(parseProcessRows([noise, row(1, 1000, "a")].join("\r\n"))).toEqual({
+      ok: false,
+      reason: "UNPARSEABLE",
+    });
+    expect(parseProcessRows([row(1, 1000, "a"), noise].join("\r\n"))).toEqual({
+      ok: false,
+      reason: "UNPARSEABLE",
+    });
+  });
+
+  it("a non-numeric pid or timestamp is malformed, not coerced to NaN", () => {
+    // The old parser accepted these: `!pid` was false for "abc", so it pushed a
+    // row whose pid was NaN and could never match anything again.
+    expect(parseProcessRows("abc|1000|x")).toEqual({ ok: false, reason: "UNPARSEABLE" });
+    expect(parseProcessRows("1|notatime|x")).toEqual({ ok: false, reason: "UNPARSEABLE" });
+  });
+
+  it("an empty command line is a VALID row, not a malformed one", () => {
+    // A process whose CommandLine is unreadable still emits three fields.
+    const out = parseProcessRows(row(7, 7000, ""));
+    expect(out.ok).toBe(true);
+    expect(out.ok && out.value[0]).toEqual({ pid: 7, startedAtMs: 7000, commandLine: "" });
   });
 });

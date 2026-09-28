@@ -404,10 +404,36 @@ export function decideWorkerSupervision(input: WorkerSupervisionInput): Supervis
 // ---------------------------------------------------------------------------
 
 /** The side effects a restart needs. Injected, so this stays testable. */
+/**
+ * What ONE ownership probe found.
+ *
+ * `{ observed: true, process: null }` is "the OS answered, and that pid is not
+ * running" -- proven absence, which `verifyOwnership` reads as GONE.
+ * `{ observed: false }` is "the OS could not be asked", which proves nothing
+ * and must never reach `verifyOwnership` at all.
+ */
+export type ProbeOutcome =
+  | { readonly observed: true; readonly process: ProcessProbe | null }
+  | { readonly observed: false };
+
 export interface WorkerRestartAdapters {
-  probe(pid: number): ProcessProbe | null;
+  probe(pid: number): ProbeOutcome;
   /** taskkill /T on ONE verified repo-owned root. */
   terminate(pid: number): boolean;
+  /**
+   * A FRESH count of runtime leaves this spawn could duplicate, minus the
+   * ones already explained by other launcher-owned records.
+   *
+   * Taken immediately before the spawn, never reused from the decision. The
+   * decision's census is older than the kill that followed it, and an
+   * externally started runtime that appeared in between is exactly the thing
+   * a replacement must not be added on top of.
+   *
+   * Zero means nothing unexplained is running and the spawn is the only one.
+   * Null means the census could not be read, which is not evidence of
+   * absence and is therefore refused.
+   */
+  unaccountedLeaves(): number | null;
   /** Spawns exactly one worker in the recorded mode. Returns its PID. */
   spawnWorker(): number | null;
   log(line: string): void;
@@ -418,6 +444,12 @@ export type WorkerRestartOutcome =
   | "TERMINATION_FAILED"
   | "SPAWN_FAILED"
   | "OWNERSHIP_LOST"
+  /** A runtime this spawn could duplicate is already running. */
+  | "DUPLICATE_PRESENT"
+  /** A required process observation could not be made at all. */
+  | "OBSERVATION_UNAVAILABLE"
+  /** The pre-spawn census could not be read, so absence is unproven. */
+  | "CENSUS_UNAVAILABLE"
   | "NOT_ATTEMPTED";
 
 export interface WorkerRestartResult {
@@ -450,9 +482,24 @@ export interface WorkerRestartResult {
  */
 export function executeWorkerRestart(
   decision: SupervisionDecision,
-  state: RuntimeState,
+  /**
+   * Structurally typed rather than `RuntimeState`, so the DUAL launcher can
+   * pass its own state shape. Only the repo root and the recorded roots are
+   * read; nothing else about the state matters to a restart.
+   */
+  state: {
+    readonly repoRoot: string;
+    readonly processes: readonly { role: string; pid: number; startedAtMs: number }[];
+  },
   attemptNumber: number,
-  adapters: WorkerRestartAdapters
+  adapters: WorkerRestartAdapters,
+  /**
+   * WHICH recorded role is being replaced. Defaults to the legacy
+   * single-stack worker so every existing caller is unchanged; the dual
+   * launcher names its own role, and a pass for one role can therefore never
+   * select another role's record.
+   */
+  role: string = "worker"
 ): WorkerRestartResult {
   if (decision.action === "NONE") {
     return { outcome: "NOT_ATTEMPTED", oldPid: null, newPid: null, record: null };
@@ -468,13 +515,23 @@ export function executeWorkerRestart(
     if (oldPid === null) {
       return { outcome: "NOT_ATTEMPTED", oldPid: null, newPid: null, record: null };
     }
-    const current = state.processes.find((entry) => entry.role === "worker" && entry.pid === oldPid);
+    const current = state.processes.find((entry) => entry.role === role && entry.pid === oldPid);
     if (!current) {
       adapters.log(`worker supervision: pid ${oldPid} is no longer in runtime state — nothing was stopped`);
       return { outcome: "OWNERSHIP_LOST", oldPid, newPid: null, record: null };
     }
     // Re-verify immediately before the kill, never on the earlier reading.
-    const before = verifyOwnership(current, adapters.probe(oldPid), state.repoRoot);
+    // A probe that could not be MADE is not a probe that found nothing. Asking
+    // `verifyOwnership` about it would return GONE, and GONE is the verdict
+    // that authorises a replacement without a kill.
+    const beforeProbe = adapters.probe(oldPid);
+    if (!beforeProbe.observed) {
+      adapters.log(
+        `worker supervision: pid ${oldPid} could not be observed — NOT terminated, no replacement was started`
+      );
+      return { outcome: "OBSERVATION_UNAVAILABLE", oldPid, newPid: null, record: null };
+    }
+    const before = verifyOwnership(current, beforeProbe.process, state.repoRoot);
     if (!before.owned) {
       if (before.reason === "GONE") {
         adapters.log(`worker supervision: pid ${oldPid} exited on its own before it could be stopped`);
@@ -485,15 +542,69 @@ export function executeWorkerRestart(
       }
     } else {
       adapters.terminate(oldPid);
-      // Trust the re-probe, not the exit code: what matters is whether the
-      // process is actually gone.
-      const after = verifyOwnership(current, adapters.probe(oldPid), state.repoRoot);
+      // Same rule after the kill: without an observation there is no proof the
+      // tree exited, and an unproven exit must not be followed by a spawn.
+      const afterProbe = adapters.probe(oldPid);
+      if (!afterProbe.observed) {
+        adapters.log(
+          `worker supervision: pid ${oldPid} was signalled but could not be observed afterwards — no replacement was started`
+        );
+        return { outcome: "OBSERVATION_UNAVAILABLE", oldPid, newPid: null, record: null };
+      }
+      const after = verifyOwnership(current, afterProbe.process, state.repoRoot);
       if (after.owned) {
         adapters.log(`worker supervision: pid ${oldPid} could NOT be stopped — no replacement was started`);
         return { outcome: "TERMINATION_FAILED", oldPid, newPid: null, record: null };
       }
+      /**
+       * PID_REUSED and NOT_THIS_REPO here both mean the tree we terminated is
+       * no longer at that pid, which is what the kill was for:
+       *
+       *   PID_REUSED     the creation time moved, so the pid was freed and
+       *                  handed to somebody else -- ours exited.
+       *   NOT_THIS_REPO  the same pid, a creation time within a second of our
+       *                  record, and a different command line. A live process
+       *                  cannot rewrite its own command line, and the pre-kill
+       *                  probe already matched this repository, so this is
+       *                  reachable only as a recycled pid that landed inside
+       *                  the timing tolerance.
+       *
+       * Neither is observation ambiguity -- that case returned above, because
+       * an unmade observation never reaches `verifyOwnership`. The fresh census
+       * below remains the authority on whether a replacement is safe.
+       */
       adapters.log(`worker supervision: pid ${oldPid} stopped`);
     }
+  }
+
+  /**
+   * --- The pre-spawn fence ------------------------------------------
+   *
+   * Everything above proved the OLD tree is gone. This proves no OTHER
+   * runtime has taken its place in the meantime.
+   *
+   * The decision was made from a census taken before the kill, and a kill
+   * takes time. An operator starting a worker by hand in that window, or a
+   * second launcher doing the same, would otherwise be joined by this
+   * replacement -- two consumers on one queue, which is the failure this
+   * whole sequence exists to prevent.
+   *
+   * Refused BOTH ways: a leaf that is present, and a census that could not
+   * be read. An unreadable census is not evidence of absence.
+   */
+  const unaccounted = adapters.unaccountedLeaves();
+  if (unaccounted === null) {
+    adapters.log(
+      "worker supervision: the pre-spawn process census could not be read — no replacement was started"
+    );
+    return { outcome: "CENSUS_UNAVAILABLE", oldPid, newPid: null, record: null };
+  }
+  if (unaccounted > 0) {
+    adapters.log(
+      `worker supervision: ${unaccounted} unaccounted runtime(s) appeared before the replacement could start — ` +
+        "no replacement was started"
+    );
+    return { outcome: "DUPLICATE_PRESENT", oldPid, newPid: null, record: null };
   }
 
   // The ONLY spawn in this module.
@@ -503,9 +614,13 @@ export function executeWorkerRestart(
     return { outcome: "SPAWN_FAILED", oldPid, newPid: null, record: null };
   }
 
-  const probe = adapters.probe(newPid);
+  // Diagnostic only: the spawn already happened, and an unreadable creation
+  // time makes the record unverifiable rather than unsafe. Reported, not
+  // refused -- refusing here would leave a started process unrecorded.
+  const spawnedProbe = adapters.probe(newPid);
+  const probe = spawnedProbe.observed ? spawnedProbe.process : null;
   const record: OwnedProcess = {
-    role: "worker",
+    role: role as OwnedProcess["role"],
     pid: newPid,
     // The OS's own creation time, so a later ownership check compares like with
     // like. Falling back to 0 would make the record unverifiable, so a missing

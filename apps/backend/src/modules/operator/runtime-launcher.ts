@@ -279,6 +279,215 @@ export function standardLimitTakeProfitOf(state: Pick<RuntimeState, "standardLim
   return state.standardLimitTakeProfit === true;
 }
 
+/**
+ * The outcome of ASKING the operating system a question about processes.
+ *
+ * ## Why this is not just an array
+ *
+ * Every process observation here is a `spawnSync` of PowerShell. That call
+ * can fail -- execution policy, PATH, a machine out of handles -- and it does
+ * not throw: it returns a result carrying `error` or a non-zero `status`, with
+ * empty stdout. Reading that empty stdout as an empty process list turns
+ * "I could not look" into "there is nothing there", which is the one
+ * substitution this codebase must never make: `verifyOwnership` reads a
+ * missing probe as GONE, and GONE authorises a replacement spawn.
+ *
+ * PROVEN ABSENT and COULD NOT OBSERVE are therefore different values, and a
+ * caller has to handle both.
+ */
+export type Observation<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly reason: ObservationFailure };
+
+export type ObservationFailure =
+  /** The command could not be run at all (`result.error`). */
+  | "COMMAND_FAILED"
+  /** It ran and reported failure (`result.status !== 0`). */
+  | "EXIT_STATUS"
+  /** It produced output, but none of it parsed. Absence is unproven. */
+  | "UNPARSEABLE";
+
+export const observed = <T>(value: T): Observation<T> => ({ ok: true, value });
+export const unobserved = <T>(reason: ObservationFailure): Observation<T> => ({
+  ok: false,
+  reason,
+});
+
+/**
+ * Classifies one `spawnSync` result, WITHOUT deciding what its output means.
+ *
+ * Empty stdout from a successful command is a legitimate answer -- no node
+ * process is running, no listener is bound -- so it stays a success here. Only
+ * the two ways the command itself can fail are rejected; the caller decides
+ * whether what it parsed is enough (see `UNPARSEABLE`).
+ */
+export function classifySpawnResult(result: {
+  error?: Error | undefined;
+  status?: number | null;
+  stdout?: string | null;
+}): Observation<string> {
+  if (result.error) return unobserved("COMMAND_FAILED");
+  if (result.status !== 0) return unobserved("EXIT_STATUS");
+  return observed(result.stdout ?? "");
+}
+
+/**
+ * The first observation that failed, or null when all of them succeeded.
+ *
+ * The seam behind Show Status. Rendering a topology needs BOTH the owned
+ * records and the process census; if either could not be read there is no
+ * topology to draw, and drawing an empty one would show six OFF roles --
+ * visually identical to a genuinely idle machine, and the opposite claim.
+ */
+export function firstObservationFailure(
+  ...observations: readonly Observation<unknown>[]
+): ObservationFailure | null {
+  for (const observation of observations) {
+    if (!observation.ok) return observation.reason;
+  }
+  return null;
+}
+
+/** What to do with ONE launcher-recorded tree that is about to be stopped. */
+export type OwnedTreeAction =
+  | { readonly act: "TERMINATE" }
+  | {
+      readonly act: "SKIP";
+      readonly reason: string;
+      /**
+       * Whether the launcher must KEEP owning this record.
+       *
+       * True only when the tree could not be observed. A record dropped on a
+       * failed observation is a live process the launcher can no longer stop --
+       * which is precisely how the generic analysis worker became unowned.
+       * A verdict that genuinely proves the tree is gone, or is somebody
+       * else's, drops the record as before.
+       */
+      readonly retainRecord: boolean;
+    };
+
+/**
+ * The shared stop decision, used by Stop Runtime and by the Start SAFE
+ * rollback so the two cannot disagree about what an unobservable tree means.
+ *
+ * Terminates only a tree it can still PROVE it owns. Everything else is a
+ * skip; the only question left is whether the record survives the skip.
+ */
+export function judgeOwnedTree(
+  record: Pick<OwnedProcess, "pid" | "startedAtMs">,
+  probed: Observation<ReadonlyMap<number, ProcessProbe>>,
+  repoRoot: string
+): OwnedTreeAction {
+  if (!probed.ok) {
+    return {
+      act: "SKIP",
+      reason: `could not be observed (${probed.reason})`,
+      // UNKNOWN is not ABSENT: keep owning it.
+      retainRecord: true,
+    };
+  }
+  const verdict = verifyOwnership(record, probed.value.get(record.pid) ?? null, repoRoot);
+  if (verdict.owned) return { act: "TERMINATE" };
+  return { act: "SKIP", reason: verdict.reason, retainRecord: false };
+}
+
+/**
+ * Every `pid|startedAtMs|commandLine` row a process listing emitted, or an
+ * explicit failure -- ALL OR NOTHING.
+ *
+ * ## Why a partial parse is a failure
+ *
+ * Skipping a row that does not parse silently removes a process from the
+ * census. Downstream that is indistinguishable from the process not
+ * existing, and one of the things the census authorises is a replacement
+ * spawn: an external runtime whose row failed to format would become
+ * "nothing is running", and supervision would start a second consumer
+ * beside it. Returning the subset that happened to parse is the same
+ * undercount, only harder to notice.
+ *
+ * Blank lines are separators, not rows -- PowerShell terminates its output
+ * with a newline, and an empty machine legitimately emits nothing, which
+ * stays a successful EMPTY observation so that legitimate recovery still
+ * works. Everything else, error text on stdout included, must parse.
+ */
+export function parseProcessRows(stdout: string): Observation<ProcessProbe[]> {
+  const rows: ProcessProbe[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    const parts = trimmed.split("|");
+    // The producing script emits exactly three fields and strips `|` from
+    // the command line, so any other shape is not a row this code wrote.
+    if (parts.length !== 3) return unobserved("UNPARSEABLE");
+    const [pid, startedAtMs, commandLine] = parts;
+    if (!/^\d+$/.test(pid) || !/^\d+$/.test(startedAtMs)) return unobserved("UNPARSEABLE");
+    rows.push({ pid: Number(pid), startedAtMs: Number(startedAtMs), commandLine });
+  }
+  return observed(rows);
+}
+
+/** The machine calls a rollback makes. Injected, so the sequence is testable. */
+export interface RollbackAdapters {
+  probe(pid: number): Observation<ReadonlyMap<number, ProcessProbe>>;
+  /** taskkill /T on ONE verified repo-owned root. */
+  terminate(pid: number): boolean;
+  log(line: string): void;
+}
+
+export interface RollbackResult<T> {
+  /**
+   * Records that MUST survive the rollback.
+   *
+   * Populated only by trees that could not be observed. Everything else was
+   * either terminated or proven not to be ours, and carrying those forward
+   * would leave the launcher owning processes that do not exist.
+   */
+  readonly retained: T[];
+  /** True when nothing is unresolved, so the state file may be cleared. */
+  readonly complete: boolean;
+}
+
+/**
+ * Undoes a partial start, and says what is left unresolved.
+ *
+ * ## Why the result is not just a list of kills
+ *
+ * A rollback used to end with an unconditional `clearState()`. That is
+ * correct only when every started tree was actually dealt with. A tree that
+ * could not be OBSERVED is deliberately not terminated -- and clearing its
+ * record then leaves a process that may still be running with no owner, no
+ * supervisor and no way for the launcher to stop it later. UNKNOWN became
+ * ABSENT at the last step, after the rest of the sequence had carefully
+ * avoided exactly that.
+ *
+ * So the caller is told which records to keep. Newest-first ordering is the
+ * caller's to choose; this preserves whatever order it is given.
+ */
+export function executeRollback<T extends Pick<OwnedProcess, "pid" | "startedAtMs"> & { role: string }>(
+  records: readonly T[],
+  repoRoot: string,
+  adapters: RollbackAdapters
+): RollbackResult<T> {
+  const retained: T[] = [];
+  for (const record of records) {
+    const action = judgeOwnedTree(record, adapters.probe(record.pid), repoRoot);
+    if (action.act === "SKIP") {
+      if (action.retainRecord) {
+        // Unobservable: not terminated, and NOT forgotten.
+        adapters.log(`${record.role}: ${action.reason} — NOT terminated, still recorded`);
+        retained.push(record);
+      } else {
+        // Provably gone, or provably not ours. Nothing to keep.
+        adapters.log(`${record.role}: ${action.reason} — NOT terminated`);
+      }
+      continue;
+    }
+    const stopped = adapters.terminate(record.pid);
+    adapters.log(`${record.role}: ${stopped ? "terminated" : "TERMINATION FAILED"}`);
+  }
+  return { retained, complete: retained.length === 0 };
+}
+
 /** What the OS reports about a live PID. Supplied by the CLI, faked in tests. */
 export interface ProcessProbe {
   pid: number;

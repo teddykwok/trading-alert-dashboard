@@ -7,8 +7,16 @@ import path from "node:path";
 import {
   defaultStatePath,
   expectedGateSnapshotFor,
+  classifySpawnResult,
+  executeRollback,
+  firstObservationFailure,
+  judgeOwnedTree,
+  observed,
+  parseProcessRows,
+  unobserved,
   verifyOwnership,
   type RoleHealth,
+  type Observation,
   type ProcessProbe,
 } from "./runtime-launcher";
 import {
@@ -49,6 +57,7 @@ import {
   EMPTY_RESTART_BUDGET,
   WORKER_SUPERVISION_INTERVAL_MS,
   decideWorkerSupervision,
+  executeWorkerRestart,
   observeWorkerHealth,
   recordRestartAttempt,
   renderSupervisionState,
@@ -132,7 +141,20 @@ function clearState(): void {
 // ---------------------------------------------------------------------------
 
 /** One PowerShell round-trip for every node process on the machine. */
-function observeProcesses(): ObservedProcess[] {
+/**
+ * Every node process on the machine, or an explicit failure.
+ *
+ * The failure case is the whole point. `spawnSync` does not throw when the
+ * command cannot be run; it returns a result with `error` set, or a non-zero
+ * `status`, and empty stdout. This used to return `[]` for all three, which
+ * every caller then read as "no processes are running" -- and for supervision
+ * that is the verdict that authorises a replacement spawn.
+ *
+ * Empty stdout from a SUCCESSFUL command still means an empty machine, which
+ * is a real and common answer. Only output that exists and yields no parsable
+ * row is rejected as UNPARSEABLE.
+ */
+function observeProcesses(): Observation<ObservedProcess[]> {
   const script =
     "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
     "ForEach-Object { '{0}|{1}|{2}' -f $_.ProcessId, " +
@@ -140,20 +162,27 @@ function observeProcesses(): ObservedProcess[] {
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
     encoding: "utf8",
   });
-  const observed: ObservedProcess[] = [];
-  for (const line of (result.stdout ?? "").split(/\r?\n/)) {
-    const [pid, startedAtMs, commandLine] = line.trim().split("|");
-    if (!pid || !startedAtMs) continue;
-    observed.push({
-      pid: Number(pid),
-      startedAtMs: Number(startedAtMs),
-      commandLine: commandLine ?? "",
-    });
-  }
-  return observed;
+  const classified = classifySpawnResult(result);
+  if (!classified.ok) return classified;
+  // ALL OR NOTHING: one malformed row discards the whole census.
+  return parseProcessRows(classified.value);
 }
 
 /** Listening sockets on the three contracted ports, with their bind address. */
+/**
+ * Raised when the machine could not be observed at all.
+ *
+ * Deliberately an exception rather than a quiet empty result: every caller of
+ * `collectStatus` renders or decides from the topology, and there is no
+ * sensible topology to hand them. The menu catches it and says so.
+ */
+class ProcessObservationError extends Error {
+  constructor(readonly reason: string) {
+    super(`the running processes could not be observed (${reason})`);
+    this.name = "ProcessObservationError";
+  }
+}
+
 function observeListeners(): ObservedListener[] {
   const script =
     "Get-NetTCPConnection -State Listen -LocalPort 4000,4001,4002 -ErrorAction SilentlyContinue | " +
@@ -179,15 +208,30 @@ function observeListeners(): ObservedListener[] {
  * parsing its rows both live in the pure module, which is what makes that
  * constraint testable without spawning anything.
  */
-function probeProcesses(pids: number[]): Map<number, ProcessProbe> {
+/**
+ * Asks about SPECIFIC pids, or reports that it could not ask.
+ *
+ * A pid that is genuinely not running produces a successful command with no
+ * row for it, which is proven absence and stays an empty entry. A command that
+ * failed produces no rows either, and conflating the two is what let a broken
+ * PowerShell read as a dead runtime.
+ */
+function probeProcesses(pids: number[]): Observation<Map<number, ProcessProbe>> {
   const found = new Map<number, ProcessProbe>();
   const script = buildProcessProbeQuery(pids);
-  if (script === null) return found;
+  // Nothing was asked because nothing was asked ABOUT: a real, empty answer.
+  if (script === null) return observed(found);
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
     encoding: "utf8",
   });
-  for (const row of parseProcessProbeRows(result.stdout ?? "")) found.set(row.pid, row);
-  return found;
+  const classified = classifySpawnResult(result);
+  if (!classified.ok) return classified;
+  // The SAME strict parser: a probe row and a census row have one shape, so
+  // they get one contract.
+  const parsed = parseProcessRows(classified.value);
+  if (!parsed.ok) return parsed;
+  for (const row of parsed.value) found.set(row.pid, row);
+  return observed(found);
 }
 
 function portOpen(port: number): Promise<boolean> {
@@ -426,9 +470,21 @@ async function readAccountShutdownState(
 // Status
 // ---------------------------------------------------------------------------
 
-function ownedRolesAlive(state: DualRuntimeState | null): { alive: OwnedRole[]; disowned: string[] } {
-  if (!state) return { alive: [], disowned: [] };
-  const probes = probeProcesses(state.processes.map((entry) => entry.pid));
+/**
+ * The recorded roots this launcher can still PROVE it owns.
+ *
+ * Returns an observation, because the difference between
+ * "nothing of ours is running" and "the machine could not be asked" decides
+ * whether a supervisor may start a replacement. A failed probe used to produce
+ * the first answer while meaning the second.
+ */
+function ownedRolesAlive(
+  state: DualRuntimeState | null
+): Observation<{ alive: OwnedRole[]; disowned: string[] }> {
+  if (!state) return observed({ alive: [], disowned: [] });
+  const probed = probeProcesses(state.processes.map((entry) => entry.pid));
+  if (!probed.ok) return probed;
+  const probes = probed.value;
   const alive: OwnedRole[] = [];
   const disowned: string[] = [];
   for (const record of state.processes) {
@@ -438,7 +494,7 @@ function ownedRolesAlive(state: DualRuntimeState | null): { alive: OwnedRole[]; 
       disowned.push(`${record.role} pid ${record.pid}: ${verdict.reason} — NOT terminated`);
     }
   }
-  return { alive, disowned };
+  return observed({ alive, disowned });
 }
 
 async function collectStatus(): Promise<{
@@ -448,8 +504,19 @@ async function collectStatus(): Promise<{
   effectiveGates: Partial<Record<RuntimeAccount, GateTriple | null>>;
 }> {
   const state = readState();
-  const { alive, disowned } = ownedRolesAlive(state);
-  const census = censusOf(observeProcesses(), observeListeners());
+  // An unobservable machine is NOT an empty machine. Both reads are required
+  // before any topology can be projected, and a failure is surfaced as a
+  // refusal rather than drawn as six OFF roles.
+  const ownership = ownedRolesAlive(state);
+  const processes = observeProcesses();
+  // The explicit test narrows both unions; the shared helper picks WHICH
+  // failure is reported, so that choice is a tested function rather than a
+  // nested conditional written twice.
+  if (!ownership.ok || !processes.ok) {
+    throw new ProcessObservationError(firstObservationFailure(ownership, processes) ?? "UNPARSEABLE");
+  }
+  const { alive, disowned } = ownership.value;
+  const census = censusOf(processes.value, observeListeners());
   const attestation = await readAllAttestation();
   const status = projectTopology({
     census,
@@ -607,16 +674,25 @@ async function startSafe(): Promise<void> {
     console.log("");
     console.log(`PARTIAL START — ${why}`);
     console.log("Rolling back ONLY the roles this action started, newest first.");
-    for (const record of [...started].reverse()) {
-      const probes = probeProcesses([record.pid]);
-      const owned = verifyOwnership(record, probes.get(record.pid) ?? null, REPO_ROOT);
-      if (!owned.owned) {
-        console.log(`  ${record.role}: ${owned.reason} — NOT terminated`);
-        continue;
-      }
-      console.log(`  ${record.role}: ${terminateTree(record.pid) ? "terminated" : "TERMINATION FAILED"}`);
+    // The SAME decision Stop Runtime makes, and the same retention rule: a
+    // tree that could not be observed is left alone AND left owned.
+    const { retained, complete } = executeRollback([...started].reverse(), REPO_ROOT, {
+      probe: (pid) => probeProcesses([pid]),
+      terminate: (pid) => terminateTree(pid),
+      log: (line) => console.log(`  ${line}`),
+    });
+    if (complete) {
+      clearState();
+      return;
     }
-    clearState();
+    // Unresolved trees keep their ownership records, so a later Stop Runtime
+    // or supervision pass can still identify and stop them.
+    writeState({ repoRoot: REPO_ROOT, startedAtMs: Date.now(), processes: retained });
+    console.log("");
+    console.log(
+      `ROLLBACK INCOMPLETE — ${retained.length} role(s) could not be observed and were NOT stopped.`
+    );
+    console.log("Their ownership records were KEPT so they can still be stopped later.");
   };
 
   for (const role of DUAL_ROLES) {
@@ -630,10 +706,11 @@ async function startSafe(): Promise<void> {
     }
     child.unref();
     const probes = probeProcesses([child.pid]);
+    const startedAtMs = probes.ok ? probes.value.get(child.pid)?.startedAtMs : undefined;
     started.push({
       role,
       pid: child.pid,
-      startedAtMs: probes.get(child.pid)?.startedAtMs ?? Date.now(),
+      startedAtMs: startedAtMs ?? Date.now(),
       envAlias: contract.envAlias,
       port: contract.port,
     });
@@ -737,10 +814,14 @@ async function stopRuntime(): Promise<void> {
   const remaining: OwnedRole[] = [];
   for (const role of order) {
     for (const record of alive.filter((entry) => entry.role === role)) {
-      const probes = probeProcesses([record.pid]);
-      const owned = verifyOwnership(record, probes.get(record.pid) ?? null, REPO_ROOT);
-      if (!owned.owned) {
-        console.log(`  ${record.role}: ${owned.reason} — NOT terminated`);
+      const action = judgeOwnedTree(record, probeProcesses([record.pid]), REPO_ROOT);
+      if (action.act === "SKIP") {
+        // `retainRecord` is the load-bearing half. Forgetting a record we
+        // merely could not observe leaves a live tree the launcher can no
+        // longer stop.
+        const kept = action.retainRecord ? ", still recorded" : "";
+        console.log(`  ${record.role}: ${action.reason} — NOT terminated${kept}`);
+        if (action.retainRecord) remaining.push(record);
         continue;
       }
       const stopped = terminateTree(record.pid);
@@ -762,6 +843,117 @@ async function stopRuntime(): Promise<void> {
 // ---------------------------------------------------------------------------
 // Supervision, per account
 // ---------------------------------------------------------------------------
+
+/**
+ * How many runtime LEAVES of a role's entrypoint are running that no
+ * launcher-owned record explains.
+ *
+ * ## Why a subtraction rather than a count
+ *
+ * A bare count cannot answer "would spawning duplicate anything?", because the
+ * OTHER account's execution worker runs the same entrypoint and is supposed to
+ * be there. What matters is whether the census holds more leaves than the
+ * launcher's own surviving records account for.
+ *
+ * ## The account-identity limit, stated rather than worked around
+ *
+ * `classifyEntrypoint` reports an entrypoint, never an account: both account
+ * execution workers are `execution.worker.ts` and differ only by an
+ * environment variable, which a command line does not carry. So an unexplained
+ * `execution.worker` leaf cannot be attributed to A or to B.
+ *
+ * The conservative reading is the only safe one: ANY unexplained leaf of that
+ * entrypoint blocks a replacement for EITHER account. Refusing to start a
+ * second worker for the account that already has one costs a stalled recovery
+ * an operator can see; guessing wrongly costs two workers admitting against
+ * one set of limits.
+ *
+ * `excludeRole` is the role being replaced -- its own tree has already been
+ * proved gone, so it must not be counted as accounting for anything.
+ */
+function unaccountedLeavesFor(role: DualRole, excludeRole: DualRole): number | null {
+  const entrypoint = ROLE_CONTRACTS[role].entrypoint;
+  // BOTH reads must succeed. A failed process scan cannot be read as zero
+  // leaves, and unverifiable ownership cannot be read as nothing to account
+  // for -- either one would turn a blind census into a licence to spawn.
+  const processes = observeProcesses();
+  if (!processes.ok) return null;
+  const ownership = ownedRolesAlive(readState());
+  if (!ownership.ok) return null;
+  const seen = censusOf(processes.value, []).counts[entrypoint] ?? 0;
+  const accountedFor = ownership.value.alive.filter(
+    (entry) => entry.role !== excludeRole && ROLE_CONTRACTS[entry.role].entrypoint === entrypoint
+  ).length;
+  return Math.max(0, seen - accountedFor);
+}
+
+/**
+ * The ONE restart-execution path both supervisors use.
+ *
+ * Everything about the safety sequence -- pre-kill ownership re-proof, the
+ * refusal to spawn after a failed re-proof, terminate, post-kill exit proof,
+ * the fresh pre-spawn census -- lives in `executeWorkerRestart` and is
+ * exercised by its own behavioural tests. This adapter supplies the machine
+ * calls and nothing else; it makes no safety decision of its own.
+ */
+function restartOwnedRole(
+  decision: ReturnType<typeof decideWorkerSupervision>,
+  role: DualRole,
+  attemptNumber: number
+): ReturnType<typeof executeWorkerRestart> {
+  const state = readState();
+  return executeWorkerRestart(
+    decision,
+    { repoRoot: state?.repoRoot ?? REPO_ROOT, processes: state?.processes ?? [] },
+    attemptNumber,
+    {
+      probe: (pid) => {
+        const probed = probeProcesses([pid]);
+        // `observed: true, process: null` is proven absence; `observed: false`
+        // is an unanswered question, and the primitive fails closed on it.
+        return probed.ok ? { observed: true, process: probed.value.get(pid) ?? null } : { observed: false };
+      },
+      terminate: (pid) => {
+        terminateTree(pid);
+        return true;
+      },
+      unaccountedLeaves: () => unaccountedLeavesFor(role, role),
+      spawnWorker: () => {
+        // The SAME role, so the SAME env file, through the same reviewed spawn
+        // plan every start of that role uses. No operator input reaches it.
+        const plan = dualSpawnPlan(role, REPO_ROOT);
+        const child = spawn(plan.command, plan.args, plan.options);
+        if (child.pid === undefined) return null;
+        child.unref();
+        return child.pid;
+      },
+      log: (line) => console.log(`  ${line}`),
+    },
+    role
+  );
+}
+
+/**
+ * The OS creation time of a freshly spawned root, or now.
+ *
+ * Best effort by design: the spawn already happened, so an unobservable
+ * creation time must not lose the record. It makes the record harder to verify
+ * later, which the ownership check reports honestly, rather than unsafe.
+ */
+function replacementStartedAt(pid: number): number {
+  const probed = probeProcesses([pid]);
+  return (probed.ok ? probed.value.get(pid)?.startedAtMs : undefined) ?? Date.now();
+}
+
+/** Records a replacement root, leaving every other role's record untouched. */
+function recordReplacement(role: DualRole, pid: number, startedAtMs: number): void {
+  const next = readState() ?? { repoRoot: REPO_ROOT, startedAtMs: Date.now(), processes: [] };
+  next.processes = [
+    ...next.processes.filter((entry) => entry.role !== role),
+    { role, pid, startedAtMs, envAlias: ROLE_CONTRACTS[role].envAlias, port: null },
+  ];
+  writeState(next);
+}
 
 async function superviseAccountWorker(
   account: Exclude<RuntimeAccount, "GENERIC">,
@@ -787,11 +979,23 @@ async function superviseAccountWorker(
   for (;;) {
     const pass = await runSupervisionSingleFlight(async () => {
       const state = readState();
-      const { alive } = ownedRolesAlive(state);
+      const ownership = ownedRolesAlive(state);
+      if (!ownership.ok) {
+        // No attempt is spent: nothing was tried, because nothing could be
+        // seen. The next tick asks again.
+        console.log(`  ${label}: processes could not be observed (${ownership.reason}) — nothing was changed.`);
+        return null;
+      }
+      const { alive } = ownership.value;
+      const processes = observeProcesses();
+      if (!processes.ok) {
+        console.log(`  ${label}: processes could not be observed (${processes.reason}) — nothing was changed.`);
+        return null;
+      }
       const record = alive.find((entry) => entry.role === workerRole) ?? null;
       const attestation = await readAccountAttestation(account);
       const status = projectTopology({
-        census: censusOf(observeProcesses(), observeListeners()),
+        census: censusOf(processes.value, observeListeners()),
         ownedRoles: alive.map((entry) => entry.role),
         attestation: { [account]: attestation },
       });
@@ -824,38 +1028,26 @@ async function superviseAccountWorker(
         hasRuntimeState: state !== null,
       });
 
-      if (decision.action === "TERMINATE_THEN_RESTART" && decision.terminatePid !== null) {
-        const probes = probeProcesses([decision.terminatePid]);
-        const owned =
-          record !== null && verifyOwnership(record, probes.get(decision.terminatePid) ?? null, REPO_ROOT).owned;
-        if (owned) terminateTree(decision.terminatePid);
-      }
-      if (decision.action === "RESTART" || decision.action === "TERMINATE_THEN_RESTART") {
-        // The SAME role, so the SAME env file. A restart cannot change account.
-        const plan = dualSpawnPlan(workerRole, REPO_ROOT);
-        const child = spawn(plan.command, plan.args, plan.options);
-        if (child.pid !== undefined) {
-          child.unref();
-          const probes = probeProcesses([child.pid]);
-          const next = readState() ?? { repoRoot: REPO_ROOT, startedAtMs: Date.now(), processes: [] };
-          next.processes = [
-            ...next.processes.filter((entry) => entry.role !== workerRole),
-            {
-              role: workerRole,
-              pid: child.pid,
-              startedAtMs: probes.get(child.pid)?.startedAtMs ?? Date.now(),
-              envAlias: ROLE_CONTRACTS[workerRole].envAlias,
-              port: null,
-            },
-          ];
-          writeState(next);
+      if (decision.action !== "NONE") {
+        // ONE fenced sequence, shared with generic analysis: re-prove, refuse
+        // to spawn on any non-GONE ownership failure, terminate, prove the old
+        // tree actually exited, re-census, then spawn at most one.
+        const outcome = restartOwnedRole(decision, workerRole, budget.attempts + 1);
+        if (outcome.outcome === "RESTARTED" && outcome.newPid !== null) {
+          recordReplacement(
+            workerRole,
+            outcome.newPid,
+            replacementStartedAt(outcome.newPid)
+          );
         }
+        // The attempt is spent whatever the outcome, so a refusal cannot spin:
+        // backoff and the ceiling apply to attempts, not to successes.
         budget = recordRestartAttempt(budget, nowMs);
       }
       return { decision, budget };
     });
 
-    if (pass.ran) {
+    if (pass.ran && pass.result !== null) {
       const stamp = new Date().toISOString().slice(11, 19);
       for (const line of renderSupervisionState(pass.result.decision, pass.result.budget)) {
         console.log(`[${stamp}] ${label}: ${line}`);
@@ -903,12 +1095,22 @@ async function superviseGenericAnalysis(ask: (question: string) => Promise<strin
   for (;;) {
     const pass = await runSupervisionSingleFlight(async () => {
       const state = readState();
-      const { alive } = ownedRolesAlive(state);
+      const ownership = ownedRolesAlive(state);
+      if (!ownership.ok) {
+        console.log(`  ${label}: processes could not be observed (${ownership.reason}) — nothing was changed.`);
+        return null;
+      }
+      const { alive } = ownership.value;
+      const processes = observeProcesses();
+      if (!processes.ok) {
+        console.log(`  ${label}: processes could not be observed (${processes.reason}) — nothing was changed.`);
+        return null;
+      }
       const record = alive.find((entry) => entry.role === GENERIC_ANALYSIS_ROLE) ?? null;
       // No attestation is read: a generic role publishes none, and inventing a
       // health signal it does not emit is exactly what this must not do.
       const status = projectTopology({
-        census: censusOf(observeProcesses(), observeListeners()),
+        census: censusOf(processes.value, observeListeners()),
         ownedRoles: alive.map((entry) => entry.role),
         attestation: {},
       });
@@ -927,54 +1129,24 @@ async function superviseGenericAnalysis(ask: (question: string) => Promise<strin
         hasRuntimeState: state !== null,
       });
 
-      if (decision.action === "TERMINATE_THEN_RESTART" && decision.terminatePid !== null) {
-        // Re-prove ownership immediately before the kill, never on the reading
-        // the decision was made from: between then and now the process could
-        // have exited and its PID been recycled.
-        const probes = probeProcesses([decision.terminatePid]);
-        const proven =
-          record !== null && verifyOwnership(record, probes.get(decision.terminatePid) ?? null, REPO_ROOT);
-        if (proven && proven.owned) {
-          terminateTree(decision.terminatePid);
-        } else if (proven && proven.reason !== "GONE") {
-          // It stopped looking like ours between the decision and now. Refuse
-          // the whole attempt: starting a replacement beside a tree we cannot
-          // prove we own is how a second consumer appears on the queue.
-          console.log(
-            `  ${label}: the recorded tree is no longer provably ours (${proven.reason}) — NOT terminated, nothing started.`
+      if (decision.action !== "NONE") {
+        // The SAME fenced sequence the account workers use. Every safety step
+        // -- re-prove, refuse on non-GONE, terminate, prove exit, re-census --
+        // lives in `executeWorkerRestart`, so the two supervisors cannot drift.
+        const outcome = restartOwnedRole(decision, GENERIC_ANALYSIS_ROLE, budget.attempts + 1);
+        if (outcome.outcome === "RESTARTED" && outcome.newPid !== null) {
+          recordReplacement(
+            GENERIC_ANALYSIS_ROLE,
+            outcome.newPid,
+            replacementStartedAt(outcome.newPid)
           );
-          return { decision, budget };
-        }
-      }
-
-      if (decision.action === "RESTART" || decision.action === "TERMINATE_THEN_RESTART") {
-        // The SAME role, so the SAME env file, through the same reviewed spawn
-        // plan every start uses. A restart cannot change which environment the
-        // replacement loads.
-        const plan = dualSpawnPlan(GENERIC_ANALYSIS_ROLE, REPO_ROOT);
-        const child = spawn(plan.command, plan.args, plan.options);
-        if (child.pid !== undefined) {
-          child.unref();
-          const probes = probeProcesses([child.pid]);
-          const next = readState() ?? { repoRoot: REPO_ROOT, startedAtMs: Date.now(), processes: [] };
-          next.processes = [
-            ...next.processes.filter((entry) => entry.role !== GENERIC_ANALYSIS_ROLE),
-            {
-              role: GENERIC_ANALYSIS_ROLE,
-              pid: child.pid,
-              startedAtMs: probes.get(child.pid)?.startedAtMs ?? Date.now(),
-              envAlias: ROLE_CONTRACTS[GENERIC_ANALYSIS_ROLE].envAlias,
-              port: null,
-            },
-          ];
-          writeState(next);
         }
         budget = recordRestartAttempt(budget, nowMs);
       }
       return { decision, budget };
     });
 
-    if (pass.ran) {
+    if (pass.ran && pass.result !== null) {
       const stamp = new Date().toISOString().slice(11, 19);
       for (const line of renderGenericAnalysisSupervision(pass.result.decision, pass.result.budget)) {
         console.log(`[${stamp}] ${line}`);
@@ -1004,7 +1176,22 @@ async function main(): Promise<void> {
 
   try {
     for (;;) {
-      const { status, disowned, effectiveGates } = await collectStatus();
+      let snapshot: Awaited<ReturnType<typeof collectStatus>>;
+      try {
+        snapshot = await collectStatus();
+      } catch (error) {
+        if (!(error instanceof ProcessObservationError)) throw error;
+        // Deliberately NOT rendered as an empty topology: six OFF roles and
+        // "the machine could not be read" look identical on screen and mean
+        // opposite things. The menu is not offered over a state nobody knows.
+        console.log("");
+        console.log(`RUNTIME STATE UNKNOWN — ${error.message}`);
+        console.log("No action is offered until the machine can be observed again.");
+        console.log("");
+        if ((await ask("Retry? (y/N) ")).trim().toLowerCase() === "y") continue;
+        break;
+      }
+      const { status, disowned, effectiveGates } = snapshot;
       for (const line of renderTopology(status, disowned, effectiveGates)) console.log(line);
 
       console.log("");
@@ -1019,17 +1206,27 @@ async function main(): Promise<void> {
       console.log("");
 
       const choice = (await ask("Choose: ")).trim();
-      if (choice === "1") continue;
-      else if (choice === "2") await startSafe();
-      else if (choice === "3") {
+      if (choice === "8") break;
+      try {
+        if (choice === "1") continue;
+        else if (choice === "2") await startSafe();
+        else if (choice === "3") {
+          console.log("");
+          for (const line of LIVE_READY_UNAVAILABLE) console.log(line);
+        } else if (choice === "4") await stopRuntime();
+        else if (choice === "5") await superviseAccountWorker("ACCOUNT_A", ask);
+        else if (choice === "6") await superviseAccountWorker("ACCOUNT_B", ask);
+        else if (choice === "7") await superviseGenericAnalysis(ask);
+        else console.log("Unrecognised choice. Nothing was changed.");
+      } catch (error) {
+        // Any action that needs to see the machine refuses when it cannot.
+        // Nothing was started, stopped or recorded on this path: the actions
+        // read the topology BEFORE they act.
+        if (!(error instanceof ProcessObservationError)) throw error;
         console.log("");
-        for (const line of LIVE_READY_UNAVAILABLE) console.log(line);
-      } else if (choice === "4") await stopRuntime();
-      else if (choice === "5") await superviseAccountWorker("ACCOUNT_A", ask);
-      else if (choice === "6") await superviseAccountWorker("ACCOUNT_B", ask);
-      else if (choice === "7") await superviseGenericAnalysis(ask);
-      else if (choice === "8") break;
-      else console.log("Unrecognised choice. Nothing was changed.");
+        console.log(`REFUSED — ${error.message}`);
+        console.log("Nothing was changed.");
+      }
     }
   } finally {
     rl.close();

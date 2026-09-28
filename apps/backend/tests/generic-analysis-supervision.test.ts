@@ -28,6 +28,9 @@ import {
   recordRestartAttempt,
   workerRestartQuietPeriodMs,
   type RestartBudget,
+  decideWorkerSupervision,
+  executeWorkerRestart,
+  type ProcessProbe,
 } from "../src/modules/operator/worker-supervision";
 
 /**
@@ -417,10 +420,12 @@ describe("generic analysis supervision reaches nothing it should not", () => {
       cli.indexOf("async function superviseGenericAnalysis"),
       cli.indexOf("// Menu")
     );
-    expect(action).toContain("dualSpawnPlan(GENERIC_ANALYSIS_ROLE, REPO_ROOT)");
-    // One spawn, one terminate, both named for this role.
-    expect(action.match(/spawn\(plan\.command/g) ?? []).toHaveLength(1);
-    expect(action.match(/terminateTree\(/g) ?? []).toHaveLength(1);
+    // The action itself no longer spawns or kills anything: it hands its role
+    // to the ONE shared, fenced restart path. That is what stops the two
+    // supervisors drifting apart again.
+    expect(action).toContain("restartOwnedRole(decision, GENERIC_ANALYSIS_ROLE, budget.attempts + 1)");
+    expect(action.match(/spawn\(plan\.command/g) ?? []).toHaveLength(0);
+    expect(action.match(/terminateTree\(/g) ?? []).toHaveLength(0);
     for (const otherRole of [
       "generic-backend",
       "account-a-control",
@@ -430,10 +435,12 @@ describe("generic analysis supervision reaches nothing it should not", () => {
     ]) {
       expect(`${otherRole}:${action.includes(otherRole)}`).toBe(`${otherRole}:false`);
     }
-    // Ownership is re-proved immediately before the kill, never inherited.
-    expect(action.indexOf("verifyOwnership(record")).toBeLessThan(action.indexOf("terminateTree("));
-    // And a replacement is never started beside a tree we cannot prove we own.
-    expect(action).toContain("NOT terminated, nothing started");
+    // The re-proof, the refusal to spawn after a failed re-proof, the post-kill
+    // exit proof and the fresh pre-spawn census are all inside
+    // `executeWorkerRestart` now, where they are proven BEHAVIOURALLY rather
+    // than by matching this file's text. The previous review flagged that
+    // weakness explicitly; see tests/worker-supervision.test.ts.
+    expect(cli).toContain("executeWorkerRestart(");
   });
 
   it("7. it is its own menu action, not bundled into account supervision", () => {
@@ -460,5 +467,152 @@ describe("generic analysis supervision reaches nothing it should not", () => {
     }
     // The ceiling it reports is the account supervisor's own constant.
     expect(moduleCode).toContain("WORKER_RESTART_MAX_ATTEMPTS");
+  });
+});
+
+
+// ===========================================================================
+// Restart fencing, exercised for the GENERIC ANALYSIS role specifically
+//
+// The sequence itself lives in `executeWorkerRestart` and is shared with the
+// account workers. These cases prove the generic role reaches it with its own
+// role name and gets the same refusals -- so the two supervisors cannot drift
+// apart again the way they did before this slice.
+// ===========================================================================
+
+describe("generic analysis restart fencing", () => {
+  const GENERIC_PID = 7777;
+  const STARTED = 1_700_000_000_000;
+  const RECORD = { role: GENERIC_ANALYSIS_ROLE, pid: GENERIC_PID, startedAtMs: STARTED };
+  const STATE = { repoRoot: REPO, processes: [RECORD] };
+  const OURS = {
+    pid: GENERIC_PID,
+    startedAtMs: STARTED,
+    commandLine: `cmd.exe /d /s /c pnpm -C ${REPO} --filter pkg worker`,
+  };
+
+  function box(
+    options: {
+      processes?: Map<number, ProcessProbe>;
+      unaccounted?: number | null;
+      /** The machine cannot be observed at all. */
+      unobservable?: boolean;
+    } = {}
+  ) {
+    const processes = options.processes ?? new Map<number, ProcessProbe>();
+    const terminated: number[] = [];
+    const spawned: number[] = [];
+    return {
+      terminated,
+      spawned,
+      adapters: {
+        probe: (pid: number) =>
+          options.unobservable
+            ? ({ observed: false } as const)
+            : ({ observed: true, process: processes.get(pid) ?? null } as const),
+        terminate: (pid: number) => {
+          terminated.push(pid);
+          processes.delete(pid);
+          return true;
+        },
+        unaccountedLeaves: () => (options.unaccounted === undefined ? 0 : options.unaccounted),
+        spawnWorker: () => {
+          spawned.push(9100);
+          return 9100;
+        },
+        log: () => undefined,
+      },
+    };
+  }
+
+  const staleDecision = () =>
+    decideWorkerSupervision({
+      record: { role: "worker", pid: GENERIC_PID, startedAtMs: STARTED },
+      ownership: { owned: true },
+      workerHealth: "STALE",
+      backendHealth: "HEALTHY",
+      budget: EMPTY_RESTART_BUDGET,
+      nowMs: STARTED + 600_000,
+      hasRuntimeState: true,
+    });
+
+  it("3. a non-GONE re-proof terminates NOTHING and spawns NOTHING", () => {
+    for (const [label, stranger] of [
+      ["PID_REUSED", { ...OURS, startedAtMs: STARTED + 60_000 }],
+      ["NOT_THIS_REPO", { ...OURS, commandLine: "cmd.exe /d /s /c pnpm -C C:\\elsewhere --filter pkg worker" }],
+    ] as const) {
+      const machine = box({ processes: new Map([[GENERIC_PID, stranger as ProcessProbe]]) });
+      const result = executeWorkerRestart(
+        staleDecision(),
+        STATE,
+        1,
+        machine.adapters,
+        GENERIC_ANALYSIS_ROLE
+      );
+      expect(`${label}:${result.outcome}`).toBe(`${label}:OWNERSHIP_LOST`);
+      expect(`${label}:terminated=${machine.terminated.length}`).toBe(`${label}:terminated=0`);
+      expect(`${label}:spawned=${machine.spawned.length}`).toBe(`${label}:spawned=0`);
+    }
+  });
+
+  it("4. a generic tree that survives the kill spawns nothing", () => {
+    const processes = new Map([[GENERIC_PID, OURS]]);
+    const machine = {
+      terminated: [] as number[],
+      spawned: [] as number[],
+      adapters: {
+        probe: (pid: number) => ({ observed: true, process: processes.get(pid) ?? null } as const),
+        // The kill "succeeds" but the tree is still there.
+        terminate: (pid: number) => {
+          machine.terminated.push(pid);
+          return true;
+        },
+        unaccountedLeaves: () => 0,
+        spawnWorker: () => {
+          machine.spawned.push(9100);
+          return 9100;
+        },
+        log: () => undefined,
+      },
+    };
+    const result = executeWorkerRestart(staleDecision(), STATE, 1, machine.adapters, GENERIC_ANALYSIS_ROLE);
+    expect(result.outcome).toBe("TERMINATION_FAILED");
+    expect(machine.terminated).toEqual([GENERIC_PID]);
+    expect(machine.spawned).toEqual([]);
+  });
+
+  it("5. a generic tree proven gone yields exactly one replacement, recorded as generic", () => {
+    const machine = box({ processes: new Map([[GENERIC_PID, OURS]]) });
+    const result = executeWorkerRestart(staleDecision(), STATE, 1, machine.adapters, GENERIC_ANALYSIS_ROLE);
+    expect(result.outcome).toBe("RESTARTED");
+    expect(machine.terminated).toEqual([GENERIC_PID]);
+    expect(machine.spawned).toHaveLength(1);
+    expect(result.record?.role).toBe(GENERIC_ANALYSIS_ROLE);
+  });
+
+  it("7. an external analysis runtime appearing before the spawn blocks it", () => {
+    // The generic half of the race: our tree is gone, but a vision-analysis
+    // leaf somebody else started is already draining the queues.
+    const machine = box({ processes: new Map([[GENERIC_PID, OURS]]), unaccounted: 1 });
+    const result = executeWorkerRestart(staleDecision(), STATE, 1, machine.adapters, GENERIC_ANALYSIS_ROLE);
+    expect(result.outcome).toBe("DUPLICATE_PRESENT");
+    expect(machine.spawned).toEqual([]);
+  });
+
+  it("an unreadable generic census refuses the spawn", () => {
+    const machine = box({ processes: new Map([[GENERIC_PID, OURS]]), unaccounted: null });
+    const result = executeWorkerRestart(staleDecision(), STATE, 1, machine.adapters, GENERIC_ANALYSIS_ROLE);
+    expect(result.outcome).toBe("CENSUS_UNAVAILABLE");
+    expect(machine.spawned).toEqual([]);
+  });
+
+  it("G. an unobservable machine refuses for the generic role too", () => {
+    // Same primitive, same refusal: the generic supervisor cannot drift from
+    // the account one, because there is only one implementation.
+    const machine = box({ processes: new Map([[GENERIC_PID, OURS]]), unobservable: true });
+    const result = executeWorkerRestart(staleDecision(), STATE, 1, machine.adapters, GENERIC_ANALYSIS_ROLE);
+    expect(result.outcome).toBe("OBSERVATION_UNAVAILABLE");
+    expect(machine.terminated).toEqual([]);
+    expect(machine.spawned).toEqual([]);
   });
 });

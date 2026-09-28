@@ -212,7 +212,13 @@ describe("the six-role SAFE spawn plan", () => {
     // Supervision restarts by role. There is no parameter it could get wrong.
     expect(path.basename(envFilePathFor("account-a-worker", FAKE_ENV))).toBe("account-a.env");
     expect(path.basename(envFilePathFor("account-b-worker", FAKE_ENV))).toBe("account-b.env");
-    expect(CLI).toContain("dualSpawnPlan(workerRole, REPO_ROOT)");
+    expect(path.basename(envFilePathFor("generic-analysis", FAKE_ENV))).toBe("generic.env");
+    // Both supervisors hand their role to ONE shared restart path, and that
+    // path is the only place a replacement is spawned. The role travels as an
+    // argument from the top of each pass, so no alias can be substituted.
+    expect(CLI).toContain("const plan = dualSpawnPlan(role, REPO_ROOT);");
+    expect(CLI).toContain("restartOwnedRole(decision, workerRole, budget.attempts + 1)");
+    expect(CLI).toContain("restartOwnedRole(decision, GENERIC_ANALYSIS_ROLE, budget.attempts + 1)");
   });
 
   it("strips exactly the bootstrap's own account key list, not a second copy", () => {
@@ -531,23 +537,31 @@ describe("the CLI's ownership and rollback fences", () => {
     for (const forbidden of ["/IM", "Stop-Process -Name", "taskkill /f /im"]) {
       expect(`${forbidden}:${CLI.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
-    // Every terminateTree call site is preceded by an ownership check in the
-    // same block. There are four: rollback, stop, account-worker supervision
-    // and generic-analysis supervision.
-    expect((CLI.match(/terminateTree\(/g) ?? []).length).toBe(5); // 1 definition + 4 call sites
-    for (const block of [
-      "const rollback =",
-      "async function stopRuntime",
-      "TERMINATE_THEN_RESTART",
-      "async function superviseGenericAnalysis",
-    ]) {
+    // Every terminateTree call site is preceded by an ownership check. There
+    // are three: rollback, stop, and the ONE shared supervised-restart
+    // adapter both supervisors use. Consolidating the two supervision kills
+    // into one fenced path is the point of this slice.
+    expect((CLI.match(/terminateTree\(/g) ?? []).length).toBe(4); // 1 definition + 3 call sites
+    // The rollback proves ownership inside `executeRollback` now, so only
+    // Stop Runtime still has an inline kill to fence here.
+    for (const block of ["async function stopRuntime"]) {
       const from = CLI.indexOf(block);
       const kill = CLI.indexOf("terminateTree(", from);
-      const proof = CLI.lastIndexOf("verifyOwnership(", kill);
+      // Ownership is now proved inside `judgeOwnedTree`, which both blocks
+      // call before their kill. One shared decision instead of two copies,
+      // and it is the thing the behavioural tests exercise.
+      const proof = CLI.lastIndexOf("judgeOwnedTree(", kill);
       expect(`${block}: ownership proved before kill -> ${proof > from}`).toBe(
         `${block}: ownership proved before kill -> true`
       );
     }
+    // The supervised kill proves ownership inside `executeWorkerRestart`
+    // rather than in the adapter, which is what its own behavioural tests
+    // exercise. The adapter must therefore do NOTHING but call taskkill.
+    const adapter = CLI.slice(CLI.indexOf("function restartOwnedRole"), CLI.indexOf("function recordReplacement"));
+    expect(adapter).toContain("terminate: (pid) => {");
+    expect((adapter.match(/terminateTree\(/g) ?? []).length).toBe(1);
+    expect((adapter.match(/spawn\(plan\.command/g) ?? []).length).toBe(1);
   });
 
   it("13. stops only launcher-owned roles, never a detected one", () => {
@@ -1600,12 +1614,21 @@ describe("ownership is never inferred", () => {
   it("9. stop and rollback act only on verified-owned roots", () => {
     const stop = CLI.slice(CLI.indexOf("async function stopRuntime"), CLI.indexOf("async function superviseAccountWorker"));
     expect(stop).toContain("alive.filter((entry) => entry.role === role)");
-    expect(stop.indexOf("verifyOwnership(record")).toBeLessThan(stop.indexOf("terminateTree("));
+    // Ownership is judged before the kill. (`indexOf` is compared against a
+    // found position on BOTH sides, so a missing call fails rather than
+    // passing vacuously on -1.)
+    expect(stop.indexOf("judgeOwnedTree(record")).toBeGreaterThanOrEqual(0);
+    expect(stop.indexOf("judgeOwnedTree(record")).toBeLessThan(stop.indexOf("terminateTree("));
     const start = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
     expect(start).toContain("[...started].reverse()");
-    expect(start.indexOf("verifyOwnership(record")).toBeLessThan(start.indexOf("terminateTree("));
+    // The rollback delegates the whole sequence -- judge, terminate, retain --
+    // to `executeRollback`, which is covered behaviourally in
+    // tests/worker-supervision.test.ts. What must hold HERE is that the CLI
+    // persists what that decision returned instead of clearing it away.
+    expect(start).toContain("executeRollback([...started].reverse(), REPO_ROOT, {");
+    expect(start).toContain("if (complete) {");
+    expect(start).toContain("processes: retained });");
     // A record that cannot be proved is reported, never killed.
-    expect(start).toContain("NOT terminated");
     expect(stop).toContain("NOT terminated");
   });
 
