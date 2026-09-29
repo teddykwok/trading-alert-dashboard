@@ -231,6 +231,7 @@ export interface AllowlistManager {
 export interface TradingControlReader {
   readStatus(): Promise<unknown>;
   readReadiness(mode?: CanaryAuthorizationMode): Promise<unknown>;
+  readExchangeFlatness(): Promise<unknown>;
 }
 
 export async function operatorRoutes(
@@ -337,6 +338,27 @@ export async function operatorRoutes(
     const service = buildTradingControl(request.server.prisma);
     return service.readReadiness(resolveMode(request.query));
   });
+
+  // Exchange flatness: the second and last route that may reach the exchange.
+  //
+  // Three account-wide signed GETs, for the account THIS control plane is
+  // bound to. It takes no account parameter and no symbol parameter, by
+  // design: an argument that chose the account would let one account's
+  // operator surface answer for the other's exposure, and an argument that
+  // narrowed the sweep would let a flat verdict mean "flat for the symbols I
+  // thought to ask about".
+  //
+  // The body is counts and a verdict. No symbol, order id, quantity, balance
+  // or account identifier reaches it -- see `describeExchangeFlatness`, which
+  // constructs every field by hand.
+  app.get(
+    "/api/operator/trading-control/exchange-flatness",
+    { preHandler: requireOperatorAuth },
+    async (request) => {
+      const service = buildTradingControl(request.server.prisma);
+      return service.readExchangeFlatness();
+    }
+  );
 
   // --- Operator ACTIONS ---------------------------------------------------
   // Three POSTs, each behind the operator guard and the strict mutation budget.

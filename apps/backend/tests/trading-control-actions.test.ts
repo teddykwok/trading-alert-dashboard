@@ -125,6 +125,7 @@ describe("operator actions: every mutation is behind the operator credential", (
       tradingControlFactory: () => ({
         readStatus: async () => ({ systemState: "SAFE_OFF" }),
         readReadiness: async () => ({ preparationReady: true }),
+        readExchangeFlatness: async () => ({ flat: true }),
       }),
       tradingControlActionsFactory: () => ({
         startTrading: record("ARMED"),
@@ -191,7 +192,11 @@ describe("operator actions: every mutation is behind the operator credential", (
     const refusing = Fastify();
     refusing.decorate("prisma", {} as PrismaClient);
     await refusing.register(operatorRoutes, {
-      tradingControlFactory: () => ({ readStatus: async () => ({}), readReadiness: async () => ({}) }),
+      tradingControlFactory: () => ({
+        readStatus: async () => ({}),
+        readReadiness: async () => ({}),
+        readExchangeFlatness: async () => ({}),
+      }),
       tradingControlActionsFactory: () => ({
         startTrading: async () => ({
           ok: false,

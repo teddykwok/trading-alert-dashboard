@@ -217,8 +217,10 @@ describe("the six-role SAFE spawn plan", () => {
     // path is the only place a replacement is spawned. The role travels as an
     // argument from the top of each pass, so no alias can be substituted.
     expect(CLI).toContain("const plan = dualSpawnPlan(role, REPO_ROOT);");
-    expect(CLI).toContain("restartOwnedRole(decision, workerRole, budget.attempts + 1)");
-    expect(CLI).toContain("restartOwnedRole(decision, GENERIC_ANALYSIS_ROLE, budget.attempts + 1)");
+    // Both supervisors restart from the decision they RE-PROVED while holding
+    // mutation authority, never from the one that merely started the pass.
+    expect(CLI).toContain("restartOwnedRole(now.decision, workerRole, now.budget.attempts + 1)");
+    expect(CLI).toContain("restartOwnedRole(now.decision, GENERIC_ANALYSIS_ROLE, now.budget.attempts + 1)");
   });
 
   it("strips exactly the bootstrap's own account key list, not a second copy", () => {
@@ -538,10 +540,10 @@ describe("the CLI's ownership and rollback fences", () => {
       expect(`${forbidden}:${CLI.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
     // Every terminateTree call site is preceded by an ownership check. There
-    // are three: rollback, stop, and the ONE shared supervised-restart
-    // adapter both supervisors use. Consolidating the two supervision kills
-    // into one fenced path is the point of this slice.
-    expect((CLI.match(/terminateTree\(/g) ?? []).length).toBe(4); // 1 definition + 3 call sites
+    // are four: rollback, stop, the ONE shared supervised-restart adapter both
+    // supervisors use, and the account-transition adapter. The last two prove
+    // ownership inside the SAME fenced primitive, which is the point.
+    expect((CLI.match(/terminateTree\(/g) ?? []).length).toBe(5); // 1 definition + 4 call sites
     // The rollback proves ownership inside `executeRollback` now, so only
     // Stop Runtime still has an inline kill to fence here.
     for (const block of ["async function stopRuntime"]) {
@@ -562,6 +564,18 @@ describe("the CLI's ownership and rollback fences", () => {
     expect(adapter).toContain("terminate: (pid) => {");
     expect((adapter.match(/terminateTree\(/g) ?? []).length).toBe(1);
     expect((adapter.match(/spawn\(plan\.command/g) ?? []).length).toBe(1);
+
+    // The account-transition adapter is held to the same rule, for the same
+    // reason: its stop is fenced inside `executeFencedStop` and its start
+    // inside `executeFencedStart`, so the adapter itself may only call the
+    // machine. One kill, one spawn, no decision.
+    const transition = CLI.slice(
+      CLI.indexOf("function transitionAdapters"),
+      CLI.indexOf("async function askAccount")
+    );
+    expect((transition.match(/terminateTree\(/g) ?? []).length).toBe(1);
+    expect((transition.match(/spawn\(plan\.command/g) ?? []).length).toBe(1);
+    expect(transition).toContain("const plan = dualSpawnPlan(role, REPO_ROOT);");
   });
 
   it("13. stops only launcher-owned roles, never a detected one", () => {
@@ -593,18 +607,52 @@ describe("the CLI's ownership and rollback fences", () => {
 // 19, 22. The launcher can no longer arm anything
 // ===========================================================================
 
-describe("LIVE-READY is gone, not merely hidden", () => {
-  it("19. has no path that could load live gates for either account", () => {
-    for (const forbidden of [
-      "applyGates",
-      "LIVE_READY_GATES",
-      "gatesFor(",
-      "isLiveReadyConfirmed",
-      "writeEnvText",
-      "startLiveReady",
-    ]) {
-      expect(`${forbidden}:${CLI.includes(forbidden)}`).toBe(`${forbidden}:false`);
+describe("LIVE-READY is account-scoped, never runtime-wide", () => {
+  it("19. loads live gates for ONE account only, and only through the fenced transition", () => {
+    // This tool CAN now move one account to LIVE-READY. What must remain
+    // impossible is the thing 11I withdrew it for: a whole-runtime arm, a
+    // second gate writer, or a start path that could load live gates.
+    for (const resurrected of ["gatesFor(", "isLiveReadyConfirmed", "writeEnvText", "startLiveReady"]) {
+      expect(`${resurrected}:${CLI.includes(resurrected)}`).toBe(`${resurrected}:false`);
     }
+
+    // Exactly one gate writer, and it rewrites exactly one account's file.
+    expect((CLI.match(/applyGates\(/g) ?? []).length).toBe(1);
+    const writer = CLI.slice(
+      CLI.indexOf("function writeAccountGates"),
+      CLI.indexOf("const GATES_FOR =")
+    );
+    expect(writer).toContain("const { control } = rolesForAccount(account);");
+    expect(writer).toContain("const file = envFilePathFor(control);");
+    // Both directions come from the shared constants, never from a literal.
+    expect(writer).toContain('mode === "SAFE" ? SAFE_GATES : LIVE_READY_GATES');
+
+    // And Start SAFE cannot reach it. A start that could write a gate is a
+    // start that could arm, which is exactly what 11I removed.
+    const startSafe = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
+    for (const forbidden of ["applyGates", "writeAccountGates", "LIVE_READY_GATES", "writeFileSync"]) {
+      expect(`startSafe/${forbidden}:${startSafe.includes(forbidden)}`).toBe(`startSafe/${forbidden}:false`);
+    }
+  });
+
+  it("19. offers the transition for ONE named account, never for both at once", () => {
+    const chooser = CLI.slice(CLI.indexOf("async function askAccount"), CLI.indexOf("async function transitionAccount"));
+    // Two answers and a cancel. There is deliberately no "both" and no "all".
+    expect(chooser).toContain('if (answer === "a") return "ACCOUNT_A";');
+    expect(chooser).toContain('if (answer === "b") return "ACCOUNT_B";');
+    expect(chooser).toContain("Cancelled. Nothing was changed.");
+    for (const forbidden of ["both", "ACCOUNT_A, ACCOUNT_B", "RUNTIME_ACCOUNTS.map"]) {
+      expect(`${forbidden}:${chooser.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+
+    // The sequence is driven for the chosen account and only its two roles.
+    const action = CLI.slice(
+      CLI.indexOf("async function transitionAccount"),
+      CLI.indexOf("async function recoverIncompleteTransition")
+    );
+    expect(action).toContain("const { control, worker } = rolesForAccount(account);");
+    // The engine is TOLD the proven direction; it never deduces one.
+    expect(action).toContain("{ account, fromMode: decision.fromMode, targetMode, startedAtMs: Date.now() }");
   });
 
   it("19. explains the refusal instead of silently dropping the feature", () => {
@@ -614,23 +662,84 @@ describe("LIVE-READY is gone, not merely hidden", () => {
     );
   });
 
-  it("22. writes no environment file, so SAFE start cannot enable anything", () => {
-    // One writeFileSync, and it is the launcher's own state file.
-    expect((CLI.match(/writeFileSync\(/g) ?? []).length).toBe(1);
+  it("22. writes exactly two files, and each one atomically", () => {
+    // The launcher's own state, and ONE account's env file during a
+    // transition. Nothing else, and no third writer may appear quietly.
+    //
+    // The mutation mutex is NOT among them. It was a lock file once, and that
+    // was the bug: a file has to be recoverable after a crash, recovery means
+    // deleting someone's file, and the filesystem has no "delete only if this
+    // is still record L0". It is now an OS-held loopback binding with nothing
+    // on disk to recover, delete or race over.
+    expect((CLI.match(/writeFileSync\(/g) ?? []).length).toBe(2);
     expect(CLI).toContain("writeFileSync(temporary, JSON.stringify(state, null, 2)");
+    expect(CLI).toContain("writeFileSync(temporary, rewritten.text");
+    // Both are temp-then-rename, so an interruption leaves the old file or the
+    // new one, never half of either.
+    expect((CLI.match(/renameSync\(temporary, /g) ?? []).length).toBe(2);
   });
 
-  it("22. touches no execution profile and no exchange", () => {
+  it("22. the mutation mutex owns no file, and nothing can clear it by hand", () => {
+    const block = CLI.slice(CLI.indexOf("function openMutationListener"), CLI.indexOf("function clearState"));
+    // No path, no create, no delete, no rename, no owner record. There is
+    // nothing an operator or a second launcher could remove to take authority.
+    for (const forbidden of [
+      "LOCK_PATH",
+      "openSync",
+      "unlinkSync",
+      "renameSync",
+      "writeFileSync",
+      "readFileSync",
+      "instanceId",
+      "stale",
+    ]) {
+      expect(`${forbidden}:${block.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+    expect(CLI).not.toContain("mutation-lock.json");
+  });
+
+  it("22. touches no execution profile, and builds no exchange client of its own", () => {
     for (const forbidden of [
       "executionProfile",
       "CanaryPreflightService",
       "readReadiness",
-      "binance",
       "armNaturalWindow",
       "safeOff(",
+      // It must never construct a client, bind credentials or sign a request.
+      // Exchange facts reach it ONLY as counts, from the account's own control
+      // plane, over authenticated loopback.
+      "BinanceReadOnlyClient",
+      "BinanceReadOnlyService",
+      "bindConfiguredExchangeRuntime",
+      "exchangeClientOptionsOf",
+      "checkAccountConnection",
+      "getPositionRisk",
+      "getOpenOrders",
     ]) {
       expect(`${forbidden}:${CLI.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
+    // The one thing it takes from the exchange package is a pure counts
+    // parser and a counts TYPE, from the single module it imports there.
+    expect(CLI).toContain(
+      'import { countsFromWire, type PreShutdownCounts } from "../binance/pre-shutdown-exchange-check";'
+    );
+    expect((CLI.match(/from "\.\.\/binance\//g) ?? []).length).toBe(1);
+    // And that module builds no client either, so no client reaches this
+    // process at runtime through it.
+    const counts = readFileSync(
+      path.join(BACKEND_ROOT, "src/modules/binance/pre-shutdown-exchange-check.ts"),
+      "utf8"
+    );
+    expect(counts).not.toMatch(/new\s+Binance/);
+    // Its only binance import is erased at compile time.
+    for (const line of counts.split(/\r?\n/).filter((row) => row.includes("./binance"))) {
+      expect(`erased: ${line.trim().startsWith("import type")}`).toBe("erased: true");
+    }
+    // And every control-plane read is a GET on 127.0.0.1.
+    for (const match of CLI.matchAll(/fetch\(`([^`]*)`/g)) {
+      expect(`fetch target: ${match[1].startsWith("http://127.0.0.1:")}`).toBe("fetch target: true");
+    }
+    expect(CLI).not.toContain('method: "POST"');
   });
 });
 
@@ -1436,7 +1545,7 @@ describe("a fully drained machine", () => {
     // Both health inputs come from that one mapping.
     expect(CLI).toContain("workerHealth: health(workerView),");
     expect(CLI).toContain("backendHealth: health(controlView),");
-    expect(CLI).toContain("budget = observeWorkerHealth(budget, health(workerView), nowMs);");
+    expect(CLI).toContain("const observedBudget = observeWorkerHealth(from, health(workerView), nowMs);");
   });
 });
 
@@ -1657,5 +1766,470 @@ describe("ownership is never inferred", () => {
     const byRole = Object.fromEntries(status.roles.map((role) => [role.role, role.presence]));
     expect(byRole["account-b-worker"]).toBe("OWNED");
     expect(byRole["account-a-worker"]).toBe("OFF");
+  });
+});
+
+
+// ===========================================================================
+// The durable marker, where the CLI meets the machine
+//
+// The DECISIONS about a marker are pure and tested in
+// `account-runtime-transition.test.ts`. What is left to prove here is the
+// wiring: that every action which starts, stops or supervises a role actually
+// consults the gate, and that no writer of the state file can drop the marker.
+// ===========================================================================
+
+describe("the transition marker fences the CLI's other actions", () => {
+  const blockOf = (fn: string, next: string): string => CLI.slice(CLI.indexOf(fn), CLI.indexOf(next));
+
+  it("Start SAFE consults the gate for all six roles, before anything else", () => {
+    const startSafe = blockOf("async function startSafe", "async function stopRuntime");
+    expect(startSafe).toContain("if (!transitionGateAllows(DUAL_ROLES)) return;");
+    // Before the first spawn, and before the first file is even validated for
+    // spawning: an interrupted transition is not something to start over.
+    expect(startSafe.indexOf("transitionGateAllows")).toBeLessThan(startSafe.indexOf("spawn("));
+  });
+
+  it("Stop Runtime consults it too, since it terminates the fenced pair", () => {
+    const stop = blockOf("async function stopRuntime", "function unaccountedLeavesFor");
+    expect(stop).toContain("if (!transitionGateAllows(DUAL_ROLES)) return;");
+    expect(stop.indexOf("transitionGateAllows")).toBeLessThan(stop.indexOf("terminateTree("));
+  });
+
+  it("account supervision is fenced by THAT account's pair only", () => {
+    const supervise = blockOf("async function superviseAccountWorker", "async function superviseGenericAnalysis");
+    expect(supervise).toContain("const { control: supervisedControl } = rolesForAccount(account);");
+    expect(supervise).toContain("if (!transitionGateAllows([supervisedControl, workerRole])) return;");
+    // Not DUAL_ROLES: Account B's supervisor must keep working while Account A
+    // is mid-transition.
+    expect(supervise).not.toContain("transitionGateAllows(DUAL_ROLES)");
+  });
+
+  it("generic supervision is fenced only by a marker nobody can read", () => {
+    const generic = blockOf("async function superviseGenericAnalysis", "// Account-scoped SAFE <-> LIVE-READY transition");
+    expect(generic).toContain("if (!transitionGateAllows([GENERIC_ANALYSIS_ROLE])) return;");
+    // The generic role belongs to neither account, so a PENDING marker for one
+    // account leaves it alone -- which is the pure gate's rule, not a second
+    // copy of it here.
+    expect(generic).not.toContain("DUAL_ROLES");
+  });
+
+  it("every gate refusal goes through ONE printer, so they all read the same", () => {
+    // 1 definition + 5 call sites: Start SAFE, Stop Runtime, account
+    // supervision, generic supervision, and the transition action itself.
+    expect((CLI.match(/transitionGateAllows\(/g) ?? []).length).toBe(6);
+    const printer = blockOf("function transitionGateAllows", "function clearState");
+    expect(printer).toContain("BLOCKED — nothing was changed:");
+    expect(printer).toContain("return true;");
+  });
+});
+
+describe("no writer of the launcher state can drop the marker", () => {
+  it("only ONE function touches the file, and every writer goes through it", () => {
+    // `writeState` is what the process-management paths call, and it carries
+    // the marker forward for them. A rollback or a replacement that rewrote
+    // the file without it would erase the record of an interrupted transition
+    // at exactly the moment it matters most.
+    expect((CLI.match(/writeFileSync\(temporary, JSON\.stringify\(state/g) ?? []).length).toBe(1);
+    const writeState = CLI.slice(CLI.indexOf("function writeState("), CLI.indexOf("/** The only function that touches the file"));
+    expect(writeState).toContain("transition: carriedTransition()");
+  });
+
+  it("a state file that cannot be parsed is rewritten WITH a blocking marker", () => {
+    // Rewriting it clean would turn "this machine may be mid-transition" into
+    // "this machine is idle", which is the one conversion that must never
+    // happen silently.
+    const carried = CLI.slice(CLI.indexOf("function carriedTransition"), CLI.indexOf("Writes the six role records"));
+    expect(carried).toContain("raw.readable ? raw.value : UNREADABLE_MARKER");
+    expect(CLI).toContain('const UNREADABLE_MARKER = { corrupt:');
+  });
+
+  it("a MISSING state file is a proven absence, not an unreadable one", () => {
+    const reader = CLI.slice(CLI.indexOf("function readRawTransition"), CLI.indexOf("const UNREADABLE_MARKER"));
+    // ENOENT means nothing has ever been started here. Every OTHER read
+    // failure is a question nobody answered.
+    expect(reader).toContain('code === "ENOENT"');
+    expect(reader).toContain("return { readable: true, value: undefined };");
+    expect(reader).toContain("return { readable: false, value: undefined };");
+  });
+
+  it("the marker writer THROWS rather than swallowing a failed write", () => {
+    // The sequence treats an unwritable marker as a reason to stop. It cannot
+    // make that decision if this reports success.
+    const writer = CLI.slice(CLI.indexOf("function writeTransitionMarker"), CLI.indexOf("function readTransitionMarker"));
+    expect(writer).not.toContain("try {");
+    expect(writer).not.toContain("catch");
+  });
+
+  it("the marker never carries an environment value, a port or a pid", () => {
+    const journal = CLI.slice(CLI.indexOf("journal: (phase: TransitionPhase)"), CLI.indexOf("clearJournal:"));
+    for (const forbidden of ["envValue", "port", "pid", "OPERATOR_API_TOKEN", "readFileSync"]) {
+      expect(`${forbidden}:${journal.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+  });
+});
+
+describe("the account transition reaches only the selected account", () => {
+  const action = CLI.slice(
+    CLI.indexOf("async function transitionAccount"),
+    CLI.indexOf("async function recoverIncompleteTransition")
+  );
+
+  it("reads the selected account's own control plane, never the other's", () => {
+    const gather = CLI.slice(
+      CLI.indexOf("async function gatherAccountFacts"),
+      CLI.indexOf("const printBlocked")
+    );
+    expect(gather).toContain("readSelectedAccount(account)");
+    expect(gather).toContain("readAccountFlatness(account)");
+    expect(gather).toContain("diskModeFor(account)");
+    expect(gather).toContain("selectedRoleOwnership(account)");
+    for (const forbidden of ["ACCOUNT_B", "account-b", "RUNTIME_ACCOUNTS", "readAllAttestation"]) {
+      expect(`${forbidden}:${(gather + action).includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+  });
+
+  it("proves the mode it is moving FROM, and refuses when it cannot", () => {
+    expect(action).toContain("if (!first.mode.ok) {");
+    expect(action).toContain("decideModeTransition(first.mode.mode, targetMode)");
+    expect(action).toContain('if (decision.kind === "ALREADY")');
+    // The direction reaching the engine is the proven one, not the opposite of
+    // the target. No expression anywhere derives one from the other.
+    expect(action).not.toContain('targetMode === "SAFE" ? "LIVE_READY"');
+    expect(CLI).not.toContain('fromMode: targetMode === "SAFE"');
+  });
+
+  it("re-proves EVERYTHING after the operator types the account name", () => {
+    const confirmAt = action.indexOf("confirmation !== account");
+    const secondAt = action.indexOf("const second = await gatherAccountFacts(account);");
+    const proofAt = action.indexOf("evaluateSecondProof(");
+    const runAt = action.indexOf("executeAccountTransition(");
+
+    // Gathered again AFTER the confirmation, judged, and only then run.
+    expect(confirmAt).toBeGreaterThan(-1);
+    expect(secondAt).toBeGreaterThan(confirmAt);
+    expect(proofAt).toBeGreaterThan(secondAt);
+    expect(runAt).toBeGreaterThan(proofAt);
+    // And a failed second proof returns before the engine is reached.
+    expect(action).toContain("if (!settled.ok) {");
+    expect(action).toContain(
+      "These facts changed while the confirmation was open, so nothing was stopped, written or started."
+    );
+  });
+
+  it("requires the operator to type the account name before anything moves", () => {
+    expect(action).toContain("const confirmation = (await ask(`Type ${account} to proceed: `)).trim();");
+    expect(action).toContain("if (confirmation !== account) {");
+    // And the confirmation is read BEFORE the sequence runs.
+    expect(action.indexOf("confirmation !== account")).toBeLessThan(action.indexOf("executeAccountTransition"));
+  });
+
+  it("says plainly that it arms nothing", () => {
+    expect(action).toContain("This arms NOTHING: no profile is enabled, no kill switch is released");
+    expect(action).toContain("The other account and the two generic roles are not touched.");
+    expect(action).toContain("Trading remains OFF until it is armed separately.");
+  });
+
+  it("recovery runs the RECOVERY engine, not a fresh transition", () => {
+    const recover = CLI.slice(
+      CLI.indexOf("async function recoverIncompleteTransition"),
+      CLI.indexOf("async function main")
+    );
+    // A fresh transition would overwrite the marker with its own PRECHECKED
+    // and could then clear it on a clean refusal -- erasing the record of the
+    // half-moved account it was called to repair.
+    expect(recover).toContain("executeTransitionRecovery(");
+    expect(recover).not.toContain("executeAccountTransition(");
+    // The EXISTING marker is what it plans from: its phase and its proven
+    // direction are the only evidence of how far the interrupted run got.
+    expect(recover).toContain("const pending = marker.transition;");
+    expect(recover).toContain("fromMode: pending.fromMode");
+    expect(recover).toContain("startedAtMs: pending.startedAtMs");
+    // It never resumes towards LIVE-READY.
+    expect(recover).not.toContain('targetMode: "LIVE_READY"');
+  });
+
+  it("recovery says plainly that the marker survives an unproven outcome", () => {
+    const recover = CLI.slice(
+      CLI.indexOf("async function recoverIncompleteTransition"),
+      CLI.indexOf("async function main")
+    );
+    expect(recover).toContain("The marker is cleared ONLY if SAFE is proven afterwards.");
+    expect(recover).toContain("The marker was KEPT.");
+  });
+
+  it("an unreadable marker names no account, so recovery refuses to guess one", () => {
+    const recover = CLI.slice(
+      CLI.indexOf("async function recoverIncompleteTransition"),
+      CLI.indexOf("async function main")
+    );
+    expect(recover).toContain('if (marker.status === "UNREADABLE")');
+    expect(recover).toContain("It does not say which account it was about");
+  });
+});
+
+
+describe("the journal write can never invent an empty runtime", () => {
+  it("the marker writer goes through the STRICT reader, which validates", () => {
+    const writer = CLI.slice(
+      CLI.indexOf("function writeTransitionMarker"),
+      CLI.indexOf("function readTransitionMarker")
+    );
+    expect(writer).toContain("const current = readStateStrict();");
+    // The ownership records are carried through exactly; this function's only
+    // edit is the marker.
+    expect(writer).toContain("processes: current.processes,");
+    for (const forbidden of ["?? []", "?? REPO_ROOT", "readState()"]) {
+      expect(`${forbidden}:${writer.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+  });
+
+  it("the strict reader refuses instead of defaulting, and delegates its rules", () => {
+    const reader = CLI.slice(
+      CLI.indexOf("function readStateStrict"),
+      CLI.indexOf("/**\r\n * Persists one transition phase")
+    );
+    expect(reader).toContain("parseLauncherStateStrict(text, REPO_ROOT)");
+    expect(reader).toContain("if (!parsed.ok) throw new Error(parsed.reason);");
+    // A MISSING file throws from readFileSync rather than becoming a blank
+    // state: once a transition is under way, lost records are not an empty
+    // runtime.
+    expect(reader).toContain('readFileSync(STATE_PATH, "utf8")');
+    expect(reader).not.toContain("try {");
+  });
+});
+
+describe("the account env file is replaced without leaving a credential behind", () => {
+  const writer = CLI.slice(CLI.indexOf("function writeAccountGates"), CLI.indexOf("function diskModeFor"));
+
+  it("removes the temp copy when the rename fails", () => {
+    // The temp file is a COMPLETE copy of the account environment, API key
+    // included. A failed rename must not leave it lying under a name nobody
+    // is watching.
+    expect(writer).toContain("unlinkSync(temporary)");
+    expect(writer.indexOf("unlinkSync(temporary)")).toBeGreaterThan(writer.indexOf("} catch {"));
+  });
+
+  it("never logs the file, its path or its contents", () => {
+    expect(writer).not.toContain("console.log");
+    expect(writer).toContain("environment file could not be replaced");
+    // Every reason this function returns is a FIXED string. `${file}` appears
+    // in the block, but only to build the temp path -- never inside a message
+    // that reaches a terminal scrollback.
+    const messages = [...writer.matchAll(/reason: ([^\n]+)/g)].map((match) => match[1]);
+    expect(messages.length).toBeGreaterThan(2);
+    for (const message of messages) {
+      expect(`${message} interpolates: ${message.includes("${") || message.includes("`")}`).toBe(
+        `${message} interpolates: false`
+      );
+    }
+  });
+});
+
+
+// ===========================================================================
+// The machine-wide mutation lock, where the CLI meets it
+//
+// The lock's own decisions are exercised in `mutation-lock.test.ts`. What is
+// left to prove here is that every action which changes runtime, process or
+// environment state actually goes through it -- and that reading status does
+// not, because an operator who is blocked must still be able to see why.
+// ===========================================================================
+
+describe("every mutating launcher action holds mutation authority", () => {
+  const menu = CLI.slice(CLI.indexOf('const choice = (await ask("Choose: ")).trim();'), CLI.length);
+
+  it("Start SAFE and Stop Runtime are wrapped at the menu", () => {
+    expect(menu).toContain('await underMutationLock("START_SAFE", startSafe)');
+    expect(menu).toContain('await underMutationLock("STOP_RUNTIME", stopRuntime)');
+    // Never called bare from the menu.
+    expect(menu).not.toContain('choice === "2") await startSafe()');
+    expect(menu).not.toContain('choice === "4") await stopRuntime()');
+  });
+
+  it("Prepare LIVE-READY and Return to SAFE are wrapped, with the right action", () => {
+    const action = CLI.slice(
+      CLI.indexOf("async function transitionAccount"),
+      CLI.indexOf("async function runAccountTransition")
+    );
+    expect(action).toContain('targetMode === "SAFE" ? "RETURN_TO_SAFE" : "PREPARE_LIVE_READY"');
+    expect(action).toContain("withMutationLock(");
+    expect(action).toContain("() => runAccountTransition(account, targetMode, ask)");
+  });
+
+  it("Recover an INCOMPLETE transition is wrapped before it reads the marker", () => {
+    const action = CLI.slice(
+      CLI.indexOf("async function recoverIncompleteTransition"),
+      CLI.indexOf("async function runRecoveryAction")
+    );
+    expect(action).toContain('withMutationLock("RECOVER_TRANSITION"');
+    // The marker is read inside the locked body, so the record an operator is
+    // shown is the record still there when they confirm.
+    expect(action).not.toContain("readTransitionMarker()");
+  });
+
+  it("the HUMAN CONFIRMATION happens while the lock is held", () => {
+    // The whole reason the lock wraps the action rather than just the mutation:
+    // otherwise a second launcher can act during the confirmation gap.
+    const locked = CLI.slice(
+      CLI.indexOf("async function runAccountTransition"),
+      CLI.indexOf("async function recoverIncompleteTransition")
+    );
+    expect(locked).toContain("await ask(`Type ${account} to proceed: `)");
+    expect(locked).toContain("gatherAccountFacts(account)");
+    expect(locked).toContain("executeAccountTransition(");
+
+    const recovery = CLI.slice(
+      CLI.indexOf("async function runRecoveryAction"),
+      CLI.indexOf("async function main")
+    );
+    expect(recovery).toContain("await ask(`Type ${account} to recover: `)");
+    expect(recovery).toContain("executeTransitionRecovery(");
+  });
+
+  it("the second proof still runs INSIDE the lock, after the confirmation", () => {
+    const locked = CLI.slice(
+      CLI.indexOf("async function runAccountTransition"),
+      CLI.indexOf("async function recoverIncompleteTransition")
+    );
+    const confirmAt = locked.indexOf("confirmation !== account");
+    const secondAt = locked.indexOf("const second = await gatherAccountFacts(account);");
+    const proofAt = locked.indexOf("evaluateSecondProof(");
+    expect(secondAt).toBeGreaterThan(confirmAt);
+    expect(proofAt).toBeGreaterThan(secondAt);
+  });
+
+  it("Show Status takes NO lock, so a blocked operator can still see why", () => {
+    expect(menu).toContain('if (choice === "1") continue;');
+    // The status path is `collectStatus`, and nothing in it acquires anything.
+    const status = CLI.slice(CLI.indexOf("async function collectStatus"), CLI.indexOf("function gateLine"));
+    for (const forbidden of ["withMutationLock", "acquireMutationLock", "underMutationLock"]) {
+      expect(`status/${forbidden}:${status.includes(forbidden)}`).toBe(`status/${forbidden}:false`);
+    }
+  });
+
+  it("there are exactly as many lock acquisitions as there are mutating actions", () => {
+    // START_SAFE, STOP_RUNTIME, the transition (two modes, one call site),
+    // RECOVER_TRANSITION, and the two supervisors' restarts.
+    expect((CLI.match(/withMutationLock\(/g) ?? []).length).toBe(5);
+    expect((CLI.match(/underMutationLock\(/g) ?? []).length).toBe(3); // 1 definition + 2 uses
+    // Nothing takes the lock directly; the acquire/release pair is written once.
+    expect(CLI).not.toContain("acquireMutationLock(");
+  });
+});
+
+describe("supervision takes the lock only when it is about to mutate", () => {
+  const supervisors = [
+    ["account", "async function superviseAccountWorker", "async function superviseGenericAnalysis"],
+    ["generic analysis", "async function superviseGenericAnalysis", "// ---------------------------------------------------------------------------\r\n// Account-scoped SAFE"],
+  ] as const;
+
+  it.each(supervisors)("the %s supervisor observes without the lock", (_label, from, to) => {
+    const body = CLI.slice(CLI.indexOf(from), CLI.indexOf(to));
+    // The first assessment happens before any acquisition, and a decision of
+    // NONE returns without ever touching the lock -- so a supervisor sitting
+    // open does not block an operator.
+    expect(body).toContain("const first = await assess(budget);");
+    expect(body.indexOf("const first = await assess(budget);")).toBeLessThan(
+      body.indexOf("withMutationLock(")
+    );
+    expect(body).toContain('if (first.decision.action === "NONE") {');
+    const noneBranch = body.slice(
+      body.indexOf('if (first.decision.action === "NONE") {'),
+      body.indexOf("withMutationLock(")
+    );
+    expect(noneBranch).not.toContain("withMutationLock");
+  });
+
+  it.each(supervisors)("the %s supervisor RE-PROVES the decision under the lock", (_label, from, to) => {
+    const body = CLI.slice(CLI.indexOf(from), CLI.indexOf(to));
+    const locked = body.slice(body.indexOf("withMutationLock("));
+    // A second assessment, inside the locked body, and the restart is driven
+    // from THAT decision.
+    expect(locked).toContain("const now = await assess(budget);");
+    expect(locked).toContain('if (now.decision.action === "NONE") {');
+    expect(locked).toContain("restartOwnedRole(now.decision");
+    // The stale first decision never reaches a restart.
+    expect(locked).not.toContain("restartOwnedRole(first.decision");
+  });
+
+  it.each(supervisors)("the %s supervisor spends no attempt when authority is refused", (_label, from, to) => {
+    const body = CLI.slice(CLI.indexOf(from), CLI.indexOf(to));
+    const refusal = body.slice(body.indexOf("if (held.ran) return held.result;"));
+    expect(refusal).toContain("nothing was restarted.");
+    // `recordRestartAttempt` lives inside the locked body only, so a refusal
+    // cannot burn the restart budget.
+    expect(refusal).not.toContain("recordRestartAttempt");
+  });
+
+  it("both supervisors use the SUPERVISE_RESTART action", () => {
+    expect((CLI.match(/withMutationLock\("SUPERVISE_RESTART"/g) ?? []).length).toBe(2);
+  });
+});
+
+
+describe("a long-running supervisor re-reads the marker under the lock", () => {
+  const supervisors = [
+    ["account", "async function superviseAccountWorker", "async function superviseGenericAnalysis"],
+    [
+      "generic analysis",
+      "async function superviseGenericAnalysis",
+      "// ---------------------------------------------------------------------------\r\n// Account-scoped SAFE",
+    ],
+  ] as const;
+
+  it.each(supervisors)("the %s supervisor proves the marker INSIDE the locked body", (_label, from, to) => {
+    const body = CLI.slice(CLI.indexOf(from), CLI.indexOf(to));
+    const locked = body.slice(body.indexOf("withMutationLock("));
+
+    // Read again here, not trusted from startup: hours may have passed, and a
+    // transition that began and crashed since would have left this account
+    // PENDING with the mutex already released by the OS.
+    expect(locked).toContain("judgeSupervisedRestart(readTransitionMarker()");
+    // Before the health re-assessment, so a blocked tick does no work at all.
+    expect(locked.indexOf("judgeSupervisedRestart(")).toBeLessThan(locked.indexOf("await assess(budget)"));
+    expect(locked).toContain('if (gate.act === "REFUSE") {');
+  });
+
+  it("the account supervisor proves its OWN pair, never the whole topology", () => {
+    const body = CLI.slice(
+      CLI.indexOf("async function superviseAccountWorker"),
+      CLI.indexOf("async function superviseGenericAnalysis")
+    );
+    expect(body).toContain("judgeSupervisedRestart(readTransitionMarker(), [supervisedControl, workerRole])");
+    expect(body).not.toContain("judgeSupervisedRestart(readTransitionMarker(), DUAL_ROLES)");
+  });
+
+  it("the generic supervisor proves only the generic role", () => {
+    const body = CLI.slice(
+      CLI.indexOf("async function superviseGenericAnalysis"),
+      CLI.indexOf("// ---------------------------------------------------------------------------\r\n// Account-scoped SAFE")
+    );
+    expect(body).toContain("judgeSupervisedRestart(readTransitionMarker(), [GENERIC_ANALYSIS_ROLE])");
+  });
+
+  it.each(supervisors)("a blocked %s tick spends no attempt and touches nothing", (_label, from, to) => {
+    const body = CLI.slice(CLI.indexOf(from), CLI.indexOf(to));
+    const locked = body.slice(body.indexOf("withMutationLock("));
+    const refusal = locked.slice(
+      locked.indexOf('if (gate.act === "REFUSE") {'),
+      locked.indexOf("const now = await assess(budget);")
+    );
+    // It returns before anything: no assess, no restart, no budget charge.
+    expect(refusal).toContain("return null;");
+    for (const forbidden of ["restartOwnedRole", "recordRestartAttempt", "recordReplacement", "assess("]) {
+      expect(`${forbidden}:${refusal.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    }
+  });
+
+  it("the startup check remains, but it is not the authority", () => {
+    // Convenience only: it tells an operator immediately rather than after the
+    // first tick. The under-lock read is what decides.
+    const body = CLI.slice(
+      CLI.indexOf("async function superviseAccountWorker"),
+      CLI.indexOf("async function superviseGenericAnalysis")
+    );
+    expect(body).toContain("if (!transitionGateAllows([supervisedControl, workerRole])) return;");
+    expect(body.indexOf("transitionGateAllows")).toBeLessThan(body.indexOf("judgeSupervisedRestart"));
   });
 });

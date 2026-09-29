@@ -85,6 +85,38 @@ export async function collectPreShutdownCounts(reads: PreShutdownReads): Promise
   };
 }
 
+/** One count as it arrives over the wire, from another process. */
+export interface FlatnessCountWire {
+  known?: unknown;
+  count?: unknown;
+}
+
+/**
+ * Turns a control plane's reported counts back into the decision type.
+ *
+ * Deliberately strict in ONE direction: a field is `known` only when it says
+ * so AND carries a number. Anything else -- a missing field, a null count, a
+ * string, a body from an older version that does not have the field at all --
+ * becomes UNKNOWN, which blocks. The whole point of crossing a process
+ * boundary with these counts is that the reader must not be able to invent a
+ * zero out of a shape it did not expect.
+ */
+export function countsFromWire(body: {
+  nonZeroPositions?: FlatnessCountWire;
+  standardOpenOrders?: FlatnessCountWire;
+  openAlgoOrders?: FlatnessCountWire;
+} | null): PreShutdownCounts {
+  const one = (field?: FlatnessCountWire): CountResult =>
+    field?.known === true && typeof field.count === "number" && Number.isFinite(field.count)
+      ? { known: true, count: field.count }
+      : { known: false };
+  return {
+    nonZeroPositions: one(body?.nonZeroPositions),
+    standardOpenOrders: one(body?.standardOpenOrders),
+    openAlgoOrders: one(body?.openAlgoOrders),
+  };
+}
+
 export type PreShutdownVerdict = { pass: true } | { pass: false; reasons: string[] };
 
 /**

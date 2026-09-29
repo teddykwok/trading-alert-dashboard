@@ -15,6 +15,7 @@ import {
   classifyDiskMode,
   defaultStatePath,
   evaluateDurableSafety,
+  parseLauncherStateStrict,
   evaluateStartPreconditions,
   gatesFor,
   isLiveReadyConfirmed,
@@ -507,9 +508,13 @@ describe("runtime launcher: the Windows spawn shape", () => {
     expect(source).toContain("const plan = dualSpawnPlan(role, REPO_ROOT);");
     expect(source).not.toContain("pnpm.cmd");
     expect(source).not.toContain("shell: true");
-    // Two spawn call sites: the six-role start, and the ONE shared supervised
-    // restart both supervisors call. The probe/kill adapters use spawnSync.
-    expect((source.match(/(?<!\w)spawn\(/g) ?? []).length).toBe(2);
+    // Three spawn call sites: the six-role start, the ONE shared supervised
+    // restart both supervisors call, and the account-transition start adapter.
+    // The probe/kill adapters use spawnSync.
+    expect((source.match(/(?<!\w)spawn\(/g) ?? []).length).toBe(3);
+    // Every one of them builds its command from the reviewed per-role plan, so
+    // no spawn can reach a role with another role's env file.
+    expect((source.match(/spawn\(plan\.command, plan\.args, plan\.options\)/g) ?? []).length).toBe(3);
   });
 });
 
@@ -788,9 +793,18 @@ describe("runtime launcher: success is never announced before verification", () 
     expect(body.indexOf("verifyOwnership(record")).toBeLessThan(body.indexOf("terminateTree("));
   });
 
-  it("uses no preflight, exchange or trading path to verify", () => {
+  it("uses no preflight, exchange client or trading path to verify", () => {
     const source = cli();
-    for (const forbidden of ["CanaryPreflightService", "readReadiness", "binance", "armNaturalWindow", "safeOff("]) {
+    for (const forbidden of [
+      "CanaryPreflightService",
+      "readReadiness",
+      "armNaturalWindow",
+      "safeOff(",
+      "BinanceReadOnlyClient",
+      "BinanceReadOnlyService",
+      "bindConfiguredExchangeRuntime",
+      "checkAccountConnection",
+    ]) {
       expect(`${forbidden}:${source.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
     // It reuses the shared attestation module rather than a new state model,
@@ -805,9 +819,12 @@ describe("runtime launcher: success is never announced before verification", () 
     // Phase 11I removed arming from this tool entirely. There is one success
     // banner and it names the only thing this tool can produce.
     expect(source).toContain("SAFE topology verified");
-    expect(source).not.toContain("The runtime is LIVE-READY");
     expect(source).not.toContain("isLiveReadyConfirmed");
-    expect(source).toContain("LIVE_READY_UNAVAILABLE");
+    // A whole-runtime LIVE-READY banner stays impossible: the only thing that
+    // can be announced now is ONE named account reaching that mode.
+    expect(source).not.toContain("The runtime is LIVE-READY");
+    expect(source).toContain("is now ${result.mode}");
+    expect(source).toContain("Trading remains OFF until it is armed separately");
   });
 
   it("bounds every wait instead of retrying forever", () => {
@@ -1406,17 +1423,29 @@ describe("runtime launcher: structural guarantees", () => {
     }
   });
 
-  it("writes no environment file at all, so no gate can be loaded by starting", () => {
-    // Phase 11I: the launcher stopped owning deployment gates. Each runtime
-    // takes them from its own account file, which this tool only ever READS.
-    // A launcher that cannot write a gate cannot arm anything by accident.
+  it("writes an environment file only from the fenced transition, never from a start", () => {
+    // Phase 11I removed gate writing because the launcher owned the gates for
+    // the WHOLE runtime. The account-scoped transition gives exactly one
+    // account's file back, and nothing else may write one.
     const source = cli();
-    for (const forbidden of ["applyGates", "writeEnvText", "gatesFor(", "LIVE_READY_GATES"]) {
-      expect(`${forbidden}:${source.includes(forbidden)}`).toBe(`${forbidden}:false`);
+    for (const resurrected of ["writeEnvText", "gatesFor("]) {
+      expect(`${resurrected}:${source.includes(resurrected)}`).toBe(`${resurrected}:false`);
     }
-    // The single writeFileSync is the launcher's own state file, never an env file.
-    expect((source.match(/writeFileSync\(/g) ?? []).length).toBe(1);
+    // Two writers: the launcher's own state file and the account gate file.
+    // The mutation mutex writes NOTHING -- it is an OS-held binding, not a
+    // record on disk, which is precisely why it has no stale state.
+    expect((source.match(/writeFileSync\(/g) ?? []).length).toBe(2);
     expect(source).toContain("writeFileSync(temporary, JSON.stringify(state, null, 2)");
+    expect((source.match(/applyGates\(/g) ?? []).length).toBe(1);
+
+    // Starting still cannot write anything at all.
+    const startSafe = source.slice(
+      source.indexOf("async function startSafe"),
+      source.indexOf("async function stopRuntime")
+    );
+    for (const forbidden of ["writeFileSync", "applyGates", "writeAccountGates"]) {
+      expect(`startSafe/${forbidden}:${startSafe.includes(forbidden)}`).toBe(`startSafe/${forbidden}:false`);
+    }
   });
 
   it("checks BOTH accounts' durable state BEFORE terminating any process", () => {
@@ -1431,7 +1460,12 @@ describe("runtime launcher: structural guarantees", () => {
   it("reads the durable state without a preflight or an exchange call", () => {
     // The cheap DB/Redis status path, not a second readiness engine.
     const source = cli();
-    for (const forbidden of ["CanaryPreflightService", "readReadiness", "checkAccountConnection", "binance"]) {
+    for (const forbidden of [
+      "CanaryPreflightService",
+      "readReadiness",
+      "checkAccountConnection",
+      "BinanceReadOnlyService",
+    ]) {
       expect(`${forbidden}:${source.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
   });
@@ -1453,10 +1487,27 @@ describe("runtime launcher: structural guarantees", () => {
   it("adds no HTTP surface", () => {
     // This must never become a web API: the internet-facing backend must not
     // gain the ability to edit .env, restart itself or toggle deployment gates.
-    for (const source of [core(), cli()]) {
-      for (const forbidden of ["fastify", "app.post(", "app.get(", "createServer", "listen("]) {
-        expect(`${forbidden}:${source.includes(forbidden)}`).toBe(`${forbidden}:false`);
-      }
+    //
+    // The pure core opens nothing whatsoever.
+    for (const forbidden of ["fastify", "app.post(", "app.get(", "createServer", "listen("]) {
+      expect(`core/${forbidden}:${core().includes(forbidden)}`).toBe(`core/${forbidden}:false`);
+    }
+
+    // The CLI binds exactly ONE socket, and it is a mutex rather than a
+    // service: it serves no request, and anything that connects is dropped at
+    // once. No HTTP framework, no router, no request handler.
+    const source = cli();
+    for (const forbidden of ["fastify", "app.post(", "app.get(", "node:http", 'from "http"', "IncomingMessage"]) {
+      expect(`cli/${forbidden}:${source.includes(forbidden)}`).toBe(`cli/${forbidden}:false`);
+    }
+    expect((source.match(/createServer\(\)/g) ?? []).length).toBe(1);
+    expect((source.match(/server\.listen\(/g) ?? []).length).toBe(1);
+    expect(source).toContain('server.on("connection", (socket) => socket.destroy());');
+    // Loopback, from the shared constant, and never a routable address.
+    expect(source).toContain("server.listen({ host, port, exclusive: true });");
+    expect(source).toContain("listenerAuthority(openMutationListener)");
+    for (const wide of ["0.0.0.0", '"::"', "INADDR_ANY"]) {
+      expect(`cli/${wide}:${source.includes(wide)}`).toBe(`cli/${wide}:false`);
     }
     // And no operator ROUTE PATH exposes runtime or environment control. Route
     // paths only: `import ... from "../config/env"` is not an endpoint.
@@ -1561,5 +1612,98 @@ describe("standard LIMIT take profit is a launch choice, never an inherited one"
   it("the pinned value is a plain boolean string", () => {
     expect(standardLimitTakeProfitEnv(true)).toEqual({ [KEY]: "true" });
     expect(standardLimitTakeProfitEnv(false)).toEqual({ [KEY]: "false" });
+  });
+});
+
+
+// ===========================================================================
+// Reading the durable state STRICTLY, for a read-modify-write
+//
+// The ordinary reader turns every failure into "nothing is running", which is
+// the right answer for a status screen and a catastrophic one for a journal
+// update: it would write the file back with an EMPTY process list, erasing
+// every ownership record on the machine.
+// ===========================================================================
+
+describe("the strict launcher-state reader", () => {
+  const ROOT = "C:\\Projects\\trading-alert-dashboard";
+  const RECORD = {
+    role: "account-a-worker",
+    pid: 4321,
+    startedAtMs: 1_800_000_000_000,
+    envAlias: "account-a",
+    port: null,
+  };
+  const STATE = {
+    repoRoot: ROOT,
+    startedAtMs: 1_800_000_000_000,
+    processes: [RECORD],
+    transition: null,
+  };
+  const read = (value: unknown, root = ROOT) => parseLauncherStateStrict(JSON.stringify(value), root);
+
+  it("a well-formed state is returned with its records intact", () => {
+    const result = read(STATE);
+    expect(result.ok).toBe(true);
+    expect(result.ok === true && result.value.processes).toEqual([RECORD]);
+    expect(result.ok === true && result.value.repoRoot).toBe(ROOT);
+  });
+
+  it.each([
+    ["not JSON at all", "{nope"],
+    ["JSON that is not an object", "42"],
+    ["JSON null", "null"],
+    ["a JSON array", "[]"],
+  ])("%s refuses rather than producing a blank state", (_label, text) => {
+    const result = parseLauncherStateStrict(text, ROOT);
+    expect(result.ok).toBe(false);
+  });
+
+  it.each([
+    ["no repository root", { ...STATE, repoRoot: undefined }],
+    ["a blank repository root", { ...STATE, repoRoot: "   " }],
+    ["no process list", { ...STATE, processes: undefined }],
+    ["a process list that is not an array", { ...STATE, processes: { role: "x" } }],
+    ["a record that is not an object", { ...STATE, processes: ["account-a-worker"] }],
+    ["a record with no role", { ...STATE, processes: [{ ...RECORD, role: undefined }] }],
+    ["a record with no pid", { ...STATE, processes: [{ ...RECORD, pid: undefined }] }],
+    ["a record with a zero pid", { ...STATE, processes: [{ ...RECORD, pid: 0 }] }],
+    ["a record with a fractional pid", { ...STATE, processes: [{ ...RECORD, pid: 12.5 }] }],
+    ["a record with no creation time", { ...STATE, processes: [{ ...RECORD, startedAtMs: undefined }] }],
+    ["a record with no env alias", { ...STATE, processes: [{ ...RECORD, envAlias: "" }] }],
+    ["a record with an unusable port", { ...STATE, processes: [{ ...RECORD, port: "4000" }] }],
+  ])("%s refuses, and never silently drops the record", (_label, value) => {
+    const result = read(value);
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.reason.length).toBeGreaterThan(0);
+  });
+
+  it("a state file from ANOTHER checkout refuses", () => {
+    // Writing this checkout's records into it, or its records back out, would
+    // mix two runtimes' ownership.
+    const result = read(STATE, "C:\\Projects\\somewhere-else");
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.reason).toContain("different checkout");
+  });
+
+  it("carries an UNRECOGNISED transition value through verbatim", () => {
+    // A marker from a future version, or a corrupt one, must survive a rewrite
+    // by this version rather than being normalised away.
+    const odd = { someFutureShape: true, phase: "SOMETHING_NEW" };
+    const result = read({ ...STATE, transition: odd });
+    expect(result.ok === true && result.value.transition).toEqual(odd);
+  });
+
+  it("never substitutes an empty process list for one it could not read", () => {
+    for (const broken of [
+      { ...STATE, processes: undefined },
+      { ...STATE, processes: null },
+      { ...STATE, processes: [{ ...RECORD, pid: "4321" }] },
+    ]) {
+      const result = read(broken);
+      expect(`${JSON.stringify(broken.processes)}:${result.ok}`).toBe(
+        `${JSON.stringify(broken.processes)}:false`
+      );
+    }
   });
 });

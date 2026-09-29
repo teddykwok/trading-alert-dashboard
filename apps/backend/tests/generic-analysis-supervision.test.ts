@@ -423,7 +423,7 @@ describe("generic analysis supervision reaches nothing it should not", () => {
     // The action itself no longer spawns or kills anything: it hands its role
     // to the ONE shared, fenced restart path. That is what stops the two
     // supervisors drifting apart again.
-    expect(action).toContain("restartOwnedRole(decision, GENERIC_ANALYSIS_ROLE, budget.attempts + 1)");
+    expect(action).toContain("restartOwnedRole(now.decision, GENERIC_ANALYSIS_ROLE, now.budget.attempts + 1)");
     expect(action.match(/spawn\(plan\.command/g) ?? []).toHaveLength(0);
     expect(action.match(/terminateTree\(/g) ?? []).toHaveLength(0);
     for (const otherRole of [
@@ -518,6 +518,15 @@ describe("generic analysis restart fencing", () => {
         unaccountedLeaves: () => (options.unaccounted === undefined ? 0 : options.unaccounted),
         spawnWorker: () => {
           spawned.push(9100);
+          // A spawn produces a process the probe can SEE. Without this the
+          // fake machine hands back a pid with no creation time, which the
+          // fenced start correctly refuses to record as owned -- a property of
+          // the harness rather than of the code under test.
+          processes.set(9100, {
+            pid: 9100,
+            startedAtMs: STARTED + 1_000,
+            commandLine: `pnpm -C ${REPO} generic-analysis`,
+          });
           return 9100;
         },
         log: () => undefined,

@@ -26,6 +26,9 @@ import {
   WORKER_RESTART_STABILIZATION_MS,
   WORKER_SUPERVISION_INTERVAL_MS,
   decideWorkerSupervision,
+  executeFencedStart,
+  executeFencedStop,
+  OWNERSHIP_PROOF_ATTEMPTS,
   executeWorkerRestart,
   isSupervisionInFlight,
   observeWorkerHealth,
@@ -924,18 +927,32 @@ describe("the launcher exposes supervision and keeps its existing guards", () =>
     // being supervised, and the plan derives the env file from the role. A
     // restart therefore cannot change which account the worker is.
     //
-    // Both supervisors now hand that role to ONE shared restart path, so the
-    // binding is asserted where the spawn actually happens: there is exactly
-    // one `dualSpawnPlan` call site left in the tool, and it is named for the
-    // role it was given.
+    // Both supervisors hand that role to ONE shared restart path, so the
+    // binding is asserted where the spawn actually happens. Every
+    // `dualSpawnPlan` call site in the tool is named for the role it was
+    // given -- there is no call site that picks a role for itself.
     expect(CLI).toContain("const plan = dualSpawnPlan(role, REPO_ROOT);");
-    expect((CLI.match(/dualSpawnPlan\(/g) ?? [])).toHaveLength(2); // start + shared restart
-    expect(CLI).toContain("restartOwnedRole(decision, workerRole, budget.attempts + 1)");
+    // Three: the six-role start, the shared supervised restart, and the
+    // account-transition start adapter.
+    expect((CLI.match(/dualSpawnPlan\(/g) ?? [])).toHaveLength(3);
+    expect((CLI.match(/dualSpawnPlan\(role, REPO_ROOT\)/g) ?? [])).toHaveLength(2);
+    expect((CLI.match(/dualSpawnPlan\(role, REPO_ROOT, process\.env, validatedKeyNames\)/g) ?? [])).toHaveLength(1);
+    expect(CLI).toContain("restartOwnedRole(now.decision, workerRole, now.budget.attempts + 1)");
     expect(CLI).toContain(
       'const workerRole: DualRole = account === "ACCOUNT_A" ? "account-a-worker" : "account-b-worker";'
     );
-    // No gate write was introduced anywhere in the tool.
-    expect(`applyGates:${CLI.includes("applyGates")}`).toBe("applyGates:false");
+    // The one gate write in the tool belongs to the account transition, and
+    // supervision cannot reach it: a restart must never change a role's mode.
+    expect((CLI.match(/applyGates\(/g) ?? [])).toHaveLength(1);
+    const supervision = CLI.slice(
+      CLI.indexOf("function restartOwnedRole"),
+      CLI.indexOf("// Account-scoped SAFE <-> LIVE-READY transition")
+    );
+    for (const forbidden of ["applyGates", "writeAccountGates", "LIVE_READY_GATES"]) {
+      expect(`supervision/${forbidden}:${supervision.includes(forbidden)}`).toBe(
+        `supervision/${forbidden}:false`
+      );
+    }
   });
 
   it("runs every pass under the single-flight guard", () => {
@@ -1663,5 +1680,204 @@ describe("the process-row parser is all-or-nothing", () => {
     const out = parseProcessRows(row(7, 7000, ""));
     expect(out.ok).toBe(true);
     expect(out.ok && out.value[0]).toEqual({ pid: 7, startedAtMs: 7000, commandLine: "" });
+  });
+});
+
+
+// ===========================================================================
+// The two fenced primitives, on their own
+//
+// An account runtime transition must stop the worker, stop the control plane,
+// rewrite their gates and only THEN start them -- so it cannot use a restart
+// that couples a stop to a spawn. These are that restart's two halves, and
+// `executeWorkerRestart` is now built from them, so supervision and account
+// transitions cannot drift into two answers about ownership or observation.
+// ===========================================================================
+
+describe("FENCED STOP on its own", () => {
+  const record = workerRecord();
+  const ours = probeOf(record);
+
+  it("stops a proven-owned tree and proves it is gone — and spawns NOTHING", () => {
+    const box = machine({ processes: new Map([[record.pid, ours]]) });
+    const result = executeFencedStop(record, REPO, box.adapters);
+
+    expect(result).toEqual({ stopped: true, alreadyGone: false });
+    expect(box.terminated).toEqual([record.pid]);
+    // The whole point of the split: a stop must not start anything.
+    expect(box.spawned).toEqual([]);
+    expect(box.censusCalls).toEqual([]);
+  });
+
+  it("an UNOBSERVABLE machine refuses: zero terminate, zero spawn", () => {
+    const box = machine({ processes: new Map([[record.pid, ours]]), unobservable: true });
+    const result = executeFencedStop(record, REPO, box.adapters);
+
+    expect(result.stopped).toBe(false);
+    expect(result.stopped === false && result.outcome).toBe("OBSERVATION_UNAVAILABLE");
+    expect(box.terminated).toEqual([]);
+    expect(box.spawned).toEqual([]);
+  });
+
+  it("PID_REUSED and NOT_THIS_REPO refuse: zero terminate, zero spawn", () => {
+    for (const [label, stranger] of [
+      ["PID_REUSED", { ...ours, startedAtMs: NOW }],
+      ["NOT_THIS_REPO", { ...ours, commandLine: "cmd.exe /c pnpm -C C:\\other worker" }],
+    ] as const) {
+      const box = machine({ processes: new Map([[record.pid, stranger as ProcessProbe]]) });
+      const result = executeFencedStop(record, REPO, box.adapters);
+      expect(`${label}:${result.stopped}`).toBe(`${label}:false`);
+      expect(result.stopped === false && result.outcome).toBe("OWNERSHIP_LOST");
+      expect(`${label}:${box.terminated.length}`).toBe(`${label}:0`);
+      expect(`${label}:${box.spawned.length}`).toBe(`${label}:0`);
+    }
+  });
+
+  it("a tree that survives the kill is TERMINATION_FAILED", () => {
+    const box = machine({ processes: new Map([[record.pid, ours]]), terminationFails: true });
+    const result = executeFencedStop(record, REPO, box.adapters);
+    expect(result.stopped === false && result.outcome).toBe("TERMINATION_FAILED");
+    expect(box.terminated).toEqual([record.pid]);
+    expect(box.spawned).toEqual([]);
+  });
+
+  it("an already-exited tree is a SUCCESSFUL stop with nothing killed", () => {
+    const box = machine();
+    const result = executeFencedStop(record, REPO, box.adapters);
+    expect(result).toEqual({ stopped: true, alreadyGone: true });
+    expect(box.terminated).toEqual([]);
+  });
+
+  it("no record means nothing to stop, and nothing is killed", () => {
+    const box = machine({ processes: new Map([[record.pid, ours]]) });
+    const result = executeFencedStop(null, REPO, box.adapters);
+    expect(result.stopped === false && result.outcome).toBe("NOT_RECORDED");
+    expect(box.terminated).toEqual([]);
+  });
+});
+
+describe("FENCED START on its own", () => {
+  it("spawns exactly one after a clean census — and terminates NOTHING", () => {
+    const box = machine({ unaccounted: 0 });
+    const result = executeFencedStart("account-a-control", box.adapters);
+
+    expect(result.started).toBe(true);
+    expect(box.spawned).toHaveLength(1);
+    expect(box.terminated).toEqual([]);
+    // The census ran BEFORE the spawn.
+    expect(box.censusCalls).toEqual([0]);
+  });
+
+  it("an UNREADABLE census refuses to spawn", () => {
+    const box = machine({ unaccounted: null });
+    const result = executeFencedStart("account-a-control", box.adapters);
+    expect(result.started === false && result.outcome).toBe("CENSUS_UNAVAILABLE");
+    expect(box.spawned).toEqual([]);
+  });
+
+  it("an unexplained matching leaf refuses to spawn", () => {
+    const box = machine({ unaccounted: 1 });
+    const result = executeFencedStart("account-a-worker", box.adapters);
+    expect(result.started === false && result.outcome).toBe("DUPLICATE_PRESENT");
+    expect(box.spawned).toEqual([]);
+    expect(box.terminated).toEqual([]);
+  });
+
+  it("a spawn whose creation time cannot be read is NOT a started role", () => {
+    // A record with no creation time can never be ownership-verified, so a
+    // transition that counted this as success would finish holding a role
+    // nobody can later prove they own -- and therefore nobody can safely stop.
+    const box = machine({ unaccounted: 0, unobservable: true });
+    const recorded: { pid: number; startedAtMs: number }[] = [];
+    const result = executeFencedStart("account-a-control", {
+      ...box.adapters,
+      recordOwnership: (pid, startedAtMs) => recorded.push({ pid, startedAtMs }),
+    });
+
+    expect(result.started).toBe(false);
+    expect(result.started === false && result.outcome).toBe("OWNERSHIP_UNPROVEN");
+    // Spawned, and deliberately NOT killed: an unproven process is unproven
+    // in both directions.
+    expect(box.spawned).toHaveLength(1);
+    expect(box.terminated).toEqual([]);
+    // The pid is still recorded, so an operator can see it -- with a creation
+    // time that fails verification, which is what keeps the census counting it
+    // as an unexplained leaf nothing may be spawned beside.
+    expect(recorded).toEqual([{ pid: box.spawned[0], startedAtMs: 0 }]);
+  });
+
+  it("asks for the creation time a BOUNDED number of times", () => {
+    let probes = 0;
+    const box = machine({ unaccounted: 0 });
+    executeFencedStart("account-a-worker", {
+      ...box.adapters,
+      probe: () => {
+        probes += 1;
+        return { observed: false };
+      },
+    });
+    expect(probes).toBe(OWNERSHIP_PROOF_ATTEMPTS);
+  });
+
+  it("stops asking as soon as it has one", () => {
+    let probes = 0;
+    const box = machine({ unaccounted: 0 });
+    const result = executeFencedStart("account-a-worker", {
+      ...box.adapters,
+      probe: (pid: number) => {
+        probes += 1;
+        return { observed: true, process: { pid, startedAtMs: NOW, commandLine: "x" } };
+      },
+    });
+    expect(probes).toBe(1);
+    expect(result.started).toBe(true);
+  });
+
+  it("records ownership the instant a pid exists, before returning", () => {
+    // The spawn -> record window is one synchronous call. It cannot be closed
+    // entirely, which is why recovery treats an unexplained leaf as UNKNOWN.
+    const box = machine({ unaccounted: 0 });
+    const recorded: { pid: number; startedAtMs: number }[] = [];
+    const result = executeFencedStart("account-a-worker", {
+      ...box.adapters,
+      recordOwnership: (pid, startedAtMs) => recorded.push({ pid, startedAtMs }),
+    });
+
+    expect(result.started).toBe(true);
+    expect(recorded).toHaveLength(1);
+    expect(result.started === true && recorded[0].pid).toBe(result.started === true ? result.pid : -1);
+  });
+
+  it("a spawn that returns no pid records nothing", () => {
+    const box = machine({ unaccounted: 0, spawnPid: null });
+    const recorded: number[] = [];
+    const result = executeFencedStart("account-a-worker", {
+      ...box.adapters,
+      recordOwnership: (pid) => recorded.push(pid),
+    });
+    expect(result.started === false && result.outcome).toBe("SPAWN_FAILED");
+    expect(recorded).toEqual([]);
+  });
+});
+
+describe("restart supervision is BUILT from the two primitives", () => {
+  const SRC = readFileSync(
+    path.resolve(__dirname, "../src/modules/operator/worker-supervision.ts"),
+    "utf8"
+  );
+
+  it("executeWorkerRestart calls them instead of re-implementing them", () => {
+    const fn = SRC.slice(SRC.indexOf("export function executeWorkerRestart"));
+    expect(fn).toContain("executeFencedStop(current, state.repoRoot, adapters)");
+    expect(fn).toContain("executeFencedStart(role, adapters)");
+    // And no longer performs the sequence itself.
+    expect(fn).not.toContain("adapters.terminate(");
+    expect(fn).not.toContain("adapters.spawnWorker(");
+    expect(fn).not.toContain("verifyOwnership(");
+  });
+
+  it("there is exactly ONE terminate and ONE spawn call site in the module", () => {
+    expect((SRC.match(/adapters\.terminate\(/g) ?? [])).toHaveLength(1);
+    expect((SRC.match(/adapters\.spawnWorker\(/g) ?? [])).toHaveLength(1);
   });
 });

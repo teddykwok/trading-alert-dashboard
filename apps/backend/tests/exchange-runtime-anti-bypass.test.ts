@@ -108,6 +108,7 @@ const SIGNED_COMPOSITION: ReadonlyArray<readonly [string, string]> = [
   ["src/modules/execution/run-fill-canary.ts", "the targeted fill canary"],
   ["src/modules/execution/run-canary-controls.ts", "canary controls"],
   ["src/modules/binance/run-read-only-check.ts", "the read-only connectivity check"],
+  ["src/modules/operator/exchange-flatness.ts", "the exchange flatness reader"],
 ];
 
 /**

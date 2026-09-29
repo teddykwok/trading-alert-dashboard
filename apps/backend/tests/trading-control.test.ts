@@ -234,7 +234,11 @@ describe("trading control: warnings mirror existing authority", () => {
 // ---------------------------------------------------------------------------
 
 describe("trading control: the routes are behind the operator guard", () => {
-  const paths = ["/api/operator/trading-control/status", "/api/operator/trading-control/readiness"];
+  const paths = [
+    "/api/operator/trading-control/status",
+    "/api/operator/trading-control/readiness",
+    "/api/operator/trading-control/exchange-flatness",
+  ];
   let app: FastifyInstance;
   let calls = 0;
 
@@ -250,6 +254,10 @@ describe("trading control: the routes are behind the operator guard", () => {
         readReadiness: async () => {
           calls += 1;
           return { preparationReady: true, liveActivationReady: false };
+        },
+        readExchangeFlatness: async () => {
+          calls += 1;
+          return { flat: true };
         },
       }),
     });

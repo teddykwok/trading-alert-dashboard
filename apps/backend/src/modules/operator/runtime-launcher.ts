@@ -81,6 +81,123 @@ export type DiskMode = "SAFE" | "LIVE_READY" | "INVALID";
  * never normalized: a half-open combination means someone edited the file by
  * hand or a write failed partway, and quietly "fixing" it would hide that.
  */
+// ---------------------------------------------------------------------------
+// Reading the durable state STRICTLY, for a read-modify-write
+// ---------------------------------------------------------------------------
+
+/** One ownership record, with every field proven present and usable. */
+export interface StrictOwnedRecord {
+  readonly role: string;
+  readonly pid: number;
+  readonly startedAtMs: number;
+  readonly envAlias: string;
+  readonly port: number | null;
+}
+
+export interface StrictLauncherState {
+  readonly repoRoot: string;
+  readonly startedAtMs: number;
+  readonly processes: readonly StrictOwnedRecord[];
+  /** Carried through verbatim. This validator has no opinion about it. */
+  readonly transition: unknown;
+}
+
+export type StrictStateResult =
+  | { readonly ok: true; readonly value: StrictLauncherState }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * The launcher's durable state, validated rather than defaulted.
+ *
+ * ## Why a second, stricter reader exists
+ *
+ * The ordinary reader collapses every failure into null, and its callers turn
+ * that into "nothing of ours is running" -- which is the right answer for a
+ * status screen that then says so.
+ *
+ * It is the wrong answer for a READ-MODIFY-WRITE. A journal update that read
+ * null and carried on would write the file back with `processes: []`, erasing
+ * every ownership record on the machine at the exact moment a transition
+ * depends on them. All six roles would become unowned: unstoppable by this
+ * tool, and invisible to the census that stops a second copy being spawned
+ * beside them. One transient parse failure would do it.
+ *
+ * So this validates every field it is going to write back, and refuses on
+ * anything it does not fully understand. A caller that cannot read the state
+ * does not get a blank one; it gets a refusal.
+ *
+ * The `transition` value is deliberately NOT validated here. It is carried
+ * through exactly as found, so a marker written by a future version -- or a
+ * corrupt one -- survives a rewrite by this one instead of being normalised
+ * away. Deciding what it means is `parseTransitionMarker`'s job.
+ */
+export function parseLauncherStateStrict(text: string, expectedRepoRoot: string): StrictStateResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { ok: false, reason: "the launcher state file is not valid JSON" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: "the launcher state file does not contain an object" };
+  }
+  const state = parsed as Record<string, unknown>;
+
+  if (typeof state.repoRoot !== "string" || state.repoRoot.trim() === "") {
+    return { ok: false, reason: "the launcher state file names no repository root" };
+  }
+  if (state.repoRoot !== expectedRepoRoot) {
+    // Another checkout's state. Writing this one's records into it, or its
+    // records back out, would mix two runtimes' ownership.
+    return { ok: false, reason: "the launcher state file belongs to a different checkout" };
+  }
+  if (!Array.isArray(state.processes)) {
+    return { ok: false, reason: "the launcher state file has no process list" };
+  }
+
+  const processes: StrictOwnedRecord[] = [];
+  for (const entry of state.processes) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      return { ok: false, reason: "a process record is not an object" };
+    }
+    const record = entry as Record<string, unknown>;
+    if (typeof record.role !== "string" || record.role === "") {
+      return { ok: false, reason: "a process record names no role" };
+    }
+    if (typeof record.pid !== "number" || !Number.isInteger(record.pid) || record.pid <= 0) {
+      return { ok: false, reason: `the record for ${record.role} has no usable pid` };
+    }
+    if (typeof record.startedAtMs !== "number" || !Number.isFinite(record.startedAtMs)) {
+      return { ok: false, reason: `the record for ${record.role} has no creation time` };
+    }
+    if (typeof record.envAlias !== "string" || record.envAlias === "") {
+      return { ok: false, reason: `the record for ${record.role} names no environment file` };
+    }
+    const port = record.port;
+    if (port !== null && (typeof port !== "number" || !Number.isInteger(port))) {
+      return { ok: false, reason: `the record for ${record.role} has an unusable port` };
+    }
+    processes.push({
+      role: record.role,
+      pid: record.pid,
+      startedAtMs: record.startedAtMs,
+      envAlias: record.envAlias,
+      port: port ?? null,
+    });
+  }
+
+  return {
+    ok: true,
+    value: {
+      repoRoot: state.repoRoot,
+      startedAtMs:
+        typeof state.startedAtMs === "number" && Number.isFinite(state.startedAtMs) ? state.startedAtMs : 0,
+      processes,
+      transition: state.transition,
+    },
+  };
+}
+
 export function classifyDiskMode(values: Partial<GateValues>): DiskMode {
   const matches = (target: GateValues) =>
     RUNTIME_GATE_KEYS.every((key) => values[key] === target[key]);

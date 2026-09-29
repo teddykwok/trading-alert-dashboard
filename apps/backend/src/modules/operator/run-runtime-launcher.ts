@@ -1,14 +1,19 @@
 import { spawn, spawnSync } from "node:child_process";
-import { createConnection } from "node:net";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createConnection, createServer } from "node:net";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import path from "node:path";
 
 import {
+  applyGates,
+  classifyDiskMode,
   defaultStatePath,
+  parseLauncherStateStrict,
   expectedGateSnapshotFor,
   classifySpawnResult,
   executeRollback,
+  LIVE_READY_GATES,
+  SAFE_GATES,
   firstObservationFailure,
   judgeOwnedTree,
   observed,
@@ -65,6 +70,42 @@ import {
   type RestartBudget,
 } from "./worker-supervision";
 import {
+  decideModeTransition,
+  describePendingTransition,
+  judgeSupervisedRestart,
+  effectiveModeFromWire,
+  evaluateSecondProof,
+  evaluateTransitionGate,
+  evaluateTransitionPreconditions,
+  executeAccountTransition,
+  executeTransitionRecovery,
+  parseTransitionMarker,
+  proveCurrentMode,
+  rolesForAccount,
+  selectedAccountStateFromWire,
+  UNREAD_ACCOUNT_STATE,
+  type GatheredAccountFacts,
+  type ObservedMode,
+  type PendingTransition,
+  type RuntimeMode,
+  type SelectedAccountState,
+  type TransitionMarkerRead,
+  type TransitionPhase,
+} from "./account-runtime-transition";
+// A pure counts parser and a counts TYPE. This module imports nothing from
+// the binance package that exists at runtime: the launcher must never be able
+// to construct a client or read a credential.
+import { countsFromWire, type PreShutdownCounts } from "../binance/pre-shutdown-exchange-check";
+import {
+  listenerAuthority,
+  withMutationLock,
+  MUTATION_LOCK_HOST,
+  MUTATION_LOCK_PORT,
+  type ListenerHandle,
+  type MutationAction,
+  type MutationLockAdapters,
+} from "./mutation-lock";
+import {
   GENERIC_ANALYSIS_ROLE,
   decideGenericAnalysisSupervision,
   genericAnalysisHealth,
@@ -110,6 +151,18 @@ interface DualRuntimeState {
   repoRoot: string;
   startedAtMs: number;
   processes: OwnedRole[];
+  /**
+   * An in-flight SAFE <-> LIVE-READY transition, or null once one finishes.
+   *
+   * Phase, direction and two instants. Nothing read out of an env file and no
+   * network address: this file is read by a status command an operator pastes
+   * into a chat window.
+   *
+   * Optional, so a state file written before this existed still parses. An
+   * ABSENT field is a proven absence; a field that is present and malformed
+   * is not -- see `parseTransitionMarker`.
+   */
+  transition?: PendingTransition | null;
 }
 
 function readState(): DualRuntimeState | null {
@@ -121,11 +174,231 @@ function readState(): DualRuntimeState | null {
   }
 }
 
-function writeState(state: DualRuntimeState): void {
+/**
+ * The raw `transition` value, and whether the file could be read at all.
+ *
+ * Raw and unvalidated on purpose. Every writer below carries this value
+ * forward verbatim, so a marker this launcher version does not understand is
+ * still preserved for one that does -- and a corrupt one keeps blocking
+ * instead of being quietly normalised away.
+ */
+function readRawTransition(): { readable: boolean; value: unknown } {
+  let text: string;
+  try {
+    text = readFileSync(STATE_PATH, "utf8");
+  } catch (error) {
+    // No state file at all is a PROVEN absence: nothing has ever been started.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { readable: true, value: undefined };
+    return { readable: false, value: undefined };
+  }
+  try {
+    return { readable: true, value: (JSON.parse(text) as { transition?: unknown }).transition };
+  } catch {
+    return { readable: false, value: undefined };
+  }
+}
+
+/**
+ * A state file that exists but cannot be parsed still means something.
+ *
+ * Rewriting it without a marker would turn "this machine may be mid-transition"
+ * into "this machine is idle", which is the one conversion that must never
+ * happen silently. So an unreadable file is rewritten with a marker that is
+ * deliberately unparseable-but-present, and the gate keeps refusing until an
+ * operator recovers.
+ */
+const UNREADABLE_MARKER = { corrupt: "the previous launcher state could not be parsed" } as const;
+
+function carriedTransition(): unknown {
+  const raw = readRawTransition();
+  return raw.readable ? raw.value : UNREADABLE_MARKER;
+}
+
+/**
+ * Writes the six role records, CARRYING THE TRANSITION MARKER FORWARD.
+ *
+ * The marker is not something a caller can forget. Every other writer of this
+ * file is about processes -- a rollback, a replacement, a clear -- and any one
+ * of them rewriting the file without the marker would erase the record of an
+ * interrupted transition at exactly the moment it matters most.
+ */
+function writeState(state: { repoRoot: string; startedAtMs: number; processes: OwnedRole[] }): void {
+  writeStateFile({ ...state, transition: carriedTransition() as PendingTransition | null | undefined });
+}
+
+/** The only function that touches the file. Atomic: write a temp, then rename. */
+function writeStateFile(state: DualRuntimeState): void {
   mkdirSync(path.dirname(STATE_PATH), { recursive: true });
   const temporary = `${STATE_PATH}.tmp`;
   writeFileSync(temporary, JSON.stringify(state, null, 2), "utf8");
   renameSync(temporary, STATE_PATH);
+}
+
+/**
+ * The launcher state, or a throw. NEVER a substitute.
+ *
+ * `readState` collapses every failure into null, which is right for a status
+ * read that then reports "nothing is running". It is completely wrong for a
+ * READ-MODIFY-WRITE of the marker: a transient parse failure would make the
+ * modify step rewrite the file with `processes: []`, erasing every ownership
+ * record on the machine at the exact moment a transition is relying on them.
+ * Six roles would become unowned, unstoppable by this tool, and invisible to
+ * the census that keeps a second copy from being spawned.
+ *
+ * So this validates instead of defaulting, and throws on anything it does not
+ * fully understand. Callers turn the throw into a refusal.
+ */
+function readStateStrict(): DualRuntimeState {
+  // A MISSING file throws here, deliberately. Once an account-scoped
+  // transition is under way its precondition is that both selected roles are
+  // launcher-owned, so a state file that has vanished is not an empty runtime
+  // -- it is the loss of the records the transition is standing on.
+  const text = readFileSync(STATE_PATH, "utf8");
+  const parsed = parseLauncherStateStrict(text, REPO_ROOT);
+  if (!parsed.ok) throw new Error(parsed.reason);
+  return {
+    repoRoot: parsed.value.repoRoot,
+    startedAtMs: parsed.value.startedAtMs,
+    processes: parsed.value.processes as OwnedRole[],
+    transition: parsed.value.transition as PendingTransition | null | undefined,
+  };
+}
+
+/**
+ * Persists one transition phase, or throws.
+ *
+ * Throwing is the contract: the sequence treats an unwritable marker as a
+ * reason to stop rather than a reason to continue unrecorded, and it cannot
+ * make that decision if this swallows the failure. The ownership records are
+ * carried through EXACTLY as they were read -- this function's only edit is
+ * the marker.
+ */
+function writeTransitionMarker(transition: PendingTransition | null): void {
+  const current = readStateStrict();
+  writeStateFile({
+    repoRoot: current.repoRoot,
+    startedAtMs: current.startedAtMs,
+    processes: current.processes,
+    transition,
+  });
+}
+
+function readTransitionMarker(): TransitionMarkerRead {
+  const raw = readRawTransition();
+  if (!raw.readable) {
+    return { status: "UNREADABLE", reason: "the launcher state file could not be read" };
+  }
+  return parseTransitionMarker(raw.value);
+}
+
+/**
+ * Refuses an action whose roles are fenced by an in-flight transition.
+ *
+ * Returns true when the action may proceed. Printing happens here so every
+ * call site refuses in the same words.
+ *
+ * ## What this does NOT do
+ *
+ * It is not a lock. It serialises one launcher process against ITSELF and
+ * against the residue of a previous run, which is what an interrupted
+ * transition leaves behind. Two launcher processes started side by side can
+ * both read NONE before either writes a marker, and would then both proceed --
+ * the check-then-act window between the read here and the first `journal` call
+ * is wide open. There is no inter-process lock in this tool to close it with:
+ * the only locking primitive in the repository is a Postgres advisory lock,
+ * and this launcher deliberately holds no database connection.
+ *
+ * The consequence is bounded rather than silent. Both runs would go on to take
+ * the SAME fenced stop and fenced start, and the second one's pre-spawn census
+ * would meet a runtime the first had started and refuse -- so the failure mode
+ * is a refusal and an INCOMPLETE marker, not two workers. It is still a race,
+ * and closing it properly needs a lock this slice does not introduce.
+ */
+function transitionGateAllows(roles: readonly DualRole[]): boolean {
+  const verdict = evaluateTransitionGate(readTransitionMarker(), roles);
+  if (verdict.ok) return true;
+  console.log("");
+  console.log("BLOCKED — nothing was changed:");
+  for (const reason of verdict.reasons) console.log(`  - ${reason}`);
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// The machine-wide mutation lock
+// ---------------------------------------------------------------------------
+
+/**
+ * One exclusive loopback binding, as the authority module wants it.
+ *
+ * Deliberately NOT a lock file. A file has to be recoverable after a crash,
+ * recovery means deleting somebody's file, and "delete this path only if it
+ * still holds the record I proved stale" is a compare-and-swap the filesystem
+ * does not offer -- so a third launcher can always slip into the moment the
+ * path is empty. The OS releases a socket binding on process death without
+ * anyone deleting anything, so that moment never exists.
+ */
+function openMutationListener(): ListenerHandle {
+  const server = createServer();
+  // It is a mutex, not a service. Anything that connects is dropped at once.
+  server.on("connection", (socket) => socket.destroy());
+  return {
+    listen: (host, port) =>
+      new Promise<void>((resolve, reject) => {
+        const failed = (error: Error): void => {
+          server.removeListener("listening", bound);
+          reject(error);
+        };
+        const bound = (): void => {
+          server.removeListener("error", failed);
+          resolve();
+        };
+        server.once("error", failed);
+        server.once("listening", bound);
+        // `exclusive` so the handle is never shared, and the host is pinned to
+        // loopback: this must not become a routable port on a machine that
+        // arms a real-money runtime.
+        server.listen({ host, port, exclusive: true });
+      }),
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        if (!server.listening) {
+          server.close();
+          resolve();
+          return;
+        }
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  };
+}
+
+const lockAdapters = (): MutationLockAdapters => ({
+  authority: listenerAuthority(openMutationListener),
+  log: (line) => console.log(`  ${line}`),
+});
+
+/** Prints one refusal, in the same words everywhere. */
+function reportLockRefusal(outcome: string, reasons: readonly string[]): void {
+  console.log("");
+  console.log("BLOCKED — another launcher holds mutation authority on this machine:");
+  for (const reason of reasons) console.log(`  - ${reason}`);
+  if (outcome !== "BUSY") {
+    console.log(`  The mutex is an exclusive binding on ${MUTATION_LOCK_HOST}:${MUTATION_LOCK_PORT}.`);
+    console.log("  There is no lock file to clear: the binding is released when its owner exits.");
+  }
+  console.log("Nothing was started, stopped, written or restarted.");
+}
+
+/**
+ * Runs one mutating action under machine-wide mutation authority.
+ *
+ * Every launcher action that changes runtime, process or environment state
+ * goes through here. Show Status does not: reading the topology mutates
+ * nothing, and blocking it would leave an operator unable to see why they are
+ * blocked.
+ */
+async function underMutationLock(action: MutationAction, run: () => Promise<void>): Promise<void> {
+  const held = await withMutationLock(action, lockAdapters(), run);
+  if (!held.ran) reportLockRefusal(held.outcome, held.reasons);
 }
 
 function clearState(): void {
@@ -615,6 +888,11 @@ async function startSafe(): Promise<void> {
   console.log("Starting the SAFE dual-account topology: six roles, three environment files.");
   console.log("This never enables trading. It writes no environment file and arms nothing.");
 
+  // An interrupted transition means at least one account's gates and processes
+  // may not agree. Starting the whole topology over that is how a half-moved
+  // account becomes a running one nobody has judged.
+  if (!transitionGateAllows(DUAL_ROLES)) return;
+
   // FIRST, and for all three files, before a single process is spawned.
   //
   // Sanitation works by deleting every name the selected file declares from
@@ -776,6 +1054,10 @@ async function startSafe(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function stopRuntime(): Promise<void> {
+  // Stopping every role includes the two an interrupted transition left in an
+  // unjudged state, so the marker is honoured here too.
+  if (!transitionGateAllows(DUAL_ROLES)) return;
+
   const { status, alive, disowned } = await collectStatus();
 
   if (alive.length === 0) {
@@ -960,6 +1242,12 @@ async function superviseAccountWorker(
   ask: (question: string) => Promise<string>
 ): Promise<void> {
   const workerRole: DualRole = account === "ACCOUNT_A" ? "account-a-worker" : "account-b-worker";
+  // Supervision restarts this worker on whatever the file currently says. Mid
+  // transition that is a coin toss between two modes, so it refuses -- but only
+  // for the account the marker names.
+  const { control: supervisedControl } = rolesForAccount(account);
+  if (!transitionGateAllows([supervisedControl, workerRole])) return;
+
   const controlRole: DualRole = account === "ACCOUNT_A" ? "account-a-control" : "account-b-control";
   const label = ROLE_CONTRACTS[workerRole].label;
 
@@ -975,9 +1263,17 @@ async function superviseAccountWorker(
     return;
   }
 
-  let budget: RestartBudget = EMPTY_RESTART_BUDGET;
-  for (;;) {
-    const pass = await runSupervisionSingleFlight(async () => {
+  /**
+   * One observation and one decision, with NO side effect.
+   *
+   * Separated so it can be run twice: once to find out whether a restart is
+   * needed at all, and again under the mutation lock to re-prove it. Both
+   * calls are given the SAME starting budget and only one result is
+   * committed, so a tick can never count a health observation twice.
+   */
+  const assess = async (
+    from: RestartBudget
+  ): Promise<{ budget: RestartBudget; decision: ReturnType<typeof decideWorkerSupervision> } | null> => {
       const state = readState();
       const ownership = ownedRolesAlive(state);
       if (!ownership.ok) {
@@ -1013,7 +1309,7 @@ async function superviseAccountWorker(
         if (view.presence === "OFF") return "OFF";
         return view.attestation === "ABSENT" ? "OFF" : "STALE";
       };
-      budget = observeWorkerHealth(budget, health(workerView), nowMs);
+      const observedBudget = observeWorkerHealth(from, health(workerView), nowMs);
 
       // The decision ladder is the tested one. Its record type names the legacy
       // single-stack role; only `pid` is read from it, and the role this pass
@@ -1023,28 +1319,66 @@ async function superviseAccountWorker(
         ownership: record === null ? null : { owned: true },
         workerHealth: health(workerView),
         backendHealth: health(controlView),
-        budget,
+        budget: observedBudget,
         nowMs,
         hasRuntimeState: state !== null,
       });
+      return { budget: observedBudget, decision };
+  };
 
-      if (decision.action !== "NONE") {
+  let budget: RestartBudget = EMPTY_RESTART_BUDGET;
+  for (;;) {
+    const pass = await runSupervisionSingleFlight(async () => {
+      const first = await assess(budget);
+      if (first === null) return null;
+
+      // Nothing to mutate, so no lock is taken. A supervisor sitting open must
+      // not block an operator's actions merely by existing.
+      if (first.decision.action === "NONE") {
+        budget = first.budget;
+        return first;
+      }
+
+      const held = await withMutationLock("SUPERVISE_RESTART", lockAdapters(), async () => {
+        // The marker is read AGAIN, here, under the mutex. The check when this
+        // supervisor started is hours old by now, and a transition that began
+        // and crashed since then would have left this account PENDING -- with
+        // the mutex released by the OS, so nothing else stands in the way.
+        const gate = judgeSupervisedRestart(readTransitionMarker(), [supervisedControl, workerRole]);
+        if (gate.act === "REFUSE") {
+          for (const reason of gate.reasons) console.log(`  ${label}: ${reason}`);
+          return null;
+        }
+
+        // RE-PROVEN under the lock. The health that justified this restart was
+        // observed before mutation authority existed, and an operator's
+        // transition could have moved the very role this is about.
+        const now = await assess(budget);
+        if (now === null) return null;
+        if (now.decision.action === "NONE") {
+          console.log(`  ${label}: the restart was no longer needed once mutation authority was held.`);
+          budget = now.budget;
+          return now;
+        }
+
         // ONE fenced sequence, shared with generic analysis: re-prove, refuse
         // to spawn on any non-GONE ownership failure, terminate, prove the old
         // tree actually exited, re-census, then spawn at most one.
-        const outcome = restartOwnedRole(decision, workerRole, budget.attempts + 1);
+        const outcome = restartOwnedRole(now.decision, workerRole, now.budget.attempts + 1);
         if (outcome.outcome === "RESTARTED" && outcome.newPid !== null) {
-          recordReplacement(
-            workerRole,
-            outcome.newPid,
-            replacementStartedAt(outcome.newPid)
-          );
+          recordReplacement(workerRole, outcome.newPid, replacementStartedAt(outcome.newPid));
         }
         // The attempt is spent whatever the outcome, so a refusal cannot spin:
         // backoff and the ceiling apply to attempts, not to successes.
-        budget = recordRestartAttempt(budget, nowMs);
-      }
-      return { decision, budget };
+        budget = recordRestartAttempt(now.budget, Date.now());
+        return { budget, decision: now.decision };
+      });
+
+      if (held.ran) return held.result;
+      // No attempt is spent: nothing was tried, because authority was refused.
+      for (const reason of held.reasons) console.log(`  ${label}: ${reason}`);
+      console.log(`  ${label}: nothing was restarted.`);
+      return null;
     });
 
     if (pass.ran && pass.result !== null) {
@@ -1074,6 +1408,10 @@ async function superviseAccountWorker(
  * SAFE runtime stays SAFE, and both accounts are untouched.
  */
 async function superviseGenericAnalysis(ask: (question: string) => Promise<string>): Promise<void> {
+  // The generic role belongs to neither account, so a PENDING marker for one
+  // account does not fence it. An UNREADABLE marker does: it does not say
+  // which account it was about, and this process shares the state file.
+  if (!transitionGateAllows([GENERIC_ANALYSIS_ROLE])) return;
   const label = ROLE_CONTRACTS[GENERIC_ANALYSIS_ROLE].label;
 
   console.log("");
@@ -1091,9 +1429,13 @@ async function superviseGenericAnalysis(ask: (question: string) => Promise<strin
     return;
   }
 
-  let budget: RestartBudget = EMPTY_RESTART_BUDGET;
-  for (;;) {
-    const pass = await runSupervisionSingleFlight(async () => {
+  /** One observation and one decision, with NO side effect. Run twice. */
+  const assess = async (
+    from: RestartBudget
+  ): Promise<{
+    budget: RestartBudget;
+    decision: ReturnType<typeof decideGenericAnalysisSupervision>;
+  } | null> => {
       const state = readState();
       const ownership = ownedRolesAlive(state);
       if (!ownership.ok) {
@@ -1118,32 +1460,68 @@ async function superviseGenericAnalysis(ask: (question: string) => Promise<strin
       // The SAME health function the decision is given below, so the restart
       // budget and the decision cannot disagree about what they are watching.
       const health = genericAnalysisHealth({ status, ownedRootAlive: record !== null });
-      budget = observeWorkerHealth(budget, health, nowMs);
+      const observedBudget = observeWorkerHealth(from, health, nowMs);
 
       const decision = decideGenericAnalysisSupervision({
         record: record === null ? null : { pid: record.pid, startedAtMs: record.startedAtMs },
         ownership: record === null ? null : { owned: true },
         status,
-        budget,
+        budget: observedBudget,
         nowMs,
         hasRuntimeState: state !== null,
       });
+      return { budget: observedBudget, decision };
+  };
 
-      if (decision.action !== "NONE") {
+  let budget: RestartBudget = EMPTY_RESTART_BUDGET;
+  for (;;) {
+    const pass = await runSupervisionSingleFlight(async () => {
+      const first = await assess(budget);
+      if (first === null) return null;
+
+      // Nothing to mutate, so no lock is taken.
+      if (first.decision.action === "NONE") {
+        budget = first.budget;
+        return first;
+      }
+
+      const held = await withMutationLock("SUPERVISE_RESTART", lockAdapters(), async () => {
+        // The same fresh read the account supervisors take. The generic role
+        // belongs to neither account, so an account's PENDING marker leaves it
+        // alone -- but a marker nobody can READ fences it too, because it does
+        // not say which account it was about.
+        const gate = judgeSupervisedRestart(readTransitionMarker(), [GENERIC_ANALYSIS_ROLE]);
+        if (gate.act === "REFUSE") {
+          for (const reason of gate.reasons) console.log(`  ${label}: ${reason}`);
+          return null;
+        }
+
+        // RE-PROVEN under the lock, for the same reason the account
+        // supervisors re-prove: the health that justified this was observed
+        // before mutation authority existed.
+        const now = await assess(budget);
+        if (now === null) return null;
+        if (now.decision.action === "NONE") {
+          console.log(`  ${label}: the restart was no longer needed once mutation authority was held.`);
+          budget = now.budget;
+          return now;
+        }
+
         // The SAME fenced sequence the account workers use. Every safety step
         // -- re-prove, refuse on non-GONE, terminate, prove exit, re-census --
         // lives in `executeWorkerRestart`, so the two supervisors cannot drift.
-        const outcome = restartOwnedRole(decision, GENERIC_ANALYSIS_ROLE, budget.attempts + 1);
+        const outcome = restartOwnedRole(now.decision, GENERIC_ANALYSIS_ROLE, now.budget.attempts + 1);
         if (outcome.outcome === "RESTARTED" && outcome.newPid !== null) {
-          recordReplacement(
-            GENERIC_ANALYSIS_ROLE,
-            outcome.newPid,
-            replacementStartedAt(outcome.newPid)
-          );
+          recordReplacement(GENERIC_ANALYSIS_ROLE, outcome.newPid, replacementStartedAt(outcome.newPid));
         }
-        budget = recordRestartAttempt(budget, nowMs);
-      }
-      return { decision, budget };
+        budget = recordRestartAttempt(now.budget, Date.now());
+        return { budget, decision: now.decision };
+      });
+
+      if (held.ran) return held.result;
+      for (const reason of held.reasons) console.log(`  ${label}: ${reason}`);
+      console.log(`  ${label}: nothing was restarted.`);
+      return null;
     });
 
     if (pass.ran && pass.result !== null) {
@@ -1168,6 +1546,519 @@ async function superviseGenericAnalysis(ask: (question: string) => Promise<strin
 // ---------------------------------------------------------------------------
 // Menu
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Account-scoped SAFE <-> LIVE-READY transition
+//
+// Every DECISION here lives in `account-runtime-transition.ts` and is exercised
+// by its own behavioural tests. What follows supplies the machine calls: an
+// HTTP read of one control plane, one env file rewrite, and the two fenced
+// primitives restart supervision already uses.
+// ---------------------------------------------------------------------------
+
+/** One authenticated loopback GET against ONE account's own control plane. */
+async function readControlPlane<T>(
+  account: Exclude<RuntimeAccount, "GENERIC">,
+  route: string
+): Promise<T | null> {
+  const { control } = rolesForAccount(account);
+  const port = ROLE_CONTRACTS[control].port;
+  const token = envValue(control, "OPERATOR_API_TOKEN");
+  if (port === null || token === null) return null;
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) return null;
+    return (await response.json()) as T;
+  } catch {
+    // Message deliberately dropped: it can carry a token or an endpoint.
+    return null;
+  }
+}
+
+interface ControlPlaneStatus {
+  systemState?: string;
+  runtimeAttestation?: { status?: string };
+}
+
+/**
+ * ONE status read, mapped two ways.
+ *
+ * Both the account's self-report and the gates it has LOADED come from the
+ * same body, so the two can never describe different moments. The mapping
+ * itself is pure and lives in the transition module, where it is tested
+ * against real HTTP bodies -- including the ones missing a field.
+ */
+async function readSelectedAccount(account: Exclude<RuntimeAccount, "GENERIC">): Promise<{
+  readonly selected: SelectedAccountState;
+  readonly effectiveMode: ObservedMode | null;
+}> {
+  const body = await readControlPlane<unknown>(account, "/api/operator/trading-control/status");
+  if (body === null) return { selected: UNREAD_ACCOUNT_STATE, effectiveMode: null };
+  return { selected: selectedAccountStateFromWire(body), effectiveMode: effectiveModeFromWire(body) };
+}
+
+/**
+ * The selected account's EXCHANGE flatness, from its own signed reads.
+ *
+ * Null -- which refuses -- whenever the route could not be reached. A count the
+ * route reports as unknown stays unknown here; this never turns one into zero.
+ */
+async function readAccountFlatness(
+  account: Exclude<RuntimeAccount, "GENERIC">
+): Promise<PreShutdownCounts | null> {
+  const body = await readControlPlane<Parameters<typeof countsFromWire>[0]>(
+    account,
+    "/api/operator/trading-control/exchange-flatness"
+  );
+  // Null, not three zeroes: a route that did not answer has proven nothing.
+  if (!body) return null;
+  // The mapping is shared with the route's own type and refuses to turn an
+  // unexpected shape into a zero.
+  return countsFromWire(body);
+}
+
+/** Ownership of exactly the two selected roles, or the reason it is unknown. */
+function selectedRoleOwnership(
+  account: Exclude<RuntimeAccount, "GENERIC">
+): Observation<{ controlOwned: boolean; workerOwned: boolean }> {
+  const ownership = ownedRolesAlive(readState());
+  if (!ownership.ok) return ownership;
+  const { control, worker } = rolesForAccount(account);
+  const alive = ownership.value.alive;
+  return observed({
+    controlOwned: alive.some((entry) => entry.role === control),
+    workerOwned: alive.some((entry) => entry.role === worker),
+  });
+}
+
+/**
+ * Rewrites ONLY the three gates of ONLY the selected account's env file.
+ *
+ * `applyGates` changes three lines and preserves every other byte -- line
+ * endings, comments, ordering and every unrelated value, credentials included.
+ * The write is atomic: a temp file in the same directory, then a rename, so an
+ * interruption can leave the old file or the new one but never half of either.
+ *
+ * ## The temp file holds the credentials too
+ *
+ * It is a complete copy of the account's environment, so a rename that fails
+ * would otherwise leave a second file on disk holding the same API key under a
+ * name nobody is watching. It is removed on every failure path, best-effort,
+ * and its contents are never logged -- the failure message names no path and
+ * quotes nothing. A crash between the write and the rename can still leave it;
+ * that residue is the known cost of atomic replacement, and it sits in the
+ * same directory, inheriting the same ACL as the file it is replacing.
+ */
+function writeAccountGates(
+  account: Exclude<RuntimeAccount, "GENERIC">,
+  mode: RuntimeMode
+): { ok: true } | { ok: false; reason: string } {
+  const { control } = rolesForAccount(account);
+  const file = envFilePathFor(control);
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return { ok: false, reason: "the account's environment file could not be read" };
+  }
+
+  const rewritten = applyGates(text, mode === "SAFE" ? SAFE_GATES : LIVE_READY_GATES);
+  if (!rewritten.ok) return { ok: false, reason: rewritten.reason };
+
+  const temporary = `${file}.tmp`;
+  try {
+    writeFileSync(temporary, rewritten.text, "utf8");
+    renameSync(temporary, file);
+    return { ok: true };
+  } catch {
+    // Leave no credential-bearing copy behind. Best-effort: if this fails too,
+    // the original file is still intact and the operator is told nothing was
+    // replaced, which is the fact that matters.
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // Already gone, or never created.
+    }
+    // No path, no contents: this message reaches a terminal scrollback.
+    return { ok: false, reason: "the account's environment file could not be replaced" };
+  }
+}
+
+/** What the account's env FILE declares, or null when it cannot be read. */
+function diskModeFor(account: Exclude<RuntimeAccount, "GENERIC">): ObservedMode | null {
+  const { control } = rolesForAccount(account);
+  const parsed = parseEnvFileStrict(envFilePathFor(control));
+  if (!parsed.ok) return null;
+  // `classifyDiskMode` never normalises: a half-open triple stays INVALID.
+  return classifyDiskMode(declaredGateValues(control));
+}
+
+/**
+ * Proves ONE role reached the target mode, by asking the control plane.
+ *
+ * The control plane answers for the gates IT loaded, so this is a statement
+ * about the running process rather than about the file that was written. The
+ * worker is proven through the same report's ATTESTATION, which the control
+ * plane judges against its own gate snapshot -- which is exactly why both
+ * roles have to move together.
+ */
+async function verifyRoleMode(
+  account: Exclude<RuntimeAccount, "GENERIC">,
+  role: DualRole,
+  mode: RuntimeMode
+): Promise<{ ok: true } | { ok: false; reasons: string[] }> {
+  const { worker } = rolesForAccount(account);
+  const deadline = Date.now() + 90_000;
+  let last = "the control plane did not answer";
+
+  for (;;) {
+    const status = await readControlPlane<ControlPlaneStatus & Record<string, unknown>>(
+      account,
+      "/api/operator/trading-control/status"
+    );
+    if (status) {
+      // The same classifier the mode proof uses, so "running LIVE-READY" means
+      // one thing in this tool rather than two.
+      const loaded = effectiveModeFromWire(status);
+      if (loaded !== mode) {
+        last = `${role} is running gates that do not match ${mode}`;
+      } else if (status.systemState !== "SAFE_OFF") {
+        // The transition changes the RUNTIME, never the trading state.
+        last = `${role} reports ${status.systemState ?? "an unreadable state"}; it must stay SAFE_OFF`;
+      } else if (role === worker && status.runtimeAttestation?.status !== "PASS") {
+        last = `the execution worker has not attested to the ${mode} gates`;
+      } else {
+        return { ok: true };
+      }
+    }
+    if (Date.now() >= deadline) return { ok: false, reasons: [`${last}.`] };
+    await new Promise((done) => setTimeout(done, 3_000));
+  }
+}
+
+/**
+ * The machine adapters the transition sequence runs on.
+ *
+ * `fromMode` and `startedAtMs` are passed in rather than derived, because the
+ * marker this writes is what recovery reads: a guessed direction here becomes
+ * a recovery that skips the gate rewrite it needed.
+ */
+function transitionAdapters(
+  account: Exclude<RuntimeAccount, "GENERIC">,
+  run: { readonly fromMode: RuntimeMode; readonly targetMode: RuntimeMode; readonly startedAtMs: number }
+) {
+  const { fromMode, targetMode, startedAtMs } = run;
+  return {
+    repoRoot: REPO_ROOT,
+    /**
+     * A FRESH ownership check of one role, from the machine.
+     *
+     * Deliberately not `selectedRoleOwnership`, which answers for both roles
+     * at once: this is asked per role, at the end, about the record as it
+     * stands after everything the sequence did to it.
+     */
+    proveOwned: (role: DualRole): Observation<boolean> => {
+      const state = readState();
+      const record = state?.processes.find((entry) => entry.role === role) ?? null;
+      if (!record || !state) return observed(false);
+      const probed = probeProcesses([record.pid]);
+      if (!probed.ok) return probed;
+      return observed(verifyOwnership(record, probed.value.get(record.pid) ?? null, state.repoRoot).owned);
+    },
+    recordFor: (role: DualRole) => readState()?.processes.find((entry) => entry.role === role) ?? null,
+    stop: {
+      probe: (pid: number) => {
+        const probed = probeProcesses([pid]);
+        return probed.ok ? { observed: true as const, process: probed.value.get(pid) ?? null } : { observed: false as const };
+      },
+      terminate: (pid: number) => {
+        terminateTree(pid);
+        return true;
+      },
+      log: (line: string) => console.log(`  ${line}`),
+    },
+    startFor: (role: DualRole) => ({
+      probe: (pid: number) => {
+        const probed = probeProcesses([pid]);
+        return probed.ok ? { observed: true as const, process: probed.value.get(pid) ?? null } : { observed: false as const };
+      },
+      unaccountedLeaves: () => unaccountedLeavesFor(role, role),
+      spawnWorker: () => {
+        // The SAME reviewed spawn plan every start of that role uses, so the
+        // role keeps its own DOTENV_CONFIG_PATH. No operator input reaches it.
+        const plan = dualSpawnPlan(role, REPO_ROOT);
+        const child = spawn(plan.command, plan.args, plan.options);
+        if (child.pid === undefined) return null;
+        child.unref();
+        return child.pid;
+      },
+      recordOwnership: (pid: number, startedAt: number) => recordReplacement(role, pid, startedAt),
+      log: (line: string) => console.log(`  ${line}`),
+    }),
+    journal: (phase: TransitionPhase) => {
+      writeTransitionMarker({
+        account,
+        // PROVEN before this run began, never inferred from the target.
+        fromMode,
+        targetMode,
+        phase,
+        startedAtMs,
+        updatedAtMs: Date.now(),
+      });
+    },
+    clearJournal: () => writeTransitionMarker(null),
+    writeGates: (mode: RuntimeMode) => writeAccountGates(account, mode),
+    verify: (role: DualRole, mode: RuntimeMode) => verifyRoleMode(account, role, mode),
+    log: (line: string) => console.log(`  ${line}`),
+  };
+}
+
+/**
+ * Asks which account, and accepts nothing else.
+ *
+ * Two answers and a cancel. There is deliberately no option that selects more
+ * than one account: a single action that moved two accounts would restart four
+ * processes on one confirmation, and the whole design of this transition is
+ * that one account's exposure is proven before one account's runtime moves.
+ */
+async function askAccount(
+  ask: (question: string) => Promise<string>,
+  verb: string
+): Promise<Exclude<RuntimeAccount, "GENERIC"> | null> {
+  console.log("");
+  console.log(`Which account should be ${verb}? One account only.`);
+  const answer = (await ask("  a = Account A, b = Account B, anything else cancels: ")).trim().toLowerCase();
+  if (answer === "a") return "ACCOUNT_A";
+  if (answer === "b") return "ACCOUNT_B";
+  console.log("Cancelled. Nothing was changed.");
+  return null;
+}
+
+/**
+ * Moves ONE account between SAFE and LIVE-READY.
+ *
+ * Preconditions first, and every one of them is about the SELECTED account:
+ * its own control plane's report, its own signed exchange reads, and launcher
+ * ownership of its own two roles. The other account and the two generic roles
+ * are never read, never stopped and never started.
+ */
+/**
+ * Gathers EVERY fact the decision depends on, in one pass.
+ *
+ * One function, called twice: once to decide what to propose, and once after
+ * the operator has confirmed. Both readings therefore have identical shape and
+ * identical strictness, so the comparison between them is meaningful.
+ */
+async function gatherAccountFacts(
+  account: Exclude<RuntimeAccount, "GENERIC">
+): Promise<GatheredAccountFacts> {
+  const [report, exchange] = await Promise.all([
+    readSelectedAccount(account),
+    readAccountFlatness(account),
+  ]);
+  return {
+    mode: proveCurrentMode({ disk: diskModeFor(account), effective: report.effectiveMode }),
+    selected: report.selected,
+    exchange,
+    ownership: selectedRoleOwnership(account),
+    marker: readTransitionMarker(),
+  };
+}
+
+const printBlocked = (reasons: readonly string[]): void => {
+  console.log("");
+  console.log("BLOCKED — nothing was changed:");
+  for (const reason of reasons) console.log(`  - ${reason}`);
+};
+
+/**
+ * Moves ONE account between SAFE and LIVE-READY.
+ *
+ * Preconditions first, and every one of them is about the SELECTED account:
+ * its own control plane's report, its own signed exchange reads, its own
+ * configured and loaded gates, and launcher ownership of its own two roles.
+ * The other account and the two generic roles are never read, never stopped
+ * and never started.
+ *
+ * ## Proven twice, side by side
+ *
+ * The facts are gathered, shown, and then a human types an account name. That
+ * gap is human-sized and the facts are perishable -- a position opened by
+ * hand, an algo order triggering, a profile enabled from the dashboard, a
+ * second launcher window starting its own transition. So everything is
+ * gathered AGAIN after the confirmation and must pass on its own AND still
+ * describe the same runtime. Only then is the first process touched.
+ */
+async function transitionAccount(
+  targetMode: RuntimeMode,
+  ask: (question: string) => Promise<string>
+): Promise<void> {
+  const account = await askAccount(ask, targetMode === "SAFE" ? "returned to SAFE" : "prepared LIVE-READY");
+  if (!account) return;
+
+  // Machine-wide authority FIRST, and held across the confirmation. Without
+  // that, a second launcher could take its own decision and act on it during
+  // the seconds or minutes an operator spends deciding -- and two transitions
+  // aimed at opposite modes would interleave a gate rewrite with a restart.
+  const held = await withMutationLock(
+    targetMode === "SAFE" ? "RETURN_TO_SAFE" : "PREPARE_LIVE_READY",
+    lockAdapters(),
+    () => runAccountTransition(account, targetMode, ask)
+  );
+  if (!held.ran) reportLockRefusal(held.outcome, held.reasons);
+}
+
+async function runAccountTransition(
+  account: Exclude<RuntimeAccount, "GENERIC">,
+  targetMode: RuntimeMode,
+  ask: (question: string) => Promise<string>
+): Promise<void> {
+  const { control, worker } = rolesForAccount(account);
+  if (!transitionGateAllows([control, worker])) return;
+
+  console.log("");
+  console.log(`Checking ${account} before changing anything…`);
+  const first = await gatherAccountFacts(account);
+
+  // The mode this account is ACTUALLY in, from its file and its running
+  // control plane. Never inferred from what was asked for.
+  if (!first.mode.ok) {
+    printBlocked([
+      ...first.mode.reasons,
+      "An account whose current mode is not proven cannot be moved; return it to SAFE first.",
+    ]);
+    return;
+  }
+  const decision = decideModeTransition(first.mode.mode, targetMode);
+  if (decision.kind === "ALREADY") {
+    console.log("");
+    console.log(`${account} is already ${decision.mode}. Nothing to do, and nothing was changed.`);
+    return;
+  }
+
+  const verdict = evaluateTransitionPreconditions({
+    account,
+    targetMode,
+    selected: first.selected,
+    exchange: first.exchange,
+    ownership: first.ownership,
+    pending: first.marker.status === "PENDING" ? first.marker.transition : null,
+  });
+  if (!verdict.ok) {
+    printBlocked(verdict.reasons);
+    return;
+  }
+
+  console.log("");
+  console.log(`${account} is ${decision.fromMode} and will be moved to ${targetMode}.`);
+  console.log("Its two roles are stopped, its three gates are rewritten, and its two roles are restarted.");
+  console.log("This arms NOTHING: no profile is enabled, no kill switch is released, no window is created.");
+  console.log("The other account and the two generic roles are not touched.");
+  const confirmation = (await ask(`Type ${account} to proceed: `)).trim();
+  if (confirmation !== account) {
+    console.log("Cancelled. Nothing was changed.");
+    return;
+  }
+
+  // EVERYTHING again, now, before the first kill.
+  console.log("");
+  console.log("Re-proving before touching anything…");
+  const second = await gatherAccountFacts(account);
+  const settled = evaluateSecondProof({ account, targetMode, first, second });
+  if (!settled.ok) {
+    printBlocked([
+      ...settled.reasons,
+      "These facts changed while the confirmation was open, so nothing was stopped, written or started.",
+    ]);
+    return;
+  }
+
+  const result = await executeAccountTransition(
+    { account, fromMode: decision.fromMode, targetMode, startedAtMs: Date.now() },
+    transitionAdapters(account, { fromMode: decision.fromMode, targetMode, startedAtMs: Date.now() })
+  );
+  console.log("");
+  if (result.ok) {
+    console.log(`${account} is now ${result.mode}. Trading remains OFF until it is armed separately.`);
+    return;
+  }
+  for (const reason of result.reasons) console.log(`  - ${reason}`);
+  if (result.state === "REFUSED") console.log(`REFUSED at ${result.phase} — nothing was changed.`);
+  else if (result.state === "RECOVERED") console.log(`ROLLED BACK — ${account} was returned to SAFE and proven.`);
+  else {
+    console.log(`INCOMPLETE at ${result.phase} — ${account} could NOT be proven SAFE.`);
+    console.log("The transition marker was KEPT. Use 'Recover an INCOMPLETE transition'.");
+  }
+}
+
+/**
+ * Finishes an interrupted transition, in the only safe direction: SAFE.
+ *
+ * It never resumes towards LIVE-READY. A transition nobody watched finish is
+ * not a transition anybody should continue, and the operator can simply run
+ * Prepare again once the account is proven SAFE.
+ *
+ * The existing marker is handed to the recovery engine AS IT STANDS. It is not
+ * replaced by a fresh one: its phase and its proven `fromMode` are the only
+ * record of how far the interrupted run got and which gates the file may still
+ * hold, and a recovery that overwrote them would be planning from its own
+ * assumptions instead of from the evidence.
+ */
+async function recoverIncompleteTransition(ask: (question: string) => Promise<string>): Promise<void> {
+  // Taken before the marker is even read, so the record an operator is shown
+  // is the record that is still there when they confirm.
+  const held = await withMutationLock("RECOVER_TRANSITION", lockAdapters(), () => runRecoveryAction(ask));
+  if (!held.ran) reportLockRefusal(held.outcome, held.reasons);
+}
+
+async function runRecoveryAction(ask: (question: string) => Promise<string>): Promise<void> {
+  const marker = readTransitionMarker();
+  console.log("");
+  if (marker.status === "NONE") {
+    console.log("There is no incomplete transition recorded. Nothing was changed.");
+    return;
+  }
+  if (marker.status === "UNREADABLE") {
+    console.log(`The transition marker is present but unreadable — ${marker.reason}.`);
+    console.log("It does not say which account it was about, so no account can be recovered automatically.");
+    console.log("Stop the runtime, confirm both accounts' gates by hand, and clear the launcher state.");
+    return;
+  }
+
+  const pending = marker.transition;
+  const { account } = pending;
+  console.log("INCOMPLETE TRANSITION");
+  for (const line of describePendingTransition(pending, Date.now())) console.log(`  ${line}`);
+  console.log("");
+  console.log(`${account} will be returned to SAFE: its gates rewritten if needed, and its roles restarted.`);
+  console.log("The marker is cleared ONLY if SAFE is proven afterwards.");
+  const confirmation = (await ask(`Type ${account} to recover: `)).trim();
+  if (confirmation !== account) {
+    console.log("Cancelled. Nothing was changed.");
+    return;
+  }
+
+  const result = await executeTransitionRecovery(
+    pending,
+    transitionAdapters(account, {
+      fromMode: pending.fromMode,
+      targetMode: pending.targetMode,
+      startedAtMs: pending.startedAtMs,
+    })
+  );
+  console.log("");
+  if (result.ok === false && result.state === "RECOVERED") {
+    console.log(`${account} is SAFE again and the transition marker was cleared.`);
+    return;
+  }
+  if (result.ok === false) {
+    for (const reason of result.reasons) console.log(`  - ${reason}`);
+    console.log(`RECOVERY DID NOT FINISH (${result.state} at ${result.phase}). The marker was KEPT.`);
+  }
+}
 
 async function main(): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -1197,26 +2088,28 @@ async function main(): Promise<void> {
       console.log("");
       console.log("1. Show Status");
       console.log("2. Start SAFE (six-role dual-account topology)");
-      console.log("3. Prepare LIVE-READY (unavailable — see why)");
+      console.log("3. Prepare ONE account LIVE-READY");
       console.log("4. Stop Runtime (requires SAFE)");
       console.log("5. Supervise Account A Worker");
       console.log("6. Supervise Account B Worker");
       console.log("7. Supervise Generic Analysis");
       console.log("8. Exit");
+      console.log("9. Return ONE account to SAFE");
+      console.log("10. Recover an INCOMPLETE transition");
       console.log("");
 
       const choice = (await ask("Choose: ")).trim();
       if (choice === "8") break;
       try {
         if (choice === "1") continue;
-        else if (choice === "2") await startSafe();
-        else if (choice === "3") {
-          console.log("");
-          for (const line of LIVE_READY_UNAVAILABLE) console.log(line);
-        } else if (choice === "4") await stopRuntime();
+        else if (choice === "2") await underMutationLock("START_SAFE", startSafe);
+        else if (choice === "3") await transitionAccount("LIVE_READY", ask);
+        else if (choice === "4") await underMutationLock("STOP_RUNTIME", stopRuntime);
         else if (choice === "5") await superviseAccountWorker("ACCOUNT_A", ask);
         else if (choice === "6") await superviseAccountWorker("ACCOUNT_B", ask);
         else if (choice === "7") await superviseGenericAnalysis(ask);
+        else if (choice === "9") await transitionAccount("SAFE", ask);
+        else if (choice === "10") await recoverIncompleteTransition(ask);
         else console.log("Unrecognised choice. Nothing was changed.");
       } catch (error) {
         // Any action that needs to see the machine refuses when it cannot.

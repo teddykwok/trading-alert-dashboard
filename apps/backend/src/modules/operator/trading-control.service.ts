@@ -32,6 +32,12 @@ import {
   readRuntimeAttestationStatusOnce,
   type RuntimeAttestationStatus,
 } from "../runtime/runtime-attestation";
+import {
+  boundReadsFor,
+  readExchangeFlatness,
+  type ExchangeFlatnessDeps,
+  type ExchangeFlatnessDto,
+} from "./exchange-flatness";
 
 /**
  * The READ-ONLY status feed behind the dashboard's Trading Control panel.
@@ -303,6 +309,13 @@ export interface TradingControlOptions {
   readAttestation?: () => Promise<RuntimeAttestationStatus>;
   now?: () => Date;
   preflightOptions?: CanaryPreflightOptions;
+  /**
+   * Injected in tests so the flatness check needs no signed Binance round-trip.
+   *
+   * Production passes nothing and gets the real binding, which resolves THIS
+   * process's account -- there is no argument that could point it elsewhere.
+   */
+  openFlatnessReads?: ExchangeFlatnessDeps["openReads"];
 }
 
 /**
@@ -318,6 +331,7 @@ export class TradingControlService {
   private readonly preflight: PreflightRunner;
   private readonly readAttestation: () => Promise<RuntimeAttestationStatus>;
   private readonly now: () => Date;
+  private readonly openFlatnessReads: ExchangeFlatnessDeps["openReads"];
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -332,6 +346,24 @@ export class TradingControlService {
           expected: currentProcessGateSnapshot(),
         }));
     this.now = options.now ?? (() => new Date());
+    // Built THERE, not here: this service resolves execution profiles
+    // directly, and a module that also constructed a signed client could
+    // establish the profile and the credentials independently -- the split
+    // brain the 11D binding exists to prevent.
+    this.openFlatnessReads = options.openFlatnessReads ?? boundReadsFor(prisma);
+  }
+
+  /**
+   * Exchange flatness for the account this process is bound to.
+   *
+   * The second operator route that may reach the exchange, and like readiness
+   * it is a GET that cannot mutate: three account-wide signed READS, no cancel,
+   * no close, no setup. It answers the question a runtime transition has to ask
+   * before restarting an execution worker -- is there anything out there the
+   * worker is currently the only thing protecting?
+   */
+  async readExchangeFlatness(): Promise<ExchangeFlatnessDto> {
+    return readExchangeFlatness({ openReads: this.openFlatnessReads, now: this.now });
   }
 
   /**

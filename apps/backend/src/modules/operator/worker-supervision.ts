@@ -450,6 +450,8 @@ export type WorkerRestartOutcome =
   | "OBSERVATION_UNAVAILABLE"
   /** The pre-spawn census could not be read, so absence is unproven. */
   | "CENSUS_UNAVAILABLE"
+  /** A process was started, but its identity could not be recorded provably. */
+  | "OWNERSHIP_UNPROVEN"
   | "NOT_ATTEMPTED";
 
 export interface WorkerRestartResult {
@@ -461,44 +463,229 @@ export interface WorkerRestartResult {
 }
 
 /**
- * Carries out ONE restart decision.
+ * A launcher-recorded root, as the fenced primitives need to see it.
  *
- * ## The singleton argument
+ * Structural rather than `OwnedProcess`, so both the legacy single-stack state
+ * and the dual-account state satisfy it without either knowing the other's
+ * role vocabulary.
+ */
+export interface OwnedRootRecord {
+  readonly role: string;
+  readonly pid: number;
+  readonly startedAtMs: number;
+}
+
+export type FencedStopOutcome =
+  | { readonly stopped: true; readonly alreadyGone: boolean }
+  | {
+      readonly stopped: false;
+      readonly outcome: "NOT_RECORDED" | "OWNERSHIP_LOST" | "OBSERVATION_UNAVAILABLE" | "TERMINATION_FAILED";
+      readonly reason: string;
+    };
+
+/**
+ * FENCED STOP. Terminates one launcher-owned tree, or refuses.
  *
- * There is exactly one `spawnWorker()` call in this function, and every path
- * that reaches it has first established that no owned worker is running:
- * either the decision was RESTART (the process is gone) or the old process was
- * terminated AND re-probed to prove it exited. A termination that cannot be
- * proven returns without spawning, so the failure mode is "no worker" rather
- * than "two workers" — the former is visible and recoverable, the latter
- * silently competes over the same executions.
+ * ## Why stopping is its own operation
  *
- * ## Why ownership is re-verified here
+ * A restart couples a stop to a spawn, which is right when a role must come
+ * straight back. An account runtime transition must NOT: it stops the worker
+ * and the control plane, rewrites their gates, and only then starts them --
+ * respawning either on the OLD gates in between would defeat the transition
+ * entirely. Splitting the sequence, rather than writing a second one, is what
+ * stops two safety implementations existing.
  *
- * The decision was made from a probe taken earlier in the tick. Between then
- * and now the process could have exited and its PID been recycled. Re-checking
- * immediately before the kill is what keeps `verifyOwnership`'s guarantee
- * intact rather than merely inherited.
+ * Success means the tree is CONFIRMED gone, by a second observation. A kill
+ * that returned is not a kill that worked.
+ */
+export function executeFencedStop(
+  record: OwnedRootRecord | null,
+  repoRoot: string,
+  adapters: Pick<WorkerRestartAdapters, "probe" | "terminate" | "log">
+): FencedStopOutcome {
+  if (!record) {
+    adapters.log("fenced stop: no launcher record for that role — nothing was stopped");
+    return { stopped: false, outcome: "NOT_RECORDED", reason: "no launcher record" };
+  }
+  const { pid } = record;
+
+  // A probe that could not be MADE is not a probe that found nothing.
+  const beforeProbe = adapters.probe(pid);
+  if (!beforeProbe.observed) {
+    adapters.log(`fenced stop: pid ${pid} could not be observed — NOT terminated`);
+    return { stopped: false, outcome: "OBSERVATION_UNAVAILABLE", reason: "process observation unavailable" };
+  }
+
+  const before = verifyOwnership(record, beforeProbe.process, repoRoot);
+  if (!before.owned) {
+    if (before.reason === "GONE") {
+      adapters.log(`fenced stop: pid ${pid} had already exited`);
+      return { stopped: true, alreadyGone: true };
+    }
+    adapters.log(`fenced stop: pid ${pid} is no longer provably ours (${before.reason}) — NOT terminated`);
+    return { stopped: false, outcome: "OWNERSHIP_LOST", reason: before.reason };
+  }
+
+  adapters.terminate(pid);
+
+  // Trust the re-probe, never the exit code.
+  const afterProbe = adapters.probe(pid);
+  if (!afterProbe.observed) {
+    adapters.log(`fenced stop: pid ${pid} was signalled but could not be observed afterwards`);
+    return { stopped: false, outcome: "OBSERVATION_UNAVAILABLE", reason: "post-kill observation unavailable" };
+  }
+  if (verifyOwnership(record, afterProbe.process, repoRoot).owned) {
+    adapters.log(`fenced stop: pid ${pid} could NOT be stopped`);
+    return { stopped: false, outcome: "TERMINATION_FAILED", reason: "the tree is still running" };
+  }
+  adapters.log(`fenced stop: pid ${pid} stopped`);
+  return { stopped: true, alreadyGone: false };
+}
+
+export type FencedStartOutcome =
+  | { readonly started: true; readonly pid: number; readonly startedAtMs: number }
+  | {
+      readonly started: false;
+      readonly outcome: "CENSUS_UNAVAILABLE" | "DUPLICATE_PRESENT" | "SPAWN_FAILED";
+      readonly reason: string;
+    }
+  | {
+      /**
+       * A process WAS started and may well be healthy, but its creation time
+       * could not be read, so no record of it can ever be ownership-verified.
+       *
+       * Carries the pid so a caller can report it. Deliberately NOT `started:
+       * true`: a role whose ownership cannot be proven must not count towards
+       * a successful transition, and deliberately not a reason to kill it
+       * either -- an unproven process is unproven in both directions.
+       */
+      readonly started: false;
+      readonly outcome: "OWNERSHIP_UNPROVEN";
+      readonly pid: number;
+      readonly reason: string;
+    };
+
+export type FencedStartAdapters = Pick<
+  WorkerRestartAdapters,
+  "probe" | "unaccountedLeaves" | "spawnWorker" | "log"
+> & {
+  /** Persists the new root. Called the instant a pid exists. */
+  recordOwnership?: (pid: number, startedAtMs: number) => void;
+};
+
+/**
+ * How many times a fresh spawn's creation time is asked for before giving up.
+ *
+ * Bounded, and small. The creation time exists the moment the process does, so
+ * a miss is a failure of the PROBE rather than of the process -- worth one or
+ * two retries because a probe is a separate round-trip that can fail on its
+ * own, and worth no more than that because a probe that fails three times is
+ * not going to succeed on the fourth.
+ */
+export const OWNERSHIP_PROOF_ATTEMPTS = 3;
+
+/**
+ * FENCED START. Spawns exactly one replacement, or refuses.
+ *
+ * The census is taken HERE, immediately before the spawn, never inherited from
+ * a decision taken earlier: between a decision and a spawn a tree gets killed,
+ * and an externally started runtime can appear in that window. An unreadable
+ * census refuses, because it is not evidence of absence.
+ *
+ * `recordOwnership` runs the instant a pid exists, so the window in which a
+ * spawned process has no durable owner is one synchronous call. It cannot be
+ * closed entirely -- a crash between spawn and record is possible -- and
+ * recovery must treat that as UNKNOWN rather than assume either outcome.
+ *
+ * ## A spawn without a provable identity is not a success
+ *
+ * A record needs a creation time: `verifyOwnership` compares it against the
+ * live process, and that comparison is the only thing standing between "our
+ * worker" and "whatever reused that pid". A record written with a zero
+ * creation time can never be verified, so treating such a spawn as success
+ * would let a transition finish and clear its marker while leaving a role
+ * nobody can subsequently prove they own -- and therefore nobody can safely
+ * stop.
+ *
+ * So the creation time is asked for a bounded number of times, and when it
+ * still cannot be read the outcome is OWNERSHIP_UNPROVEN. The pid is recorded
+ * anyway, because an operator needs to see it, but with a creation time that
+ * fails verification -- which keeps the process counted as an UNEXPLAINED LEAF
+ * by the census. That is deliberate: it is the thing that stops anyone
+ * spawning beside it. It is not killed, because an unproven process is
+ * unproven in both directions.
+ */
+export function executeFencedStart(role: string, adapters: FencedStartAdapters): FencedStartOutcome {
+  const unaccounted = adapters.unaccountedLeaves();
+  if (unaccounted === null) {
+    adapters.log(`fenced start: the pre-spawn census for ${role} could not be read — nothing was started`);
+    return { started: false, outcome: "CENSUS_UNAVAILABLE", reason: "process census unavailable" };
+  }
+  if (unaccounted > 0) {
+    adapters.log(
+      `fenced start: ${unaccounted} unaccounted ${role} runtime(s) are already running — nothing was started`
+    );
+    return { started: false, outcome: "DUPLICATE_PRESENT", reason: `${unaccounted} unaccounted runtime(s)` };
+  }
+
+  const pid = adapters.spawnWorker();
+  if (pid === null) {
+    adapters.log(`fenced start: ${role} could not be started`);
+    return { started: false, outcome: "SPAWN_FAILED", reason: "spawn returned no pid" };
+  }
+
+  // A bounded fresh attempt to establish an ownership record that can later
+  // be VERIFIED, rather than one that merely exists.
+  let startedAtMs = 0;
+  for (let attempt = 0; attempt < OWNERSHIP_PROOF_ATTEMPTS && startedAtMs === 0; attempt += 1) {
+    const probe = adapters.probe(pid);
+    startedAtMs = (probe.observed ? probe.process?.startedAtMs : undefined) ?? 0;
+  }
+
+  // Durable FIRST, before anything else can fail -- including in the unproven
+  // case, so the pid is at least visible to an operator.
+  adapters.recordOwnership?.(pid, startedAtMs);
+
+  if (startedAtMs === 0) {
+    adapters.log(
+      `fenced start: started ${role} pid ${pid}, but its creation time could not be read — ` +
+        "its ownership cannot be proven, so it was NOT killed and nothing was started beside it"
+    );
+    return {
+      started: false,
+      outcome: "OWNERSHIP_UNPROVEN",
+      pid,
+      reason: "the new process's creation time could not be read",
+    };
+  }
+
+  adapters.log(`fenced start: started ${role} pid ${pid}`);
+  return { started: true, pid, startedAtMs };
+}
+
+/**
+ * Carries out ONE restart decision, by composing the two fenced primitives.
+ *
+ * ## The singleton argument, unchanged
+ *
+ * There is exactly one spawn, inside `executeFencedStart`, and it is reached
+ * only once `executeFencedStop` has CONFIRMED the old tree is gone -- either
+ * because it exited on its own or because a post-kill observation proved it.
+ * A stop that cannot be proven returns without starting anything, so the
+ * failure mode stays "no worker" rather than "two workers".
+ *
+ * Since the account runtime transition drives the same two primitives in a
+ * different order, supervision and transitions cannot drift into two different
+ * answers about what an unobservable or unowned tree means.
  */
 export function executeWorkerRestart(
   decision: SupervisionDecision,
-  /**
-   * Structurally typed rather than `RuntimeState`, so the DUAL launcher can
-   * pass its own state shape. Only the repo root and the recorded roots are
-   * read; nothing else about the state matters to a restart.
-   */
   state: {
     readonly repoRoot: string;
     readonly processes: readonly { role: string; pid: number; startedAtMs: number }[];
   },
   attemptNumber: number,
   adapters: WorkerRestartAdapters,
-  /**
-   * WHICH recorded role is being replaced. Defaults to the legacy
-   * single-stack worker so every existing caller is unchanged; the dual
-   * launcher names its own role, and a pass for one role can therefore never
-   * select another role's record.
-   */
   role: string = "worker"
 ): WorkerRestartResult {
   if (decision.action === "NONE") {
@@ -515,124 +702,32 @@ export function executeWorkerRestart(
     if (oldPid === null) {
       return { outcome: "NOT_ATTEMPTED", oldPid: null, newPid: null, record: null };
     }
-    const current = state.processes.find((entry) => entry.role === role && entry.pid === oldPid);
-    if (!current) {
-      adapters.log(`worker supervision: pid ${oldPid} is no longer in runtime state — nothing was stopped`);
-      return { outcome: "OWNERSHIP_LOST", oldPid, newPid: null, record: null };
-    }
-    // Re-verify immediately before the kill, never on the earlier reading.
-    // A probe that could not be MADE is not a probe that found nothing. Asking
-    // `verifyOwnership` about it would return GONE, and GONE is the verdict
-    // that authorises a replacement without a kill.
-    const beforeProbe = adapters.probe(oldPid);
-    if (!beforeProbe.observed) {
+    const current = state.processes.find((entry) => entry.role === role && entry.pid === oldPid) ?? null;
+    const stop = executeFencedStop(current, state.repoRoot, adapters);
+    if (!stop.stopped) {
+      // A record that vanished from state is the same refusal as one we cannot
+      // prove: nothing was stopped, so nothing may be started.
+      const outcome = stop.outcome === "NOT_RECORDED" ? "OWNERSHIP_LOST" : stop.outcome;
+      // The primitive reports what IT did; only the composer knows a spawn was
+      // going to follow, so the consequence is stated here.
       adapters.log(
-        `worker supervision: pid ${oldPid} could not be observed — NOT terminated, no replacement was started`
+        `worker supervision: ${stop.reason} — no replacement was started`
       );
-      return { outcome: "OBSERVATION_UNAVAILABLE", oldPid, newPid: null, record: null };
-    }
-    const before = verifyOwnership(current, beforeProbe.process, state.repoRoot);
-    if (!before.owned) {
-      if (before.reason === "GONE") {
-        adapters.log(`worker supervision: pid ${oldPid} exited on its own before it could be stopped`);
-      } else {
-        // It stopped looking like ours between the decision and now. Refuse.
-        adapters.log(`worker supervision: pid ${oldPid} is no longer provably ours (${before.reason}) — NOT terminated`);
-        return { outcome: "OWNERSHIP_LOST", oldPid, newPid: null, record: null };
-      }
-    } else {
-      adapters.terminate(oldPid);
-      // Same rule after the kill: without an observation there is no proof the
-      // tree exited, and an unproven exit must not be followed by a spawn.
-      const afterProbe = adapters.probe(oldPid);
-      if (!afterProbe.observed) {
-        adapters.log(
-          `worker supervision: pid ${oldPid} was signalled but could not be observed afterwards — no replacement was started`
-        );
-        return { outcome: "OBSERVATION_UNAVAILABLE", oldPid, newPid: null, record: null };
-      }
-      const after = verifyOwnership(current, afterProbe.process, state.repoRoot);
-      if (after.owned) {
-        adapters.log(`worker supervision: pid ${oldPid} could NOT be stopped — no replacement was started`);
-        return { outcome: "TERMINATION_FAILED", oldPid, newPid: null, record: null };
-      }
-      /**
-       * PID_REUSED and NOT_THIS_REPO here both mean the tree we terminated is
-       * no longer at that pid, which is what the kill was for:
-       *
-       *   PID_REUSED     the creation time moved, so the pid was freed and
-       *                  handed to somebody else -- ours exited.
-       *   NOT_THIS_REPO  the same pid, a creation time within a second of our
-       *                  record, and a different command line. A live process
-       *                  cannot rewrite its own command line, and the pre-kill
-       *                  probe already matched this repository, so this is
-       *                  reachable only as a recycled pid that landed inside
-       *                  the timing tolerance.
-       *
-       * Neither is observation ambiguity -- that case returned above, because
-       * an unmade observation never reaches `verifyOwnership`. The fresh census
-       * below remains the authority on whether a replacement is safe.
-       */
-      adapters.log(`worker supervision: pid ${oldPid} stopped`);
+      return { outcome, oldPid, newPid: null, record: null };
     }
   }
 
-  /**
-   * --- The pre-spawn fence ------------------------------------------
-   *
-   * Everything above proved the OLD tree is gone. This proves no OTHER
-   * runtime has taken its place in the meantime.
-   *
-   * The decision was made from a census taken before the kill, and a kill
-   * takes time. An operator starting a worker by hand in that window, or a
-   * second launcher doing the same, would otherwise be joined by this
-   * replacement -- two consumers on one queue, which is the failure this
-   * whole sequence exists to prevent.
-   *
-   * Refused BOTH ways: a leaf that is present, and a census that could not
-   * be read. An unreadable census is not evidence of absence.
-   */
-  const unaccounted = adapters.unaccountedLeaves();
-  if (unaccounted === null) {
-    adapters.log(
-      "worker supervision: the pre-spawn process census could not be read — no replacement was started"
-    );
-    return { outcome: "CENSUS_UNAVAILABLE", oldPid, newPid: null, record: null };
-  }
-  if (unaccounted > 0) {
-    adapters.log(
-      `worker supervision: ${unaccounted} unaccounted runtime(s) appeared before the replacement could start — ` +
-        "no replacement was started"
-    );
-    return { outcome: "DUPLICATE_PRESENT", oldPid, newPid: null, record: null };
+  const started = executeFencedStart(role, adapters);
+  if (!started.started) {
+    return { outcome: started.outcome, oldPid, newPid: null, record: null };
   }
 
-  // The ONLY spawn in this module.
-  const newPid = adapters.spawnWorker();
-  if (newPid === null) {
-    adapters.log("worker supervision: the replacement worker could not be started");
-    return { outcome: "SPAWN_FAILED", oldPid, newPid: null, record: null };
-  }
-
-  // Diagnostic only: the spawn already happened, and an unreadable creation
-  // time makes the record unverifiable rather than unsafe. Reported, not
-  // refused -- refusing here would leave a started process unrecorded.
-  const spawnedProbe = adapters.probe(newPid);
-  const probe = spawnedProbe.observed ? spawnedProbe.process : null;
   const record: OwnedProcess = {
     role: role as OwnedProcess["role"],
-    pid: newPid,
-    // The OS's own creation time, so a later ownership check compares like with
-    // like. Falling back to 0 would make the record unverifiable, so a missing
-    // probe keeps the spawn but is reported.
-    startedAtMs: probe?.startedAtMs ?? 0,
+    pid: started.pid,
+    startedAtMs: started.startedAtMs,
   };
-  if (!probe) {
-    adapters.log(`worker supervision: started pid ${newPid} but its creation time could not be read`);
-  } else {
-    adapters.log(`worker supervision: started replacement worker pid ${newPid}`);
-  }
-  return { outcome: "RESTARTED", oldPid, newPid, record };
+  return { outcome: "RESTARTED", oldPid, newPid: started.pid, record };
 }
 
 /**
