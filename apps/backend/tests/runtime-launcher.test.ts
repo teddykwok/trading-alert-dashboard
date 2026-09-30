@@ -505,16 +505,25 @@ describe("runtime launcher: the Windows spawn shape", () => {
     // Both supervisors now route through ONE shared restart adapter, which
     // builds the plan from the role it was handed. That is the only
     // supervised spawn in the tool.
-    expect(source).toContain("const plan = dualSpawnPlan(role, REPO_ROOT);");
+    expect(source).toContain("spawnRoleWithDurableLog(role, dualSpawnPlan(role, REPO_ROOT))");
     expect(source).not.toContain("pnpm.cmd");
     expect(source).not.toContain("shell: true");
-    // Three spawn call sites: the six-role start, the ONE shared supervised
+    // ONE spawn call site in the whole tool, inside the helper that attaches
+    // the durable log sink. Stronger than the three it replaced: a new start
+    // path cannot now be added that quietly forgets the sink.
     // restart both supervisors call, and the account-transition start adapter.
     // The probe/kill adapters use spawnSync.
-    expect((source.match(/(?<!\w)spawn\(/g) ?? []).length).toBe(3);
+    expect((source.match(/(?<!\w)spawn\(/g) ?? []).length).toBe(1);
+    expect(source).toContain("function spawnRoleWithDurableLog(");
+    // Three CALLERS still: the six-role start, the shared supervised restart,
+    // and the account-transition start adapter.
+    expect((source.match(/spawnRoleWithDurableLog\(/g) ?? []).length).toBe(4); // 1 definition + 3 callers
     // Every one of them builds its command from the reviewed per-role plan, so
     // no spawn can reach a role with another role's env file.
-    expect((source.match(/spawn\(plan\.command, plan\.args, plan\.options\)/g) ?? []).length).toBe(3);
+    // The plan's own stdio is overridden with the opened sink, and nothing
+    // else may spawn with the raw plan options.
+    expect((source.match(/spawn\(plan\.command, plan\.args, plan\.options\)/g) ?? []).length).toBe(0);
+    expect(source).toContain("stdio: [\"ignore\", sink.fd, sink.fd],");
   });
 });
 
@@ -1417,7 +1426,13 @@ describe("runtime launcher: structural guarantees", () => {
     // not a target list: every occurrence must sit in a CIM query, and the
     // only terminator remains taskkill with an explicit PID.
     for (const line of source.split("\n").filter((candidate) => candidate.includes("node.exe"))) {
-      expect(`${line.trim().slice(0, 40)} -> ${line.includes("Get-CimInstance")}`).toBe(
+      // The ancestry filter names it for a second, equally read-only reason:
+      // the process tree deliberately includes cmd.exe wrappers, whose command
+      // lines carry the entrypoint too, so the executable is what separates a
+      // runtime from its wrapper. Still an observation, never a target list.
+      const isObservation =
+        line.includes("Get-CimInstance") || line.includes("executable.toLowerCase()");
+      expect(`${line.trim().slice(0, 40)} -> ${isObservation}`).toBe(
         `${line.trim().slice(0, 40)} -> true`
       );
     }

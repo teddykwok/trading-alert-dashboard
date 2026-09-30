@@ -186,6 +186,49 @@ export function runtimeEnvDir(env: NodeJS.ProcessEnv = process.env): string {
   return join(env.LOCALAPPDATA ?? "", "trading-alert-dashboard", "env");
 }
 
+/**
+ * Where a launcher-managed role's stdout and stderr are kept.
+ *
+ * ## Why this exists
+ *
+ * Every role was spawned with `stdio: "ignore"`. When Account A's execution
+ * runtime died, everything it said on the way out -- the stack, the reason,
+ * the last log line -- went to a null device, and the cause was unrecoverable
+ * afterwards by construction.
+ *
+ * The file is named after the ROLE, which is a fixed identifier from this
+ * module. No account identifier, token, port or environment value appears in
+ * the path: a log filename is something an operator reads aloud and pastes
+ * into a chat window.
+ *
+ * Lives beside the launcher's own state and env, outside the repository, so a
+ * checkout never carries a production log and `git clean` never deletes one.
+ */
+export function roleLogDirectory(env: NodeJS.ProcessEnv = process.env): string {
+  return join(env.LOCALAPPDATA ?? env.TEMP ?? ".", "trading-alert-dashboard", "logs");
+}
+
+/** One file per ROLE, so two accounts can never share or rotate each other's. */
+export function roleLogPath(role: DualRole, env: NodeJS.ProcessEnv = process.env): string {
+  return join(roleLogDirectory(env), `${role}.log`);
+}
+
+/** The single previous generation. Rotation renames onto exactly this name. */
+export function rotatedRoleLogPath(role: DualRole, env: NodeJS.ProcessEnv = process.env): string {
+  return `${roleLogPath(role, env)}.1`;
+}
+
+/**
+ * How large one role's log may grow before a start rotates it.
+ *
+ * Checked when a role is STARTED, not while it runs, which is the whole of the
+ * bound: a single long-lived process can exceed this and keep going. That
+ * residual is accepted deliberately -- a size check on a hot path, or a second
+ * process watching the file, would both be worse than a file that can grow
+ * between restarts.
+ */
+export const ROLE_LOG_ROTATE_BYTES = 32 * 1024 * 1024;
+
 export function envFilePathFor(role: DualRole, env: NodeJS.ProcessEnv = process.env): string {
   return join(runtimeEnvDir(env), `${ROLE_CONTRACTS[role].envAlias}.env`);
 }

@@ -543,6 +543,150 @@ export function parseProcessRows(stdout: string): Observation<ProcessProbe[]> {
   return observed(rows);
 }
 
+/**
+ * One observed process, with the link that makes a TREE out of a list.
+ *
+ * Separate from `ProcessProbe` because the parent link is only needed for
+ * ancestry: every existing caller asks "is this pid still ours", which the
+ * pid and creation time already answer.
+ */
+export interface ObservedProcessNode {
+  readonly pid: number;
+  readonly parentPid: number;
+  /**
+   * The image name, e.g. `node.exe`.
+   *
+   * Recorded because the tree deliberately includes `cmd.exe` wrappers, and a
+   * wrapper's command line carries the entrypoint too: `cmd /c tsx
+   * .../execution.worker.ts` matches every text rule a runtime matches. Only
+   * the executable tells them apart, and counting a wrapper as a runtime would
+   * turn one healthy worker into an apparent duplicate.
+   */
+  readonly executable: string;
+  readonly startedAtMs: number;
+  readonly commandLine: string;
+}
+
+/**
+ * Parses the process TREE listing. All-or-nothing, like its sibling.
+ *
+ * Five fields rather than three, and the producing script strips `|` from the
+ * command line, so any other shape is not a row this code wrote. One malformed
+ * row discards the whole observation: a partially-parsed tree would let a leaf
+ * look parentless, and a parentless leaf reads as somebody else's.
+ */
+export function parseProcessTreeRows(stdout: string): Observation<ObservedProcessNode[]> {
+  const rows: ObservedProcessNode[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    const parts = trimmed.split("|");
+    if (parts.length !== 5) return unobserved("UNPARSEABLE");
+    const [pid, parentPid, executable, startedAtMs, commandLine] = parts;
+    if (!/^\d+$/.test(pid) || !/^\d+$/.test(parentPid) || !/^\d+$/.test(startedAtMs)) {
+      return unobserved("UNPARSEABLE");
+    }
+    if (executable.trim() === "") return unobserved("UNPARSEABLE");
+    rows.push({
+      pid: Number(pid),
+      parentPid: Number(parentPid),
+      executable,
+      startedAtMs: Number(startedAtMs),
+      commandLine,
+    });
+  }
+  return observed(rows);
+}
+
+/**
+ * Runtime leaves, sorted by WHOSE TREE they are in.
+ *
+ * ## Why counting was never going to be enough
+ *
+ * Both account workers run the same entrypoint with the same command line;
+ * the only thing that distinguishes them is an environment variable, which
+ * the process table does not expose. So a leaf cannot be labelled with an
+ * account by looking at it -- it can only be labelled by where it hangs.
+ *
+ * An earlier version subtracted other accounts' healthy roots from the
+ * machine-wide leaf count and treated any remainder as unexplained. That is
+ * right when the remainder is somebody else's, and exactly wrong when the
+ * remainder is OUR OWN still-running runtime: a worker whose reconciliation
+ * failed withdraws its attestation and keeps running, and subtraction reports
+ * its leaf as an unexplained stranger. The account then cannot be repaired at
+ * all, which is the hole this replaces.
+ */
+export interface LeafAncestryCounts {
+  /** Leaves descended from the selected owned root. */
+  readonly underSelected: number;
+  /** Leaves descended from another launcher-owned root. Not our business. */
+  readonly underOtherOwned: number;
+  /** Leaves under nobody we own. Any of these refuses every repair. */
+  readonly unowned: number;
+}
+
+export type LeafAncestry =
+  | { readonly known: false; readonly reason: string }
+  | ({ readonly known: true } & LeafAncestryCounts);
+
+/**
+ * Walks each runtime leaf up to the owned root it belongs to.
+ *
+ * `isLeaf` decides what counts as a runtime rather than a wrapper, so the
+ * caller supplies the same entrypoint rule the census uses and this function
+ * has no opinion about role vocabulary. It is given the whole node, because
+ * the command line alone cannot tell a `cmd /c tsx <entrypoint>` wrapper from
+ * the runtime it wraps.
+ *
+ * A chain that leaves the observed set before reaching any owned root counts
+ * as UNOWNED. That is the conservative direction on purpose: an unresolvable
+ * ancestry is not evidence that a leaf is ours, and treating it as ours is
+ * what would authorise killing somebody else's runtime.
+ */
+export function classifyLeavesByAncestry(input: {
+  readonly processes: readonly ObservedProcessNode[];
+  readonly isLeaf: (process: ObservedProcessNode) => boolean;
+  readonly selectedRootPid: number;
+  readonly otherOwnedRootPids: readonly number[];
+}): LeafAncestryCounts {
+  const byPid = new Map<number, ObservedProcessNode>();
+  for (const process of input.processes) byPid.set(process.pid, process);
+  const otherRoots = new Set(input.otherOwnedRootPids);
+
+  let underSelected = 0;
+  let underOtherOwned = 0;
+  let unowned = 0;
+
+  for (const process of input.processes) {
+    if (!input.isLeaf(process)) continue;
+
+    // Walk up. The bound is the observed set, so a cycle or a very deep chain
+    // terminates rather than spinning.
+    let current: ObservedProcessNode | undefined = process;
+    const visited = new Set<number>();
+    let owner: "SELECTED" | "OTHER" | null = null;
+
+    while (current !== undefined && !visited.has(current.pid)) {
+      visited.add(current.pid);
+      if (current.pid === input.selectedRootPid) {
+        owner = "SELECTED";
+        break;
+      }
+      if (otherRoots.has(current.pid)) {
+        owner = "OTHER";
+        break;
+      }
+      current = byPid.get(current.parentPid);
+    }
+
+    if (owner === "SELECTED") underSelected += 1;
+    else if (owner === "OTHER") underOtherOwned += 1;
+    else unowned += 1;
+  }
+
+  return { underSelected, underOtherOwned, unowned };
+}
+
 /** The machine calls a rollback makes. Injected, so the sequence is testable. */
 export interface RollbackAdapters {
   probe(pid: number): Observation<ReadonlyMap<number, ProcessProbe>>;

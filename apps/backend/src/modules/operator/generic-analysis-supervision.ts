@@ -163,6 +163,16 @@ function messageFor(reasonCode: SupervisionReasonCode, leaves: number): string {
       );
     case "INCONSISTENT_OBSERVATION":
       return "Generic analysis ownership and health disagree. Nothing was changed.";
+    // The account-worker leaf-accounting branch. This role supplies no leaf
+    // evidence, so the ladder never enters it and these are unreachable here --
+    // but the switch stays exhaustive so a future reason code cannot be added
+    // without this file being made to answer for it.
+    case "OWNED_ROOT_WITHOUT_RUNTIME":
+    case "WORKER_RUNTIME_UNHEALTHY":
+    case "STARTUP_GRACE":
+    case "LEAF_CENSUS_UNKNOWN":
+    case "LEAF_UNEXPLAINED":
+      return "Generic analysis supervision does not use account leaf accounting. Nothing was changed.";
   }
 }
 

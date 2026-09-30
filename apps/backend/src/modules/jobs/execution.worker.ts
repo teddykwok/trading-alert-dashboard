@@ -20,6 +20,7 @@ import { ExecutionService } from "../execution/execution.service";
 import { SelectedPlanExecutor } from "../execution/selected-plan-executor";
 import { ExtremeRRService } from "../extreme-rr/extreme-rr.service";
 import { createRuntimeAttestationPublisher } from "../runtime/runtime-attestation";
+import { installFatalHandlers, startWorkerLiveness } from "../runtime/worker-liveness";
 import {
   createAttestationRedisClient,
   describeRedisFailure,
@@ -72,6 +73,13 @@ import {
  * per-process heap, and there is one profile per process.
  */
 
+// FIRST, before any await can reject into nothing.
+//
+// Node terminates on an unhandled rejection and this process had no handler,
+// so a worker could die leaving no record of why. These write synchronously to
+// fd 2 -- which the launcher now points at a durable file -- and exit non-zero.
+installFatalHandlers();
+
 async function startExecutionRuntime(): Promise<void> {
   const bound = await bindConfiguredExchangeRuntime(prisma);
   if (!bound.ok) {
@@ -83,6 +91,11 @@ async function startExecutionRuntime(): Promise<void> {
       { reasonCode: bound.reasonCode },
       "Account-bound runtime could not be established - this execution worker is NOT running"
     );
+    // Non-zero, and deliberately not a silent return. Nothing below has run, so
+    // there is no liveness handle and no attestation; a bare `return` would
+    // leave the process to exit 0 as though it had done its job, and the
+    // launcher root would collapse looking like a clean shutdown.
+    process.exitCode = 1;
     return;
   }
 
@@ -159,11 +172,25 @@ async function startExecutionRuntime(): Promise<void> {
   });
   runtimeAttestation.start();
 
+  // LAST, and only now: every scheduler is running and attestation is
+  // publishing, so this process is a runtime authority and should stay alive
+  // until it is told otherwise. Created here rather than at the top so a
+  // startup that failed above still exits instead of idling forever.
+  //
+  // It holds the event loop open and nothing else. It publishes no health, and
+  // attestation stays gated on `isReconciliationHealthy`, so a worker kept
+  // alive by this with a stalled scheduler still withdraws its attestation and
+  // is still recoverable by supervision.
+  const liveness = startWorkerLiveness();
+
   logger.info("Account execution worker started — orchestration and plan adoption running");
 
   // Owns ONLY what it created. It must never close the generic worker's queues,
   // and the generic worker must never withdraw this attestation.
   process.on("SIGTERM", async () => {
+    // Released FIRST so a shutdown that then hangs on a socket is visible as a
+    // hang, rather than being held open by our own keepalive.
+    liveness.stop();
     await runtimeAttestation.stop();
     await attestationRedis.close();
     clearInterval(orchestrationTimer);
@@ -182,6 +209,10 @@ void startExecutionRuntime().catch((error) => {
     { error: error instanceof Error ? error.message.slice(0, 300) : "unknown" },
     "Account execution worker bootstrap threw - execution is NOT running"
   );
+  // A bootstrap that threw leaves no scheduler, no attestation and no liveness
+  // handle. Exiting non-zero says so; returning quietly would let the process
+  // wind down as if it had finished normally.
+  process.exitCode = 1;
 });
 
 /**

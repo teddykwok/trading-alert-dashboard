@@ -312,11 +312,34 @@ describe("readiness and deployment name the account worker", () => {
     expect(clearers).toEqual([]);
   });
 
-  it("15. the account worker is startable as its own process", () => {
+  it("15. the account worker is startable as its own process, WITHOUT a file watcher", () => {
     const pkg = JSON.parse(raw("package.json")) as { scripts: Record<string, string> };
-    expect(pkg.scripts["execution-worker"]).toBe("tsx watch src/modules/jobs/execution.worker.ts");
-    // The generic one is unchanged, and still a separate command.
+
+    // `tsx watch` is a development file watcher, not a process supervisor. Its
+    // wrapper respawns the target only on a file CHANGE; a target that exits on
+    // its own leaves the wrapper alive forever with nothing underneath it. That
+    // is exactly what happened in production: an owned root with no runtime,
+    // which supervision could not see and could not repair.
+    //
+    // Plain `tsx` still spawns a child, but the wrapper EXITS with it, so a dead
+    // runtime collapses the whole owned tree into an honest "gone".
+    expect(pkg.scripts["execution-worker"]).toBe("tsx src/modules/jobs/execution.worker.ts");
+    expect(pkg.scripts["execution-worker"]).not.toContain("watch");
+
+    // Watch mode survives for developers, under a name production never uses.
+    expect(pkg.scripts["execution-worker:watch"]).toBe("tsx watch src/modules/jobs/execution.worker.ts");
+
+    // The generic one is out of scope for this branch and unchanged.
     expect(pkg.scripts.worker).toBe("tsx watch src/modules/jobs/vision-analysis.worker.ts");
+  });
+
+  it("15a. the launcher can never start the account worker in watch mode", () => {
+    // The role contract names the script, so this is the one place the
+    // production command is chosen.
+    const contracts = codeOf("src/modules/operator/dual-account-topology.ts");
+    expect((contracts.match(/script: "execution-worker"/g) ?? []).length).toBe(2);
+    expect(contracts).not.toContain("execution-worker:watch");
+    expect(codeOf(LAUNCHER)).not.toContain("execution-worker:watch");
   });
 
   it("15b. the launcher starts the generic AND the account worker", () => {

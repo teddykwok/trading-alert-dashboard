@@ -209,6 +209,16 @@ export type SupervisionReasonCode =
   | "RESTART_BUDGET_EXHAUSTED"
   | "WORKER_EXITED"
   | "WORKER_STALE"
+  /** The owned root is alive but the runtime it should be wrapping is gone. */
+  | "OWNED_ROOT_WITHOUT_RUNTIME"
+  /** A freshly started root has not published anything yet. Not a fault. */
+  | "STARTUP_GRACE"
+  /** The process census could not be read, so leaves cannot be accounted for. */
+  | "LEAF_CENSUS_UNKNOWN"
+  /** A runtime leaf exists outside every launcher-owned tree. */
+  | "LEAF_UNEXPLAINED"
+  /** The runtime is alive inside our tree but has stopped attesting. */
+  | "WORKER_RUNTIME_UNHEALTHY"
   | "INCONSISTENT_OBSERVATION";
 
 export type SupervisionAction = "NONE" | "RESTART" | "TERMINATE_THEN_RESTART";
@@ -223,6 +233,53 @@ export interface SupervisionDecision {
   terminatePid: number | null;
 }
 
+/**
+ * Runtime leaves, sorted by WHOSE TREE they hang in.
+ *
+ * ## Why counting was never going to work
+ *
+ * Both account workers run the same entrypoint with the same command line;
+ * only an environment variable distinguishes them, and the process table does
+ * not expose it. A leaf therefore cannot be identified by looking at it -- only
+ * by where it hangs.
+ *
+ * Two successive versions of this got it wrong in opposite directions. The
+ * first assumed one leaf per alive root, which the incident falsified: an
+ * owned root was alive with nothing underneath it. The second subtracted other
+ * accounts' healthy roots and called any remainder unexplained -- correct when
+ * the remainder is a stranger, and exactly wrong when the remainder is OUR OWN
+ * still-running runtime. A worker whose reconciliation fails withdraws its
+ * attestation and keeps running; subtraction reported its leaf as somebody
+ * else's and refused every repair, permanently.
+ *
+ * Ancestry answers the question the counts were standing in for.
+ */
+export type LeafAccounting =
+  | { readonly known: false; readonly reason: string }
+  | {
+      readonly known: true;
+      /** Leaves descended from THIS role's owned root. */
+      readonly underSelected: number;
+      /** Leaves descended from another launcher-owned root. */
+      readonly underOtherOwned: number;
+      /** Leaves under nobody we own, including any we could not trace. */
+      readonly unowned: number;
+    };
+
+/**
+ * How long a freshly started root is left alone before absence means failure.
+ *
+ * A root that has just been spawned is legitimately a wrapper with nothing
+ * underneath it yet: the runtime has to start, connect and publish its first
+ * heartbeat. Reading that interval as a dead worker would make supervision
+ * kill every worker it started, moments after starting it.
+ *
+ * Measured from the RECORD's creation time rather than from a restart attempt,
+ * because a root started by Start SAFE or by an account transition has no
+ * restart attempt behind it and needs the same grace.
+ */
+export const WORKER_STARTUP_GRACE_MS = 45_000;
+
 export interface WorkerSupervisionInput {
   /** The launcher's recorded worker process, or null when none is recorded. */
   record: OwnedProcess | null;
@@ -236,6 +293,11 @@ export interface WorkerSupervisionInput {
   nowMs: number;
   /** True when the launcher has no runtime state file at all. */
   hasRuntimeState: boolean;
+  /**
+   * Runtime leaves for this role's entrypoint. Absent or unknown REFUSES the
+   * owned-root-without-runtime repair; it never permits it.
+   */
+  leaves?: LeafAccounting;
 }
 
 const decide = (
@@ -372,6 +434,95 @@ export function decideWorkerSupervision(input: WorkerSupervisionInput): Supervis
       "WORKER_RESTARTING",
       "WORKER_EXITED",
       "The worker process is gone. Starting exactly one replacement in the recorded deployment mode."
+    );
+  }
+
+  // CASE C: the owned root is alive, and the runtime under it is gone.
+  //
+  // This is the state the incident produced and the ladder did not model. The
+  // root is a wrapper process; killing it was never the question, because it
+  // was provably ours and provably running. What was missing was any way to
+  // say "and yet there is no runtime", which needs the census as well as the
+  // attestation.
+  // Scoped to callers that supply leaf evidence. The generic-analysis
+  // supervisor shares this ladder but has no account entrypoint census to
+  // offer, so it never enters here and its decisions are unchanged.
+  if (input.ownership.owned && input.workerHealth === "OFF" && input.leaves !== undefined) {
+    // A root that was started moments ago has not failed; it has not finished
+    // starting. This gate is FIRST so no amount of census evidence can turn a
+    // normal startup interval into a restart.
+    const rootAgeMs = input.nowMs - input.record.startedAtMs;
+    if (rootAgeMs < WORKER_STARTUP_GRACE_MS) {
+      return decide(
+        "NONE",
+        "WORKER_RESTARTING",
+        "STARTUP_GRACE",
+        "The worker root was started moments ago and has not published a heartbeat yet; it is not judged."
+      );
+    }
+
+    const leaves = input.leaves;
+    if (!leaves.known) {
+      return decide(
+        "NONE",
+        "WORKER_DEGRADED",
+        "LEAF_CENSUS_UNKNOWN",
+        `The process census could not be read (${leaves.reason}), so an absent runtime cannot be told ` +
+          "from an unreadable machine. Nothing was changed."
+      );
+    }
+
+    // A runtime nobody owns. It may be a hand-started worker for this very
+    // account, so it is neither killed nor spawned beside -- the same refusal
+    // `executeFencedStart` would reach a moment later, reached before anything
+    // has been stopped.
+    if (leaves.unowned > 0) {
+      return decide(
+        "NONE",
+        "WORKER_DEGRADED",
+        "LEAF_UNEXPLAINED",
+        `${leaves.unowned} execution runtime(s) are running outside every launcher-owned tree. ` +
+          "Nothing was terminated and nothing was started."
+      );
+    }
+
+    // Two runtimes under OUR root. Terminating the tree would stop both, but a
+    // tree that grew a second runtime is not a state this understands, and
+    // choosing is not its job.
+    if (leaves.underSelected > 1) {
+      return decide(
+        "NONE",
+        "WORKER_DEGRADED",
+        "WORKER_DUPLICATE",
+        `${leaves.underSelected} execution runtimes are running inside this account's own tree. ` +
+          "Supervision will not choose between them; resolve the duplicate first."
+      );
+    }
+
+    if (leaves.underSelected === 0) {
+      // The incident: an owned wrapper with nothing underneath it.
+      return decide(
+        "TERMINATE_THEN_RESTART",
+        "WORKER_STALE",
+        "OWNED_ROOT_WITHOUT_RUNTIME",
+        "The worker root is alive but no runtime is running under it. Stopping the owned tree, then starting exactly one replacement.",
+        input.record.pid
+      );
+    }
+
+    // Exactly one runtime, in our tree, not attesting, past its grace.
+    //
+    // This is the health-withdrawal path: `isReconciliationHealthy` went false,
+    // the attestation publisher withdrew, the TTL expired to ABSENT -- and the
+    // process is still there, now deliberately held alive by its own keepalive.
+    // It is a live worker that has stopped doing the job, which is exactly what
+    // a restart is for.
+    return decide(
+      "TERMINATE_THEN_RESTART",
+      "WORKER_STALE",
+      "WORKER_RUNTIME_UNHEALTHY",
+      "The worker is running inside its owned tree but has withdrawn its attestation. Stopping the owned tree, then starting exactly one replacement.",
+      input.record.pid
     );
   }
 

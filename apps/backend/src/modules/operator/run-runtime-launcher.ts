@@ -1,6 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createConnection, createServer } from "node:net";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createInterface } from "node:readline";
 import path from "node:path";
 
@@ -16,10 +26,14 @@ import {
   SAFE_GATES,
   firstObservationFailure,
   judgeOwnedTree,
+  classifyLeavesByAncestry,
   observed,
   parseProcessRows,
+  parseProcessTreeRows,
   unobserved,
   verifyOwnership,
+  type ObservedProcessNode,
+  type OwnershipVerdict,
   type RoleHealth,
   type Observation,
   type ProcessProbe,
@@ -34,8 +48,13 @@ import {
   ROLE_CONTRACTS,
   RUNTIME_ACCOUNTS,
   censusOf,
+  classifyEntrypoint,
   dualSpawnPlan,
   envFilePathFor,
+  roleLogDirectory,
+  roleLogPath,
+  rotatedRoleLogPath,
+  ROLE_LOG_ROTATE_BYTES,
   evaluateAccountProfileProof,
   evaluateDualShutdownSafety,
   evaluateDualStartPreconditions,
@@ -47,6 +66,7 @@ import {
   validateEnvFiles,
   verifyDualTopology,
   type AccountAttestationView,
+  type DualSpawnPlan,
   type AccountProfileProof,
   type AccountShutdownState,
   type DualRole,
@@ -60,6 +80,7 @@ import {
 } from "./dual-account-topology";
 import {
   EMPTY_RESTART_BUDGET,
+  type LeafAccounting,
   WORKER_SUPERVISION_INTERVAL_MS,
   decideWorkerSupervision,
   executeWorkerRestart,
@@ -454,6 +475,36 @@ class ProcessObservationError extends Error {
     super(`the running processes could not be observed (${reason})`);
     this.name = "ProcessObservationError";
   }
+}
+
+/**
+ * Every node and cmd process on the machine, WITH its parent link.
+ *
+ * Separate from `observeProcesses` rather than replacing it: that one feeds
+ * the entrypoint census, whose all-or-nothing parsing and node-only filter are
+ * load-bearing and separately tested. This one answers a different question --
+ * which tree a runtime hangs in -- and needs `cmd.exe` because the chain from
+ * an owned root to its runtime runs through two of them:
+ *
+ *   cmd.exe (owned root) -> node (pnpm) -> cmd.exe (tsx) -> node (tsx cli)
+ *     -> node (the runtime)
+ *
+ * Read-only, and the minimum widening that makes ancestry provable: a parent
+ * column and one extra executable name.
+ */
+function observeProcessTree(): Observation<ObservedProcessNode[]> {
+  const script =
+    "Get-CimInstance Win32_Process -Filter \"Name='node.exe' OR Name='cmd.exe'\" | " +
+    "ForEach-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.ProcessId, $_.ParentProcessId, $_.Name, " +
+    "([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds(), ($_.CommandLine -replace '\\|',' ') }";
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+  });
+  const classified = classifySpawnResult(result);
+  if (!classified.ok) return classified;
+  // ALL OR NOTHING: a half-parsed tree would leave a leaf looking parentless,
+  // and a parentless leaf reads as somebody else's.
+  return parseProcessTreeRows(classified.value);
 }
 
 function observeListeners(): ObservedListener[] {
@@ -977,17 +1028,16 @@ async function startSafe(): Promise<void> {
     const contract = ROLE_CONTRACTS[role];
     console.log(`Starting ${contract.label} (${contract.envAlias}.env)…`);
     const plan = dualSpawnPlan(role, REPO_ROOT, process.env, validatedKeyNames);
-    const child = spawn(plan.command, plan.args, plan.options);
-    if (child.pid === undefined) {
+    const pid = spawnRoleWithDurableLog(role, plan);
+    if (pid === null) {
       rollback(`${contract.label} could not be spawned.`);
       return;
     }
-    child.unref();
-    const probes = probeProcesses([child.pid]);
-    const startedAtMs = probes.ok ? probes.value.get(child.pid)?.startedAtMs : undefined;
+    const probes = probeProcesses([pid]);
+    const startedAtMs = probes.ok ? probes.value.get(pid)?.startedAtMs : undefined;
     started.push({
       role,
-      pid: child.pid,
+      pid,
       startedAtMs: startedAtMs ?? Date.now(),
       envAlias: contract.envAlias,
       port: contract.port,
@@ -1170,6 +1220,79 @@ function unaccountedLeavesFor(role: DualRole, excludeRole: DualRole): number | n
 }
 
 /**
+ * Opens ONE role's durable output sink, or returns null.
+ *
+ * Returning null is a refusal, not a downgrade: a role whose log could not be
+ * opened is NOT started. Falling back to `stdio: "ignore"` would reproduce
+ * exactly the condition that made the incident unexplainable, and it would do
+ * it silently, at the moment something is already going wrong.
+ *
+ * Rotation is one generation and touches ONLY this role's own two filenames,
+ * so a busy account can never rename or delete another role's log.
+ */
+function openRoleLogSink(role: DualRole): { fd: number; close: () => void } | null {
+  try {
+    mkdirSync(roleLogDirectory(), { recursive: true });
+    const file = roleLogPath(role);
+    try {
+      if (statSync(file).size >= ROLE_LOG_ROTATE_BYTES) renameSync(file, rotatedRoleLogPath(role));
+    } catch {
+      // No file yet, or it cannot be measured. Appending is still correct.
+    }
+    const fd = openSync(file, "a");
+    return {
+      fd,
+      close: () => {
+        try {
+          closeSync(fd);
+        } catch {
+          // Already closed, or never valid. Nothing is leaked either way.
+        }
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Spawns ONE role with its output going somewhere durable.
+ *
+ * The plan's own `stdio` is the pure module's safe default; the sink is opened
+ * here because opening a file is not a decision a pure planner may make. The
+ * parent's copy of the descriptor is closed in a `finally` -- on success, on a
+ * spawn that returned no pid, and on a throw -- so a launcher that runs for
+ * days across many restarts never accumulates descriptors.
+ *
+ * stdout and stderr share one descriptor deliberately: interleaved output in
+ * the order the process actually produced it is what makes a crash readable.
+ */
+function spawnRoleWithDurableLog(role: DualRole, plan: DualSpawnPlan): number | null {
+  const sink = openRoleLogSink(role);
+  if (sink === null) {
+    console.log(
+      `  ${ROLE_CONTRACTS[role].label}: its log file could not be opened, so it was NOT started. ` +
+        "A runtime whose output goes nowhere is how the last incident became unexplainable."
+    );
+    return null;
+  }
+  try {
+    const child = spawn(plan.command, plan.args, {
+      ...plan.options,
+      stdio: ["ignore", sink.fd, sink.fd],
+    });
+    if (child.pid === undefined) return null;
+    child.unref();
+    return child.pid;
+  } catch {
+    return null;
+  } finally {
+    // The child has its own copy from here on.
+    sink.close();
+  }
+}
+
+/**
  * The ONE restart-execution path both supervisors use.
  *
  * Everything about the safety sequence -- pre-kill ownership re-proof, the
@@ -1203,11 +1326,7 @@ function restartOwnedRole(
       spawnWorker: () => {
         // The SAME role, so the SAME env file, through the same reviewed spawn
         // plan every start of that role uses. No operator input reaches it.
-        const plan = dualSpawnPlan(role, REPO_ROOT);
-        const child = spawn(plan.command, plan.args, plan.options);
-        if (child.pid === undefined) return null;
-        child.unref();
-        return child.pid;
+        return spawnRoleWithDurableLog(role, dualSpawnPlan(role, REPO_ROOT));
       },
       log: (line) => console.log(`  ${line}`),
     },
@@ -1288,12 +1407,41 @@ async function superviseAccountWorker(
         console.log(`  ${label}: processes could not be observed (${processes.reason}) — nothing was changed.`);
         return null;
       }
-      const record = alive.find((entry) => entry.role === workerRole) ?? null;
-      const attestation = await readAccountAttestation(account);
+      // The DURABLE record, not merely the alive ones.
+      //
+      // `ownedRolesAlive` drops a record whose process is conclusively GONE,
+      // and the old code then passed `record: null` -- which the ladder reads
+      // as "nothing is owned here" and refuses. That is what made the
+      // process-is-gone case unreachable: the very evidence that justifies a
+      // start-only repair was being thrown away before the decision saw it.
+      const durable = state?.processes.find((entry) => entry.role === workerRole) ?? null;
+      const aliveRecord = alive.find((entry) => entry.role === workerRole) ?? null;
+
+      let ownershipVerdict: OwnershipVerdict | null = null;
+      if (durable !== null && state !== null) {
+        if (aliveRecord !== null) {
+          ownershipVerdict = { owned: true };
+        } else {
+          // Re-probed HERE so the verdict is as fresh as the decision. An
+          // unobservable machine returns without a verdict: UNKNOWN must never
+          // become GONE, because GONE is what authorises a spawn.
+          const probed = probeProcesses([durable.pid]);
+          if (!probed.ok) {
+            console.log(`  ${label}: the recorded worker PID could not be observed (${probed.reason}) — nothing was changed.`);
+            return null;
+          }
+          ownershipVerdict = verifyOwnership(durable, probed.value.get(durable.pid) ?? null, state.repoRoot);
+        }
+      }
+
+      // BOTH accounts' attestation. The other account's health is not idle
+      // curiosity: it is the only thing that can explain a runtime leaf, and
+      // the two account workers share one entrypoint.
+      const attestation = await readAllAttestation();
       const status = projectTopology({
         census: censusOf(processes.value, observeListeners()),
         ownedRoles: alive.map((entry) => entry.role),
-        attestation: { [account]: attestation },
+        attestation,
       });
       const workerView = status.roles.find((entry) => entry.role === workerRole);
       const controlView = status.roles.find((entry) => entry.role === controlRole);
@@ -1311,17 +1459,60 @@ async function superviseAccountWorker(
       };
       const observedBudget = observeWorkerHealth(from, health(workerView), nowMs);
 
+      // WHOSE TREE each runtime hangs in.
+      //
+      // Counting could never answer this: both accounts run the same
+      // entrypoint with the same command line, and the only thing that differs
+      // is an environment variable the process table does not expose. Ancestry
+      // is the one available discriminator, and it is what separates "our
+      // wrapper is empty" from "our worker is alive but has stopped working".
+      const entrypoint = ROLE_CONTRACTS[workerRole].entrypoint;
+      const tree = observeProcessTree();
+      const leaves: LeafAccounting = !tree.ok
+        ? { known: false, reason: tree.reason }
+        : durable === null
+          ? { known: false, reason: "no durable root to trace leaves to" }
+          : {
+              known: true,
+              ...classifyLeavesByAncestry({
+                processes: tree.value,
+                // The SAME entrypoint rule the census uses, and the same
+                // executable filter: the census only ever sees node.exe, so a
+                // `cmd /c tsx <entrypoint>` wrapper must be excluded here too
+                // or one healthy worker would look like a duplicate.
+                isLeaf: (node) =>
+                  node.executable.toLowerCase() === "node.exe" &&
+                  classifyEntrypoint(node.commandLine) === entrypoint,
+                selectedRootPid: durable.pid,
+                // ONLY roles whose contract runs this same entrypoint may
+                // absorb one of its runtimes. `alive` holds every owned role
+                // -- both control planes and both generic roles -- and none of
+                // them is ever supposed to have an execution runtime beneath
+                // it. Letting them absorb one would turn a rogue worker
+                // hanging off a control plane into somebody's legitimate leaf,
+                // and the repair would proceed over the top of it.
+                otherOwnedRootPids: alive
+                  .filter(
+                    (entry) =>
+                      entry.role !== workerRole &&
+                      ROLE_CONTRACTS[entry.role].entrypoint === entrypoint
+                  )
+                  .map((entry) => entry.pid),
+              }),
+            };
+
       // The decision ladder is the tested one. Its record type names the legacy
       // single-stack role; only `pid` is read from it, and the role this pass
       // is about is fixed above — so an A pass can never act on B's process.
       const decision = decideWorkerSupervision({
-        record: record === null ? null : { role: "worker", pid: record.pid, startedAtMs: record.startedAtMs },
-        ownership: record === null ? null : { owned: true },
+        record: durable === null ? null : { role: "worker", pid: durable.pid, startedAtMs: durable.startedAtMs },
+        ownership: ownershipVerdict,
         workerHealth: health(workerView),
         backendHealth: health(controlView),
         budget: observedBudget,
         nowMs,
         hasRuntimeState: state !== null,
+        leaves,
       });
       return { budget: observedBudget, decision };
   };
@@ -1789,11 +1980,7 @@ function transitionAdapters(
       spawnWorker: () => {
         // The SAME reviewed spawn plan every start of that role uses, so the
         // role keeps its own DOTENV_CONFIG_PATH. No operator input reaches it.
-        const plan = dualSpawnPlan(role, REPO_ROOT);
-        const child = spawn(plan.command, plan.args, plan.options);
-        if (child.pid === undefined) return null;
-        child.unref();
-        return child.pid;
+        return spawnRoleWithDurableLog(role, dualSpawnPlan(role, REPO_ROOT));
       },
       recordOwnership: (pid: number, startedAt: number) => recordReplacement(role, pid, startedAt),
       log: (line: string) => console.log(`  ${line}`),

@@ -931,7 +931,7 @@ describe("the launcher exposes supervision and keeps its existing guards", () =>
     // binding is asserted where the spawn actually happens. Every
     // `dualSpawnPlan` call site in the tool is named for the role it was
     // given -- there is no call site that picks a role for itself.
-    expect(CLI).toContain("const plan = dualSpawnPlan(role, REPO_ROOT);");
+    expect(CLI).toContain("spawnRoleWithDurableLog(role, dualSpawnPlan(role, REPO_ROOT))");
     // Three: the six-role start, the shared supervised restart, and the
     // account-transition start adapter.
     expect((CLI.match(/dualSpawnPlan\(/g) ?? [])).toHaveLength(3);
@@ -1354,11 +1354,14 @@ describe("the launcher's own observation plumbing", () => {
   it("G. every process observation is classified, never read raw", () => {
     // The bug was `result.stdout ?? ""` with no check of `error` or `status`.
     // Both observers must go through the shared classifier.
-    expect((SRC.match(/classifySpawnResult\(result\)/g) ?? [])).toHaveLength(2);
+    // THREE observers now: the entrypoint census, the pid probe, and the
+    // process TREE that proves which runtime hangs under which owned root.
+    expect((SRC.match(/classifySpawnResult\(result\)/g) ?? [])).toHaveLength(3);
     expect(SRC).not.toContain("parseProcessProbeRows(result.stdout");
-    // Both PROCESS observers parse the classified value, never raw stdout.
-    // Both observers hand the classified output to the ONE strict parser.
+    // Every one parses the classified value, never raw stdout, and every one
+    // hands it to a strict all-or-nothing parser.
     expect((SRC.match(/parseProcessRows\(classified\.value\)/g) ?? [])).toHaveLength(2);
+    expect((SRC.match(/parseProcessTreeRows\(classified\.value\)/g) ?? [])).toHaveLength(1);
     // `observeListeners` is deliberately NOT in scope: a listener feeds port
     // presence, never an ownership or absence verdict, so it cannot authorise
     // a spawn. Pinned so the exemption stays a decision, not an oversight.

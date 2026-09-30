@@ -216,7 +216,9 @@ describe("the six-role SAFE spawn plan", () => {
     // Both supervisors hand their role to ONE shared restart path, and that
     // path is the only place a replacement is spawned. The role travels as an
     // argument from the top of each pass, so no alias can be substituted.
-    expect(CLI).toContain("const plan = dualSpawnPlan(role, REPO_ROOT);");
+    // Every supervised start builds its plan from the ROLE it was handed, and
+    // goes through the one helper that gives the child a durable log sink.
+    expect(CLI).toContain("spawnRoleWithDurableLog(role, dualSpawnPlan(role, REPO_ROOT))");
     // Both supervisors restart from the decision they RE-PROVED while holding
     // mutation authority, never from the one that merely started the pass.
     expect(CLI).toContain("restartOwnedRole(now.decision, workerRole, now.budget.attempts + 1)");
@@ -563,7 +565,7 @@ describe("the CLI's ownership and rollback fences", () => {
     const adapter = CLI.slice(CLI.indexOf("function restartOwnedRole"), CLI.indexOf("function recordReplacement"));
     expect(adapter).toContain("terminate: (pid) => {");
     expect((adapter.match(/terminateTree\(/g) ?? []).length).toBe(1);
-    expect((adapter.match(/spawn\(plan\.command/g) ?? []).length).toBe(1);
+    expect((adapter.match(/spawnRoleWithDurableLog\(/g) ?? []).length).toBe(1);
 
     // The account-transition adapter is held to the same rule, for the same
     // reason: its stop is fenced inside `executeFencedStop` and its start
@@ -574,8 +576,8 @@ describe("the CLI's ownership and rollback fences", () => {
       CLI.indexOf("async function askAccount")
     );
     expect((transition.match(/terminateTree\(/g) ?? []).length).toBe(1);
-    expect((transition.match(/spawn\(plan\.command/g) ?? []).length).toBe(1);
-    expect(transition).toContain("const plan = dualSpawnPlan(role, REPO_ROOT);");
+    expect((transition.match(/spawnRoleWithDurableLog\(/g) ?? []).length).toBe(1);
+    expect(transition).toContain("spawnRoleWithDurableLog(role, dualSpawnPlan(role, REPO_ROOT))");
   });
 
   it("13. stops only launcher-owned roles, never a detected one", () => {
@@ -1037,7 +1039,9 @@ describe("the SAFE deployment posture", () => {
 
   it("runs the posture check before any spawn in the CLI", () => {
     const start = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
-    expect(start.indexOf("evaluateSafeGatePosture(")).toBeLessThan(start.indexOf("spawn(plan.command"));
+    expect(start.indexOf("evaluateSafeGatePosture(")).toBeLessThan(
+      start.indexOf("spawnRoleWithDurableLog(")
+    );
     expect(start.indexOf("evaluateSafeGatePosture(")).toBeLessThan(start.indexOf("await collectStatus()"));
   });
 });
@@ -1310,7 +1314,7 @@ describe("Start SAFE refuses a bad env file before it spawns anything", () => {
   it("validates ALL THREE files before the first spawn, and returns on failure", () => {
     const start = CLI.slice(CLI.indexOf("async function startSafe"), CLI.indexOf("async function stopRuntime"));
     const validate = start.indexOf("validateEnvFiles()");
-    const spawnAt = start.indexOf("spawn(plan.command");
+    const spawnAt = start.indexOf("spawnRoleWithDurableLog(");
     expect(validate).toBeGreaterThan(-1);
     expect(validate).toBeLessThan(spawnAt);
     // Everything else that could refuse also precedes the spawn.
@@ -1787,7 +1791,9 @@ describe("the transition marker fences the CLI's other actions", () => {
     expect(startSafe).toContain("if (!transitionGateAllows(DUAL_ROLES)) return;");
     // Before the first spawn, and before the first file is even validated for
     // spawning: an interrupted transition is not something to start over.
-    expect(startSafe.indexOf("transitionGateAllows")).toBeLessThan(startSafe.indexOf("spawn("));
+    expect(startSafe.indexOf("transitionGateAllows")).toBeLessThan(
+      startSafe.indexOf("spawnRoleWithDurableLog(")
+    );
   });
 
   it("Stop Runtime consults it too, since it terminates the fenced pair", () => {
