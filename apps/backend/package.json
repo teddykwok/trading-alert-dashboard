@@ -27,6 +27,7 @@
     "binance:testnet-protection-verify": "tsx src/modules/binance/run-testnet-protection-verify.ts",
     "runtime:launcher": "tsx src/modules/operator/run-runtime-launcher.ts",
     "scanner:replay": "tsx src/modules/native-scanner/run-historical-replay.ts",
+    "scanner:compat-replay": "tsx src/modules/native-scanner/run-compat-replay.ts",
     "execution:canary-preflight": "tsx src/modules/execution/run-canary-preflight.ts",
     "execution:ensure-profile": "tsx src/modules/execution/run-ensure-profile.ts",
     "execution:set-policy": "tsx src/modules/execution/run-set-policy-cli.ts",

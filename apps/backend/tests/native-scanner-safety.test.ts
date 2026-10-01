@@ -10,7 +10,8 @@ import { describe, expect, it } from "vitest";
  */
 
 const SCANNER_DIR = path.resolve(__dirname, "../src/modules/native-scanner");
-const CLI_FILE = "run-historical-replay.ts";
+/** The two CLI entrypoints: the causal replay (Slice 2A) and the compatibility replay (Slice 2B-2A). */
+const CLI_FILES = ["run-historical-replay.ts", "run-compat-replay.ts"];
 const PATHS_FILE = "scanner-paths.ts";
 
 const sources = readdirSync(SCANNER_DIR)
@@ -26,15 +27,21 @@ const importsOf = (text: string) =>
   );
 
 describe("the native scanner data layer", () => {
-  it("consists of exactly the Slice 2A modules", () => {
+  it("consists of exactly the Slice 2A and 2B-2A modules", () => {
     expect(sources.map((s) => s.file).sort()).toEqual([
       "binance-public-futures.ts",
+      "canonical-json.ts",
+      "compat-replay-cli-args.ts",
+      "compat-replay-runner.ts",
+      "compat-replay.ts",
       "historical-replay-runner.ts",
       "historical-replay.ts",
       "kline-cache.ts",
       "kline-fetcher.ts",
       "replay-cli-args.ts",
+      "run-compat-replay.ts",
       "run-historical-replay.ts",
+      "scanner-lineage.ts",
       "scanner-paths.ts",
     ]);
   });
@@ -46,7 +53,7 @@ describe("the native scanner data layer", () => {
           specifier.startsWith("node:") ||
           specifier === "@trading-alert-dashboard/shared" ||
           /^\.\/[a-z-]+$/.test(specifier) ||
-          (file === CLI_FILE && ["../../config/bootstrap-generic", "../../config/env"].includes(specifier));
+          (CLI_FILES.includes(file) && ["../../config/bootstrap-generic", "../../config/env"].includes(specifier));
         expect({ file, specifier, allowed }).toEqual({ file, specifier, allowed: true });
       }
     }
@@ -78,39 +85,40 @@ describe("the native scanner data layer", () => {
     }
   });
 
-  it("only the CLI may use the real network, the real clock or timers", () => {
+  it("only the CLIs may use the real network, the real clock or timers", () => {
     for (const { file, text } of sources) {
-      if (file === CLI_FILE) continue;
+      if (CLI_FILES.includes(file)) continue;
       const body = code(text);
       expect({ file, hit: body.match(/\bfetch\s*\(|Date\.now|setTimeout|setInterval/)?.[0] ?? null }).toEqual({ file, hit: null });
     }
   });
 
-  it("only the CLI reads process.env; the paths helper takes the environment as an argument", () => {
+  it("only the CLIs read process.env; the paths helper takes the environment as an argument", () => {
     for (const { file, text } of sources) {
-      if (file === CLI_FILE) continue;
+      if (CLI_FILES.includes(file)) continue;
       expect({ file, hit: code(text).match(/process\.env/)?.[0] ?? null }).toEqual({ file, hit: null });
     }
     expect(code(readFileSync(path.join(SCANNER_DIR, PATHS_FILE), "utf8"))).toMatch(/env: NodeJS\.ProcessEnv/);
   });
 
-  it("the CLI's FIRST import is the generic, credential-free bootstrap", () => {
-    const cli = code(sources.find((s) => s.file === CLI_FILE)!.text);
+  it.each(CLI_FILES)("%s: its FIRST import is the generic, credential-free bootstrap", (cliFile) => {
+    const cli = code(sources.find((s) => s.file === cliFile)!.text);
     expect(importsOf(cli)[0]).toBe("../../config/bootstrap-generic");
   });
 
-  it("the CLI refuses redirects and sends only the controller's headers", () => {
-    const cli = code(sources.find((s) => s.file === CLI_FILE)!.text);
+  it.each(CLI_FILES)("%s: refuses redirects and sends only the controller's headers", (cliFile) => {
+    const cli = code(sources.find((s) => s.file === cliFile)!.text);
     expect(cli).toContain('redirect: "error"');
     expect(cli).toContain("headers: init.headers");
     expect(cli).toContain('method: "GET"');
   });
 
-  it("the package exposes exactly one scanner script: the one-symbol replay", () => {
+  it("the package exposes exactly two scanner scripts: the causal replay and the compatibility replay", () => {
     const scripts = (JSON.parse(readFileSync(path.resolve(__dirname, "../package.json"), "utf8")) as { scripts: Record<string, string> })
       .scripts;
     expect(Object.entries(scripts).filter(([name, command]) => /scanner/.test(name) || /native-scanner/.test(command))).toEqual([
       ["scanner:replay", "tsx src/modules/native-scanner/run-historical-replay.ts"],
+      ["scanner:compat-replay", "tsx src/modules/native-scanner/run-compat-replay.ts"],
     ]);
   });
 });
