@@ -7,6 +7,12 @@ export type {
   NativeEngineConfig,
   NativeEngineConfigInput,
   NativeEngineState,
+  NativeHistoricalInput,
+  NativeHistoricalPeriod,
+  NativeHistoricalProjection,
+  NativeHistoricalReport,
+  NativeHistoricalResult,
+  NativeHistoricalTouch,
   NativeHtfAggregate,
   NativeHtfTrack,
   NativeCandidate,
@@ -17,6 +23,7 @@ export type {
   NativeLevel,
   NativeLevelColor,
   NativeLevelCondition,
+  NativePartialPeriodPolicy,
   NativeRetestCandidate,
   NativeSignal,
   NativeSignalInputErrorCode,
@@ -27,16 +34,19 @@ export type {
 } from "./types";
 export {
   DEFAULT_CALENDAR_ALIGNMENT,
+  NATIVE_HISTORICAL_STATE_SEMANTICS,
   NATIVE_LEVEL_CONDITIONS,
   NATIVE_SOURCE_TF_ORDER,
   NATIVE_TIMING_MODES,
   NativeSignalInputError,
   PINE_V55_INPUT_DEFAULTS,
+  PINE_V5_FIRST_HISTORY_BAR_NO_EDGE,
+  SWITCHOVER_TRUNCATED_CLOSED_BARS,
   createNativeEngineConfig,
   pinePercentInputToFraction,
 } from "./types";
 
-export { advanceHtfAggregate, barFitsHtfPeriod, htfPeriodStartMs } from "./htf-aggregate";
+export { advanceHtfAggregate, barFitsHtfPeriod, htfPeriodStartMs, projectPineHistoricalHtf } from "./htf-aggregate";
 export {
   createNativeEngineState,
   evaluateLevelConditions,
@@ -46,4 +56,4 @@ export {
 } from "./engine";
 
 export type { NativeImmediateReplayResult, NativeReplayResult } from "./replay";
-export { replayNativeEngine, replayNativeEngineWithImmediate } from "./replay";
+export { reconstructPineHistoricalState, replayNativeEngine, replayNativeEngineWithImmediate } from "./replay";

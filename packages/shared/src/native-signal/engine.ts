@@ -124,10 +124,10 @@ function isPositiveFinite(value: unknown): value is number {
 }
 
 /**
- * Refuses a bar the engine cannot reason about. Nothing is repaired: a bar that
+ * @internal Refuses a bar the engine cannot reason about. Nothing is repaired: a bar that
  * is malformed, out of order or missing would shift every bar-count rule.
  */
-function assertBarAcceptable(
+export function assertBarAcceptable(
   state: Pick<NativeEngineState, "config" | "intervalMs" | "lastBar">,
   bar: NativeKline
 ): number {
@@ -169,58 +169,52 @@ export interface BarOutputs {
 }
 
 /**
- * @internal Applies one confirmed bar to `state` IN PLACE. Used only by the
- * engine's own `step` and `replay`; the public step clones first.
+ * @internal Pine's `f_registerLevel` (lines 178-195): push one level, then drop
+ * exactly the oldest once the registry exceeds MAX_LEVELS.
+ *
+ * `source` is the HTF candle the registering projection saw: the causal
+ * forming candle here, or the period's projected candle during historical
+ * reconstruction (replay.ts).
  */
-export function applyBarInPlace(state: WorkingState, bar: NativeKline, out: BarOutputs): void {
-  const intervalMs = assertBarAcceptable(state, bar);
-  const { config } = state;
-  const barIndex = state.barIndex;
-  const tolerance = config.touchTolerancePct;
-
-  // ---- 1. BAGIAN 3: registration ------------------------------------------
-  // Timeframes in canonical order; within each, GOR -> ROR -> GOG -> ROG.
-  // Pine: `if show and tf_sX and not tf_sX[1]` — the previous CHART bar's
-  // projected flag, which must be KNOWN false for an edge.
-  for (const tf of config.enabledSourceTfs) {
-    const track = state.htf[tf] as NativeHtfTrack;
-    const aggregate = advanceHtfAggregate(track.aggregate, bar, tf, config.calendar);
-    const flags = evaluateLevelConditions(aggregate, config.minMovePct);
-    const previous = track.previousFlags;
-
-    if (flags !== null && previous !== null) {
-      for (const condition of NATIVE_LEVEL_CONDITIONS) {
-        if (!flags[condition] || previous[condition]) continue;
-        const shape = LEVEL_SHAPE[condition];
-        // f_registerLevel (lines 178-195): push, then drop exactly the oldest.
-        const level: Mutable<NativeLevel> = {
-          id: state.nextLevelId,
-          price: shape.at === "high" ? aggregate.high : aggregate.low,
-          color: shape.color,
-          sourceTf: tf,
-          condition,
-          htfPeriodStartMs: aggregate.periodStartMs,
-          createdBarIndex: barIndex,
-          createdBarOpenTimeMs: bar.openTimeMs,
-          lastTouchBarIndex: -1,
-          armed: false,
-          armedBarIndex: -1,
-        };
-        state.nextLevelId += 1;
-        state.levels.push(level);
-        out.registered.push({ ...level });
-        if (state.levels.length > config.maxLevels) {
-          const dropped = state.levels.shift() as Mutable<NativeLevel>;
-          out.evicted.push({ ...dropped });
-        }
-      }
-    }
-    state.htf[tf] = { aggregate, previousFlags: flags };
+export function registerLevelInPlace(
+  state: WorkingState,
+  tf: NativeSourceTf,
+  condition: NativeLevelCondition,
+  source: Pick<NativeHtfAggregate, "periodStartMs" | "high" | "low">,
+  bar: NativeKline,
+  barIndex: number,
+  out: Pick<BarOutputs, "registered" | "evicted">
+): void {
+  const shape = LEVEL_SHAPE[condition];
+  const level: Mutable<NativeLevel> = {
+    id: state.nextLevelId,
+    price: shape.at === "high" ? source.high : source.low,
+    color: shape.color,
+    sourceTf: tf,
+    condition,
+    htfPeriodStartMs: source.periodStartMs,
+    createdBarIndex: barIndex,
+    createdBarOpenTimeMs: bar.openTimeMs,
+    lastTouchBarIndex: -1,
+    armed: false,
+    armedBarIndex: -1,
+  };
+  state.nextLevelId += 1;
+  state.levels.push(level);
+  out.registered.push({ ...level });
+  if (state.levels.length > state.config.maxLevels) {
+    const dropped = state.levels.shift() as Mutable<NativeLevel>;
+    out.evicted.push({ ...dropped });
   }
+}
 
-  // ---- 2. BAGIAN 4A: ARM / DISARM on the confirmed close ------------------
-  // armedBar moves only on a transition, so minBarsAfterArming measures the
-  // age of the arming, not of the latest bar that held above it.
+/**
+ * @internal BAGIAN 4A (lines 264-280): ARM / DISARM on the confirmed close.
+ * armedBar moves only on a transition, so minBarsAfterArming measures the age
+ * of the arming, not of the latest bar that held above it.
+ */
+export function armDisarmInPlace(state: WorkingState, bar: NativeKline, barIndex: number): void {
+  const tolerance = state.config.touchTolerancePct;
   for (const level of state.levels) {
     const upperBand = level.price * (1 + tolerance);
     const lowerBand = level.price * (1 - tolerance);
@@ -235,8 +229,25 @@ export function applyBarInPlace(state: WorkingState, bar: NativeKline, out: BarO
       level.armedBarIndex = -1;
     }
   }
+}
 
-  // ---- 3. BAGIAN 4B: retest, oldest level first ---------------------------
+/**
+ * @internal BAGIAN 4B (lines 297-329): the retest loop, oldest level first.
+ *
+ * For each qualifying level `onRetest` is told first, then that level's
+ * `lvlLastTouchBar` is written — for EVERY qualifying level, exactly as Pine's
+ * loop runs `array.set` after each `alert()` call and never breaks. What a
+ * qualifying level means to the caller (a committed candidate, or a historical
+ * state write) is the caller's business; the state write is not.
+ */
+export function retestInPlace(
+  state: WorkingState,
+  bar: NativeKline,
+  barIndex: number,
+  onRetest: (level: Readonly<NativeLevel>, longRetest: boolean) => void
+): void {
+  const { config } = state;
+  const tolerance = config.touchTolerancePct;
   // `close[1]` is na on the first bar, so nothing can retest there.
   const previousClose = state.lastBar === null ? null : state.lastBar.close;
   if (config.retestEnabled && previousClose !== null) {
@@ -253,34 +264,76 @@ export function applyBarInPlace(state: WorkingState, bar: NativeKline, out: BarO
       const shortRetest = level.color === "RED" && previousClose < lowerBand && inBand;
 
       if ((longRetest || shortRetest) && armedReady && oldEnough && cooledDown) {
-        out.candidates.push({
-          basis: "COMMITTED_BAR_CLOSE",
-          signal: longRetest ? "LONG" : "SHORT",
-          touchDirection: longRetest ? "FROM_ABOVE" : "FROM_BELOW",
-          levelColor: level.color,
-          sourceTf: level.sourceTf,
-          levelPrice: level.price,
-          chartBarIndex: barIndex,
-          chartBarOpenTimeMs: bar.openTimeMs,
-          chartBarCloseTimeMs: bar.closeTimeMs,
-          level: {
-            id: level.id,
-            condition: level.condition,
-            htfPeriodStartMs: level.htfPeriodStartMs,
-            createdBarIndex: level.createdBarIndex,
-            createdBarOpenTimeMs: level.createdBarOpenTimeMs,
-          },
-        });
+        onRetest(level, longRetest);
         // Written ONLY when a retest fires: a wrong-side touch starts no cooldown.
         level.lastTouchBarIndex = barIndex;
       }
     }
   }
+}
 
-  // ---- 4. advance ----------------------------------------------------------
+/** @internal Step 4: this bar becomes `close[1]` for the next one. */
+export function advanceBarInPlace(state: WorkingState, bar: NativeKline, intervalMs: number): void {
   state.lastBar = { openTimeMs: bar.openTimeMs, closeTimeMs: bar.closeTimeMs, close: bar.close };
   state.intervalMs = intervalMs;
-  state.barIndex = barIndex + 1;
+  state.barIndex += 1;
+}
+
+/**
+ * @internal Applies one confirmed bar to `state` IN PLACE. Used only by the
+ * engine's own `step` and `replay`; the public step clones first.
+ */
+export function applyBarInPlace(state: WorkingState, bar: NativeKline, out: BarOutputs): void {
+  const intervalMs = assertBarAcceptable(state, bar);
+  const { config } = state;
+  const barIndex = state.barIndex;
+
+  // ---- 1. BAGIAN 3: registration ------------------------------------------
+  // Timeframes in canonical order; within each, GOR -> ROR -> GOG -> ROG.
+  // Pine: `if show and tf_sX and not tf_sX[1]` — the previous CHART bar's
+  // projected flag, which must be KNOWN false for an edge.
+  for (const tf of config.enabledSourceTfs) {
+    const track = state.htf[tf] as NativeHtfTrack;
+    const aggregate = advanceHtfAggregate(track.aggregate, bar, tf, config.calendar);
+    const flags = evaluateLevelConditions(aggregate, config.minMovePct);
+    const previous = track.previousFlags;
+
+    if (flags !== null && previous !== null) {
+      for (const condition of NATIVE_LEVEL_CONDITIONS) {
+        if (!flags[condition] || previous[condition]) continue;
+        registerLevelInPlace(state, tf, condition, aggregate, bar, barIndex, out);
+      }
+    }
+    state.htf[tf] = { aggregate, previousFlags: flags };
+  }
+
+  // ---- 2. BAGIAN 4A: ARM / DISARM on the confirmed close ------------------
+  armDisarmInPlace(state, bar, barIndex);
+
+  // ---- 3. BAGIAN 4B: retest -> committed candidates -----------------------
+  retestInPlace(state, bar, barIndex, (level, longRetest) => {
+    out.candidates.push({
+      basis: "COMMITTED_BAR_CLOSE",
+      signal: longRetest ? "LONG" : "SHORT",
+      touchDirection: longRetest ? "FROM_ABOVE" : "FROM_BELOW",
+      levelColor: level.color,
+      sourceTf: level.sourceTf,
+      levelPrice: level.price,
+      chartBarIndex: barIndex,
+      chartBarOpenTimeMs: bar.openTimeMs,
+      chartBarCloseTimeMs: bar.closeTimeMs,
+      level: {
+        id: level.id,
+        condition: level.condition,
+        htfPeriodStartMs: level.htfPeriodStartMs,
+        createdBarIndex: level.createdBarIndex,
+        createdBarOpenTimeMs: level.createdBarOpenTimeMs,
+      },
+    });
+  });
+
+  // ---- 4. advance ----------------------------------------------------------
+  advanceBarInPlace(state, bar, intervalMs);
 }
 
 /**

@@ -347,7 +347,8 @@ export type NativeSignalInputErrorCode =
   | "INVALID_KLINE"
   | "INCONSISTENT_INTERVAL"
   | "NON_CONTIGUOUS_BARS"
-  | "BAR_STRADDLES_HTF_PERIOD";
+  | "BAR_STRADDLES_HTF_PERIOD"
+  | "INVALID_HISTORY_RANGE";
 
 /**
  * Refusal to compute over input the engine cannot reason about honestly.
@@ -451,4 +452,138 @@ export function createNativeEngineConfig(input: NativeEngineConfigInput): Native
       multiMonthAnchorMonth: calendar.multiMonthAnchorMonth,
     }),
   });
+}
+
+// ===========================================================================
+// Slice 2B-1 — Pine-compatible HISTORICAL state reconstruction
+// ===========================================================================
+//
+// TradingView computes a script's history once, with `request.security(...,
+// lookahead=barmerge.lookahead_on)` (Pine lines 211-212). On a historical bar
+// that call returns the HTF period's FINAL values, so every historical chart
+// bar of a period sees the same candle. Reconstructing the state TradingView
+// holds therefore needs that projection for history, and the causal engine
+// after a fixed switchover. Nothing here is causal before the switchover, by
+// design; nothing here ever reads a bar at or after it.
+
+/** Bumped whenever historical reconstruction semantics change. */
+export const NATIVE_HISTORICAL_STATE_SEMANTICS = "pine-v5.5/historical-lookahead-on/v1";
+
+/**
+ * Pine v5 at the first chart-history bar: `tf_s[1]` is na, na is false as a
+ * condition and propagates through `and`/`not`, so `tf_s and not tf_s[1]`
+ * creates NO edge there. Fixed semantics, not an option.
+ */
+export const PINE_V5_FIRST_HISTORY_BAR_NO_EDGE = "PINE_V5_FIRST_HISTORY_BAR_NO_EDGE";
+
+/**
+ * The only approved treatment of an HTF period that contains the switchover:
+ * its historical bars see the candle of its CLOSED chart bars before the
+ * switchover, never anything later.
+ */
+export const SWITCHOVER_TRUNCATED_CLOSED_BARS = "SWITCHOVER_TRUNCATED_CLOSED_BARS";
+export type NativePartialPeriodPolicy = typeof SWITCHOVER_TRUNCATED_CLOSED_BARS;
+
+/** One HTF period as Pine's historical bars see it. */
+export interface NativeHistoricalPeriod {
+  readonly sourceTf: NativeSourceTf;
+  readonly periodStartMs: number;
+  /**
+   * The projected candle: the period's FINAL candle, or — when the period
+   * contains the switchover — the candle of its closed bars before it.
+   * `complete` false means the period's real open is unknown.
+   */
+  readonly candle: NativeHtfAggregate;
+  readonly truncatedAtSwitchover: boolean;
+  readonly firstChartBarIndex: number;
+  readonly lastChartBarIndex: number;
+}
+
+export interface NativeHistoricalProjection {
+  readonly switchoverMs: number;
+  /** Per enabled timeframe, the periods that contain chart bars, in order. */
+  readonly periods: Readonly<Partial<Record<NativeSourceTf, readonly NativeHistoricalPeriod[]>>>;
+  /** Per enabled timeframe, for each chart bar, the index of its period in `periods`. */
+  readonly barPeriodIndex: Readonly<Partial<Record<NativeSourceTf, readonly number[]>>>;
+}
+
+export interface NativeHistoricalInput {
+  readonly config: NativeEngineConfig;
+  /** Open time of the first chart-history bar (Pine's bar_index 0). */
+  readonly historyStartMs: number;
+  /**
+   * Open time of the first bar that belongs to the causal engine. Bars with
+   * open < switchoverMs are reconstructed here; none at or after it is read.
+   */
+  readonly switchoverMs: number;
+  /**
+   * Bars immediately before historyStart, used ONLY to know the real open and
+   * range of HTF periods that began before the chart history. They get no bar
+   * index, arm nothing, retest nothing and register nothing.
+   */
+  readonly contextBars: readonly NativeKline[];
+  /** Chart bars from historyStart. May run past the switchover; those are never read. */
+  readonly bars: readonly NativeKline[];
+  readonly partialPeriodPolicy: NativePartialPeriodPolicy;
+}
+
+/**
+ * A level that qualified for a retest on a HISTORICAL bar. Pine wrote its
+ * cooldown (`lvlLastTouchBar`); TradingView delivered nothing. This is a
+ * diagnostic of that state write — never a candidate, never actionable.
+ */
+export interface NativeHistoricalTouch {
+  readonly actionable: false;
+  readonly basis: "HISTORICAL_STATE_WRITE";
+  readonly signal: NativeSignal;
+  readonly touchDirection: NativeTouchDirection;
+  readonly levelColor: NativeLevelColor;
+  readonly sourceTf: NativeSourceTf;
+  readonly levelPrice: number;
+  readonly chartBarIndex: number;
+  readonly chartBarOpenTimeMs: number;
+  readonly chartBarCloseTimeMs: number;
+  readonly level: {
+    readonly id: number;
+    readonly condition: NativeLevelCondition;
+    readonly htfPeriodStartMs: number;
+    readonly createdBarIndex: number;
+    readonly createdBarOpenTimeMs: number;
+  };
+}
+
+export interface NativeHistoricalReport {
+  readonly semantics: typeof NATIVE_HISTORICAL_STATE_SEMANTICS;
+  readonly firstHistoryBar: typeof PINE_V5_FIRST_HISTORY_BAR_NO_EDGE;
+  readonly partialPeriodPolicy: NativePartialPeriodPolicy;
+  readonly historyStartMs: number;
+  readonly switchoverMs: number;
+  /** Open time of the first context bar, or null without context. */
+  readonly contextStartMs: number | null;
+  readonly contextBarCount: number;
+  readonly chartBarCount: number;
+  /** Every level registered during reconstruction, in registration order. */
+  readonly registrations: readonly NativeLevel[];
+  /** Every level dropped by MAX_LEVELS during reconstruction, in order. */
+  readonly evictions: readonly NativeLevel[];
+  /** Every historical retest state write, in bar order, oldest level first. */
+  readonly touches: readonly NativeHistoricalTouch[];
+  /** Conditions true on the first history bar, where Pine creates no edge. */
+  readonly firstHistoryBarFlags: readonly { readonly sourceTf: NativeSourceTf; readonly condition: NativeLevelCondition }[];
+  /** True conditions that could not edge because the previous projected flag was unknown. */
+  readonly unknownPreviousFlagEdges: readonly {
+    readonly sourceTf: NativeSourceTf;
+    readonly condition: NativeLevelCondition;
+    readonly chartBarIndex: number;
+  }[];
+  /** Periods seen by chart bars whose real open is unknown (no or too little context). */
+  readonly incompletePeriods: readonly { readonly sourceTf: NativeSourceTf; readonly periodStartMs: number }[];
+  /** Per enabled timeframe, the period of the last historical bar — the one handed to the causal engine. */
+  readonly handoffPeriods: readonly NativeHistoricalPeriod[];
+}
+
+export interface NativeHistoricalResult {
+  /** The committed state at the switchover, ready for the causal engine's first bar. */
+  readonly state: NativeEngineState;
+  readonly report: NativeHistoricalReport;
 }

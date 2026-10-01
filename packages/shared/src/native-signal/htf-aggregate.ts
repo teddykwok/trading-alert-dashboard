@@ -1,6 +1,8 @@
 import {
   DEFAULT_CALENDAR_ALIGNMENT,
   type CalendarAlignment,
+  type NativeHistoricalPeriod,
+  type NativeHistoricalProjection,
   type NativeHtfAggregate,
   type NativeKline,
   type NativeSourceTf,
@@ -104,4 +106,65 @@ export function barFitsHtfPeriod(
   calendar: CalendarAlignment = DEFAULT_CALENDAR_ALIGNMENT
 ): boolean {
   return htfPeriodStartMs(tf, bar.openTimeMs, calendar) === htfPeriodStartMs(tf, bar.closeTimeMs, calendar);
+}
+
+/**
+ * Pine's HISTORICAL projection of every HTF period (Slice 2B-1) — deliberately
+ * NOT the causal forming candle above.
+ *
+ * On historical bars `request.security(..., lookahead=barmerge.lookahead_on)`
+ * returns the HTF period's FINAL values, so every historical chart bar of a
+ * period sees one and the same candle. That candle is built here with
+ * `advanceHtfAggregate` itself: a period's last value is, by construction,
+ * exactly the candle the causal engine would hold after the period's last bar.
+ *
+ * The period containing `switchoverMs` (SWITCHOVER_TRUNCATED_CLOSED_BARS) is
+ * built from its chart bars before the switchover only. The caller passes only
+ * those bars; nothing at or after the switchover can reach this function.
+ *
+ * `contextBars` (immediately before the chart history) only extend periods
+ * backwards so their real open is known; they are never chart bars. A period
+ * whose real open is not covered keeps `complete: false` — unknown, never
+ * guessed.
+ *
+ * The caller is responsible for validating the bars (contiguity, interval,
+ * no HTF straddle) before trusting the projection.
+ */
+export function projectPineHistoricalHtf(
+  contextBars: readonly NativeKline[],
+  chartBars: readonly NativeKline[],
+  timeframes: readonly NativeSourceTf[],
+  calendar: CalendarAlignment,
+  switchoverMs: number
+): NativeHistoricalProjection {
+  const periods: Partial<Record<NativeSourceTf, NativeHistoricalPeriod[]>> = {};
+  const barPeriodIndex: Partial<Record<NativeSourceTf, number[]>> = {};
+  for (const tf of timeframes) {
+    const switchoverPeriodStartMs = htfPeriodStartMs(tf, switchoverMs, calendar);
+    let aggregate: NativeHtfAggregate | null = null;
+    for (const bar of contextBars) aggregate = advanceHtfAggregate(aggregate, bar, tf, calendar);
+
+    const list: NativeHistoricalPeriod[] = [];
+    const index: number[] = [];
+    for (let i = 0; i < chartBars.length; i += 1) {
+      aggregate = advanceHtfAggregate(aggregate, chartBars[i], tf, calendar);
+      const current = list[list.length - 1];
+      if (current === undefined || current.periodStartMs !== aggregate.periodStartMs) {
+        list.push({
+          sourceTf: tf,
+          periodStartMs: aggregate.periodStartMs,
+          candle: aggregate,
+          truncatedAtSwitchover: aggregate.periodStartMs === switchoverPeriodStartMs,
+          firstChartBarIndex: i,
+          lastChartBarIndex: i,
+        });
+      } else {
+        list[list.length - 1] = { ...current, candle: aggregate, lastChartBarIndex: i };
+      }
+      index.push(list.length - 1);
+    }
+    periods[tf] = list;
+    barPeriodIndex[tf] = index;
+  }
+  return { switchoverMs, periods, barPeriodIndex };
 }
