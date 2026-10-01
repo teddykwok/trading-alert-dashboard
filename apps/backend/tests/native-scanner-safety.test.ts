@@ -10,8 +10,9 @@ import { describe, expect, it } from "vitest";
  */
 
 const SCANNER_DIR = path.resolve(__dirname, "../src/modules/native-scanner");
-/** The two CLI entrypoints: the causal replay (Slice 2A) and the compatibility replay (Slice 2B-2A). */
-const CLI_FILES = ["run-historical-replay.ts", "run-compat-replay.ts"];
+/** The CLI entrypoints: causal replay (2A), compatibility replay (2B-2A) and live shadow scanner (2B-2B). */
+const CLI_FILES = ["run-historical-replay.ts", "run-compat-replay.ts", "run-live-shadow.ts"];
+const LIVE_CLI_FILE = "run-live-shadow.ts";
 const PATHS_FILE = "scanner-paths.ts";
 
 const sources = readdirSync(SCANNER_DIR)
@@ -27,7 +28,7 @@ const importsOf = (text: string) =>
   );
 
 describe("the native scanner data layer", () => {
-  it("consists of exactly the Slice 2A and 2B-2A modules", () => {
+  it("consists of exactly the Slice 2A, 2B-2A and 2B-2B modules", () => {
     expect(sources.map((s) => s.file).sort()).toEqual([
       "binance-public-futures.ts",
       "canonical-json.ts",
@@ -38,9 +39,16 @@ describe("the native scanner data layer", () => {
       "historical-replay.ts",
       "kline-cache.ts",
       "kline-fetcher.ts",
+      "live-kline-stream.ts",
+      "live-shadow-checkpoint.ts",
+      "live-shadow-cli-args.ts",
+      "live-shadow-runner.ts",
+      "live-shadow-session.ts",
+      "live-shadow-store.ts",
       "replay-cli-args.ts",
       "run-compat-replay.ts",
       "run-historical-replay.ts",
+      "run-live-shadow.ts",
       "scanner-lineage.ts",
       "scanner-paths.ts",
     ]);
@@ -113,12 +121,32 @@ describe("the native scanner data layer", () => {
     expect(cli).toContain('method: "GET"');
   });
 
-  it("the package exposes exactly two scanner scripts: the causal replay and the compatibility replay", () => {
+  it("the package exposes exactly three scanner scripts: causal replay, compatibility replay, live shadow", () => {
     const scripts = (JSON.parse(readFileSync(path.resolve(__dirname, "../package.json"), "utf8")) as { scripts: Record<string, string> })
       .scripts;
     expect(Object.entries(scripts).filter(([name, command]) => /scanner/.test(name) || /native-scanner/.test(command))).toEqual([
       ["scanner:replay", "tsx src/modules/native-scanner/run-historical-replay.ts"],
       ["scanner:compat-replay", "tsx src/modules/native-scanner/run-compat-replay.ts"],
+      ["scanner:live-shadow", "tsx src/modules/native-scanner/run-live-shadow.ts"],
     ]);
+  });
+
+  it("only the live CLI opens a WebSocket, and only through the public kline stream builder", () => {
+    for (const { file, text } of sources) {
+      const opens = /new\s+WebSocket\s*\(/.test(code(text));
+      expect({ file, opens }).toEqual({ file, opens: file === LIVE_CLI_FILE });
+    }
+    const live = code(sources.find((s) => s.file === LIVE_CLI_FILE)!.text);
+    expect(live).toContain("buildPublicKlineStreamUrl(request.symbol, request.chartInterval)");
+    // Exactly one argument: the URL. No sub-protocols, no options object, so no header can ride along.
+    expect(live.match(/new\s+WebSocket\s*\([^)]*\)/g)).toEqual(["new WebSocket(url)"]);
+  });
+
+  it("no scanner module can express a listen key, a user-data stream or an actionable record", () => {
+    for (const { file, text } of sources) {
+      const body = code(text);
+      expect({ file, hit: body.match(/listenKey|userData|user-data|\/fapi\/v\d\/listen/i)?.[0] ?? null }).toEqual({ file, hit: null });
+      expect({ file, hit: body.match(/actionable:\s*true/)?.[0] ?? null }).toEqual({ file, hit: null });
+    }
   });
 });
