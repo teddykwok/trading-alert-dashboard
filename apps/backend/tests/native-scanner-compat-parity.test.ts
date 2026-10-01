@@ -183,13 +183,20 @@ for (const spec of SPECS) {
     const load = () => {
       if (klines.length > 0) return klines;
       const text = readFileSync(file as string, "utf8");
-      // Wrong bytes are a FAILURE, never a silent replay of different market data.
-      expect(sha256Hex(text)).toBe(spec.cacheSha256);
-      klines = parseCachedKlines(text, 15 * 60_000);
+      // The cache is append-only and legitimately grows (a live --fetch adds newer closed
+      // bars). What is pinned is the exact bytes of the range this regression replays:
+      // they must hash to the pinned SHA and be the file's untouched prefix. Wrong bytes
+      // there are a FAILURE, never a silent replay of different market data.
+      const lines = text.split("\n").filter((line) => line !== "");
+      const pinned = lines.filter((line) => (JSON.parse(line) as number[])[0] < END);
+      const pinnedText = `${pinned.join("\n")}\n`;
+      expect(sha256Hex(pinnedText)).toBe(spec.cacheSha256);
+      expect(text.startsWith(pinnedText)).toBe(true);
+      klines = parseCachedKlines(pinnedText, 15 * 60_000);
       return klines;
     };
 
-    it("the cache bytes are exactly the pinned ones", () => {
+    it("the pinned range's cache bytes are exactly the pinned ones (the cache may only have grown after it)", () => {
       expect(load().length).toBe(27_736);
     });
 

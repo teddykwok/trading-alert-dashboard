@@ -121,6 +121,7 @@ function harness(options: { variant?: Variant; trustedEndMs: number; dir?: strin
   });
   const connections: FakeConnection[] = [];
   const fetchCalls: [number, number][] = [];
+  const logs: string[] = [];
   const runner = new LiveShadowRunner({
     session,
     url: buildPublicKlineStreamUrl(SYMBOL, "15m"),
@@ -136,7 +137,7 @@ function harness(options: { variant?: Variant; trustedEndMs: number; dir?: strin
       return bars.filter((b) => b.openTimeMs >= fromMs && b.openTimeMs < toMs);
     },
     nowMs: () => now,
-    log: () => undefined,
+    log: (line) => logs.push(line),
   });
   const live = () => connections[connections.length - 1];
   const send = (at: number, text: string) => {
@@ -145,7 +146,7 @@ function harness(options: { variant?: Variant; trustedEndMs: number; dir?: strin
   };
   const records = (): ShadowRecord[] =>
     existsSync(events.file) ? readFileSync(events.file, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as ShadowRecord) : [];
-  return { bars, dir, plan, checkpoints, events, session, runner, connections, live, send, records, persisted, fetchCalls, setNow: (ms: number) => (now = ms) };
+  return { bars, dir, plan, checkpoints, events, session, runner, connections, live, send, records, persisted, fetchCalls, logs, setNow: (ms: number) => (now = ms) };
 }
 
 /** Ready at 23:59:59 on bar 23:45 (quarantined); bar 00:00 is the first LIVE_ELIGIBLE bar. */
@@ -309,19 +310,83 @@ describe("readiness and mid-bar quarantine", () => {
 // ===========================================================================
 
 describe("public kline stream adapter", () => {
-  it("builds exactly one public stream URL and refuses anything else", () => {
-    expect(buildPublicKlineStreamUrl("LDOUSDT", "15m")).toBe("wss://fstream.binance.com/ws/ldousdt@kline_15m");
+  it("1. builds exactly the routed MARKET raw kline stream: wss://fstream.binance.com/market/ws/<symbol>@kline_15m", () => {
+    expect(buildPublicKlineStreamUrl("LDOUSDT", "15m")).toBe("wss://fstream.binance.com/market/ws/ldousdt@kline_15m");
+    expect(assertPublicKlineStreamUrl("wss://fstream.binance.com/market/ws/ldousdt@kline_15m", "LDOUSDT", "15m")).toBe(
+      "wss://fstream.binance.com/market/ws/ldousdt@kline_15m"
+    );
+  });
+
+  it("2-4. refuses the decommissioned legacy /ws/ path, the /public/ route, /stream mode and anything else", () => {
+    const refused = (url: string) => {
+      try {
+        assertPublicKlineStreamUrl(url, "LDOUSDT", "15m");
+        return false;
+      } catch (error) {
+        return error instanceof LiveStreamError && error.code === "FORBIDDEN_STREAM";
+      }
+    };
     for (const bad of [
-      "ws://fstream.binance.com/ws/ldousdt@kline_15m",
-      "wss://fapi.binance.com/ws/ldousdt@kline_15m",
-      "wss://fstream.binance.com/ws/ldousdt@kline_1m",
-      "wss://fstream.binance.com/ws/btcusdt@kline_15m",
-      "wss://fstream.binance.com/ws/abc123listenkey",
-      "wss://fstream.binance.com/ws/ldousdt@kline_15m?listenKey=x",
-      "wss://user:pass@fstream.binance.com/ws/ldousdt@kline_15m",
-      "wss://fstream.binance.com:9443/ws/ldousdt@kline_15m",
+      "wss://fstream.binance.com/ws/ldousdt@kline_15m", // 2. legacy un-routed path (decommissioned 2026-04-23)
+      "wss://fstream.binance.com/public/ws/ldousdt@kline_15m", // 3. klines are not on the /public route
+      "wss://fstream.binance.com/market/stream?streams=ldousdt@kline_15m", // 4. stream (combined) mode
+      "wss://fstream.binance.com/market/stream/ldousdt@kline_15m",
+      "wss://fstream.binance.com/private/ws/ldousdt@kline_15m",
+      "wss://fstream.binance.com/private/ws?listenKey=x",
+      "wss://fstream.binance.com/market/ws/abc123listenkey",
+      "ws://fstream.binance.com/market/ws/ldousdt@kline_15m",
+      "wss://fapi.binance.com/market/ws/ldousdt@kline_15m",
+      "wss://dstream.binance.com/market/ws/ldousdt@kline_15m",
+      "wss://fstream.binance.com/market/ws/ldousdt@kline_1m",
+      "wss://fstream.binance.com/market/ws/btcusdt@kline_15m",
+      "wss://fstream.binance.com/market/ws/ldousdt@kline_15m?listenKey=x",
+      "wss://user:pass@fstream.binance.com/market/ws/ldousdt@kline_15m",
+      "wss://fstream.binance.com:9443/market/ws/ldousdt@kline_15m",
     ]) {
-      expect(() => assertPublicKlineStreamUrl(bad, "LDOUSDT", "15m")).toThrow(LiveStreamError);
+      expect({ bad, refused: refused(bad) }).toEqual({ bad, refused: true });
+    }
+    // A COIN-M contract cannot even be requested: the scanner symbol rule has no underscore.
+    expect(() => buildPublicKlineStreamUrl("BTCUSD_PERP", "15m")).toThrow();
+  });
+
+  it("accepts the full current kline payload; an st discriminator must be 1 (USD-M), never 2 (COIN-M)", () => {
+    const full = (extraTop: Record<string, unknown> = {}, extraK: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        e: "kline",
+        E: L0 + 250,
+        s: SYMBOL,
+        ...extraTop,
+        k: {
+          t: L0,
+          T: L0 + M15 - 1,
+          s: SYMBOL,
+          i: "15m",
+          f: 100,
+          L: 200,
+          o: "123",
+          c: "122.5",
+          h: "123",
+          l: "121.5",
+          v: "1000",
+          n: 100,
+          x: false,
+          q: "1.0000",
+          V: "500",
+          Q: "0.500",
+          B: "123456",
+          ...extraK,
+        },
+      });
+    expect(parseKlineStreamMessage(full(), SYMBOL, "15m")).toMatchObject({ openTimeMs: L0, open: 123, high: 123, low: 121.5, close: 122.5, closed: false });
+    expect(parseKlineStreamMessage(full({ st: 1, ps: SYMBOL }), SYMBOL, "15m").symbol).toBe(SYMBOL);
+    for (const cm of [full({ st: 2 }), full({}, { st: 2 }), full({ st: "1" })]) {
+      let code: string | null = null;
+      try {
+        parseKlineStreamMessage(cm, SYMBOL, "15m");
+      } catch (error) {
+        code = (error as LiveStreamError).code;
+      }
+      expect(code).toBe("WRONG_MARKET");
     }
   });
 
@@ -535,6 +600,97 @@ describe("disconnect and reconnect", () => {
     h.send(L0 + M15 + 61_000, message(L0 + M15, [122.5, 122.5, 122.0, 122.1], false, L0 + M15 + 61_000));
     expect(h.session.barStatus(L0 + M15)).toBe("QUARANTINED_CURRENT_BAR");
     expect(h.session.barStatus(L0 + 2 * M15)).toBe("LIVE_ELIGIBLE");
+  });
+});
+
+// ===========================================================================
+// Connection lifecycle and bounded timeouts
+// ===========================================================================
+
+describe("connection lifecycle and bounded timeouts", () => {
+  it("5-6/10. CONNECTING -> OPEN -> FIRST_MESSAGE -> READINESS, each visible; readiness needs a VALID update, not OPEN", () => {
+    const h = harness({ trustedEndMs: L0 });
+    h.setNow(L0 + 500);
+    h.runner.connect();
+    expect(h.runner.lifecycle).toBe("STREAM_CONNECTING");
+    h.live().handlers.onOpen();
+    expect(h.runner.lifecycle).toBe("STREAM_OPEN");
+    expect(h.session.phase).toBe("DISCONNECTED"); // OPEN alone is never readiness
+    h.send(L0 + 1_000, message(L0, [123, 123, 123, 123], false, L0 + 1_000, { i: "1m" }));
+    expect(h.runner.lifecycle).toBe("FIRST_MESSAGE_RECEIVED");
+    expect(h.session.phase).toBe("DISCONNECTED"); // 9. an invalid message does not establish readiness
+    h.send(L0 + 1_250, message(L0, [123, 123, 123, 123], false, L0 + 1_250));
+    expect(h.runner.lifecycle).toBe("READINESS_ESTABLISHED");
+    expect(h.session.barStatus(L0)).toBe("QUARANTINED_CURRENT_BAR");
+    const order = ["STREAM_CONNECTING", "STREAM_OPEN", "FIRST_MESSAGE_RECEIVED", "READINESS_ESTABLISHED"].map((tag) =>
+      h.logs.findIndex((line) => line.startsWith(tag))
+    );
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+  });
+
+  it("7. no OPEN within the bound: STREAM_OPEN_TIMEOUT, visible and fail-closed", () => {
+    const h = harness({ trustedEndMs: L0 });
+    h.setNow(L0 + 1_000);
+    h.runner.connect();
+    h.setNow(L0 + 1_000 + 15_000);
+    expect(h.runner.checkTimeouts()).toBeNull();
+    h.setNow(L0 + 1_000 + 15_001);
+    expect(h.runner.checkTimeouts()).toMatch(/^STREAM_OPEN_TIMEOUT/);
+    expect(h.runner.connected).toBe(false);
+    expect(h.live().closed).toBe(true);
+    expect(h.runner.lifecycle).toBe("STREAM_CLOSED");
+    expect(h.session.barStatus(L0)).toBe("NOT_READY");
+    expect(h.logs.some((line) => line.startsWith("STREAM_CLOSED (dropped: STREAM_OPEN_TIMEOUT"))).toBe(true);
+  });
+
+  it("8. OPEN but no valid update within the bound: STREAM_READINESS_TIMEOUT, saying whether anything arrived", () => {
+    for (const sendRefused of [false, true]) {
+      const h = harness({ trustedEndMs: L0 });
+      h.setNow(L0 + 1_000);
+      h.runner.connect();
+      h.live().handlers.onOpen();
+      if (sendRefused) h.send(L0 + 2_000, message(L0, [123, 123, 123, 123], false, L0 + 2_000, {}, { s: "BTCUSDT" }));
+      h.setNow(L0 + 1_000 + 30_000);
+      expect(h.runner.checkTimeouts()).toBeNull();
+      h.setNow(L0 + 1_000 + 30_001);
+      const reason = h.runner.checkTimeouts();
+      expect(reason).toMatch(/^STREAM_READINESS_TIMEOUT/);
+      expect(reason).toContain(sendRefused ? "1 message(s) refused" : "no message at all");
+      expect(h.runner.connected).toBe(false);
+      expect(h.session.phase).toBe("DISCONNECTED");
+    }
+  });
+
+  it("a ready stream that goes silent is dropped as STREAM_STALE; an error is visible and drops the stream", () => {
+    const h = readyBeforeL0();
+    expect(h.runner.lifecycle).toBe("READINESS_ESTABLISHED");
+    h.setNow(D(10, 23, 59, 59) + 900 + 90_000);
+    expect(h.runner.checkTimeouts()).toBeNull();
+    h.setNow(D(10, 23, 59, 59) + 900 + 90_001);
+    expect(h.runner.checkTimeouts()).toMatch(/^STREAM_STALE/);
+    expect(h.session.barStatus(L0)).toBe("NOT_READY");
+
+    const e = readyBeforeL0();
+    e.live().handlers.onError("websocket error event");
+    expect(e.logs.some((line) => line.startsWith("STREAM_ERROR (websocket error event)"))).toBe(true);
+    expect(e.runner.connected).toBe(false);
+    expect(e.session.barStatus(L0)).toBe("NOT_READY");
+  });
+
+  it("11. events from a dead connection (open, error, close, message) never touch the new one", async () => {
+    const h = readyBeforeL0();
+    h.live().handlers.onClose("network");
+    h.setNow(L0 + 60_000);
+    await h.runner.recoverAndReconnect();
+    const dead = h.connections[0].handlers;
+    dead.onOpen();
+    dead.onError("late error");
+    dead.onClose("late close");
+    dead.onMessage(message(L0, [123, 123, 123, 123], false, L0 + 60_000));
+    expect(h.runner.connected).toBe(true);
+    expect(h.runner.lifecycle).toBe("STREAM_CONNECTING");
+    expect(h.session.phase).toBe("DISCONNECTED");
   });
 });
 

@@ -36,7 +36,6 @@ import { ScannerPathError, assertOutsideRepository, scannerKlineCacheDir, scanne
  */
 
 const REPO_ROOT = path.resolve(__dirname, "../../../../..");
-const STALE_STREAM_MS = 90_000;
 const RECONNECT_DELAYS_MS = [5_000, 10_000, 30_000, 60_000];
 
 /** Public REST transport: GET only, the scanner's own headers only, no redirects followed. */
@@ -53,9 +52,10 @@ const publicTransport: PublicHttpTransport = async (url, init) => {
 /** Public WebSocket: no headers of ours at all, so no key can ever be sent. */
 const openPublicStream: OpenPublicStream = (url, handlers) => {
   const socket = new WebSocket(url);
+  socket.addEventListener("open", () => handlers.onOpen());
   socket.addEventListener("message", (event) => handlers.onMessage(typeof event.data === "string" ? event.data : String(event.data)));
-  socket.addEventListener("close", (event) => handlers.onClose(`code ${event.code}`));
-  socket.addEventListener("error", () => handlers.onClose("error"));
+  socket.addEventListener("error", () => handlers.onError("websocket error event"));
+  socket.addEventListener("close", (event) => handlers.onClose(`code ${event.code}${event.reason ? ` ${event.reason}` : ""}`));
   return { close: () => socket.close() };
 };
 
@@ -181,17 +181,18 @@ async function main(): Promise<void> {
 
   runner.connect();
   for (;;) {
-    await sleep(5_000);
+    await sleep(1_000);
     if (stopping) return;
-    if (runner.connected && runner.lastMessageAtMs !== null && Date.now() - runner.lastMessageAtMs > STALE_STREAM_MS) {
-      runner.disconnect("stale stream: no message for 90s");
-    }
+    // Bounded: no OPEN, no valid update after OPEN, or a stale ready stream all fail visibly.
+    runner.checkTimeouts();
+    if (runner.lifecycle === "READINESS_ESTABLISHED") attempt = 0;
     if (!runner.connected) {
-      await sleep(RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)]);
+      const delayMs = RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
+      console.log(`[${iso(Date.now())}] STREAM_RECONNECT in ${delayMs / 1000}s (attempt ${attempt + 1}); recovering any closed gap first`);
+      await sleep(delayMs);
       attempt += 1;
       try {
         await runner.recoverAndReconnect();
-        attempt = 0;
       } catch (error) {
         console.error(`recovery failed (${error instanceof Error ? error.name : "unknown"}): ${error instanceof Error ? error.message : ""}`);
         if (error instanceof LiveShadowError && error.code !== "RECOVERY_REQUIRED") throw error;

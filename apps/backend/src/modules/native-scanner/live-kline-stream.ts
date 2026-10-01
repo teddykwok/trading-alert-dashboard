@@ -3,7 +3,13 @@ import { assertScannerSymbol, intervalMsOf, type ScannerChartInterval } from "./
 /**
  * Binance USD-M Futures PUBLIC kline stream, as the live shadow scanner sees it.
  *
- * One raw stream per run: wss://fstream.binance.com/ws/<symbol>@kline_<interval>.
+ * One raw ("ws" mode) stream per run on the routed MARKET path:
+ *   wss://fstream.binance.com/market/ws/<symbol>@kline_<interval>
+ * Binance split USD-M WebSocket traffic into /public (high-frequency book
+ * data), /market (regular market data — klines included) and /private (user
+ * data). The legacy un-routed /ws/ URLs were decommissioned after 2026-04-23;
+ * a legacy connection still opens but receives nothing from /market channels.
+ *
  * There is no listen key, no user-data stream, no account and no API key here:
  * the URL builder below can express exactly one public market-data stream and
  * nothing else, and every message is validated into a narrow internal update
@@ -11,8 +17,12 @@ import { assertScannerSymbol, intervalMsOf, type ScannerChartInterval } from "./
  */
 
 export const PUBLIC_FUTURES_STREAM_HOST = "fstream.binance.com";
+/** The routed path for regular market data in raw ("ws") mode. */
+export const PUBLIC_FUTURES_MARKET_WS_PATH = "/market/ws/";
+/** Binance's post-migration symbol-type discriminator: 1 = USD-M (UM), 2 = COIN-M (CM). */
+export const USDM_SYMBOL_TYPE = 1;
 
-export type LiveStreamErrorCode = "FORBIDDEN_STREAM" | "WRONG_EVENT" | "WRONG_SYMBOL" | "WRONG_INTERVAL" | "MALFORMED_KLINE";
+export type LiveStreamErrorCode = "FORBIDDEN_STREAM" | "WRONG_EVENT" | "WRONG_SYMBOL" | "WRONG_INTERVAL" | "WRONG_MARKET" | "MALFORMED_KLINE";
 
 export class LiveStreamError extends Error {
   constructor(
@@ -32,7 +42,11 @@ function refuse(code: LiveStreamErrorCode, message: string): never {
 export function buildPublicKlineStreamUrl(symbol: string, interval: ScannerChartInterval): string {
   const canonical = assertScannerSymbol(symbol);
   intervalMsOf(interval);
-  return assertPublicKlineStreamUrl(`wss://${PUBLIC_FUTURES_STREAM_HOST}/ws/${canonical.toLowerCase()}@kline_${interval}`, canonical, interval);
+  return assertPublicKlineStreamUrl(
+    `wss://${PUBLIC_FUTURES_STREAM_HOST}${PUBLIC_FUTURES_MARKET_WS_PATH}${canonical.toLowerCase()}@kline_${interval}`,
+    canonical,
+    interval
+  );
 }
 
 /** Refuses any URL that is not exactly the public kline stream of `symbol` / `interval`. */
@@ -47,7 +61,8 @@ export function assertPublicKlineStreamUrl(raw: string, symbol: string, interval
   if (url.username !== "" || url.password !== "") refuse("FORBIDDEN_STREAM", "the stream URL must not carry credentials");
   if (url.hostname !== PUBLIC_FUTURES_STREAM_HOST || url.port !== "") refuse("FORBIDDEN_STREAM", `the stream host must be ${PUBLIC_FUTURES_STREAM_HOST}`);
   if (url.search !== "" || url.hash !== "") refuse("FORBIDDEN_STREAM", "the stream URL must have no query or fragment");
-  const expectedPath = `/ws/${symbol.toLowerCase()}@kline_${interval}`;
+  // Exact routed market path in raw mode: no legacy /ws/, no /public/, no /stream mode.
+  const expectedPath = `${PUBLIC_FUTURES_MARKET_WS_PATH}${symbol.toLowerCase()}@kline_${interval}`;
   if (url.pathname !== expectedPath) refuse("FORBIDDEN_STREAM", `the stream path must be exactly ${expectedPath}`);
   return url.toString();
 }
@@ -99,6 +114,17 @@ export function parseKlineStreamMessage(raw: string, symbol: string, interval: S
   const kline = k as Record<string, unknown>;
   if (kline.s !== symbol) refuse("WRONG_SYMBOL", `kline symbol ${JSON.stringify(kline.s)} is not ${symbol}`);
   if (kline.i !== interval) refuse("WRONG_INTERVAL", `kline interval ${JSON.stringify(kline.i)} is not ${interval}`);
+  // After the CM migration fstream can serve COIN-M symbols too. Kline payloads
+  // carry no discriminator today (the exact USD-M symbol match above is the
+  // identity check), but if Binance ever appends its st field it must say UM.
+  for (const [where, value] of [
+    ["st", m.st],
+    ["k.st", kline.st],
+  ] as const) {
+    if (value !== undefined && value !== USDM_SYMBOL_TYPE) {
+      refuse("WRONG_MARKET", `${where} ${JSON.stringify(value)} is not ${USDM_SYMBOL_TYPE} (USD-M)`);
+    }
+  }
 
   const intervalMs = intervalMsOf(interval);
   const eventTimeMs = integerTime(m.E, "E");

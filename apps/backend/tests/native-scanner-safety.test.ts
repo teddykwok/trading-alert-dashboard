@@ -142,6 +142,22 @@ describe("the native scanner data layer", () => {
     expect(live.match(/new\s+WebSocket\s*\([^)]*\)/g)).toEqual(["new WebSocket(url)"]);
   });
 
+  it("the stream lives on the routed /market raw path; the decommissioned un-routed /ws/ path appears nowhere", () => {
+    for (const { file, text } of sources) {
+      expect({ file, hit: code(text).match(/fstream\.binance\.com\/ws\/|["'`]\/ws\//)?.[0] ?? null }).toEqual({ file, hit: null });
+    }
+    const stream = code(sources.find((s) => s.file === "live-kline-stream.ts")!.text);
+    expect(stream).toContain('PUBLIC_FUTURES_MARKET_WS_PATH = "/market/ws/"');
+  });
+
+  it("the live CLI reports every socket lifecycle event and enforces the bounded timeouts", () => {
+    const live = code(sources.find((s) => s.file === LIVE_CLI_FILE)!.text);
+    expect(live).toContain('socket.addEventListener("open", () => handlers.onOpen())');
+    expect(live).toMatch(/socket\.addEventListener\("error", \(\) => handlers\.onError\(/);
+    expect(live).toMatch(/socket\.addEventListener\("close", \(event\) => handlers\.onClose\(/);
+    expect(live).toContain("runner.checkTimeouts()");
+  });
+
   it("no scanner module can express a listen key, a user-data stream or an actionable record", () => {
     for (const { file, text } of sources) {
       const body = code(text);
