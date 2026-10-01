@@ -159,3 +159,42 @@ export {
 } from "./extreme-rr";
 
 export { subtractDecimalStrings, isNegativeDecimalString } from "./decimal-compare";
+
+export type {
+  CalendarAlignment,
+  NativeConditionFlags,
+  NativeEngineConfig,
+  NativeEngineConfigInput,
+  NativeEngineState,
+  NativeHtfAggregate,
+  NativeHtfTrack,
+  NativeKline,
+  NativeLevel,
+  NativeLevelColor,
+  NativeLevelCondition,
+  NativeReplayResult,
+  NativeRetestCandidate,
+  NativeSignal,
+  NativeSignalInputErrorCode,
+  NativeSourceTf,
+  NativeStepResult,
+  NativeTimingMode,
+  NativeTouchDirection,
+} from "./native-signal/index";
+export {
+  DEFAULT_CALENDAR_ALIGNMENT,
+  NATIVE_LEVEL_CONDITIONS,
+  NATIVE_SOURCE_TF_ORDER,
+  NATIVE_TIMING_MODES,
+  NativeSignalInputError,
+  PINE_V55_INPUT_DEFAULTS,
+  advanceHtfAggregate,
+  barFitsHtfPeriod,
+  createNativeEngineConfig,
+  createNativeEngineState,
+  evaluateLevelConditions,
+  htfPeriodStartMs,
+  pinePercentInputToFraction,
+  replayNativeEngine,
+  stepNativeEngine,
+} from "./native-signal/index";
