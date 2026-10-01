@@ -7,6 +7,8 @@ import {
   type NativeEngineState,
   type NativeHtfAggregate,
   type NativeHtfTrack,
+  type NativeImmediateCandidate,
+  type NativeImmediateStepResult,
   type NativeKline,
   type NativeLevel,
   type NativeLevelCondition,
@@ -125,7 +127,10 @@ function isPositiveFinite(value: unknown): value is number {
  * Refuses a bar the engine cannot reason about. Nothing is repaired: a bar that
  * is malformed, out of order or missing would shift every bar-count rule.
  */
-function assertBarAcceptable(state: WorkingState, bar: NativeKline): number {
+function assertBarAcceptable(
+  state: Pick<NativeEngineState, "config" | "intervalMs" | "lastBar">,
+  bar: NativeKline
+): number {
   if (bar === null || typeof bar !== "object") refuse("INVALID_KLINE", "bar must be an object");
   const { openTimeMs, closeTimeMs, open, high, low, close } = bar;
   if (!Number.isSafeInteger(openTimeMs) || !Number.isSafeInteger(closeTimeMs) || closeTimeMs <= openTimeMs) {
@@ -287,4 +292,137 @@ export function stepNativeEngine(state: NativeEngineState, bar: NativeKline): Na
   const out: BarOutputs = { registered: [], evicted: [], candidates: [] };
   applyBarInPlace(working, bar, out);
   return { state: working, registered: out.registered, evicted: out.evicted, candidates: out.candidates };
+}
+
+// ---------------------------------------------------------------------------
+// Slice 1b — IMMEDIATE INTRABAR candidates
+// ---------------------------------------------------------------------------
+
+/**
+ * How many of the OLDEST pre-bar levels might be missing from the registry on
+ * some intrabar update.
+ *
+ * On a realtime update Pine re-runs BAGIAN 3 before 4B, and a rising HTF flag
+ * registers a level for that update (rolled back before the next). Past
+ * MAX_LEVELS each such push shifts the oldest level out — for that update. Per
+ * update, a timeframe can push at most the two conditions of its forming
+ * candle's colour (GOR+ROR when red, GOG+ROG when green), and only conditions
+ * whose committed previous flag is KNOWN false can edge at all. That bounds the
+ * pushes per update, and therefore how many oldest levels are at risk.
+ *
+ * An upper bound, deliberately: it never claims a level was present when it
+ * might not have been.
+ */
+function levelsAtIntrabarEvictionRisk(preBar: NativeEngineState): number {
+  let maxPushesPerUpdate = 0;
+  for (const tf of preBar.config.enabledSourceTfs) {
+    const previous = preBar.htf[tf]?.previousFlags ?? null;
+    if (previous === null) continue;
+    const redPushes = Number(!previous.GOR) + Number(!previous.ROR);
+    const greenPushes = Number(!previous.GOG) + Number(!previous.ROG);
+    maxPushesPerUpdate += Math.max(redPushes, greenPushes);
+  }
+  return Math.max(0, preBar.levels.length + maxPushesPerUpdate - preBar.config.maxLevels);
+}
+
+/**
+ * The IMMEDIATE INTRABAR candidates of `bar`, reconstructed from `preBar` —
+ * the state committed at the close of the PREVIOUS bar.
+ *
+ * Pine's realtime model makes this exact for levels that already existed:
+ * before the confirmed tick, 4A has not run, so armed / armedBar / createdBar /
+ * lastTouch are the previous close's values, `close[1]` is the previous close,
+ * and only the bar's high and low move — monotonically outward. Every 4B
+ * condition except `inBand` is therefore fixed for the whole bar, and `inBand`
+ * held on some update if and only if it holds for the FINAL range.
+ *
+ * Deliberately limited:
+ *  - Only levels in `preBar` are considered. A level registered during this bar
+ *    (transiently intrabar, or at the close) is never reconstructed: its price
+ *    and existence depend on the intrabar path, which OHLC does not record. It
+ *    could not pass `oldEnough` anyway (minBarsAfterCreation >= 1).
+ *  - Every qualifying level is returned, oldest first. Whether TradingView
+ *    delivered one alert per bar or one per level is a platform question this
+ *    engine does not answer.
+ *  - Nothing here commits anything. `preBar` is only read.
+ */
+export function reconstructImmediateCandidates(
+  preBar: NativeEngineState,
+  bar: NativeKline
+): NativeImmediateCandidate[] {
+  assertBarAcceptable(preBar, bar);
+  const { config } = preBar;
+  // Pine alerts intrabar only in Immediate mode (freq_once_per_bar), and only
+  // when the 4B loop runs at all (line 297). `close[1]` is na on the first bar.
+  if (config.timing !== "Immediate" || !config.retestEnabled || preBar.lastBar === null) return [];
+
+  const barIndex = preBar.barIndex;
+  const previousClose = preBar.lastBar.close;
+  const tolerance = config.touchTolerancePct;
+  const atRisk = levelsAtIntrabarEvictionRisk(preBar);
+  const candidates: NativeImmediateCandidate[] = [];
+
+  for (let position = 0; position < preBar.levels.length; position += 1) {
+    const level = preBar.levels[position];
+    // Pine's 4B conditions, operand for operand — against the PRE-BAR state.
+    const upperBand = level.price * (1 + tolerance);
+    const lowerBand = level.price * (1 - tolerance);
+    const armedReady =
+      level.armed && level.armedBarIndex >= 0 && barIndex - level.armedBarIndex >= config.minBarsAfterArming;
+    const oldEnough = barIndex - level.createdBarIndex >= config.minBarsAfterCreation;
+    const cooledDown =
+      level.lastTouchBarIndex < 0 || barIndex - level.lastTouchBarIndex >= config.touchCooldownBars;
+    const inBand = bar.low <= upperBand && bar.high >= lowerBand;
+    const longRetest = level.color === "GREEN" && previousClose > upperBand && inBand;
+    const shortRetest = level.color === "RED" && previousClose < lowerBand && inBand;
+    if (!((longRetest || shortRetest) && armedReady && oldEnough && cooledDown)) continue;
+
+    // The low reached the band before the closing update if the bar opened at
+    // or below it, or if its low was printed before the close (low < close).
+    // Likewise for the high. Both must hold on the same earlier update, which
+    // monotonic high/low guarantee once each has been reached.
+    const lowBeforeClose = bar.open <= upperBand || bar.low < bar.close;
+    const highBeforeClose = bar.open >= lowerBand || bar.high > bar.close;
+
+    candidates.push({
+      basis: "IMMEDIATE_INTRABAR",
+      signal: longRetest ? "LONG" : "SHORT",
+      touchDirection: longRetest ? "FROM_ABOVE" : "FROM_BELOW",
+      levelColor: level.color,
+      sourceTf: level.sourceTf,
+      levelPrice: level.price,
+      chartBarIndex: barIndex,
+      chartBarOpenTimeMs: bar.openTimeMs,
+      chartBarCloseTimeMs: bar.closeTimeMs,
+      level: {
+        id: level.id,
+        condition: level.condition,
+        htfPeriodStartMs: level.htfPeriodStartMs,
+        createdBarIndex: level.createdBarIndex,
+        createdBarOpenTimeMs: level.createdBarOpenTimeMs,
+      },
+      proof: {
+        bandEnteredBeforeClosingUpdate: lowBeforeClose && highBeforeClose,
+        levelPresentOnEveryUpdate: position >= atRisk,
+      },
+    });
+  }
+  return candidates;
+}
+
+/**
+ * One bar, both candidate kinds, in Pine's order:
+ *
+ *   A/B. IMMEDIATE INTRABAR candidates, from the state committed at the
+ *        previous close — before anything this bar does;
+ *   C.   the confirmed-close engine, exactly `stepNativeEngine`;
+ *   D.   both, in separate fields.
+ *
+ * The immediate reconstruction reads `state` and nothing else, so the
+ * committed result is identical to `stepNativeEngine(state, bar)`.
+ */
+export function stepNativeEngineWithImmediate(state: NativeEngineState, bar: NativeKline): NativeImmediateStepResult {
+  const immediateCandidates = reconstructImmediateCandidates(state, bar);
+  const committed = stepNativeEngine(state, bar);
+  return { ...committed, immediateCandidates };
 }

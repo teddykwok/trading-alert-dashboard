@@ -9,6 +9,10 @@ export type {
   NativeEngineState,
   NativeHtfAggregate,
   NativeHtfTrack,
+  NativeCandidate,
+  NativeCandidateBasis,
+  NativeImmediateCandidate,
+  NativeImmediateStepResult,
   NativeKline,
   NativeLevel,
   NativeLevelColor,
@@ -33,7 +37,13 @@ export {
 } from "./types";
 
 export { advanceHtfAggregate, barFitsHtfPeriod, htfPeriodStartMs } from "./htf-aggregate";
-export { createNativeEngineState, evaluateLevelConditions, stepNativeEngine } from "./engine";
+export {
+  createNativeEngineState,
+  evaluateLevelConditions,
+  reconstructImmediateCandidates,
+  stepNativeEngine,
+  stepNativeEngineWithImmediate,
+} from "./engine";
 
-export type { NativeReplayResult } from "./replay";
-export { replayNativeEngine } from "./replay";
+export type { NativeImmediateReplayResult, NativeReplayResult } from "./replay";
+export { replayNativeEngine, replayNativeEngineWithImmediate } from "./replay";

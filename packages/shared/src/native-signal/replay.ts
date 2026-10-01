@@ -1,7 +1,14 @@
-import { applyBarInPlace, cloneWorkingState, createNativeEngineState, type BarOutputs } from "./engine";
+import {
+  applyBarInPlace,
+  cloneWorkingState,
+  createNativeEngineState,
+  reconstructImmediateCandidates,
+  type BarOutputs,
+} from "./engine";
 import type {
   NativeEngineConfig,
   NativeEngineState,
+  NativeImmediateCandidate,
   NativeKline,
   NativeLevel,
   NativeRetestCandidate,
@@ -34,5 +41,38 @@ export function replayNativeEngine(bars: readonly NativeKline[], config: NativeE
     candidates: out.candidates,
     registrations: out.registered,
     evictions: out.evicted,
+  };
+}
+
+export interface NativeImmediateReplayResult extends NativeReplayResult {
+  /** Every IMMEDIATE INTRABAR candidate, in bar order and, within a bar, oldest level first. */
+  readonly immediateCandidates: readonly NativeImmediateCandidate[];
+}
+
+/**
+ * `replayNativeEngine`, plus the IMMEDIATE INTRABAR candidates of every bar.
+ *
+ * Each bar's immediate candidates are reconstructed from the state as it stood
+ * BEFORE that bar is applied; the bar is then applied exactly as the committed
+ * replay applies it. The committed fields are therefore identical to
+ * `replayNativeEngine(bars, config)`.
+ */
+export function replayNativeEngineWithImmediate(
+  bars: readonly NativeKline[],
+  config: NativeEngineConfig
+): NativeImmediateReplayResult {
+  const working = cloneWorkingState(createNativeEngineState(config));
+  const out: BarOutputs = { registered: [], evicted: [], candidates: [] };
+  const immediateCandidates: NativeImmediateCandidate[] = [];
+  for (const bar of bars) {
+    immediateCandidates.push(...reconstructImmediateCandidates(working, bar));
+    applyBarInPlace(working, bar, out);
+  }
+  return {
+    state: working,
+    candidates: out.candidates,
+    registrations: out.registered,
+    evictions: out.evicted,
+    immediateCandidates,
   };
 }

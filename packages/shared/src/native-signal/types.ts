@@ -257,6 +257,73 @@ export interface NativeRetestCandidate {
   };
 }
 
+/**
+ * Slice 1b — an IMMEDIATE INTRABAR candidate.
+ *
+ * Three different things must never be confused:
+ *
+ *   1. COMMITTED candidate (`NativeRetestCandidate`): the closing-tick 4B
+ *      evaluation fired and `lvlLastTouchBar` was written.
+ *   2. IMMEDIATE INTRABAR candidate (this type): reconstructed from the state
+ *      committed at the END of the previous bar plus this bar's final OHLC. It
+ *      says Pine's Immediate `alert()` COULD have fired during the bar — every
+ *      4B condition held from the pre-bar state, and the bar's range entered
+ *      the band.
+ *   3. A DELIVERED TradingView alert: a fact about the platform. Nothing in
+ *      this engine observes delivery, so nothing here claims it.
+ *
+ * Why the pre-bar state: on realtime ticks Pine runs 4B against `var` state
+ * rolled back to the previous close, and 4A (ARM/DISARM) only runs on the
+ * confirmed tick. So until the close, arming, armedBar, createdBar and
+ * lastTouch are exactly the previous bar's committed values, `close[1]` is the
+ * previous close, and only the bar's high/low move — and they only widen.
+ *
+ * An immediate candidate NEVER commits a cooldown: Pine rolls back the
+ * intrabar `lvlLastTouchBar` write, and only the closing evaluation (the
+ * committed candidate, if any) leaves one behind.
+ */
+export interface NativeImmediateCandidate {
+  readonly basis: "IMMEDIATE_INTRABAR";
+  readonly signal: NativeSignal;
+  readonly touchDirection: NativeTouchDirection;
+  readonly levelColor: NativeLevelColor;
+  readonly sourceTf: NativeSourceTf;
+  readonly levelPrice: number;
+  readonly chartBarIndex: number;
+  readonly chartBarOpenTimeMs: number;
+  readonly chartBarCloseTimeMs: number;
+  readonly level: NativeRetestCandidate["level"];
+  /**
+   * What closed OHLC alone can and cannot prove. A candidate is "could have
+   * fired"; these flags say whether that is established or merely possible.
+   */
+  readonly proof: {
+    /**
+     * True when the bar's OHLC proves the band was entered on an update
+     * BEFORE the closing one: the low reached the band either at the open or
+     * strictly before the close (low < close), and likewise for the high.
+     *
+     * False means the band may only have been reached by the closing update
+     * itself — and on that update Pine runs 4A first, so the only alert it
+     * could send is the committed one. Assumes the bar's opening update is not
+     * also its closing update.
+     */
+    readonly bandEnteredBeforeClosingUpdate: boolean;
+    /**
+     * True when this level is provably in the registry on EVERY intrabar
+     * update. A transient intrabar registration (rolled back afterwards) pushes
+     * a level and, past MAX_LEVELS, shifts the oldest out for that update; with
+     * the registry near capacity the oldest pre-bar levels may be absent at the
+     * very update that touched the band. False = not provable from OHLC.
+     */
+    readonly levelPresentOnEveryUpdate: boolean;
+  };
+}
+
+/** Either kind of candidate; `basis` always says which. */
+export type NativeCandidate = NativeRetestCandidate | NativeImmediateCandidate;
+export type NativeCandidateBasis = NativeCandidate["basis"];
+
 export interface NativeStepResult {
   readonly state: NativeEngineState;
   /** Levels registered on this bar, as they were at registration. */
@@ -264,6 +331,15 @@ export interface NativeStepResult {
   /** Levels dropped by MAX_LEVELS on this bar. */
   readonly evicted: readonly NativeLevel[];
   readonly candidates: readonly NativeRetestCandidate[];
+}
+
+/**
+ * A step that reports BOTH candidate kinds, in separate fields. `candidates`
+ * is exactly what `stepNativeEngine` returns; the immediate ones never
+ * influence it.
+ */
+export interface NativeImmediateStepResult extends NativeStepResult {
+  readonly immediateCandidates: readonly NativeImmediateCandidate[];
 }
 
 export type NativeSignalInputErrorCode =
