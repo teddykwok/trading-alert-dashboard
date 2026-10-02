@@ -12,11 +12,11 @@ import { CandidateRankHaltError, GovernedPublicTransport } from "./candidate-ran
 import { KlineCacheStore } from "./kline-cache";
 import { PublicRequestController, REQUEST_POLICY_LIMITS, type PublicHttpTransport } from "./kline-fetcher";
 import type { OpenPublicStream } from "./live-shadow-runner";
-import { LiveShadowSupervisor, SupervisorConfigError, liveShadowDir, type SupervisorStatus } from "./live-shadow-supervisor";
+import { LiveShadowSupervisor, SupervisorConfigError, TargetNotReachedError, liveShadowDir, type SupervisorSelection, type SupervisorStatus } from "./live-shadow-supervisor";
 import { SUPERVISOR_CLI_USAGE, SupervisorCliUsageError, parseSupervisorCliArgs } from "./live-shadow-supervisor-cli-args";
 import { ScannerPathError, assertOutsideRepository, scannerKlineCacheDir, scannerRootDir } from "./scanner-paths";
 import { acquireLiveShadowLock } from "./scanner-lock";
-import { UniverseSelectionError, parseExchangeInfoContracts, selectSymbols, selectUsdtPerpetualUniverse } from "./usdm-universe";
+import { UniverseSelectionError, parseExchangeInfoContracts, selectSymbols, selectUsdtPerpetualUniverse, universeWalk } from "./usdm-universe";
 
 /**
  * MULTI-SYMBOL NATIVE LIVE-SHADOW SUPERVISOR — SHADOW ONLY.
@@ -121,12 +121,22 @@ async function main(): Promise<void> {
 
   // The same universe and selection rules as the ranker; explicit symbols must be active USDT perpetuals.
   const universe = selectUsdtPerpetualUniverse(parseExchangeInfoContracts(await new PublicRequestController(fetchDeps).getJson(buildPublicFuturesUrl(baseUrl, EXCHANGE_INFO_PATH))));
-  const selection = selectSymbols(universe, options.selection);
+  // EXPLICIT: exactly the named symbols, never substituted. UNIVERSE: walk the universe and
+  // accept SCANNER-ELIGIBLE symbols until --max-symbols are accepted, or all of them (--all-active).
+  let selection: SupervisorSelection;
+  if (options.selection.mode === "EXPLICIT") {
+    const explicit = selectSymbols(universe, options.selection);
+    selection = { mode: "EXPLICIT", candidates: explicit.contracts.map((c) => ({ symbol: c.symbol, onboardDateMs: c.onboardDateMs, required: true })) };
+  } else {
+    const walk = universeWalk(universe, options.selection).map(({ contract, required }) => ({ symbol: contract.symbol, onboardDateMs: contract.onboardDateMs, required }));
+    selection = options.selection.maxSymbols === null ? { mode: "ALL_ACTIVE", candidates: walk } : { mode: "TARGET", candidates: walk, target: options.selection.maxSymbols };
+  }
   const started = Date.now();
   const supervisor = new LiveShadowSupervisor(
     {
       lineage: options.lineage,
-      symbols: selection.symbols,
+      selection,
+      universeActive: universe.contracts.length,
       symbolsPerConnection: options.symbolsPerConnection,
       maxConnections: options.maxConnections,
       restConcurrency: options.restConcurrency,
@@ -148,10 +158,14 @@ async function main(): Promise<void> {
       log: (line) => console.log(`[${iso(Date.now())}] ${line}`),
     }
   );
-  const connections = Math.ceil(selection.symbols.length / options.symbolsPerConnection);
   console.log(`universe active: ${universe.contracts.length}`);
-  console.log(`selected: ${selection.symbols.length}${selection.truncatedByMaxSymbols > 0 ? ` (${selection.truncatedByMaxSymbols} left out by --max-symbols)` : ""}`);
-  console.log(`connections: ${connections} (${options.symbolsPerConnection} symbols per connection max)`);
+  console.log(
+    selection.mode === "TARGET"
+      ? `target eligible: ${selection.target} (walking ${selection.candidates.length} candidates)`
+      : selection.mode === "ALL_ACTIVE"
+        ? `target: every scanner-eligible active symbol (${selection.candidates.length} candidates)`
+        : `explicit symbols: ${selection.candidates.length}`
+  );
   console.log(`interval: ${options.lineage.chartInterval}`);
 
   const statusDir = assertOutsideRepository(path.join(root, "live-shadow-supervisor"), REPO_ROOT);
@@ -181,6 +195,17 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => stop("operator stop"));
 
   await supervisor.start();
+  const sel = supervisor.status().selection;
+  if (sel !== null) {
+    console.log(`tested candidates: ${sel.candidatesTested}`);
+    console.log(`accepted eligible: ${sel.acceptedEligible}`);
+    console.log("skipped (never joined the running set):");
+    console.log(`  too-new precheck: ${sel.skippedTooNew}`);
+    console.log(`  insufficient history: ${sel.skippedInsufficientHistory}`);
+    console.log(`  other: ${sel.skippedOther}`);
+    console.log(`universe exhausted: ${sel.universeExhausted}`);
+  }
+  console.log(`connections: ${supervisor.status().connections.length} (${options.symbolsPerConnection} symbols per connection max)`);
   console.log(`startup complete in ${((Date.now() - started) / 1000).toFixed(1)}s; REST requests ${governor.requestsMade}`);
   printTable(supervisor.status());
 
@@ -209,8 +234,16 @@ void main().catch((error: unknown) => {
     error instanceof ScannerPathError ||
     error instanceof UniverseSelectionError ||
     error instanceof SupervisorConfigError ||
-    error instanceof CandidateRankHaltError
+    error instanceof CandidateRankHaltError ||
+    error instanceof TargetNotReachedError
   ) {
+    if (error instanceof TargetNotReachedError) {
+      const s = error.summary;
+      console.error(
+        `target ${s.targetEligible ?? "all-active"}; accepted ${s.acceptedEligible}; tested ${s.candidatesTested}; remaining universe ${s.remainingUniverse}; requests used ${s.requestsUsed}; ` +
+          `skipped too-new ${s.skippedTooNew}, insufficient history ${s.skippedInsufficientHistory}, other ${s.skippedOther}`
+      );
+    }
     const code = "code" in error ? ` (${String((error as { code: unknown }).code)})` : "";
     console.error(`REFUSED${code}: ${error.message}`);
   } else {
