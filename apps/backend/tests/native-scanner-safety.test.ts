@@ -10,9 +10,10 @@ import { describe, expect, it } from "vitest";
  */
 
 const SCANNER_DIR = path.resolve(__dirname, "../src/modules/native-scanner");
-/** The CLI entrypoints: causal replay (2A), compatibility replay (2B-2A), live shadow scanner (2B-2B), read-only candidate ranker, read-only parity audit. */
-const CLI_FILES = ["run-historical-replay.ts", "run-compat-replay.ts", "run-live-shadow.ts", "run-candidate-rank.ts", "run-parity-audit.ts"];
+/** The CLI entrypoints: causal replay (2A), compatibility replay (2B-2A), live shadow scanner (2B-2B), read-only candidate ranker, read-only parity audit, live shadow supervisor. */
+const CLI_FILES = ["run-historical-replay.ts", "run-compat-replay.ts", "run-live-shadow.ts", "run-candidate-rank.ts", "run-parity-audit.ts", "run-live-shadow-supervisor.ts"];
 const LIVE_CLI_FILE = "run-live-shadow.ts";
+const SUPERVISOR_CLI_FILE = "run-live-shadow-supervisor.ts";
 const PATHS_FILE = "scanner-paths.ts";
 
 const sources = readdirSync(SCANNER_DIR)
@@ -28,7 +29,7 @@ const importsOf = (text: string) =>
   );
 
 describe("the native scanner data layer", () => {
-  it("consists of exactly the Slice 2A, 2B-2A, 2B-2B, candidate-ranker and parity-audit modules", () => {
+  it("consists of exactly the Slice 2A, 2B-2A, 2B-2B, candidate-ranker, parity-audit and supervisor modules", () => {
     expect(sources.map((s) => s.file).sort()).toEqual([
       "binance-public-futures.ts",
       "candidate-rank-cli-args.ts",
@@ -48,16 +49,21 @@ describe("the native scanner data layer", () => {
       "live-shadow-runner.ts",
       "live-shadow-session.ts",
       "live-shadow-store.ts",
+      "live-shadow-supervisor-cli-args.ts",
+      "live-shadow-supervisor.ts",
       "parity-audit-runner.ts",
       "parity-audit.ts",
       "replay-cli-args.ts",
       "run-candidate-rank.ts",
       "run-compat-replay.ts",
       "run-historical-replay.ts",
+      "run-live-shadow-supervisor.ts",
       "run-live-shadow.ts",
       "run-parity-audit.ts",
       "scanner-lineage.ts",
+      "scanner-lock.ts",
       "scanner-paths.ts",
+      "symbol-stream-channel.ts",
       "usdm-universe.ts",
     ]);
   });
@@ -129,23 +135,29 @@ describe("the native scanner data layer", () => {
     expect(cli).toContain('method: "GET"');
   });
 
-  it("the package exposes exactly five scanner scripts: causal replay, compatibility replay, live shadow, candidate rank, parity audit", () => {
+  it("the package exposes exactly six scanner scripts: causal replay, compatibility replay, live shadow, candidate rank, parity audit, live shadow supervisor", () => {
     const scripts = (JSON.parse(readFileSync(path.resolve(__dirname, "../package.json"), "utf8")) as { scripts: Record<string, string> })
       .scripts;
     expect(Object.entries(scripts).filter(([name, command]) => /scanner/.test(name) || /native-scanner/.test(command))).toEqual([
       ["scanner:replay", "tsx src/modules/native-scanner/run-historical-replay.ts"],
       ["scanner:compat-replay", "tsx src/modules/native-scanner/run-compat-replay.ts"],
       ["scanner:live-shadow", "tsx src/modules/native-scanner/run-live-shadow.ts"],
+      ["scanner:live-shadow-supervisor", "tsx src/modules/native-scanner/run-live-shadow-supervisor.ts"],
       ["scanner:candidate-rank", "tsx src/modules/native-scanner/run-candidate-rank.ts"],
       ["scanner:parity-audit", "tsx src/modules/native-scanner/run-parity-audit.ts"],
     ]);
   });
 
-  it("only the live CLI opens a WebSocket, and only through the public kline stream builder", () => {
+  it("only the two live CLIs open a WebSocket, and only through the public kline stream builders", () => {
     for (const { file, text } of sources) {
       const opens = /new\s+WebSocket\s*\(/.test(code(text));
-      expect({ file, opens }).toEqual({ file, opens: file === LIVE_CLI_FILE });
+      expect({ file, opens }).toEqual({ file, opens: file === LIVE_CLI_FILE || file === SUPERVISOR_CLI_FILE });
     }
+    const supervisorCli = code(sources.find((s) => s.file === SUPERVISOR_CLI_FILE)!.text);
+    expect(supervisorCli.match(/new\s+WebSocket\s*\([^)]*\)/g)).toEqual(["new WebSocket(url)"]);
+    // The supervisor's URL comes only from the combined public kline builder.
+    const supervisor = code(sources.find((s) => s.file === "live-shadow-supervisor.ts")!.text);
+    expect(supervisor).toContain("buildPublicCombinedKlineStreamUrl(symbols, this.config.lineage.chartInterval)");
     const live = code(sources.find((s) => s.file === LIVE_CLI_FILE)!.text);
     expect(live).toContain("buildPublicKlineStreamUrl(request.symbol, request.chartInterval)");
     // Exactly one argument: the URL. No sub-protocols, no options object, so no header can ride along.

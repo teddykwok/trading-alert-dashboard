@@ -21,6 +21,7 @@ import { LiveShadowEventStore } from "./live-shadow-store";
 import { REPLAY_PAGE_LIMIT, REPLAY_SETTLE_MS } from "./replay-cli-args";
 import { ScannerLineageError, deriveHtfContextStartMs } from "./scanner-lineage";
 import { ScannerPathError, assertOutsideRepository, scannerKlineCacheDir, scannerRootDir } from "./scanner-paths";
+import { ScannerLockError, acquireLiveShadowLock } from "./scanner-lock";
 
 /**
  * LIVE SHADOW scanner for ONE symbol on Binance USD-M public 15m klines.
@@ -60,6 +61,15 @@ const openPublicStream: OpenPublicStream = (url, handlers) => {
 };
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
 const iso = (ms: number) => new Date(ms).toISOString();
 
 function git(args: string[]): string {
@@ -132,6 +142,9 @@ async function main(): Promise<void> {
     trustedEndMs = contiguousEnd(klines, contextStartMs, currentBarOpenMs, intervalMs);
   }
 
+  // One live-shadow writer per symbol directory: refuses if the supervisor (or another scanner) owns it.
+  const lock = acquireLiveShadowLock(liveDir, { pid: process.pid, owner: "scanner:live-shadow", startedAt: iso(Date.now()), isProcessAlive });
+  process.on("exit", () => lock.release());
   const checkpoints = new LiveCheckpointStore(liveDir);
   const plan = prepareLiveShadowState(klines, request, trustedEndMs, checkpoints.load());
   checkpoints.save(plan.checkpointBody, iso(Date.now()));
@@ -209,7 +222,8 @@ void main().catch((error: unknown) => {
     error instanceof CompatReplayError ||
     error instanceof ScannerLineageError ||
     error instanceof LiveShadowError ||
-    error instanceof LiveStreamError
+    error instanceof LiveStreamError ||
+    error instanceof ScannerLockError
   ) {
     const code = "code" in error ? ` (${String((error as { code: unknown }).code)})` : "";
     console.error(`REFUSED${code}: ${error.message}`);
