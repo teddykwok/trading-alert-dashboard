@@ -29,6 +29,7 @@
     "scanner:replay": "tsx src/modules/native-scanner/run-historical-replay.ts",
     "scanner:compat-replay": "tsx src/modules/native-scanner/run-compat-replay.ts",
     "scanner:live-shadow": "tsx src/modules/native-scanner/run-live-shadow.ts",
+    "scanner:candidate-rank": "tsx src/modules/native-scanner/run-candidate-rank.ts",
     "native-alerts:emitter": "tsx src/modules/native-alerts/run-native-alert-emitter.ts",
     "execution:canary-preflight": "tsx src/modules/execution/run-canary-preflight.ts",
     "execution:ensure-profile": "tsx src/modules/execution/run-ensure-profile.ts",

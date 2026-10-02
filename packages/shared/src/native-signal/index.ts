@@ -5,6 +5,7 @@ export type {
   CalendarAlignment,
   NativeConditionFlags,
   NativeEngineConfig,
+  NativeEngineDiagnosticSnapshot,
   NativeEngineConfigInput,
   NativeEngineState,
   NativeHistoricalInput,
@@ -23,6 +24,7 @@ export type {
   NativeLevel,
   NativeLevelColor,
   NativeLevelCondition,
+  NativeLevelDiagnostic,
   NativePartialPeriodPolicy,
   NativeRetestCandidate,
   NativeSignal,
@@ -51,6 +53,7 @@ export {
   createNativeEngineState,
   evaluateLevelConditions,
   reconstructImmediateCandidates,
+  snapshotNativeEngineForNextBar,
   stepNativeEngine,
   stepNativeEngineWithImmediate,
 } from "./engine";

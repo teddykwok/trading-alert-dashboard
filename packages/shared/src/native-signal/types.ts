@@ -342,6 +342,60 @@ export interface NativeImmediateStepResult extends NativeStepResult {
   readonly immediateCandidates: readonly NativeImmediateCandidate[];
 }
 
+/**
+ * One registered level as the NEXT bar's 4B retest would judge it, from the
+ * committed state alone. A read-only DIAGNOSTIC: it is not a candidate, never
+ * actionable, and nothing in the engine reads it back.
+ *
+ * Every gate is Pine's 4B condition evaluated exactly as the engine evaluates
+ * it, against `nextBarIndex` and the committed `close[1]`. Only `inBand` is
+ * missing, because it depends on the next bar's range.
+ */
+export interface NativeLevelDiagnostic {
+  /** 0-based position in the registry, oldest first (the retest loop order). */
+  readonly position: number;
+  readonly id: number;
+  readonly sourceTf: NativeSourceTf;
+  readonly color: NativeLevelColor;
+  readonly condition: NativeLevelCondition;
+  readonly price: number;
+  readonly htfPeriodStartMs: number;
+  readonly createdBarIndex: number;
+  readonly createdBarOpenTimeMs: number;
+  readonly armed: boolean;
+  readonly armedBarIndex: number;
+  readonly lastTouchBarIndex: number;
+  /** level * (1 + tolerance) and level * (1 - tolerance), written as the engine writes them. */
+  readonly upperBand: number;
+  readonly lowerBand: number;
+  /** GREEN retests as LONG (touch from above); RED as SHORT (touch from below). */
+  readonly retestSignal: NativeSignal;
+  readonly gates: {
+    /** armed && armedBar >= 0 && nextBar - armedBar >= minBarsAfterArming */
+    readonly armedReady: boolean;
+    /** nextBar - createdBar >= minBarsAfterCreation */
+    readonly oldEnough: boolean;
+    /** lastTouch < 0 || nextBar - lastTouch >= touchCooldownBars */
+    readonly cooledDown: boolean;
+    /** GREEN: close[1] > upperBand. RED: close[1] < lowerBand. False when close[1] is na. */
+    readonly approachSide: boolean;
+  };
+  /** May be pushed out of the registry intrabar by transient registrations (see Slice 1b proof). */
+  readonly intrabarEvictionRisk: boolean;
+}
+
+export interface NativeEngineDiagnosticSnapshot {
+  /** The bar index the NEXT bar will have: the committed state's barIndex. */
+  readonly nextBarIndex: number;
+  /** The committed `close[1]` for the next bar; null before the first bar. */
+  readonly previousClose: number | null;
+  readonly lastBarOpenTimeMs: number | null;
+  /** False when Pine's 4B loop does not run at all (retest disabled). */
+  readonly retestEnabled: boolean;
+  readonly timing: NativeTimingMode;
+  readonly levels: readonly NativeLevelDiagnostic[];
+}
+
 export type NativeSignalInputErrorCode =
   | "INVALID_CONFIG"
   | "INVALID_KLINE"
