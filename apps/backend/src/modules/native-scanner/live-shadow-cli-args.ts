@@ -4,6 +4,7 @@ import {
   SWITCHOVER_TRUNCATED_CLOSED_BARS,
   createNativeEngineConfig,
   pinePercentInputToFraction,
+  type NativeEngineConfig,
   type NativeSourceTf,
   type NativeTimingMode,
 } from "@trading-alert-dashboard/shared";
@@ -27,6 +28,26 @@ export class LiveShadowCliUsageError extends Error {
     this.name = "LiveShadowCliUsageError";
   }
 }
+
+/**
+ * The options that define a scanner LINEAGE's signal configuration. Shared by
+ * every CLI that reconstructs live-shadow state (the live scanner and the
+ * read-only candidate ranker), so the two can never parse them differently.
+ */
+export const LINEAGE_CONFIG_OPTIONS = [
+  "--interval",
+  "--history-start",
+  "--switchover",
+  "--min-move-percent",
+  "--touch-tolerance-percent",
+  "--cooldown-bars",
+  "--min-bars-after-creation",
+  "--min-bars-after-arming",
+  "--source-timeframes",
+  "--max-levels",
+  "--timing",
+  "--partial-period-policy",
+] as const;
 
 const REQUIRED = [
   "--symbol",
@@ -104,6 +125,47 @@ export function parseLiveShadowCliArgs(argv: readonly string[]): LiveShadowCliOp
 
   try {
     const symbol = assertScannerSymbol(get("--symbol"));
+    const { chartInterval, engine, historyStartMs, switchoverMs } = parseLineageConfig(get);
+    const expectedLineageId = values.has("--expect-lineage-id") ? get("--expect-lineage-id") : null;
+    if (expectedLineageId !== null && !/^[0-9a-f]{64}$/.test(expectedLineageId)) usage("--expect-lineage-id must be a lowercase SHA-256 hex digest");
+    const policy = assertRequestPolicy({
+      ...CONSERVATIVE_REQUEST_POLICY,
+      ...(values.has("--max-requests") ? { maxRequests: integer(get("--max-requests"), "--max-requests") } : {}),
+      ...(values.has("--request-spacing-ms") ? { minSpacingMs: integer(get("--request-spacing-ms"), "--request-spacing-ms") } : {}),
+    });
+    return {
+      request: {
+        symbol,
+        marketType: SCANNER_MARKET_TYPE,
+        chartInterval,
+        historyStartMs,
+        switchoverMs,
+        engine,
+        partialPeriodPolicy: SWITCHOVER_TRUNCATED_CLOSED_BARS,
+        expectedLineageId,
+      },
+      fetch: flags.has("--fetch"),
+      policy,
+    };
+  } catch (error) {
+    if (error instanceof ScannerDataError || error instanceof NativeSignalInputError) usage(error.message);
+    throw error;
+  }
+}
+
+export interface LineageConfig {
+  readonly chartInterval: ScannerChartInterval;
+  readonly engine: NativeEngineConfig;
+  readonly historyStartMs: number;
+  readonly switchoverMs: number;
+}
+
+/**
+ * Parses the LINEAGE_CONFIG_OPTIONS (all required) into the engine config and
+ * the fixed history/switchover times. Refuses with LiveShadowCliUsageError.
+ */
+export function parseLineageConfig(get: (name: string) => string): LineageConfig {
+  try {
     const chartInterval = get("--interval") as ScannerChartInterval;
     const intervalMs = intervalMsOf(chartInterval);
     const timing = get("--timing");
@@ -111,8 +173,6 @@ export function parseLiveShadowCliArgs(argv: readonly string[]): LiveShadowCliOp
     if (get("--partial-period-policy") !== SWITCHOVER_TRUNCATED_CLOSED_BARS) {
       usage(`--partial-period-policy must be ${SWITCHOVER_TRUNCATED_CLOSED_BARS} (the only approved policy)`);
     }
-    const expectedLineageId = values.has("--expect-lineage-id") ? get("--expect-lineage-id") : null;
-    if (expectedLineageId !== null && !/^[0-9a-f]{64}$/.test(expectedLineageId)) usage("--expect-lineage-id must be a lowercase SHA-256 hex digest");
     const engine = createNativeEngineConfig({
       minMovePct: percent(get("--min-move-percent"), "--min-move-percent"),
       touchTolerancePct: percent(get("--touch-tolerance-percent"), "--touch-tolerance-percent"),
@@ -136,25 +196,7 @@ export function parseLiveShadowCliArgs(argv: readonly string[]): LiveShadowCliOp
     if (historyStartMs % intervalMs !== 0 || switchoverMs % intervalMs !== 0 || !(historyStartMs < switchoverMs)) {
       usage("--history-start and --switchover must be bar boundaries with history-start < switchover");
     }
-    const policy = assertRequestPolicy({
-      ...CONSERVATIVE_REQUEST_POLICY,
-      ...(values.has("--max-requests") ? { maxRequests: integer(get("--max-requests"), "--max-requests") } : {}),
-      ...(values.has("--request-spacing-ms") ? { minSpacingMs: integer(get("--request-spacing-ms"), "--request-spacing-ms") } : {}),
-    });
-    return {
-      request: {
-        symbol,
-        marketType: SCANNER_MARKET_TYPE,
-        chartInterval,
-        historyStartMs,
-        switchoverMs,
-        engine,
-        partialPeriodPolicy: SWITCHOVER_TRUNCATED_CLOSED_BARS,
-        expectedLineageId,
-      },
-      fetch: flags.has("--fetch"),
-      policy,
-    };
+    return { chartInterval, engine, historyStartMs, switchoverMs };
   } catch (error) {
     if (error instanceof ScannerDataError || error instanceof NativeSignalInputError) usage(error.message);
     throw error;

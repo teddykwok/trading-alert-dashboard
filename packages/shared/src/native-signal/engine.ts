@@ -4,6 +4,7 @@ import {
   NativeSignalInputError,
   type NativeConditionFlags,
   type NativeEngineConfig,
+  type NativeEngineDiagnosticSnapshot,
   type NativeEngineState,
   type NativeHtfAggregate,
   type NativeHtfTrack,
@@ -12,6 +13,7 @@ import {
   type NativeKline,
   type NativeLevel,
   type NativeLevelCondition,
+  type NativeLevelDiagnostic,
   type NativeRetestCandidate,
   type NativeSourceTf,
   type NativeStepResult,
@@ -461,6 +463,63 @@ export function reconstructImmediateCandidates(
     });
   }
   return candidates;
+}
+
+/**
+ * A read-only DIAGNOSTIC view of `state`: every registered level with each of
+ * Pine's 4B gates evaluated for the NEXT bar, exactly as
+ * `reconstructImmediateCandidates` and the retest loop evaluate them.
+ *
+ * `state` is only read. The result is a fresh, frozen structure that shares no
+ * object with `state`, so calling this any number of times cannot change a
+ * later step, the canonical state, or its hash. No clock, no input beyond
+ * `state`.
+ */
+export function snapshotNativeEngineForNextBar(state: NativeEngineState): NativeEngineDiagnosticSnapshot {
+  const { config } = state;
+  const barIndex = state.barIndex;
+  const tolerance = config.touchTolerancePct;
+  const previousClose = state.lastBar === null ? null : state.lastBar.close;
+  const atRisk = levelsAtIntrabarEvictionRisk(state);
+  const levels: NativeLevelDiagnostic[] = state.levels.map((level, position) => {
+    // Pine's 4B conditions, operand for operand, as in reconstructImmediateCandidates.
+    const upperBand = level.price * (1 + tolerance);
+    const lowerBand = level.price * (1 - tolerance);
+    const armedReady =
+      level.armed && level.armedBarIndex >= 0 && barIndex - level.armedBarIndex >= config.minBarsAfterArming;
+    const oldEnough = barIndex - level.createdBarIndex >= config.minBarsAfterCreation;
+    const cooledDown =
+      level.lastTouchBarIndex < 0 || barIndex - level.lastTouchBarIndex >= config.touchCooldownBars;
+    const approachSide =
+      previousClose !== null && (level.color === "GREEN" ? previousClose > upperBand : previousClose < lowerBand);
+    return Object.freeze({
+      position,
+      id: level.id,
+      sourceTf: level.sourceTf,
+      color: level.color,
+      condition: level.condition,
+      price: level.price,
+      htfPeriodStartMs: level.htfPeriodStartMs,
+      createdBarIndex: level.createdBarIndex,
+      createdBarOpenTimeMs: level.createdBarOpenTimeMs,
+      armed: level.armed,
+      armedBarIndex: level.armedBarIndex,
+      lastTouchBarIndex: level.lastTouchBarIndex,
+      upperBand,
+      lowerBand,
+      retestSignal: level.color === "GREEN" ? "LONG" : "SHORT",
+      gates: Object.freeze({ armedReady, oldEnough, cooledDown, approachSide }),
+      intrabarEvictionRisk: position < atRisk,
+    });
+  });
+  return Object.freeze({
+    nextBarIndex: barIndex,
+    previousClose,
+    lastBarOpenTimeMs: state.lastBar === null ? null : state.lastBar.openTimeMs,
+    retestEnabled: config.retestEnabled,
+    timing: config.timing,
+    levels: Object.freeze(levels),
+  });
 }
 
 /**

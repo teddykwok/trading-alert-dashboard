@@ -92,10 +92,16 @@ export const PUBLIC_FUTURES_HOSTS: readonly string[] = Object.freeze(["fapi.bina
 const PUBLIC_ENDPOINTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   "/fapi/v1/time": Object.freeze([]),
   "/fapi/v1/klines": Object.freeze(["symbol", "interval", "startTime", "endTime", "limit"]),
+  // Universe discovery: contract metadata for every symbol. Unsigned, no parameters.
+  "/fapi/v1/exchangeInfo": Object.freeze([]),
+  // Advisory current price: latest trade price, all symbols in one request (or one symbol).
+  "/fapi/v1/ticker/price": Object.freeze(["symbol"]),
 });
 
 export const KLINES_PATH = "/fapi/v1/klines";
 export const SERVER_TIME_PATH = "/fapi/v1/time";
+export const EXCHANGE_INFO_PATH = "/fapi/v1/exchangeInfo";
+export const TICKER_PRICE_PATH = "/fapi/v1/ticker/price";
 
 /** Normalises and checks a configured base URL: https, an allowed host, nothing else. */
 export function assertPublicFuturesBaseUrl(baseUrl: unknown): string {

@@ -165,6 +165,7 @@ export type {
   CalendarAlignment,
   NativeConditionFlags,
   NativeEngineConfig,
+  NativeEngineDiagnosticSnapshot,
   NativeEngineConfigInput,
   NativeEngineState,
   NativeHistoricalInput,
@@ -184,6 +185,7 @@ export type {
   NativeLevel,
   NativeLevelColor,
   NativeLevelCondition,
+  NativeLevelDiagnostic,
   NativePartialPeriodPolicy,
   NativeReplayResult,
   NativeRetestCandidate,
@@ -216,6 +218,7 @@ export {
   reconstructPineHistoricalState,
   replayNativeEngine,
   replayNativeEngineWithImmediate,
+  snapshotNativeEngineForNextBar,
   stepNativeEngine,
   stepNativeEngineWithImmediate,
 } from "./native-signal/index";
