@@ -3,6 +3,7 @@ import { Card } from "../ui/Card";
 import { SignalBadge } from "./SignalBadge";
 import { StatusBadge } from "./StatusBadge";
 import { MockAiBadge } from "./MockAiBadge";
+import { NativeBadge } from "./NativeBadge";
 import { OpenAiBadge } from "./OpenAiBadge";
 import { MinMovementBadge } from "./MinMovementBadge";
 import { DuplicateBadge } from "./DuplicateBadge";
@@ -12,6 +13,7 @@ import { ChecklistBadge } from "./ChecklistBadge";
 import { ScreenshotPreview } from "../charts/ScreenshotPreview";
 import { formatPrice } from "../../utils/formatPrice";
 import { formatRelativeTime } from "../../utils/formatDate";
+import { isNativeAlert } from "../../utils/alertSource";
 import type { Alert } from "../../types/alert";
 
 export function AlertCard({ alert }: { alert: Alert }) {
@@ -34,6 +36,7 @@ export function AlertCard({ alert }: { alert: Alert }) {
             <span className="font-semibold text-slate-100">{alert.symbol}</span>
             <span className="text-xs text-slate-500">{alert.timeframe}</span>
             <SignalBadge signal={alert.signal} />
+            {isNativeAlert(alert) && <NativeBadge />}
             <StatusBadge status={alert.status} />
             {alert.aiProvider === "mock" && <MockAiBadge />}
             {alert.aiProvider === "openai" && <OpenAiBadge />}

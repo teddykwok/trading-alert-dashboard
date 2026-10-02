@@ -5,6 +5,7 @@
 export type {
   AssetType,
   SignalType,
+  AlertSource,
   AlertStatus,
   AiRiskNote,
   AiVisionResult,

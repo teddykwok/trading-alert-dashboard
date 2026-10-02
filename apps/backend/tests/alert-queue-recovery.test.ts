@@ -443,8 +443,10 @@ describe("O/P. the scan is bounded and deterministic", () => {
     const queue = fakeQueue();
     const { queries } = await sweep([received("a")], queue.queue);
     const where = (queries[0] as { where: Record<string, unknown> }).where;
-    // Alert is indexed on both status and createdAt.
-    expect(Object.keys(where).sort()).toEqual(["createdAt", "status"]);
+    // Alert is indexed on status, createdAt and source. `source` keeps NATIVE
+    // (dashboard-only) alerts out of the sweep in the query itself.
+    expect(Object.keys(where).sort()).toEqual(["createdAt", "source", "status"]);
+    expect(where.source).toBe("TRADINGVIEW");
   });
 });
 

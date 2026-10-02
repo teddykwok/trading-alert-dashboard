@@ -16,6 +16,7 @@ import {
   type DynamicLeveragePlan,
 } from "@trading-alert-dashboard/shared";
 import { NotFoundError, ValidationError } from "../../utils/errors";
+import { assertExecutableAlertSource } from "../alerts/alert-source";
 import {
   assertDecimalString,
   buildClientOrderId,
@@ -344,9 +345,12 @@ export class ExecutionService {
     // alertId — so the value has to live on the execution itself.
     const alert = await this.prisma.alert.findUnique({
       where: { id: input.alertId },
-      select: { triggeredAt: true, sourceTimeframe: true },
+      select: { triggeredAt: true, sourceTimeframe: true, source: true },
     });
     if (!alert) throw new NotFoundError(`Alert ${input.alertId} not found.`);
+    // Native execution fence, defense in depth: only a TRADINGVIEW alert can
+    // ever own a TradeExecution, whoever the caller is.
+    assertExecutableAlertSource({ id: input.alertId, source: alert.source }, "execution");
     if (!(alert.triggeredAt instanceof Date) || Number.isNaN(alert.triggeredAt.getTime())) {
       throw new ValidationError(
         `Alert ${input.alertId} has no usable triggeredAt; refusing to create an execution with unknown signal time.`

@@ -9,6 +9,12 @@ export type AssetType = "CRYPTO" | "STOCK";
 
 export type SignalType = "LONG" | "SHORT" | "WATCH" | "EXIT";
 
+/**
+ * Who produced an alert. TRADINGVIEW: the authenticated webhook. NATIVE: the
+ * in-house native scanner's emitter — dashboard-only, never planned or executed.
+ */
+export type AlertSource = "TRADINGVIEW" | "NATIVE";
+
 export type AlertStatus =
   | "RECEIVED"
   | "PROCESSING_SCREENSHOT"
@@ -42,6 +48,8 @@ export interface Alert {
   indicatorName: string | null;
   indicatorValue: number | null;
   rawPayload: unknown;
+  /** Optional only for payloads from servers that predate the column; absent means TRADINGVIEW. */
+  source?: AlertSource;
   status: AlertStatus;
   screenshotUrl: string | null;
   aiBias: string | null;

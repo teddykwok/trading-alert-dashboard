@@ -28,6 +28,16 @@ enum AlertStatus {
   IGNORED_DUPLICATE
 }
 
+// Where an alert came from. Every webhook alert, and every row that existed
+// before this column, is TRADINGVIEW. NATIVE is the in-house scanner's
+// dashboard-only delivery: it is hard-fenced in code from Extreme RR plans,
+// queue recovery, selected-plan adoption and execution, and no configuration
+// can lift that fence.
+enum AlertSource {
+  TRADINGVIEW
+  NATIVE
+}
+
 enum TradeReviewStatus {
   UNREVIEWED
   IGNORED
@@ -125,6 +135,10 @@ model Alert {
   levelColor      LevelColor?
   sourceTimeframe String?
   touchDirection  TouchDirection?
+  // TRADINGVIEW unless the native emitter wrote the row. Never inferred from
+  // the payload: a native alert carries no webhook secret and never claims to
+  // be a TradingView alert.
+  source          AlertSource @default(TRADINGVIEW)
   status          AlertStatus @default(RECEIVED)
   screenshotUrl   String?
   aiBias          String?
@@ -144,6 +158,7 @@ model Alert {
   extremeRRPlan   ExtremeRRPlan?
   tradeExecutions TradeExecution[]
   selectedPlanOutcome SelectedPlanOutcome?
+  nativeDelivery  NativeAlertDelivery?
 
   @@index([status])
   @@index([symbol])
@@ -152,6 +167,39 @@ model Alert {
   @@index([symbol, assetType, timeframe, signal, indicatorName])
   @@index([sourceTimeframe])
   @@index([levelColor])
+  @@index([source])
+}
+
+// The native alert emitter's delivery LEDGER: at most one dashboard Alert per
+// (delivery policy, lineage, market, symbol, chart interval, bar).
+//
+// `deliveryKey` is a versioned canonical hash of exactly those fields and is
+// UNIQUE, so the database — not process memory, not a time window, not a
+// "looks similar" query — decides the single winner across restarts and
+// racing emitters. The row and its Alert are created in one transaction.
+// The provenance hash pins WHICH shadow observation won; an existing key whose
+// provenance differs is a contradiction the emitter refuses rather than reuses.
+//
+// alertId is SetNull on delete so a manually removed Alert keeps its key
+// claimed: the bar is never delivered a second time.
+model NativeAlertDelivery {
+  id                   String   @id @default(cuid())
+  deliveryKey          String   @unique
+  deliveryKeySchema    String
+  policyVersion        String
+  lineageId            String
+  marketType           String
+  symbol               String
+  chartInterval        String
+  barOpenTime          DateTime
+  winningShadowEventId String
+  evidenceClass        String
+  provenanceSha256     String
+  alertId              String?  @unique
+  alert                Alert?   @relation(fields: [alertId], references: [id], onDelete: SetNull)
+  createdAt            DateTime @default(now())
+
+  @@index([lineageId, symbol, barOpenTime])
 }
 
 // Manual live-outcome tracking: one review per alert, filled in by the user

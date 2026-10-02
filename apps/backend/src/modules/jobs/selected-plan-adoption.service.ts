@@ -6,6 +6,7 @@ import { logger } from "../../config/logger";
 import type { BoundExecutionProfileProjection } from "../execution/exchange-runtime-binding";
 import type { SelectedPlanExecutor, SelectedPlanOutcome } from "../execution/selected-plan-executor";
 import type { ExtremeRRService } from "../extreme-rr/extreme-rr.service";
+import { EXECUTABLE_ALERT_SOURCE } from "../alerts/alert-source";
 
 /**
  * Phase 11E — how ONE account decides about a plan the whole system shares.
@@ -141,6 +142,11 @@ export class SelectedPlanAdoptionService {
         // the plan, not a guess about when the deployment happened.
         executionFanoutReadyAt: { not: null },
         cutoffAt: { gt: this.freshnessFloor(now) },
+        // THE NATIVE EXECUTION FENCE, at the earliest point an account can be
+        // involved: discovery itself. A plan whose alert is not TRADINGVIEW is
+        // never discovered, so it is never claimed, never reaches the
+        // executor, and never costs a signed Binance read. Not configurable.
+        alert: { source: EXECUTABLE_ALERT_SOURCE },
         OR: [
           // Never offered to this profile.
           { selectedPlanAdoptions: { none: { executionProfileId } } },
@@ -161,7 +167,7 @@ export class SelectedPlanAdoptionService {
       select: {
         id: true,
         alertId: true,
-        alert: { select: { symbol: true } },
+        alert: { select: { symbol: true, source: true } },
         selectedPlanAdoptions: {
           where: { executionProfileId },
           select: { id: true, attempts: true, status: true },
@@ -169,7 +175,9 @@ export class SelectedPlanAdoptionService {
       },
     });
 
-    return plans.map((plan) => {
+    // Defense in depth: the query already excludes them, and this re-checks
+    // the row it actually returned.
+    return plans.filter((plan) => plan.alert.source === EXECUTABLE_ALERT_SOURCE).map((plan) => {
       const mine = plan.selectedPlanAdoptions[0] ?? null;
       return {
         planId: plan.id,
