@@ -3,7 +3,8 @@ import type { NativeKline } from "@trading-alert-dashboard/shared";
 import type { ScannerChartInterval } from "./binance-public-futures";
 import { LiveStreamError, parseKlineStreamMessage } from "./live-kline-stream";
 import type { BarCloseCommitRecord } from "./live-shadow-store";
-import type { LiveBarStatus, LiveSessionPhase, LiveShadowSession, LiveUpdateOutcome } from "./live-shadow-session";
+import type { LiveShadowSession, LiveUpdateOutcome } from "./live-shadow-session";
+import { SymbolStreamChannel } from "./symbol-stream-channel";
 
 /**
  * Connects a live shadow session to a public kline stream, and recovers it.
@@ -65,18 +66,28 @@ export class LiveShadowRunner {
   private connection: StreamConnection | null = null;
   /** Identifies the live connection; events from any older connection are ignored. */
   private generation = 0;
-  private awaitingFirstUpdate = true;
+  /** The per-symbol half (readiness, session, recovery detection), shared with the supervisor. */
+  private readonly channel: SymbolStreamChannel;
   private connectStartedAtMs: number | null = null;
   private openedAtMs: number | null = null;
   private firstMessageAtMs: number | null = null;
-  /** Messages refused by the stream validator, by reason. */
-  readonly dropped: Record<string, number> = {};
   /** The current connection's lifecycle stage. */
   lifecycle: StreamLifecycle = "IDLE";
   /** Local time of the last message of any kind from the current connection. */
   lastMessageAtMs: number | null = null;
 
-  constructor(private readonly deps: LiveShadowRunnerDeps) {}
+  constructor(private readonly deps: LiveShadowRunnerDeps) {
+    this.channel = new SymbolStreamChannel({ session: deps.session, log: deps.log });
+  }
+
+  /** Messages refused by the stream validator, by reason. */
+  get dropped(): Record<string, number> {
+    return this.channel.dropped;
+  }
+
+  private get awaitingFirstUpdate(): boolean {
+    return this.channel.awaitingFirstUpdate;
+  }
 
   get connected(): boolean {
     return this.connection !== null;
@@ -90,7 +101,7 @@ export class LiveShadowRunner {
   connect(): void {
     if (this.deps.session.phase === "RECOVERY_REQUIRED") throw new Error("recover before reconnecting");
     if (this.connection !== null) return;
-    this.awaitingFirstUpdate = true;
+    this.channel.arm();
     this.connectStartedAtMs = this.deps.nowMs();
     this.openedAtMs = null;
     this.firstMessageAtMs = null;
@@ -160,34 +171,14 @@ export class LiveShadowRunner {
       update = parseKlineStreamMessage(text, this.deps.symbol, this.deps.interval);
     } catch (error) {
       if (!(error instanceof LiveStreamError)) throw error;
-      this.dropped[error.code] = (this.dropped[error.code] ?? 0) + 1;
-      this.deps.log(`REFUSED stream message (${error.code}): ${error.message}`);
+      this.channel.refuse(error);
       return null;
     }
-    const { session } = this.deps;
-    if (this.awaitingFirstUpdate) {
-      const status: LiveBarStatus = session.markStreamReady(update);
-      if (session.phase === "READY") {
-        this.awaitingFirstUpdate = false;
-        this.lifecycle = "READINESS_ESTABLISHED";
-        this.deps.log(
-          `READINESS_ESTABLISHED at bar ${new Date(update.openTimeMs).toISOString()}: ${status}; live eligible from ${new Date(session.liveEligibleFromMs as number).toISOString()}`
-        );
-      }
-    }
-    if (session.phase === "RECOVERY_REQUIRED") {
-      this.drop(`RECOVERY_REQUIRED: ${session.recoveryReason ?? ""}`);
-      return null;
-    }
-    if (session.phase !== "READY") return null;
-    const outcome = session.onUpdate(update);
-    for (const o of outcome.observations) {
-      this.deps.log(`SHADOW_LIVE_ONLY ${o.barOpenTime} ${o.signal} ${o.sourceTf} ${o.levelColor} ${o.levelPrice} (${o.evidence.evidenceClass}) — not an alert, not actionable`);
-    }
-    if (outcome.commit !== null) this.logCommit(outcome.commit);
-    // onUpdate may have moved the session into recovery: read the phase afresh.
-    if ((session.phase as LiveSessionPhase) === "RECOVERY_REQUIRED") this.drop(`RECOVERY_REQUIRED: ${session.recoveryReason ?? ""}`);
-    return outcome;
+    const result = this.channel.accept(update);
+    if (result.readinessEstablished !== null) this.lifecycle = "READINESS_ESTABLISHED";
+    // One socket, one symbol: a session that needs recovery drops the socket.
+    if (result.recoveryReason !== null) this.drop(`RECOVERY_REQUIRED: ${result.recoveryReason}`);
+    return result.outcome;
   }
 
   handleClose(reason: string): void {
@@ -204,7 +195,7 @@ export class LiveShadowRunner {
     const currentBarOpen = Math.floor(this.deps.nowMs() / session.intervalMs) * session.intervalMs;
     const bars = currentBarOpen > session.hwmOpenTimeMs ? await this.deps.fetchClosedBars(session.hwmOpenTimeMs, currentBarOpen) : [];
     const records = session.recoverClosedBars(bars);
-    for (const record of records) this.logCommit(record);
+    for (const record of records) this.channel.logCommit(record);
     this.connect();
     return records;
   }
@@ -221,9 +212,4 @@ export class LiveShadowRunner {
     }
   }
 
-  private logCommit(record: BarCloseCommitRecord): void {
-    this.deps.log(
-      `${record.classification} commit ${record.barOpenTime}: ${record.committedCandidates.length} committed candidate(s); hwm ${new Date(record.hwmOpenTimeMs).toISOString()} state ${record.stateSha256.slice(0, 12)}`
-    );
-  }
 }

@@ -19,6 +19,10 @@ import { assertScannerSymbol, intervalMsOf, type ScannerChartInterval } from "./
 export const PUBLIC_FUTURES_STREAM_HOST = "fstream.binance.com";
 /** The routed path for regular market data in raw ("ws") mode. */
 export const PUBLIC_FUTURES_MARKET_WS_PATH = "/market/ws/";
+/** The routed path for regular market data in COMBINED mode: `?streams=a@kline_15m/b@kline_15m`. */
+export const PUBLIC_FUTURES_MARKET_COMBINED_PATH = "/market/stream";
+/** Hard ceiling on streams in one combined connection, whatever is configured. */
+export const MAX_STREAMS_PER_COMBINED_CONNECTION = 200;
 /** Binance's post-migration symbol-type discriminator: 1 = USD-M (UM), 2 = COIN-M (CM). */
 export const USDM_SYMBOL_TYPE = 1;
 
@@ -67,6 +71,61 @@ export function assertPublicKlineStreamUrl(raw: string, symbol: string, interval
   return url.toString();
 }
 
+/**
+ * The one MULTIPLEXED stream form the supervisor may open: the combined
+ * routed-market URL carrying exactly these symbols' `@kline_<interval>`
+ * streams, in the given (deterministic) order, and nothing else.
+ */
+export function buildPublicCombinedKlineStreamUrl(symbols: readonly string[], interval: ScannerChartInterval): string {
+  intervalMsOf(interval);
+  if (symbols.length === 0 || symbols.length > MAX_STREAMS_PER_COMBINED_CONNECTION) {
+    refuse("FORBIDDEN_STREAM", `a combined stream must carry 1..${MAX_STREAMS_PER_COMBINED_CONNECTION} symbols`);
+  }
+  const canonical = symbols.map((s) => assertScannerSymbol(s));
+  if (new Set(canonical).size !== canonical.length) refuse("FORBIDDEN_STREAM", "a combined stream must not repeat a symbol");
+  const streams = canonical.map((s) => `${s.toLowerCase()}@kline_${interval}`).join("/");
+  return assertPublicCombinedKlineStreamUrl(`wss://${PUBLIC_FUTURES_STREAM_HOST}${PUBLIC_FUTURES_MARKET_COMBINED_PATH}?streams=${streams}`, canonical, interval);
+}
+
+/** Refuses any URL that is not exactly the combined public kline stream of `symbols` / `interval`. */
+export function assertPublicCombinedKlineStreamUrl(raw: string, symbols: readonly string[], interval: ScannerChartInterval): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    refuse("FORBIDDEN_STREAM", "the stream URL could not be parsed");
+  }
+  if (url.protocol !== "wss:") refuse("FORBIDDEN_STREAM", "the stream must use wss");
+  if (url.username !== "" || url.password !== "") refuse("FORBIDDEN_STREAM", "the stream URL must not carry credentials");
+  if (url.hostname !== PUBLIC_FUTURES_STREAM_HOST || url.port !== "") refuse("FORBIDDEN_STREAM", `the stream host must be ${PUBLIC_FUTURES_STREAM_HOST}`);
+  if (url.pathname !== PUBLIC_FUTURES_MARKET_COMBINED_PATH || url.hash !== "") refuse("FORBIDDEN_STREAM", `the combined stream path must be exactly ${PUBLIC_FUTURES_MARKET_COMBINED_PATH}`);
+  const keys = [...url.searchParams.keys()];
+  if (keys.length !== 1 || keys[0] !== "streams") refuse("FORBIDDEN_STREAM", "the combined stream URL must carry exactly one query parameter: streams");
+  const expected = symbols.map((s) => `${s.toLowerCase()}@kline_${interval}`).join("/");
+  if (url.searchParams.get("streams") !== expected) refuse("FORBIDDEN_STREAM", "the combined stream must carry exactly the selected kline streams");
+  return `wss://${PUBLIC_FUTURES_STREAM_HOST}${PUBLIC_FUTURES_MARKET_COMBINED_PATH}?streams=${expected}`;
+}
+
+/** One combined-stream envelope: `{ "stream": "<symbol>@kline_<interval>", "data": { ...kline event... } }`. */
+export interface CombinedStreamMessage {
+  readonly stream: string;
+  readonly data: unknown;
+}
+
+/** Splits a combined-stream message into its stream name and payload, or refuses it. */
+export function parseCombinedStreamEnvelope(raw: string): CombinedStreamMessage {
+  let message: unknown;
+  try {
+    message = JSON.parse(raw);
+  } catch {
+    refuse("MALFORMED_KLINE", "the stream message is not JSON");
+  }
+  if (message === null || typeof message !== "object" || Array.isArray(message)) refuse("MALFORMED_KLINE", "the stream message is not an object");
+  const m = message as Record<string, unknown>;
+  if (typeof m.stream !== "string" || m.data === undefined) refuse("MALFORMED_KLINE", "a combined stream message must carry stream and data");
+  return { stream: m.stream, data: m.data };
+}
+
 /** One validated kline update: the bar's OHLC SO FAR (Binance sends cumulative values). */
 export interface LiveKlineUpdate {
   readonly symbol: string;
@@ -105,6 +164,11 @@ export function parseKlineStreamMessage(raw: string, symbol: string, interval: S
   } catch {
     refuse("MALFORMED_KLINE", "the stream message is not JSON");
   }
+  return parseKlineStreamPayload(message, symbol, interval);
+}
+
+/** Validates one already-decoded kline event (a raw message, or a combined envelope's `data`). */
+export function parseKlineStreamPayload(message: unknown, symbol: string, interval: ScannerChartInterval): LiveKlineUpdate {
   if (message === null || typeof message !== "object" || Array.isArray(message)) refuse("MALFORMED_KLINE", "the stream message is not an object");
   const m = message as Record<string, unknown>;
   if (m.e !== "kline") refuse("WRONG_EVENT", `unexpected stream event ${JSON.stringify(m.e)}`);
