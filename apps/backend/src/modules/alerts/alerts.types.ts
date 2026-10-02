@@ -1,6 +1,7 @@
 import type {
   Alert,
   AlertEventType,
+  AlertSource,
   AlertStatus,
   AssetType,
   LevelColor,
@@ -9,7 +10,7 @@ import type {
   Prisma,
 } from "@prisma/client";
 
-export type { Alert, AlertEventType, AlertStatus, AssetType, LevelColor, SignalType, TouchDirection };
+export type { Alert, AlertEventType, AlertSource, AlertStatus, AssetType, LevelColor, SignalType, TouchDirection };
 
 export interface CreateAlertInput {
   assetId: string | null;
@@ -22,6 +23,8 @@ export interface CreateAlertInput {
   indicatorName: string | null;
   indicatorValue: number | null;
   rawPayload: Prisma.InputJsonValue;
+  /** Required: who produced the alert is stated, never left to a default. */
+  source: AlertSource;
   triggeredAt: Date;
   // Level context parsed from the webhook note (all null when the note has
   // no structured metadata). sourceTimeframe = level origin tf, NOT the

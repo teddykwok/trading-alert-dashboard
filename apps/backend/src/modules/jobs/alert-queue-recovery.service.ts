@@ -162,7 +162,11 @@ export async function runAlertQueueRecoverySweep(
   };
 
   const stranded = await prisma.alert.findMany({
-    where: { status: "RECEIVED", createdAt: { lte: cutoff } },
+    // Only TradingView alerts are re-queued: a NATIVE alert is dashboard-only
+    // and RECEIVED is its permanent state, never a stranded job. In the QUERY,
+    // not after it: filtering in memory would let native rows fill the batch
+    // and starve real stranded TradingView alerts. (Alert.source is indexed.)
+    where: { status: "RECEIVED", createdAt: { lte: cutoff }, source: "TRADINGVIEW" },
     // Oldest first, stable by id: a backlog drains in a deterministic order
     // across ticks and no alert can be starved by a newer one.
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],

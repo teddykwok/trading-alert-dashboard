@@ -27,6 +27,7 @@ import type { SnapshotCandle } from "../market-data/market-data.types";
 import { RiskTemplateRepository } from "../risk-template/risk-template.repository";
 import { inferMarketType } from "../../utils/symbol";
 import { NotFoundError, ValidationError } from "../../utils/errors";
+import { assertNotNativeAlert } from "../alerts/alert-source";
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import type { ExtremeRRSelectionInput } from "./extreme-rr.schema";
@@ -268,6 +269,8 @@ export class ExtremeRRService {
    * existing plan.
    */
   async ensurePendingPlan(alert: Alert): Promise<void> {
+    // Native execution fence: a NATIVE alert never gets a plan row at all.
+    assertNotNativeAlert(alert, "Extreme RR planning");
     const direction = ExtremeRRService.assertDirectional(alert);
     const existing = await this.prisma.extremeRRPlan.findUnique({ where: { alertId: alert.id } });
     if (existing) return;
@@ -298,6 +301,9 @@ export class ExtremeRRService {
    */
   async generateForAlert(alertId: string): Promise<ExtremeRRPlanDto> {
     const alert = await this.getAlertOrThrow(alertId);
+    // Native execution fence: no plan, so no READY plan, so no fan-out marker
+    // for an execution worker to discover — before any candle is fetched.
+    assertNotNativeAlert(alert, "Extreme RR planning");
     const direction = ExtremeRRService.assertDirectional(alert);
 
     const existing = await this.prisma.extremeRRPlan.findUnique({

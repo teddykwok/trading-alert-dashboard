@@ -6,6 +6,8 @@ import { TabList, TabPanel, type TabDefinition } from "../components/ui/Tabs";
 import { AlertExecutionPanel } from "../features/executions/AlertExecutionPanel";
 import { SignalBadge } from "../components/alerts/SignalBadge";
 import { StatusBadge } from "../components/alerts/StatusBadge";
+import { NativeBadge } from "../components/alerts/NativeBadge";
+import { NATIVE_ALERT_PLAN_NOTICE, isNativeAlert } from "../utils/alertSource";
 import { MockAiBadge } from "../components/alerts/MockAiBadge";
 import { OpenAiBadge } from "../components/alerts/OpenAiBadge";
 import { AiOpinionPanel } from "../components/alerts/AiOpinionPanel";
@@ -189,6 +191,7 @@ export function AlertDetailPage() {
         <h1 className="text-xl font-semibold text-slate-100">{alert.symbol}</h1>
         <span className="text-sm text-slate-500">{alert.timeframe}</span>
         <SignalBadge signal={alert.signal} />
+        {isNativeAlert(alert) && <NativeBadge />}
         <StatusBadge status={alert.status} />
         {alert.aiProvider === "mock" && <MockAiBadge />}
         {alert.aiProvider === "openai" && <OpenAiBadge />}
@@ -252,9 +255,15 @@ export function AlertDetailPage() {
         <TabList tabs={WORKFLOW_TABS} activeId={activeTab} onChange={setActiveTab} label="Alert workflow" />
 
         <TabPanel id="plan" activeId={activeTab}>
-          <ExtremeRRPlanner alert={alert} />
+          {isNativeAlert(alert) ? (
+            <Card className="p-4">
+              <p className="text-sm text-slate-500">{NATIVE_ALERT_PLAN_NOTICE}</p>
+            </Card>
+          ) : (
+            <ExtremeRRPlanner alert={alert} />
+          )}
 
-          {!isDirectional && (
+          {!isDirectional && !isNativeAlert(alert) && (
             <Card className="p-4">
               <p className="text-sm text-slate-500">
                 Extreme RR plans are generated for LONG and SHORT alerts only. Use the manual
