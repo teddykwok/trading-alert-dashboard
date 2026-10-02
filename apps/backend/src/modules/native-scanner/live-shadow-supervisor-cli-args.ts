@@ -10,7 +10,10 @@ import type { UniverseSelectionSpec } from "./usdm-universe";
  *
  * Selection is always explicit. `--universe usdt-perpetual` alone is refused:
  * it needs either `--max-symbols N` or the deliberate `--all-active`
- * acknowledgement, so a typo can never start hundreds of symbols. There is no
+ * acknowledgement, so a typo can never start hundreds of symbols.
+ * `--max-symbols N` counts SCANNER-ELIGIBLE symbols: the universe is walked in
+ * order and an ineligible candidate is skipped and backfilled, never run.
+ * `--symbols` and `--include-symbols` are never substituted. There is no
  * account, order, alert, emitter or database option, and none can be
  * expressed: anything unlisted is refused.
  */

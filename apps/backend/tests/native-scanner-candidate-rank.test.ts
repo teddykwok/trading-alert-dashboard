@@ -154,7 +154,10 @@ describe("1. the USD-M USDT-perpetual universe filter", () => {
     expect(universeOf(many).contracts.length).toBe(777);
     expect(() => parseExchangeInfoContracts({})).toThrow(/symbols array/);
     expect(() => parseExchangeInfoContracts({ symbols: [{ symbol: "BTCUSDT" }] })).toThrow(/baseAsset/);
-    expect(() => parseExchangeInfoContracts({ symbols: [contract("BTCUSDT", { onboardDate: "soon" })] })).toThrow(/onboardDate/);
+    // Listing metadata is advisory: malformed or missing becomes "unknown" (null), never a refusal or an exclusion.
+    expect(parseExchangeInfoContracts({ symbols: [contract("BTCUSDT", { onboardDate: "soon" })] })[0].onboardDateMs).toBeNull();
+    expect(parseExchangeInfoContracts({ symbols: [contract("BTCUSDT", { onboardDate: undefined })] })[0].onboardDateMs).toBeNull();
+    expect(universeOf([contract("BTCUSDT", { onboardDate: -5 })]).contracts.map((c) => c.symbol)).toEqual(["BTCUSDT"]);
   });
 });
 

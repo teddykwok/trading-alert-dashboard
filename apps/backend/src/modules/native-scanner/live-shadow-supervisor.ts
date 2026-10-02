@@ -52,10 +52,74 @@ import { SymbolStreamChannel } from "./symbol-stream-channel";
 
 export type SymbolStatus = "PENDING" | "ATTACHED" | "RECOVERING" | "FAILED";
 
+/** One symbol the supervisor may try, with Binance's advisory listing time. */
+export interface SupervisorCandidate {
+  readonly symbol: string;
+  /** Advisory only; null when unknown. Never proof that a symbol IS eligible. */
+  readonly onboardDateMs: number | null;
+  /** Named by the operator (--include-symbols): must be accepted, never replaced. */
+  readonly required: boolean;
+}
+
+/**
+ * How the running set is chosen.
+ *  EXPLICIT    exactly these symbols (--symbols); an ineligible one is a visible FAILED symbol, never replaced;
+ *  TARGET      walk `candidates` in order and accept the first `target` SCANNER-ELIGIBLE ones (backfill);
+ *  ALL_ACTIVE  walk every candidate and accept every scanner-eligible one.
+ * In TARGET / ALL_ACTIVE, a rejected candidate never joins: no lock, no stream, no runtime slot.
+ */
+export type SupervisorSelection =
+  | { readonly mode: "EXPLICIT"; readonly candidates: readonly SupervisorCandidate[] }
+  | { readonly mode: "TARGET"; readonly candidates: readonly SupervisorCandidate[]; readonly target: number }
+  | { readonly mode: "ALL_ACTIVE"; readonly candidates: readonly SupervisorCandidate[] };
+
+/**
+ * A candidate is skipped as TOO_NEW only when Binance lists it more than this
+ * long after the HTF context start. The margin makes the cheap pre-check
+ * strictly conservative: anything closer falls through to canonical preparation.
+ */
+export const ONBOARD_PRECHECK_MARGIN_MS = 7 * 24 * 60 * 60 * 1000;
+
+export type SkipClass = "TOO_NEW_PRECHECK" | "INSUFFICIENT_HISTORY" | "OTHER";
+
+export interface SelectionSummary {
+  readonly mode: SupervisorSelection["mode"];
+  readonly universeActive: number | null;
+  readonly targetEligible: number | null;
+  readonly candidatesTested: number;
+  readonly acceptedEligible: number;
+  readonly skippedTooNew: number;
+  readonly skippedInsufficientHistory: number;
+  readonly skippedOther: number;
+  readonly universeExhausted: boolean;
+  readonly skipped: readonly { readonly symbol: string; readonly class: SkipClass; readonly reason: string }[];
+}
+
+/** The target could not be met: budget spent, REST halted, or a required symbol ineligible. Nothing was started. */
+export class TargetNotReachedError extends Error {
+  readonly code = "TARGET_NOT_REACHED";
+
+  constructor(
+    message: string,
+    readonly summary: SelectionSummary & { readonly requestsUsed: number; readonly remainingUniverse: number }
+  ) {
+    super(message);
+    this.name = "TargetNotReachedError";
+  }
+}
+
 export interface SupervisorConfig {
   readonly lineage: LineageConfig;
-  /** The selected symbols. The supervisor sorts them; assignment never depends on input order. */
-  readonly symbols: readonly string[];
+  /**
+   * Shorthand for an EXPLICIT selection of these symbols (no listing metadata).
+   * Give exactly one of `symbols` or `selection`.
+   */
+  readonly symbols?: readonly string[];
+  readonly selection?: SupervisorSelection;
+  /** The active universe size, for the report only. */
+  readonly universeActive?: number;
+  /** TOO_NEW pre-check margin after the context start (default ONBOARD_PRECHECK_MARGIN_MS; 0..30 days). */
+  readonly onboardPrecheckMarginMs?: number;
   readonly symbolsPerConnection: number;
   readonly maxConnections: number;
   /** Concurrent catch-ups and recoveries (their REST still goes through the one serial governor). */
@@ -119,7 +183,8 @@ interface SymbolCounters {
 
 interface SymbolWorker {
   readonly symbol: string;
-  readonly connection: number;
+  /** Assigned once the running set is known. */
+  connection: number;
   readonly dir: string;
   status: SymbolStatus;
   failure: string | null;
@@ -181,7 +246,9 @@ export function assignConnections(symbols: readonly string[], perConnection: num
 export class LiveShadowSupervisor {
   private readonly intervalMs: number;
   private readonly workers = new Map<string, SymbolWorker>();
-  private readonly connections: Connection[];
+  private connections: Connection[] = [];
+  private readonly selection: SupervisorSelection;
+  private selectionSummary: SelectionSummary | null = null;
   private readonly streamToSymbol = new Map<string, string>();
   /** Closed bars committed live, awaiting their (non-authoritative) cache write. */
   private readonly pendingCacheBars = new Map<string, NativeKline[]>();
@@ -193,19 +260,228 @@ export class LiveShadowSupervisor {
     private readonly deps: SupervisorDeps
   ) {
     this.intervalMs = intervalMsOf(config.lineage.chartInterval);
-    if (config.symbols.length === 0 || config.symbols.length > SUPERVISOR_LIMITS.maxSymbols) {
+    if ((config.symbols === undefined) === (config.selection === undefined)) {
+      throw new SupervisorConfigError("give exactly one of symbols or selection");
+    }
+    this.selection =
+      config.selection ?? { mode: "EXPLICIT", candidates: (config.symbols as readonly string[]).map((symbol) => ({ symbol, onboardDateMs: null, required: true })) };
+    const candidates = this.selection.candidates;
+    if (candidates.length === 0 || candidates.length > SUPERVISOR_LIMITS.maxSymbols) {
       throw new SupervisorConfigError(`select 1..${SUPERVISOR_LIMITS.maxSymbols} symbols`);
     }
+    if (new Set(candidates.map((c) => c.symbol)).size !== candidates.length) throw new SupervisorConfigError("the selection repeats a symbol");
     for (const [name, value, min, max] of [
       ["queue capacity", config.queueCapacity, 100, SUPERVISOR_LIMITS.maxQueueCapacity],
       ["REST concurrency", config.restConcurrency, 1, 8],
       ["max processing lag", config.maxProcessingLagMs, 1_000, 600_000],
       ["stale symbol timeout", config.staleSymbolMs, 10_000, 14_400_000],
       ["recovery attempts", config.maxRecoveryAttempts, 1, 100],
+      ["onboard pre-check margin", config.onboardPrecheckMarginMs ?? ONBOARD_PRECHECK_MARGIN_MS, 0, 30 * 24 * 60 * 60 * 1000],
     ] as const) {
       if (!Number.isSafeInteger(value) || value < min || value > max) throw new SupervisorConfigError(`${name} must be ${min}..${max}`);
     }
-    const groups = assignConnections(config.symbols, config.symbolsPerConnection, config.maxConnections);
+    // Capacity is checked up front for everything the run could need, so a valid config can never fail after the walk.
+    // ALL_ACTIVE: every candidate the free pre-check cannot rule out might be accepted.
+    const capacityNeeded =
+      this.selection.mode === "TARGET"
+        ? this.selection.target
+        : this.selection.mode === "EXPLICIT"
+          ? candidates.length
+          : Math.max(1, candidates.filter((c) => !this.tooNew(c)).length);
+    if (this.selection.mode === "TARGET" && (!Number.isSafeInteger(this.selection.target) || this.selection.target < 1)) {
+      throw new SupervisorConfigError("the target must be a positive integer");
+    }
+    assignConnections(
+      Array.from({ length: capacityNeeded }, (_, i) => `S${i}`),
+      config.symbolsPerConnection,
+      config.maxConnections
+    );
+    this.startedAt = deps.nowIso();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Start-up: lock, catch up (bounded, governed), then connect
+  // ---------------------------------------------------------------------------
+
+  async start(): Promise<void> {
+    const accepted = this.selection.mode === "EXPLICIT" ? await this.startExplicit() : await this.walkCandidates();
+    this.assign(accepted);
+    for (const connection of this.connections) this.connect(connection);
+  }
+
+  private newWorker(symbol: string): SymbolWorker {
+    return {
+      symbol,
+      connection: -1,
+      dir: this.config.liveDirFor(symbol),
+      status: "PENDING",
+      failure: null,
+      lock: null,
+      session: null,
+      channel: null,
+      lineageId: null,
+      lastValidMessageAtMs: null,
+      armedAtMs: 0,
+      recoveryAttempts: 0,
+      recoveryNotBeforeMs: 0,
+      recoveryInFlight: false,
+      counters: { observations: 0, commitsLive: 0, commitsQuarantined: 0, commitsReplayed: 0, refused: 0, ignoredWhileDetached: 0, recoveries: 0, laggedUpdates: 0 },
+    };
+  }
+
+  private contextStartMs(): number {
+    const { lineage } = this.config;
+    return deriveHtfContextStartMs(lineage.historyStartMs, lineage.engine.enabledSourceTfs, lineage.engine.calendar);
+  }
+
+  /**
+   * The cheap negative pre-check. True only when Binance's listing time is
+   * known, plausible (not in the future) and later than the context start by
+   * more than the margin: such a symbol cannot hold contiguous data from the
+   * context start. Unknown or implausible metadata never excludes anything.
+   */
+  private tooNew(candidate: SupervisorCandidate): boolean {
+    const onboard = candidate.onboardDateMs;
+    if (onboard === null || onboard > this.deps.nowMs()) return false;
+    return onboard > this.contextStartMs() + (this.config.onboardPrecheckMarginMs ?? ONBOARD_PRECHECK_MARGIN_MS);
+  }
+
+  /** Runs canonical preparation, containing any failure to this symbol. */
+  private async prepareContained(worker: SymbolWorker): Promise<void> {
+    try {
+      await this.prepare(worker);
+    } catch (error) {
+      // Whatever went wrong, it went wrong for this symbol only.
+      this.fail(worker, "UNEXPECTED_ERROR", error instanceof Error ? `${error.name}: ${error.message}` : "unknown");
+    }
+  }
+
+  /** EXPLICIT: exactly the named symbols; an ineligible one stays visible as FAILED and is never replaced. */
+  private async startExplicit(): Promise<SymbolWorker[]> {
+    const workers = this.selection.candidates.map((c) => this.newWorker(c.symbol));
+    await mapBounded(workers, this.config.restConcurrency, async (worker, i) => {
+      const candidate = this.selection.candidates[i];
+      if (this.tooNew(candidate)) {
+        return this.fail(worker, "ONBOARD_AFTER_CONTEXT_START", `listed ${new Date(candidate.onboardDateMs as number).toISOString()}, after the HTF context start`);
+      }
+      await this.prepareContained(worker);
+    });
+    const tooNew = workers.filter((w) => w.failure?.startsWith("ONBOARD_AFTER_CONTEXT_START")).length;
+    const insufficient = workers.filter((w) => w.failure !== null && /^(INSUFFICIENT_HISTORY|INSUFFICIENT_HTF_CONTEXT|INCOMPLETE_DATA)\b/.test(w.failure)).length;
+    const failed = workers.filter((w) => w.status === "FAILED").length;
+    this.selectionSummary = {
+      mode: "EXPLICIT",
+      universeActive: this.config.universeActive ?? null,
+      targetEligible: null,
+      candidatesTested: workers.length,
+      acceptedEligible: workers.length - failed,
+      skippedTooNew: tooNew,
+      skippedInsufficientHistory: insufficient,
+      skippedOther: failed - tooNew - insufficient,
+      universeExhausted: true,
+      skipped: [],
+    };
+    return workers;
+  }
+
+  /**
+   * TARGET / ALL_ACTIVE: walk the candidates in order, a bounded chunk at a
+   * time, and accept scanner-eligible symbols IN CANDIDATE ORDER, so the
+   * accepted set never depends on which preparation finished first. A chunk is
+   * never larger than what is still needed, so nothing is prepared and then
+   * thrown away. Rejected candidates release their lock and never join.
+   */
+  private async walkCandidates(): Promise<SymbolWorker[]> {
+    const selection = this.selection as Exclude<SupervisorSelection, { mode: "EXPLICIT" }>;
+    const target = selection.mode === "TARGET" ? selection.target : null;
+    const accepted: SymbolWorker[] = [];
+    const skipped: { symbol: string; class: SkipClass; reason: string }[] = [];
+    let tested = 0;
+    let next = 0;
+    let stop: string | null = null;
+    while (next < selection.candidates.length && (target === null || accepted.length < target) && stop === null) {
+      const room = target === null ? this.config.restConcurrency : Math.min(this.config.restConcurrency, target - accepted.length);
+      const chunk = selection.candidates.slice(next, next + room);
+      next += chunk.length;
+      const workers = chunk.map((c) => this.newWorker(c.symbol));
+      await mapBounded(workers, this.config.restConcurrency, async (worker, i) => {
+        if (this.tooNew(chunk[i])) {
+          worker.status = "FAILED";
+          worker.failure = `TOO_NEW_PRECHECK: listed ${new Date(chunk[i].onboardDateMs as number).toISOString()}, too long after the HTF context start to hold its history`;
+          return;
+        }
+        await this.prepareContained(worker);
+      });
+      // Decide strictly in candidate order.
+      for (let i = 0; i < workers.length; i += 1) {
+        const worker = workers[i];
+        if (worker.status !== "FAILED") {
+          tested += 1;
+          accepted.push(worker);
+          continue;
+        }
+        worker.lock?.release();
+        worker.lock = null;
+        const failure = worker.failure ?? "UNKNOWN";
+        if (/^(REST_HALTED|REQUEST_BUDGET_EXHAUSTED)\b/.test(failure)) {
+          stop = failure;
+          // This candidate and the rest of its chunk are released and UNDECIDED: the walk ends here.
+          for (const rest of workers.slice(i + 1)) rest.lock?.release();
+          break;
+        }
+        tested += 1;
+        const cls: SkipClass = failure.startsWith("TOO_NEW_PRECHECK")
+          ? "TOO_NEW_PRECHECK"
+          : /^(INSUFFICIENT_HISTORY|INSUFFICIENT_HTF_CONTEXT|INCOMPLETE_DATA)\b/.test(failure)
+            ? "INSUFFICIENT_HISTORY"
+            : "OTHER";
+        skipped.push({ symbol: worker.symbol, class: cls, reason: failure });
+        if (chunk[i].required) stop = `REQUIRED_SYMBOL_INELIGIBLE: ${worker.symbol} (${failure}) — an included symbol is never replaced`;
+        if (stop !== null) {
+          for (const rest of workers.slice(i + 1)) rest.lock?.release();
+          break;
+        }
+      }
+    }
+    const summary: SelectionSummary = {
+      mode: selection.mode,
+      universeActive: this.config.universeActive ?? null,
+      targetEligible: target,
+      candidatesTested: tested,
+      acceptedEligible: accepted.length,
+      skippedTooNew: skipped.filter((s) => s.class === "TOO_NEW_PRECHECK").length,
+      skippedInsufficientHistory: skipped.filter((s) => s.class === "INSUFFICIENT_HISTORY").length,
+      skippedOther: skipped.filter((s) => s.class === "OTHER").length,
+      universeExhausted: stop === null && next >= selection.candidates.length,
+      skipped,
+    };
+    this.selectionSummary = summary;
+    for (const s of skipped) this.deps.log(`${s.symbol} SKIPPED (${s.class}): ${s.reason} — not part of the running set`);
+    if (stop !== null) {
+      for (const worker of accepted) worker.lock?.release();
+      throw new TargetNotReachedError(
+        `TARGET_NOT_REACHED: ${stop}. ${target === null ? "The universe was not exhausted" : `${accepted.length} of ${target} eligible accepted`} after testing ${tested}; nothing was started`,
+        { ...summary, requestsUsed: this.deps.governor.requestsMade, remainingUniverse: selection.candidates.length - tested }
+      );
+    }
+    if (accepted.length === 0) {
+      throw new TargetNotReachedError("TARGET_NOT_REACHED: no scanner-eligible symbol in the walked universe; nothing was started", {
+        ...summary,
+        requestsUsed: this.deps.governor.requestsMade,
+        remainingUniverse: selection.candidates.length - tested,
+      });
+    }
+    return accepted;
+  }
+
+  /** The running set is known: deterministic assignment, connections, stream routing. */
+  private assign(workers: readonly SymbolWorker[]): void {
+    const groups = assignConnections(
+      workers.map((w) => w.symbol),
+      this.config.symbolsPerConnection,
+      this.config.maxConnections
+    );
+    const byName = new Map(workers.map((w) => [w.symbol, w]));
     this.connections = groups.map((symbols, index) => ({
       index,
       symbols,
@@ -226,44 +502,12 @@ export class LiveShadowSupervisor {
     }));
     groups.forEach((symbols, index) => {
       for (const symbol of symbols) {
-        this.workers.set(symbol, {
-          symbol,
-          connection: index,
-          dir: config.liveDirFor(symbol),
-          status: "PENDING",
-          failure: null,
-          lock: null,
-          session: null,
-          channel: null,
-          lineageId: null,
-          lastValidMessageAtMs: null,
-          armedAtMs: 0,
-          recoveryAttempts: 0,
-          recoveryNotBeforeMs: 0,
-          recoveryInFlight: false,
-          counters: { observations: 0, commitsLive: 0, commitsQuarantined: 0, commitsReplayed: 0, refused: 0, ignoredWhileDetached: 0, recoveries: 0, laggedUpdates: 0 },
-        });
-        this.streamToSymbol.set(`${symbol.toLowerCase()}@kline_${config.lineage.chartInterval}`, symbol);
+        const worker = byName.get(symbol) as SymbolWorker;
+        worker.connection = index;
+        this.workers.set(symbol, worker);
+        this.streamToSymbol.set(`${symbol.toLowerCase()}@kline_${this.config.lineage.chartInterval}`, symbol);
       }
     });
-    this.startedAt = deps.nowIso();
-  }
-
-  // ---------------------------------------------------------------------------
-  // Start-up: lock, catch up (bounded, governed), then connect
-  // ---------------------------------------------------------------------------
-
-  async start(): Promise<void> {
-    const workers = [...this.workers.values()];
-    await mapBounded(workers, this.config.restConcurrency, async (worker) => {
-      try {
-        await this.prepare(worker);
-      } catch (error) {
-        // Whatever went wrong, it went wrong for this symbol only.
-        this.fail(worker, "UNEXPECTED_ERROR", error instanceof Error ? `${error.name}: ${error.message}` : "unknown");
-      }
-    });
-    for (const connection of this.connections) this.connect(connection);
   }
 
   private fail(worker: SymbolWorker, code: string, detail: string): void {
@@ -281,7 +525,7 @@ export class LiveShadowSupervisor {
       if (error instanceof ScannerLockError) return this.fail(worker, error.code, error.message);
       throw error;
     }
-    const contextStartMs = deriveHtfContextStartMs(lineage.historyStartMs, lineage.engine.enabledSourceTfs, lineage.engine.calendar);
+    const contextStartMs = this.contextStartMs();
     // Every bar before the one forming now (less the settle margin) is closed: the single-symbol CLI's rule.
     const boundaryMs = Math.floor((this.deps.nowMs() - REPLAY_SETTLE_MS) / this.intervalMs) * this.intervalMs;
     let filled;
@@ -667,11 +911,13 @@ export class LiveShadowSupervisor {
     });
     const count = (pred: (s: (typeof symbols)[number]) => boolean) => symbols.filter(pred).length;
     return {
-      schema: "teddy.native-scanner.live-shadow-supervisor-status.v1",
+      schema: "teddy.native-scanner.live-shadow-supervisor-status.v2",
       notice: ["SHADOW ONLY", "NO ALERT AUTHORITY", "NO ORDER AUTHORITY"],
       actionable: false as const,
       startedAt: this.startedAt,
       interval: this.config.lineage.chartInterval,
+      /** How the running set was chosen. Skipped candidates never joined and are not runtime failures. */
+      selection: this.selectionSummary,
       totals: {
         selected: symbols.length,
         liveEligible: count((s) => s.readiness === "LIVE_ELIGIBLE"),
