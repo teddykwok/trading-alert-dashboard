@@ -13,7 +13,10 @@ export interface AlertStats {
   total: number;
   long: number;
   short: number;
-  /** RECEIVED + PROCESSING_SCREENSHOT + ANALYZING_WITH_AI (still in flight). */
+  /**
+   * RECEIVED + PROCESSING_SCREENSHOT + ANALYZING_WITH_AI (still in flight),
+   * excluding dashboard-only NATIVE alerts, which are never analysed.
+   */
   processing: number;
   analyzed: number;
   failed: number;

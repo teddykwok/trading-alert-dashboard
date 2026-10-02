@@ -706,10 +706,11 @@ describe("static fences", () => {
     }
   });
 
-  it("42. the package exposes exactly one emitter script, outside the scanner script namespace", () => {
+  it("42. the package exposes exactly one emitter script (and the separate read-only audit), outside the scanner script namespace", () => {
     const scripts = (JSON.parse(readFileSync(path.join(BACKEND, "package.json"), "utf8")) as { scripts: Record<string, string> }).scripts;
     expect(Object.entries(scripts).filter(([name, command]) => /native-alerts/.test(name) || /native-alerts/.test(command))).toEqual([
       ["native-alerts:emitter", "tsx src/modules/native-alerts/run-native-alert-emitter.ts"],
+      ["native-alerts:audit", "tsx src/modules/native-audit/run-native-alert-audit.ts"],
     ]);
   });
 
@@ -739,6 +740,7 @@ describe("static fences", () => {
 
     const webhook = read("src/modules/webhook/webhook.service.ts");
     expect(webhook).toContain("source: EXECUTABLE_ALERT_SOURCE,");
-    expect(webhook).toContain("const existingDuplicate = recentMatch?.source === NATIVE_ALERT_SOURCE ? null : recentMatch;");
+    const lookup = webhook.slice(webhook.indexOf("alertsService.findRecentDuplicate({"), webhook.indexOf("if (existingDuplicate) {"));
+    expect(lookup).toContain("source: EXECUTABLE_ALERT_SOURCE,");
   });
 });

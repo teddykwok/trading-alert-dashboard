@@ -249,6 +249,90 @@ function skip(symbol: string, reason: SkipReason, detail: string, fetchedRequest
   return { evaluation: null, skip: { symbol, reason, detail }, fetchedRequests, fromCacheOnly: false };
 }
 
+export type CacheFillOutcome =
+  | { readonly kind: "OK"; readonly klines: NativeKline[]; readonly fetchedRequests: number }
+  | { readonly kind: "SKIP"; readonly reason: SkipReason; readonly detail: string; readonly fetchedRequests: number };
+
+export interface CacheFillRequest {
+  readonly symbol: string;
+  readonly chartInterval: LineageConfig["chartInterval"];
+  /** Every bar from here … */
+  readonly contextStartMs: number;
+  /** … to here (exclusive) must be cached, contiguous and closed. */
+  readonly endMs: number;
+  readonly cache: KlineCacheLike;
+  readonly fetchDeps: Parameters<typeof fetchClosedFuturesKlines>[0];
+  readonly governor: GovernedPublicTransport;
+  readonly cacheOnly: boolean;
+  readonly nowIso: () => string;
+}
+
+/**
+ * The public kline cache for one symbol, filled (through the run's governed
+ * transport) so that every CLOSED bar of [contextStartMs, endMs) is present
+ * and contiguous — or a machine-readable reason it cannot be. A corrupt cache
+ * is reported and never overwritten; a 418/429 halts the whole run.
+ */
+export async function fillClosedBarCache(args: CacheFillRequest): Promise<CacheFillOutcome> {
+  const { symbol, chartInterval, contextStartMs, endMs, cache, governor } = args;
+  const intervalMs = intervalMsOf(chartInterval);
+  const skipped = (reason: SkipReason, detail: string, fetchedRequests = 0): CacheFillOutcome => ({ kind: "SKIP", reason, detail, fetchedRequests });
+
+  let loaded: LoadedKlineCache | null;
+  try {
+    loaded = cache.load(SCANNER_MARKET_TYPE, symbol, chartInterval);
+  } catch (error) {
+    // A corrupt cache is reported and left untouched — never overwritten.
+    if (error instanceof KlineCacheError || error instanceof ScannerDataError) return skipped("CACHE_UNUSABLE", `${error.name}: ${error.message}`);
+    throw error;
+  }
+  let klines = loaded?.klines ?? [];
+  let trustedEndMs = contiguousEnd(klines, contextStartMs, endMs, intervalMs);
+  let fetchedRequests = 0;
+
+  if (trustedEndMs < endMs) {
+    if (args.cacheOnly) return skipped("CACHE_ONLY_MISSING_DATA", `the cache covers closed bars only to ${new Date(trustedEndMs).toISOString()}`);
+    if (governor.exhausted) return skipped("REQUEST_BUDGET_EXHAUSTED", "the run's public request budget was spent before this symbol");
+    try {
+      const result = await fetchClosedFuturesKlines(args.fetchDeps, {
+        symbol,
+        interval: chartInterval,
+        startMs: trustedEndMs,
+        endMs,
+        maxBars: Math.max(1, (endMs - trustedEndMs) / intervalMs),
+        pageLimit: REPLAY_PAGE_LIMIT,
+        settleMs: REPLAY_SETTLE_MS,
+      });
+      fetchedRequests = result.requestsMade;
+      if (result.klines.length > 0) {
+        klines = mergeClosedKlines(klines, result.klines);
+        cache.save(SCANNER_MARKET_TYPE, symbol, chartInterval, klines, args.nowIso());
+        // Replay the verified cache, never memory.
+        klines = cache.load(SCANNER_MARKET_TYPE, symbol, chartInterval)?.klines ?? [];
+      }
+    } catch (error) {
+      if (governor.halt !== null) throw governor.halt;
+      if (error instanceof ScannerDataError) {
+        if (error.code === "REQUEST_BUDGET_EXHAUSTED") return skipped("REQUEST_BUDGET_EXHAUSTED", error.message, fetchedRequests);
+        if (error.code === "INVALID_SYMBOL") return skipped("UNSUPPORTED_SYMBOL", error.message);
+        if (error.code === "CONTRADICTORY_ROW") return skipped("CACHE_UNUSABLE", `fetched bars contradict the cache: ${error.message}`);
+        return skipped("PUBLIC_FETCH_FAILED", `${error.code}: ${error.message}`, fetchedRequests);
+      }
+      if (error instanceof KlineCacheError) return skipped("CACHE_UNUSABLE", error.message);
+      throw error;
+    }
+    trustedEndMs = contiguousEnd(klines, contextStartMs, endMs, intervalMs);
+  }
+
+  if (trustedEndMs < endMs) {
+    const first = klines.find((k) => k.openTimeMs >= contextStartMs);
+    return first === undefined || first.openTimeMs > contextStartMs
+      ? skipped("INSUFFICIENT_HISTORY", `no contiguous data from the HTF context start ${new Date(contextStartMs).toISOString()}`, fetchedRequests)
+      : skipped("INCOMPLETE_DATA", `closed bars are contiguous only to ${new Date(trustedEndMs).toISOString()}`, fetchedRequests);
+  }
+  return { kind: "OK", klines, fetchedRequests };
+}
+
 export async function runCandidateRank(request: CandidateRankRequest, deps: CandidateRankDeps) {
   const { lineage } = request;
   const intervalMs = intervalMsOf(lineage.chartInterval);
@@ -328,60 +412,19 @@ export async function runCandidateRank(request: CandidateRankRequest, deps: Cand
       return skip(symbol, "INSUFFICIENT_HISTORY", `listed ${new Date(onboardDateMs).toISOString()}, after the HTF context start ${new Date(contextStartMs).toISOString()}`);
     }
 
-    let loaded: LoadedKlineCache | null;
-    try {
-      loaded = deps.cache.load(SCANNER_MARKET_TYPE, symbol, lineage.chartInterval);
-    } catch (error) {
-      // A corrupt cache is reported and left untouched — never overwritten.
-      if (error instanceof KlineCacheError || error instanceof ScannerDataError) return skip(symbol, "CACHE_UNUSABLE", `${error.name}: ${error.message}`);
-      throw error;
-    }
-    let klines = loaded?.klines ?? [];
-    let trustedEndMs = contiguousEnd(klines, contextStartMs, boundaryMs, intervalMs);
-    let fetchedRequests = 0;
-
-    if (trustedEndMs < boundaryMs) {
-      if (request.cacheOnly) {
-        return skip(symbol, "CACHE_ONLY_MISSING_DATA", `the cache covers closed bars only to ${new Date(trustedEndMs).toISOString()}`);
-      }
-      if (governor.exhausted) return skip(symbol, "REQUEST_BUDGET_EXHAUSTED", "the run's public request budget was spent before this symbol");
-      try {
-        const result = await fetchClosedFuturesKlines(fetchDeps, {
-          symbol,
-          interval: lineage.chartInterval,
-          startMs: trustedEndMs,
-          endMs: boundaryMs,
-          maxBars: Math.max(1, (boundaryMs - trustedEndMs) / intervalMs),
-          pageLimit: REPLAY_PAGE_LIMIT,
-          settleMs: REPLAY_SETTLE_MS,
-        });
-        fetchedRequests = result.requestsMade;
-        if (result.klines.length > 0) {
-          klines = mergeClosedKlines(klines, result.klines);
-          deps.cache.save(SCANNER_MARKET_TYPE, symbol, lineage.chartInterval, klines, deps.nowIso());
-          // Replay the verified cache, never memory.
-          klines = deps.cache.load(SCANNER_MARKET_TYPE, symbol, lineage.chartInterval)?.klines ?? [];
-        }
-      } catch (error) {
-        if (governor.halt !== null) throw governor.halt;
-        if (error instanceof ScannerDataError) {
-          if (error.code === "REQUEST_BUDGET_EXHAUSTED") return skip(symbol, "REQUEST_BUDGET_EXHAUSTED", error.message, fetchedRequests);
-          if (error.code === "INVALID_SYMBOL") return skip(symbol, "UNSUPPORTED_SYMBOL", error.message);
-          if (error.code === "CONTRADICTORY_ROW") return skip(symbol, "CACHE_UNUSABLE", `fetched bars contradict the cache: ${error.message}`);
-          return skip(symbol, "PUBLIC_FETCH_FAILED", `${error.code}: ${error.message}`, fetchedRequests);
-        }
-        if (error instanceof KlineCacheError) return skip(symbol, "CACHE_UNUSABLE", error.message);
-        throw error;
-      }
-      trustedEndMs = contiguousEnd(klines, contextStartMs, boundaryMs, intervalMs);
-    }
-
-    if (trustedEndMs < boundaryMs) {
-      const first = klines.find((k) => k.openTimeMs >= contextStartMs);
-      return first === undefined || first.openTimeMs > contextStartMs
-        ? skip(symbol, "INSUFFICIENT_HISTORY", `no contiguous data from the HTF context start ${new Date(contextStartMs).toISOString()}`, fetchedRequests)
-        : skip(symbol, "INCOMPLETE_DATA", `closed bars are contiguous only to ${new Date(trustedEndMs).toISOString()}`, fetchedRequests);
-    }
+    const filled = await fillClosedBarCache({
+      symbol,
+      chartInterval: lineage.chartInterval,
+      contextStartMs,
+      endMs: boundaryMs,
+      cache: deps.cache,
+      fetchDeps,
+      governor,
+      cacheOnly: request.cacheOnly,
+      nowIso: deps.nowIso,
+    });
+    if (filled.kind === "SKIP") return skip(symbol, filled.reason, filled.detail, filled.fetchedRequests);
+    const { klines, fetchedRequests } = filled;
 
     try {
       // The live scanner's own reconstruction, over CLOSED bars before the boundary only.

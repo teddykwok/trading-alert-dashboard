@@ -86,6 +86,8 @@ export interface AiVisionUpdateInput {
 }
 
 export interface DuplicateLookupInput {
+  /** Only alerts of this source can be a duplicate. The webhook always passes TRADINGVIEW. */
+  source: AlertSource;
   symbol: string;
   assetType: AssetType;
   timeframe: string;

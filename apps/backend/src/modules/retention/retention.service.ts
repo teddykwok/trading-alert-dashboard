@@ -156,6 +156,29 @@ export function lineageProtectedAlertWhere(cutoff: Date): Prisma.AlertWhereInput
   };
 }
 
+/**
+ * Dashboard-only NATIVE alerts: written by the native emitter, never analysed,
+ * planned or executed, so RECEIVED is their permanent state — not "in flight".
+ * The terminal-status rule above can never match them, which is correct for
+ * TradingView alerts and would make native alerts immortal. They get their own
+ * explicit rule instead; the TradingView rule is untouched.
+ */
+export const NATIVE_DASHBOARD_ONLY_WHERE = { source: "NATIVE", status: "RECEIVED" } as const satisfies Prisma.AlertWhereInput;
+
+/**
+ * Old NATIVE dashboard-only alerts released by the user, with the same user-
+ * state and execution-lineage gates as every other deletion. Their
+ * NativeAlertDelivery ledger row survives (alertId SetNull), so the bar stays
+ * delivered and is never re-sent.
+ */
+export function deletableNativeAlertWhere(cutoff: Date): Prisma.AlertWhereInput {
+  return {
+    createdAt: { lt: cutoff },
+    ...NATIVE_DASHBOARD_ONLY_WHERE,
+    AND: [releasedByUserWhere, disposableLineageWhere],
+  };
+}
+
 export interface RetentionReport {
   dryRun: boolean;
   lockAcquired: boolean;
@@ -181,6 +204,11 @@ export interface RetentionReport {
    * looking like unfinished user state.
    */
   skippedExecutionLineage: number;
+  /** Old NATIVE dashboard-only alerts eligible for deletion (dry-run: that WOULD be deleted). */
+  nativeAlertsSelected: number;
+  nativeAlertsDeleted: number;
+  /** Old NATIVE alerts kept because of open/unfinalized user-entered state. */
+  skippedNativeOpenUserState: number;
   failures: number;
 }
 
@@ -243,6 +271,9 @@ export async function runRetentionCleanup(
     skippedNonTerminal: 0,
     skippedOpenUserState: 0,
     skippedExecutionLineage: 0,
+    nativeAlertsSelected: 0,
+    nativeAlertsDeleted: 0,
+    skippedNativeOpenUserState: 0,
     failures: 0,
   };
 
@@ -316,7 +347,31 @@ export async function runRetentionCleanup(
       // meaning exactly what its name says.
       report.skippedOpenUserState = agedTerminal - deletable.length - lineageProtected;
 
+      // ---- Phase C: old NATIVE dashboard-only alerts (their own rule) ----
+      const nativeDeletable = await tx.alert.findMany({
+        where: deletableNativeAlertWhere(alertCutoff),
+        select: { id: true, screenshotUrl: true },
+      });
+      const nativeAged = await tx.alert.count({ where: { ...agedWhere, ...NATIVE_DASHBOARD_ONLY_WHERE } });
+      report.nativeAlertsSelected = nativeDeletable.length;
+      report.skippedNativeOpenUserState = nativeAged - nativeDeletable.length;
+      // Native alerts are non-terminal by status but are governed by Phase C, not "skipped".
+      report.skippedNonTerminal = agedNonTerminal - nativeAged;
+
       if (!options.dryRun) {
+        for (const batch of chunk(nativeDeletable, DELETE_BATCH_SIZE)) {
+          try {
+            // Native alerts carry no screenshot, plan or execution; the ledger
+            // row stays (SetNull) so a re-read shadow log can never re-deliver.
+            const result = await tx.alert.deleteMany({
+              where: { id: { in: batch.map((row) => row.id) }, ...NATIVE_DASHBOARD_ONLY_WHERE },
+            });
+            report.nativeAlertsDeleted += result.count;
+          } catch (error) {
+            report.failures += 1;
+            logger.error({ batchSize: batch.length, error }, "Retention: native alert deletion batch failed");
+          }
+        }
         for (const batch of chunk(deletable, DELETE_BATCH_SIZE)) {
           try {
             // Best-effort file removal first so deleted alerts never leave

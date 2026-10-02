@@ -1,4 +1,4 @@
-import type { PrismaClient, Prisma } from "@prisma/client";
+import type { AlertStatus, PrismaClient, Prisma } from "@prisma/client";
 import type {
   AlertListFilter,
   AlertNeighbor,
@@ -33,6 +33,9 @@ export class AlertsRepository {
   findRecentDuplicate(input: DuplicateLookupInput) {
     return this.prisma.alert.findFirst({
       where: {
+        // In the query, so a newer row of another source can never shadow an
+        // older TradingView duplicate (or be bumped as one).
+        source: input.source,
         symbol: input.symbol,
         assetType: input.assetType,
         timeframe: input.timeframe,
@@ -185,6 +188,13 @@ export class AlertsRepository {
       by: ["status"],
       _count: { _all: true },
       where: this.rangeWhere(range),
+    });
+  }
+
+  /** Dashboard-only NATIVE alerts in the range whose status is one of `statuses`. */
+  countNativeInStatuses(range: AlertStatsRange, statuses: AlertStatus[]) {
+    return this.prisma.alert.count({
+      where: { ...this.rangeWhere(range), source: "NATIVE", status: { in: statuses } },
     });
   }
 

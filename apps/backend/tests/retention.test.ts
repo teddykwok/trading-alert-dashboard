@@ -137,6 +137,9 @@ interface TxMockInput {
   agedNonTerminal?: number;
   agedTerminal?: number;
   lineageProtected?: number;
+  /** Phase C (native dashboard-only alerts), queried after everything above. */
+  nativeDeletable?: Array<{ id: string; screenshotUrl: string | null }>;
+  nativeAged?: number;
 }
 
 function createTx(input: TxMockInput) {
@@ -146,12 +149,14 @@ function createTx(input: TxMockInput) {
       findMany: vi
         .fn()
         .mockResolvedValueOnce(input.expiredShots ?? [])
-        .mockResolvedValueOnce(input.deletable ?? []),
+        .mockResolvedValueOnce(input.deletable ?? [])
+        .mockResolvedValueOnce(input.nativeDeletable ?? []),
       count: vi
         .fn()
         .mockResolvedValueOnce(input.agedNonTerminal ?? 0)
         .mockResolvedValueOnce(input.agedTerminal ?? 0)
-        .mockResolvedValueOnce(input.lineageProtected ?? 0),
+        .mockResolvedValueOnce(input.lineageProtected ?? 0)
+        .mockResolvedValueOnce(input.nativeAged ?? 0),
       update: vi.fn().mockResolvedValue({}),
       deleteMany: vi.fn().mockImplementation(({ where }: { where: { id: { in: string[] } } }) =>
         Promise.resolve({ count: where.id.in.length })
