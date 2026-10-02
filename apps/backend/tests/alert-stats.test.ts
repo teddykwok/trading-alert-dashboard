@@ -20,7 +20,8 @@ function createMockPrisma(
           Promise.resolve(by[0] === "status" ? statusGroups : signalGroups)
         ),
       findMany: vi.fn(),
-      count: vi.fn(),
+      // Dashboard-only NATIVE alerts in processing statuses (none in these TradingView-only fixtures).
+      count: vi.fn().mockResolvedValue(0),
     },
   } as unknown as PrismaClient;
 }

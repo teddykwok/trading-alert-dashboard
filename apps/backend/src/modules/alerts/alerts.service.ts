@@ -43,9 +43,10 @@ export class AlertsService {
    * groups, which is every alert in the range whatever its status.
    */
   async statsForRange(range: AlertStatsRange): Promise<AlertStats> {
-    const [statusGroups, signalGroups] = await Promise.all([
+    const [statusGroups, signalGroups, nativeInProcessingStatuses] = await Promise.all([
       this.repository.groupByStatus(range),
       this.repository.groupBySignal(range),
+      this.repository.countNativeInStatuses(range, PROCESSING_ALERT_STATUSES),
     ]);
 
     const statusCount = (status: AlertStatus): number =>
@@ -57,7 +58,10 @@ export class AlertsService {
       total: statusGroups.reduce((sum, group) => sum + group._count._all, 0),
       long: signalGroups.find((group) => group.signal === "LONG")?._count._all ?? 0,
       short: signalGroups.find((group) => group.signal === "SHORT")?._count._all ?? 0,
-      processing: PROCESSING_ALERT_STATUSES.reduce((sum, status) => sum + statusCount(status), 0),
+      // NATIVE alerts are dashboard-only: RECEIVED is their permanent state and
+      // nothing will ever analyse them, so they are never "in flight". They
+      // still count in `total` and in long/short.
+      processing: PROCESSING_ALERT_STATUSES.reduce((sum, status) => sum + statusCount(status), 0) - nativeInProcessingStatuses,
       analyzed: statusCount("ANALYZED"),
       failed: statusCount("FAILED"),
     };

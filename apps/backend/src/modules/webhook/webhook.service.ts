@@ -3,7 +3,7 @@ import { ASSET_TYPES, SIGNAL_TYPES, parseAlertNote } from "@trading-alert-dashbo
 import { tradingViewWebhookSchema, type TradingViewWebhookInput } from "./webhook.schema";
 import { isValidWebhookSecret } from "./webhook.security";
 import { AlertsService } from "../alerts/alerts.service";
-import { EXECUTABLE_ALERT_SOURCE, NATIVE_ALERT_SOURCE } from "../alerts/alert-source";
+import { EXECUTABLE_ALERT_SOURCE } from "../alerts/alert-source";
 import { ExtremeRRService } from "../extreme-rr/extreme-rr.service";
 import { enqueueExtremeRRPlan, enqueueVisionAnalysis } from "../jobs/queue";
 import { logger } from "../../config/logger";
@@ -81,7 +81,11 @@ export async function handleTradingViewWebhook(
   const suppressionWindowStart = new Date(
     Date.now() - env.DUPLICATE_SUPPRESSION_WINDOW_SECONDS * 1000
   );
-  const recentMatch = await alertsService.findRecentDuplicate({
+  const existingDuplicate = await alertsService.findRecentDuplicate({
+    // TradingView duplicates are TradingView alerts only: a NATIVE
+    // (dashboard-only) row can neither absorb this webhook nor hide an older
+    // TradingView duplicate behind it.
+    source: EXECUTABLE_ALERT_SOURCE,
     symbol: normalizedSymbol,
     assetType,
     timeframe: payload.timeframe,
@@ -89,10 +93,6 @@ export async function handleTradingViewWebhook(
     indicatorName,
     since: suppressionWindowStart,
   });
-
-  // A NATIVE (dashboard-only) alert never absorbs a TradingView webhook as its
-  // duplicate: the webhook alert is created as if the native row did not exist.
-  const existingDuplicate = recentMatch?.source === NATIVE_ALERT_SOURCE ? null : recentMatch;
 
   if (existingDuplicate) {
     const updated = await alertsService.registerDuplicate(existingDuplicate.id);

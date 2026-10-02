@@ -286,10 +286,13 @@ describe("handleTradingViewWebhook", () => {
       expect(prisma.alert.create).not.toHaveBeenCalled();
 
       // The duplicate lookup must not have gained any level-context fields.
+      // `source` is the one deliberate addition: only TradingView alerts can be
+      // a TradingView webhook's duplicate.
       const lookupWhere = (prisma.alert.findFirst as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
       expect(Object.keys(lookupWhere).sort()).toEqual(
-        ["assetType", "createdAt", "indicatorName", "signal", "symbol", "timeframe"].sort()
+        ["assetType", "createdAt", "indicatorName", "signal", "source", "symbol", "timeframe"].sort()
       );
+      expect(lookupWhere.source).toBe("TRADINGVIEW");
     });
   });
 

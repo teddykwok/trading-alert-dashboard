@@ -10,8 +10,8 @@ import { describe, expect, it } from "vitest";
  */
 
 const SCANNER_DIR = path.resolve(__dirname, "../src/modules/native-scanner");
-/** The CLI entrypoints: causal replay (2A), compatibility replay (2B-2A), live shadow scanner (2B-2B), read-only candidate ranker. */
-const CLI_FILES = ["run-historical-replay.ts", "run-compat-replay.ts", "run-live-shadow.ts", "run-candidate-rank.ts"];
+/** The CLI entrypoints: causal replay (2A), compatibility replay (2B-2A), live shadow scanner (2B-2B), read-only candidate ranker, read-only parity audit. */
+const CLI_FILES = ["run-historical-replay.ts", "run-compat-replay.ts", "run-live-shadow.ts", "run-candidate-rank.ts", "run-parity-audit.ts"];
 const LIVE_CLI_FILE = "run-live-shadow.ts";
 const PATHS_FILE = "scanner-paths.ts";
 
@@ -28,7 +28,7 @@ const importsOf = (text: string) =>
   );
 
 describe("the native scanner data layer", () => {
-  it("consists of exactly the Slice 2A, 2B-2A, 2B-2B and candidate-ranker modules", () => {
+  it("consists of exactly the Slice 2A, 2B-2A, 2B-2B, candidate-ranker and parity-audit modules", () => {
     expect(sources.map((s) => s.file).sort()).toEqual([
       "binance-public-futures.ts",
       "candidate-rank-cli-args.ts",
@@ -48,11 +48,14 @@ describe("the native scanner data layer", () => {
       "live-shadow-runner.ts",
       "live-shadow-session.ts",
       "live-shadow-store.ts",
+      "parity-audit-runner.ts",
+      "parity-audit.ts",
       "replay-cli-args.ts",
       "run-candidate-rank.ts",
       "run-compat-replay.ts",
       "run-historical-replay.ts",
       "run-live-shadow.ts",
+      "run-parity-audit.ts",
       "scanner-lineage.ts",
       "scanner-paths.ts",
       "usdm-universe.ts",
@@ -126,7 +129,7 @@ describe("the native scanner data layer", () => {
     expect(cli).toContain('method: "GET"');
   });
 
-  it("the package exposes exactly four scanner scripts: causal replay, compatibility replay, live shadow, candidate rank", () => {
+  it("the package exposes exactly five scanner scripts: causal replay, compatibility replay, live shadow, candidate rank, parity audit", () => {
     const scripts = (JSON.parse(readFileSync(path.resolve(__dirname, "../package.json"), "utf8")) as { scripts: Record<string, string> })
       .scripts;
     expect(Object.entries(scripts).filter(([name, command]) => /scanner/.test(name) || /native-scanner/.test(command))).toEqual([
@@ -134,6 +137,7 @@ describe("the native scanner data layer", () => {
       ["scanner:compat-replay", "tsx src/modules/native-scanner/run-compat-replay.ts"],
       ["scanner:live-shadow", "tsx src/modules/native-scanner/run-live-shadow.ts"],
       ["scanner:candidate-rank", "tsx src/modules/native-scanner/run-candidate-rank.ts"],
+      ["scanner:parity-audit", "tsx src/modules/native-scanner/run-parity-audit.ts"],
     ]);
   });
 
