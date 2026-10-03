@@ -14,8 +14,9 @@ import { BAR0, M15, bar, commit, logOf, observation } from "./helpers/native-ale
  *  - V2 never re-delivers a canonical shadow event a V1 row already delivered,
  *    and never recreates a deleted Alert. V1 rows are never touched.
  *  - The future execution policy (1D/1W) changes nothing: a NATIVE alert of
- *    ANY source timeframe is refused by the planner, adoption, execution
- *    creation and queue recovery, exactly as before.
+ *    ANY source timeframe, under EVERY profile (Teddy Aggressive and Teddy 7%
+ *    All Active), is refused by the planner, adoption, execution creation and
+ *    queue recovery, exactly as before.
  *
  * No Binance client is imported and no exchange request is made.
  */
@@ -29,7 +30,7 @@ const { PrismaNativeDeliveryLedger } = await import("../src/modules/native-alert
 const { selectNativeDeliveries } = await import("../src/modules/native-alerts/native-delivery-policy");
 const { selectNativeDeliveriesV2, ineligibilityOfV2 } = await import("../src/modules/native-alerts/native-delivery-policy-v2");
 const { parseShadowEventLog } = await import("../src/modules/native-alerts/shadow-log-reader");
-const { TEDDY_AGGRESSIVE_V1, profileSummaryOf } = await import("../src/modules/native-scanner/scanner-profile");
+const { SCANNER_PROFILES, TEDDY_7_ALL_ACTIVE_V1, TEDDY_AGGRESSIVE_V1, profileSummaryOf } = await import("../src/modules/native-scanner/scanner-profile");
 const { NativeAlertExecutionForbiddenError } = await import("../src/modules/alerts/alert-source");
 const { ExtremeRRService } = await import("../src/modules/extreme-rr/extreme-rr.service");
 const { SelectedPlanAdoptionService } = await import("../src/modules/jobs/selected-plan-adoption.service");
@@ -159,11 +160,11 @@ describe("NATIVE_DELIVERY_V2 through the real ledger (no migration)", () => {
 // The execution fences, per source timeframe
 // ===========================================================================
 
-async function nativeAlert(symbol: string, sourceTimeframe: SourceTimeframe, triggeredAt = new Date(Date.now() - 30_000)) {
+async function nativeAlert(symbol: string, sourceTimeframe: SourceTimeframe, triggeredAt = new Date(Date.now() - 30_000), profileId = "TEDDY_AGGRESSIVE_V1") {
   return prisma.alert.create({
     data: {
       symbol, assetType: "CRYPTO", exchange: "BINANCE", timeframe: "15m", price: 100, signal: "LONG", indicatorName: "Native Level Scanner",
-      rawPayload: { source: "NATIVE", profile: { profileId: "TEDDY_AGGRESSIVE_V1", futureExecutionSourceTimeframes: ["1D", "1W"], nativeExecutionEnabled: false } },
+      rawPayload: { source: "NATIVE", profile: { profileId, futureExecutionSourceTimeframes: ["1D", "1W"], nativeExecutionEnabled: false } },
       triggeredAt, source: "NATIVE", sourceTimeframe, eventType: "LEVEL_TOUCHED",
     },
   });
@@ -195,24 +196,31 @@ function readyMarginPlan(symbol: string): DynamicLeveragePlan {
 describe("execution stays hard-fenced for NATIVE alerts of every source timeframe", () => {
   beforeEach(() => resetRecoverySweepGuardForTests());
 
-  it.each([
-    ["1D", true],
-    ["1W", true],
-    ["1M", true],
-    ["3M", false],
-    ["6M", false],
-    ["12M", false],
-  ] as const)("%s: dashboard-deliverable=%s under Teddy Aggressive — decided by the DeliveryPolicy alone", (tf, deliverable) => {
-    const record = parseShadowEventLog(logOf([observation({ symbol: "LDOUSDT", lineageId: LINEAGE, sourceTf: tf })]), identity("LDOUSDT"))[0];
-    expect(ineligibilityOfV2(record, T.delivery) === null).toBe(deliverable);
-    // The future execution policy is modelling only: it lists 1D/1W and enables nothing.
-    expect(T.execution.nativeExecutionEnabled).toBe(false);
+  it("every registered profile is in this matrix, and none can enable native execution", () => {
+    expect(Object.values(SCANNER_PROFILES).map((p) => p.profileId).sort()).toEqual(["TEDDY_7_ALL_ACTIVE_V1", "TEDDY_AGGRESSIVE_V1"]);
+    for (const p of Object.values(SCANNER_PROFILES)) expect(p.execution.nativeExecutionEnabled).toBe(false);
   });
 
-  for (const tf of ["1D", "1W", "1M", "3M", "6M", "12M"] as const) {
-    maybe()(`Native ${tf}: planner, adoption, execution creation and queue recovery all refuse it`, async () => {
+  for (const p of [T, TEDDY_7_ALL_ACTIVE_V1]) {
+    it.each([
+      ["1D", true],
+      ["1W", true],
+      ["1M", true],
+      ["3M", false],
+      ["6M", false],
+      ["12M", false],
+    ] as const)(`%s: dashboard-deliverable=%s under ${p.label} — decided by the DeliveryPolicy alone`, (tf, deliverable) => {
+      const record = parseShadowEventLog(logOf([observation({ symbol: "LDOUSDT", lineageId: LINEAGE, sourceTf: tf })]), identity("LDOUSDT"))[0];
+      expect(ineligibilityOfV2(record, p.delivery) === null).toBe(deliverable);
+      // The future execution policy is modelling only: it lists 1D/1W and enables nothing.
+      expect(p.execution.nativeExecutionEnabled).toBe(false);
+    });
+  }
+
+  for (const [profileId, tf] of [T.profileId, TEDDY_7_ALL_ACTIVE_V1.profileId].flatMap((id) => (["1D", "1W", "1M", "3M", "6M", "12M"] as const).map((t) => [id, t] as const))) {
+    maybe()(`${profileId} Native ${tf}: planner, adoption, execution creation and queue recovery all refuse it`, async () => {
       const symbol = nextSymbol();
-      const alert = await nativeAlert(symbol, tf);
+      const alert = await nativeAlert(symbol, tf, undefined, profileId);
       // Planner: refused before any candle fetch.
       const fetchCandles = vi.fn(async () => {
         throw new Error("a Binance kline fetch was attempted for a NATIVE alert");

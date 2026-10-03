@@ -3,7 +3,7 @@ import { CONSERVATIVE_REQUEST_POLICY, REQUEST_POLICY_LIMITS } from "./kline-fetc
 import { MAX_STREAMS_PER_COMBINED_CONNECTION } from "./live-kline-stream";
 import { LINEAGE_CONFIG_OPTIONS, LiveShadowCliUsageError, parseLineageConfig, type LineageConfig } from "./live-shadow-cli-args";
 import { SUPERVISOR_LIMITS } from "./live-shadow-supervisor";
-import { ScannerProfileError, lineageConfigOf, resolveScannerProfile, type ScannerProfile } from "./scanner-profile";
+import { SCANNER_PROFILES, ScannerProfileError, isAllActiveUniverse, lineageConfigOf, resolveScannerProfile, type ScannerProfile } from "./scanner-profile";
 import type { UniverseSelectionSpec } from "./usdm-universe";
 
 /**
@@ -22,7 +22,9 @@ import type { UniverseSelectionSpec } from "./usdm-universe";
  * It is fail-closed: no lineage flag and no universe flag may accompany it
  * (not even one with the profile's own value), so a profile run can never be
  * silently re-parameterised. Only operational tuning and the diagnostic,
- * never-substituting `--symbols` are accepted alongside it.
+ * never-substituting `--symbols` are accepted alongside it. A profile may
+ * carry operational defaults (an all-active profile's connection ceiling);
+ * the operational flags still override them.
  */
 
 export class SupervisorCliUsageError extends Error {
@@ -71,8 +73,8 @@ export const SUPERVISOR_CLI_USAGE = [
   `    [--queue-capacity ${SUPERVISOR_DEFAULTS.queueCapacity}] [--max-lag-ms ${SUPERVISOR_DEFAULTS.maxProcessingLagMs}] [--stale-symbol-ms ${SUPERVISOR_DEFAULTS.staleSymbolMs}]`,
   `    [--max-total-requests ${SUPERVISOR_DEFAULTS.maxTotalRequests}] [--request-spacing-ms ${CONSERVATIVE_REQUEST_POLICY.minSpacingMs}] [--status-every-s ${SUPERVISOR_DEFAULTS.statusEverySeconds}]`,
   "    [--duration-minutes N] [--json-status]",
-  "  scanner:live-shadow-supervisor --profile teddy-aggressive [--symbols A,B,...] [operational tuning flags]",
-  "    (a profile fixes the engine and the universe target; lineage and universe flags are refused with it)",
+  `  scanner:live-shadow-supervisor --profile <${Object.keys(SCANNER_PROFILES).join("|")}> [--symbols A,B,...] [operational tuning flags]`,
+  "    (a profile fixes the engine and the universe; lineage and universe flags are refused with it)",
 ].join("\n");
 
 export interface SupervisorCliOptions {
@@ -152,8 +154,9 @@ export function parseSupervisorCliArgs(argv: readonly string[]): SupervisorCliOp
   if (hasUniverse === hasSymbols) usage("give exactly one of --symbols or --universe usdt-perpetual");
   let selection: UniverseSelectionSpec;
   if (profile !== null && hasUniverse) {
-    // The profile's universe: walk the active USDT perpetuals and accept its target of SCANNER-ELIGIBLE symbols.
-    selection = { mode: "UNIVERSE", include: [], exclude: [], maxSymbols: profile.universe.targetEligible };
+    // The profile's universe: walk the active USDT perpetuals and accept its target of SCANNER-ELIGIBLE
+    // symbols, or, for an all-active profile, every scanner-eligible one (no count, no cap).
+    selection = { mode: "UNIVERSE", include: [], exclude: [], maxSymbols: isAllActiveUniverse(profile.universe) ? null : profile.universe.targetEligible };
   } else if (hasUniverse) {
     if (values.get("--universe") !== "usdt-perpetual") usage("--universe must be usdt-perpetual");
     const all = flags.has("--all-active");
@@ -178,7 +181,7 @@ export function parseSupervisorCliArgs(argv: readonly string[]): SupervisorCliOp
     lineage,
     selection,
     symbolsPerConnection: bounded(values.get("--symbols-per-connection"), "--symbols-per-connection", 1, MAX_STREAMS_PER_COMBINED_CONNECTION, SUPERVISOR_DEFAULTS.symbolsPerConnection),
-    maxConnections: bounded(values.get("--max-connections"), "--max-connections", 1, SUPERVISOR_LIMITS.maxConnections, SUPERVISOR_DEFAULTS.maxConnections),
+    maxConnections: bounded(values.get("--max-connections"), "--max-connections", 1, SUPERVISOR_LIMITS.maxConnections, profile?.operations?.maxConnections ?? SUPERVISOR_DEFAULTS.maxConnections),
     restConcurrency: bounded(values.get("--rest-concurrency"), "--rest-concurrency", 1, 8, SUPERVISOR_DEFAULTS.restConcurrency),
     queueCapacity: bounded(values.get("--queue-capacity"), "--queue-capacity", 100, SUPERVISOR_LIMITS.maxQueueCapacity, SUPERVISOR_DEFAULTS.queueCapacity),
     maxProcessingLagMs: bounded(values.get("--max-lag-ms"), "--max-lag-ms", 1_000, 600_000, SUPERVISOR_DEFAULTS.maxProcessingLagMs),

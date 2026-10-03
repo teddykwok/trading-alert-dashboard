@@ -34,8 +34,8 @@ import { SCANNER_KLINE_SOURCE, buildScannerLineage, deriveHtfContextStartMs, typ
  *
  * The three timeframe lists carry distinct brands, so the compiler refuses to
  * pass a delivery list where an engine list is expected (and every other mix).
- * The display label and the universe target are in no fingerprint. A profile is
- * not an account: it never names Account A or Account B.
+ * The display label, the universe selection and the operational defaults are in
+ * no fingerprint. A profile is not an account: it never names Account A or Account B.
  */
 
 declare const ENGINE_TF: unique symbol;
@@ -120,12 +120,48 @@ export interface ExecutionPolicy {
   readonly nativeExecutionEnabled: false;
 }
 
-export interface UniversePolicy {
+/** The first `targetEligible` SCANNER-ELIGIBLE symbols of the universe walk (eligible-symbol backfill). */
+export interface TargetEligibleUniversePolicy {
   readonly layer: "UNIVERSE";
   readonly universe: "usdt-perpetual";
   /** Count of SCANNER-ELIGIBLE symbols (eligible-symbol backfill), not of candidates. */
   readonly targetEligible: number;
 }
+
+/**
+ * EVERY scanner-eligible active symbol: the whole universe is walked and every
+ * eligible candidate is accepted. There is no count: the active universe is
+ * dynamic, and an ineligible candidate is skipped by reason, never silently.
+ */
+export interface AllActiveUniversePolicy {
+  readonly layer: "UNIVERSE";
+  readonly universe: "usdt-perpetual";
+  readonly selection: "ALL_ACTIVE";
+  readonly targetEligible: null;
+}
+
+export type UniversePolicy = TargetEligibleUniversePolicy | AllActiveUniversePolicy;
+
+export const isAllActiveUniverse = (universe: UniversePolicy): universe is AllActiveUniversePolicy =>
+  (universe as Partial<AllActiveUniversePolicy>).selection === "ALL_ACTIVE";
+
+/**
+ * What a profile needs operationally to run as defined. Never semantic: in no
+ * fingerprint, no lineage and no manifest identity, and the operator's
+ * operational flags still override it. A profile without it uses the
+ * supervisor's generic defaults.
+ */
+export interface ProfileOperations {
+  /**
+   * The CEILING of combined-stream connections. Only as many as the accepted
+   * set needs are opened; an accepted set that does not fit is refused at
+   * start-up, before any request, never truncated.
+   */
+  readonly maxConnections: number;
+}
+
+/** The supervisor's own ceiling (SUPERVISOR_LIMITS.maxConnections), restated here so profiles stay import-free of it. */
+export const PROFILE_MAX_CONNECTIONS_CEILING = 32;
 
 export interface ScannerProfile {
   /** Stable semantic identity. Never the label. */
@@ -138,6 +174,7 @@ export interface ScannerProfile {
   readonly delivery: DeliveryPolicy;
   readonly execution: ExecutionPolicy;
   readonly universe: UniversePolicy;
+  readonly operations?: ProfileOperations;
 }
 
 export const TEDDY_AGGRESSIVE_V1: ScannerProfile = Object.freeze({
@@ -179,8 +216,60 @@ export const TEDDY_AGGRESSIVE_V1: ScannerProfile = Object.freeze({
   universe: Object.freeze({ layer: "UNIVERSE", universe: "usdt-perpetual", targetEligible: 50 }),
 }) as ScannerProfile;
 
+/**
+ * Teddy's 7% engine over EVERY scanner-eligible active USD-M USDT perpetual.
+ * Identical to TEDDY_AGGRESSIVE_V1 in every engine setting but the minimum
+ * move, and in delivery and future-execution policy; only the universe and
+ * its connection ceiling differ. A separate profile: never an alias.
+ */
+export const TEDDY_7_ALL_ACTIVE_V1: ScannerProfile = Object.freeze({
+  profileId: "TEDDY_7_ALL_ACTIVE_V1",
+  cliName: "teddy-7-all-active",
+  label: "Teddy 7% All Active",
+  engine: Object.freeze({
+    layer: "ENGINE",
+    marketType: SCANNER_MARKET_TYPE,
+    chartInterval: "15m",
+    historyStart: "2026-01-01T00:00:00Z",
+    switchover: "2026-09-12T01:00:00Z",
+    minMovePercent: 7,
+    touchTolerancePercent: 1,
+    cooldownBars: 10,
+    minBarsAfterCreation: 5,
+    minBarsAfterArming: 4,
+    engineSourceTimeframes: engineTimeframes("1D", "1W", "1M", "3M", "6M", "12M"),
+    maxLevels: 500,
+    timing: "Immediate",
+    partialPeriodPolicy: SWITCHOVER_TRUNCATED_CLOSED_BARS,
+  }),
+  delivery: Object.freeze({
+    layer: "DASHBOARD_DELIVERY",
+    policyVersion: NATIVE_DELIVERY_V2_VERSION,
+    dashboardSourceTimeframes: dashboardTimeframes("1D", "1W", "1M"),
+    evidenceClasses: Object.freeze(["PROVEN_INTRABAR_POSSIBLE", "POSSIBLE_ONLY"] as const),
+    source: "NATIVE",
+    exchange: "BINANCE",
+    assetType: "CRYPTO",
+    provenance: "SHADOW_LIVE_ONLY",
+    actionable: false,
+  }),
+  execution: Object.freeze({
+    layer: "FUTURE_EXECUTION",
+    futureExecutionSourceTimeframes: futureExecutionTimeframes("1D", "1W"),
+    nativeExecutionEnabled: false,
+  }),
+  universe: Object.freeze({ layer: "UNIVERSE", universe: "usdt-perpetual", selection: "ALL_ACTIVE", targetEligible: null }),
+  // 16 x 50 symbols per connection = 800 symbols: room for the whole active USD-M USDT-perpetual
+  // universe (about 520 active, about 470 eligible, as of 2026-10) with headroom. Only the
+  // connections the accepted set needs are opened (about 10 today); a larger set is refused.
+  operations: Object.freeze({ maxConnections: 16 }),
+}) as ScannerProfile;
+
 /** Every profile the scanner knows, by --profile name. */
-export const SCANNER_PROFILES: Readonly<Record<string, ScannerProfile>> = Object.freeze({ [TEDDY_AGGRESSIVE_V1.cliName]: TEDDY_AGGRESSIVE_V1 });
+export const SCANNER_PROFILES: Readonly<Record<string, ScannerProfile>> = Object.freeze({
+  [TEDDY_AGGRESSIVE_V1.cliName]: TEDDY_AGGRESSIVE_V1,
+  [TEDDY_7_ALL_ACTIVE_V1.cliName]: TEDDY_7_ALL_ACTIVE_V1,
+});
 
 export function resolveScannerProfile(name: string): ScannerProfile {
   if (!Object.prototype.hasOwnProperty.call(SCANNER_PROFILES, name)) {
@@ -213,7 +302,18 @@ export function assertScannerProfile(profile: ScannerProfile): ScannerProfile {
   const engineTfs = new Set<string>(profile.engine.engineSourceTimeframes);
   for (const tf of profile.delivery.dashboardSourceTimeframes) if (!engineTfs.has(tf)) refuse(`delivery timeframe ${tf} is not an engine timeframe`);
   for (const tf of profile.execution.futureExecutionSourceTimeframes) if (!engineTfs.has(tf)) refuse(`future execution timeframe ${tf} is not an engine timeframe`);
-  if (!Number.isSafeInteger(profile.universe.targetEligible) || profile.universe.targetEligible < 1) refuse("the universe target must be a positive integer");
+  if (isAllActiveUniverse(profile.universe)) {
+    if (profile.universe.targetEligible !== null) refuse("an ALL_ACTIVE universe has no target count");
+    // Every eligible symbol must fit: an all-active profile states its own connection ceiling.
+    if (profile.operations === undefined) refuse("an ALL_ACTIVE profile must declare its connection ceiling (operations.maxConnections)");
+  } else {
+    if ("selection" in profile.universe) refuse("unknown universe selection");
+    if (!Number.isSafeInteger(profile.universe.targetEligible) || profile.universe.targetEligible < 1) refuse("the universe target must be a positive integer");
+  }
+  if (profile.operations !== undefined) {
+    const max = profile.operations.maxConnections;
+    if (!Number.isSafeInteger(max) || max < 1 || max > PROFILE_MAX_CONNECTIONS_CEILING) refuse(`operations.maxConnections must be 1..${PROFILE_MAX_CONNECTIONS_CEILING}`);
+  }
   lineageConfigOf(profile.engine);
   return profile;
 }
@@ -369,7 +469,8 @@ export interface ProfileSummary {
   };
   readonly delivery: { readonly policyVersion: string; readonly dashboardSourceTimeframes: readonly string[]; readonly evidenceClasses: readonly string[] };
   readonly execution: { readonly futureExecutionSourceTimeframes: readonly string[]; readonly nativeExecutionEnabled: false; readonly notice: string };
-  readonly universe: { readonly universe: string; readonly targetEligible: number };
+  /** A target profile: { universe, targetEligible: N }. An all-active profile: { universe, selection: "ALL_ACTIVE", targetEligible: null }. */
+  readonly universe: { readonly universe: string; readonly targetEligible: number | null; readonly selection?: "ALL_ACTIVE" };
 }
 
 export const FUTURE_EXECUTION_NOTICE = "Future execution policy only. Native execution is NOT enabled: it is hard-disabled in code for every source timeframe.";
@@ -407,7 +508,9 @@ export function profileSummaryOf(profile: ScannerProfile): ProfileSummary {
       nativeExecutionEnabled: false,
       notice: FUTURE_EXECUTION_NOTICE,
     },
-    universe: { universe: profile.universe.universe, targetEligible: profile.universe.targetEligible },
+    universe: isAllActiveUniverse(profile.universe)
+      ? { universe: profile.universe.universe, selection: "ALL_ACTIVE", targetEligible: null }
+      : { universe: profile.universe.universe, targetEligible: profile.universe.targetEligible },
   };
 }
 

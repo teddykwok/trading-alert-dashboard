@@ -29,7 +29,7 @@ const importsOf = (text: string) =>
   );
 
 describe("the native scanner data layer", () => {
-  it("consists of exactly the Slice 2A, 2B-2A, 2B-2B, candidate-ranker, parity-audit, supervisor and profile modules", () => {
+  it("consists of exactly the Slice 2A, 2B-2A, 2B-2B, candidate-ranker, parity-audit, supervisor (with its pure run plan) and profile modules", () => {
     expect(sources.map((s) => s.file).sort()).toEqual([
       "binance-public-futures.ts",
       "candidate-rank-cli-args.ts",
@@ -65,6 +65,7 @@ describe("the native scanner data layer", () => {
       "scanner-paths.ts",
       "scanner-profile.ts",
       "supervisor-run-manifest.ts",
+      "supervisor-run-plan.ts",
       "symbol-stream-channel.ts",
       "usdm-universe.ts",
     ]);
