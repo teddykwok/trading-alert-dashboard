@@ -20,14 +20,16 @@ import {
   type ExtremeRRPlanDto,
   type ExtremeRRPlanStatus,
   type ExtremeRRTemplateSnapshot,
+  type NativePlanListDto,
   type SelectedPlanAccountOutcomeDto,
+  selectedPlanSummaryOf,
 } from "@trading-alert-dashboard/shared";
 import { getClosedCandlesBefore } from "../market-data/market-data.service";
 import type { SnapshotCandle } from "../market-data/market-data.types";
 import { RiskTemplateRepository } from "../risk-template/risk-template.repository";
-import { inferMarketType } from "../../utils/symbol";
+import { inferMarketType, type MarketType } from "../../utils/symbol";
 import { NotFoundError, ValidationError } from "../../utils/errors";
-import { assertNotNativeAlert } from "../alerts/alert-source";
+import { NATIVE_ALERT_SOURCE, assertNotNativeAlert } from "../alerts/alert-source";
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import type { ExtremeRRSelectionInput } from "./extreme-rr.schema";
@@ -39,9 +41,29 @@ import type { ExtremeRRSelectionInput } from "./extreme-rr.schema";
  */
 export type SnapshotCandleFetcher = (alert: Alert, cutoff: Date, limit: number) => Promise<SnapshotCandle[]>;
 
+/** The only market a Native alert can come from: the scanner's Binance USD-M USDT perpetuals. */
+const NATIVE_PLAN_MARKET = "USDM_PERPETUAL";
+
+/**
+ * Which Binance market an alert's plan candles come from.
+ *
+ * TRADINGVIEW: TradingView's ".P" perpetual suffix on the webhook symbol, as
+ * always. NATIVE: the market the Native payload itself names; a Native symbol
+ * carries no ".P", so the TradingView rule would silently pick SPOT. A Native
+ * alert that does not name USDM_PERPETUAL yields null: the plan is refused
+ * (ERROR) rather than planned against a guessed market.
+ */
+export function extremeRRMarketTypeOf(alert: Pick<Alert, "source" | "symbol" | "rawPayload">): MarketType | null {
+  const payload = alert.rawPayload as { symbol?: unknown; marketType?: unknown } | null;
+  if (alert.source === NATIVE_ALERT_SOURCE) return payload?.marketType === NATIVE_PLAN_MARKET ? "futures" : null;
+  return inferMarketType(payload?.symbol ?? alert.symbol);
+}
+
 const defaultCandleFetcher: SnapshotCandleFetcher = (alert, cutoff, limit) => {
-  const rawPayloadSymbol = (alert.rawPayload as { symbol?: unknown } | null)?.symbol;
-  const marketType = inferMarketType(rawPayloadSymbol ?? alert.symbol);
+  const marketType = extremeRRMarketTypeOf(alert);
+  if (marketType === null) {
+    throw new Error(`Native alert ${alert.id} does not name its market (${NATIVE_PLAN_MARKET}); refusing to plan against a guessed market`);
+  }
   return getClosedCandlesBefore(
     alert.assetType,
     alert.symbol,
@@ -169,6 +191,19 @@ function decimalToString(value: unknown): string | null {
   return value === null || value === undefined ? null : String(value);
 }
 
+/**
+ * The alert's source, exactly as stored. Strict: a value that is neither
+ * TRADINGVIEW nor NATIVE is a refusal, never a default, because the executor
+ * admits only a plan that positively says TRADINGVIEW.
+ */
+function planAlertSourceOf(source: unknown): ExtremeRRPlanDto["alertSource"] {
+  if (source === "TRADINGVIEW" || source === NATIVE_ALERT_SOURCE) return source;
+  throw new Error(`Unknown alert source ${String(source)}; refusing to serialize the plan`);
+}
+
+/** How many Native plans the read-only list returns at most. */
+export const NATIVE_PLAN_LIST_LIMIT = { default: 20, max: 50 } as const;
+
 type PlanWithOutcome = ExtremeRRPlan & {
   selectedPlanOutcome?: SelectedPlanOutcome | null;
   /** Phase 11E: the canonical per-account verdicts. */
@@ -269,8 +304,10 @@ export class ExtremeRRService {
    * existing plan.
    */
   async ensurePendingPlan(alert: Alert): Promise<void> {
-    // Native execution fence: a NATIVE alert never gets a plan row at all.
-    assertNotNativeAlert(alert, "Extreme RR planning");
+    // A NATIVE alert is never queued for background planning: its plan is
+    // generated on demand only (generateForAlert), so no worker, no Telegram
+    // and no eager row ever exist for it.
+    assertNotNativeAlert(alert, "queued Extreme RR planning");
     const direction = ExtremeRRService.assertDirectional(alert);
     const existing = await this.prisma.extremeRRPlan.findUnique({ where: { alertId: alert.id } });
     if (existing) return;
@@ -301,9 +338,11 @@ export class ExtremeRRService {
    */
   async generateForAlert(alertId: string): Promise<ExtremeRRPlanDto> {
     const alert = await this.getAlertOrThrow(alertId);
-    // Native execution fence: no plan, so no READY plan, so no fan-out marker
-    // for an execution worker to discover — before any candle is fetched.
-    assertNotNativeAlert(alert, "Extreme RR planning");
+    // TradingView and Native alike: one planner, one formula, one cutoff rule.
+    // A NATIVE plan is planning only — it never carries the fan-out marker
+    // (below), and every execution path refuses it by source.
+    const native = alert.source === NATIVE_ALERT_SOURCE;
+    const alertSource = planAlertSourceOf(alert.source);
     const direction = ExtremeRRService.assertDirectional(alert);
 
     const existing = await this.prisma.extremeRRPlan.findUnique({
@@ -311,13 +350,12 @@ export class ExtremeRRService {
       include: PLAN_OUTCOME_INCLUDE,
     });
     if (existing?.status === "READY") {
-      return this.serialize(existing);
+      return this.serialize(existing, alertSource);
     }
 
     const cutoff = alert.triggeredAt;
     const entryPrice = String(alert.price);
-    const rawPayloadSymbol = (alert.rawPayload as { symbol?: unknown } | null)?.symbol;
-    const marketType = inferMarketType(rawPayloadSymbol ?? alert.symbol);
+    const marketType = extremeRRMarketTypeOf(alert);
 
     // Snapshot the ACTIVE template at generation time. Later template edits
     // never touch this plan; explicit regeneration re-snapshots by design.
@@ -359,6 +397,10 @@ export class ExtremeRRService {
       // a plan ERROR with its reason, exactly as a data-layer failure is, so
       // nothing is planned on a fallback nobody chose.
       const initialLookback = await this.resolveLookback();
+      // The canonical entry is the alert price: never a current price, never a fallback.
+      if (!Number.isFinite(alert.price) || alert.price <= 0) {
+        throw new Error(`The alert has no usable canonical entry price (${String(alert.price)})`);
+      }
       const candles = await this.fetchCandles(alert, cutoff, Math.max(...EXTREME_RR_LOOKBACKS));
       const candidates = buildCandidates(
         candles,
@@ -385,7 +427,10 @@ export class ExtremeRRService {
       // untouched (above) rather than regenerating it. That is the rollout
       // fence: those plans were already evaluated once, under an
       // architecture with nowhere to record that they had been.
-      const executionFanoutReadyAt = status === "READY" ? new Date() : null;
+      //
+      // A NATIVE plan never gets it, READY or not: planning visibility is not
+      // execution eligibility.
+      const executionFanoutReadyAt = status === "READY" && !native ? new Date() : null;
 
       const saved = await this.prisma.extremeRRPlan.upsert({
         where: { alertId },
@@ -418,7 +463,7 @@ export class ExtremeRRService {
         },
         include: PLAN_OUTCOME_INCLUDE,
       });
-      return this.serialize(saved);
+      return this.serialize(saved, alertSource);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logger.warn({ alertId, error: message }, "Extreme RR plan generation failed");
@@ -446,23 +491,50 @@ export class ExtremeRRService {
         },
         include: PLAN_OUTCOME_INCLUDE,
       });
-      return this.serialize(saved);
+      return this.serialize(saved, alertSource);
     }
   }
 
   /** Plan for the alert, or null when none exists (e.g. pre-feature alerts). */
   async getForAlert(alertId: string): Promise<ExtremeRRPlanDto | null> {
-    await this.getAlertOrThrow(alertId);
+    const alert = await this.getAlertOrThrow(alertId);
     const plan = await this.prisma.extremeRRPlan.findUnique({
       where: { alertId },
       include: PLAN_OUTCOME_INCLUDE,
     });
-    return plan ? this.serialize(plan) : null;
+    return plan ? this.serialize(plan, planAlertSourceOf(alert.source)) : null;
+  }
+
+  /**
+   * The most recently updated Native plans, each as its selected, frozen
+   * summary. READ ONLY: it generates nothing and writes nothing, and every
+   * item says NATIVE_PLAN_EXECUTION_STATUS.
+   */
+  async listNativePlans(limit: number = NATIVE_PLAN_LIST_LIMIT.default): Promise<NativePlanListDto> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > NATIVE_PLAN_LIST_LIMIT.max) {
+      throw new ValidationError(`limit must be an integer 1..${NATIVE_PLAN_LIST_LIMIT.max}`);
+    }
+    const plans = await this.prisma.extremeRRPlan.findMany({
+      where: { alert: { source: NATIVE_ALERT_SOURCE } },
+      orderBy: [{ updatedAt: "desc" }, { id: "asc" }],
+      take: limit,
+      include: { ...PLAN_OUTCOME_INCLUDE, alert: { select: { source: true, symbol: true, sourceTimeframe: true, triggeredAt: true } } },
+    });
+    return {
+      nativeExecutionEnabled: false,
+      items: plans.map((plan) => ({
+        alertId: plan.alertId,
+        symbol: plan.alert.symbol,
+        sourceTimeframe: plan.alert.sourceTimeframe,
+        triggeredAt: plan.alert.triggeredAt.toISOString(),
+        plan: selectedPlanSummaryOf(this.serialize(plan, planAlertSourceOf(plan.alert.source))),
+      })),
+    };
   }
 
   /** Persists the lookback/leverage selection (the only client-writable fields). */
   async updateSelection(alertId: string, input: ExtremeRRSelectionInput): Promise<ExtremeRRPlanDto> {
-    await this.getAlertOrThrow(alertId);
+    const alert = await this.getAlertOrThrow(alertId);
     const plan = await this.prisma.extremeRRPlan.findUnique({ where: { alertId } });
     if (!plan) throw new NotFoundError(`No Extreme RR plan exists for alert ${alertId}`);
 
@@ -474,7 +546,7 @@ export class ExtremeRRService {
       },
       include: PLAN_OUTCOME_INCLUDE,
     });
-    return this.serialize(updated);
+    return this.serialize(updated, planAlertSourceOf(alert.source));
   }
 
   /**
@@ -490,7 +562,7 @@ export class ExtremeRRService {
    * checks and simply reports no outcome — which is the truthful answer for a
    * plan whose executor never ran.
    */
-  private serialize(plan: PlanWithOutcome): ExtremeRRPlanDto {
+  private serialize(plan: PlanWithOutcome, alertSource: ExtremeRRPlanDto["alertSource"]): ExtremeRRPlanDto {
     const riskAmount = decimalToString(plan.riskAmount);
     const template: ExtremeRRTemplateSnapshot | null = plan.templateName
       ? {
@@ -543,6 +615,7 @@ export class ExtremeRRService {
     return {
       id: plan.id,
       alertId: plan.alertId,
+      alertSource,
       status: plan.status,
       direction: plan.direction as "LONG" | "SHORT",
       entryBasis: "ALERT_PRICE",

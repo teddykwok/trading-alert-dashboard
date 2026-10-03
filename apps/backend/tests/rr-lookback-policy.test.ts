@@ -180,6 +180,7 @@ function harness(policyLookback: number) {
     triggeredAt: CUTOFF,
     rawPayload: {},
     exchange: null,
+    source: "TRADINGVIEW",
   } as unknown as Alert;
 
   const prisma = {
@@ -262,7 +263,7 @@ describe("rr lookback: existing plans are frozen", () => {
     );
     const upsert = source.slice(source.indexOf("extremeRRPlan.upsert({"));
     const createBranch = upsert.slice(upsert.indexOf("create: {"), upsert.indexOf("update: {"));
-    const updateBranch = upsert.slice(upsert.indexOf("update: {"), upsert.indexOf("return this.serialize(saved)"));
+    const updateBranch = upsert.slice(upsert.indexOf("update: {"), upsert.indexOf("return this.serialize(saved, alertSource)"));
 
     expect(createBranch).toContain("selectedLookback: initialLookback");
     expect(updateBranch).not.toContain("selectedLookback");

@@ -3,6 +3,7 @@ import type {
   ExtremeRRLeverage,
   ExtremeRRLookback,
   ExtremeRRPlanDto,
+  NativePlanListDto,
 } from "@trading-alert-dashboard/shared";
 
 /**
@@ -26,4 +27,7 @@ export const extremeRRApi = {
 
   updateSelection: (alertId: string, input: ExtremeRRSelectionInput) =>
     apiClient.patch<ExtremeRRPlanDto>(`/api/alerts/${alertId}/extreme-rr`, input),
+
+  /** READ ONLY: recent Native plans as their selected, frozen summaries. Generates nothing. */
+  listNativePlans: () => apiClient.get<NativePlanListDto>("/api/extreme-rr/native-plans"),
 };

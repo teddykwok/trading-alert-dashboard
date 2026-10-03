@@ -288,9 +288,10 @@ describe("readiness and deployment name the account worker", () => {
     // Required to adopt at all.
     expect(adoption).toContain("executionFanoutReadyAt: { not: null },");
 
-    // Written ONLY by the generic READY transition, and only for READY.
+    // Written ONLY by the generic READY transition, only for READY, and
+    // never for a NATIVE alert's plan (planning visibility is not eligibility).
     expect(generation).toContain(
-      'const executionFanoutReadyAt = status === \"READY\" ? new Date() : null;'
+      'const executionFanoutReadyAt = status === \"READY\" && !native ? new Date() : null;'
     );
 
     // Never cleared by an account: adoption and the execution worker must

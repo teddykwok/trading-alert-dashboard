@@ -40,6 +40,7 @@ const ALERT_FIXTURE = {
   price: 188,
   triggeredAt: CUTOFF,
   rawPayload: { symbol: "BINANCE:BTCUSDT.P" },
+  source: "TRADINGVIEW",
 } as unknown as Alert;
 
 const TEMPLATE_ROW = {

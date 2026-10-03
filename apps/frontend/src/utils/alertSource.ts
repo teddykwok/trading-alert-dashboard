@@ -15,7 +15,7 @@ export const NATIVE_ALERT_BADGE_TITLE =
   "Native scanner alert — dashboard only. Not a TradingView alert; plans and execution are disabled.";
 
 export const NATIVE_ALERT_PLAN_NOTICE =
-  "This is a native scanner alert. It is delivered to the dashboard only: Extreme RR plans and execution are hard-disabled for native alerts.";
+  "This is a native scanner alert, delivered to the dashboard only. Its Extreme RR plan is planning only, generated on demand from the same frozen pre-alert candles; execution is hard-disabled for native alerts, for every source timeframe.";
 
 /**
  * The native scanner PROFILE a native alert was delivered under, as recorded in

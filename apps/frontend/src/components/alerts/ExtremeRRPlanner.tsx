@@ -19,6 +19,7 @@ import { Disclosure } from "../ui/Disclosure";
 import { extremeRRApi } from "../../api/extreme-rr.api";
 import { formatDateTime } from "../../utils/formatDate";
 import { formatPrice } from "../../utils/formatPrice";
+import { isNativeAlert } from "../../utils/alertSource";
 import type { Alert } from "../../types/alert";
 
 const STATUS_TONE = { PENDING: "blue", READY: "green", INVALID: "yellow", ERROR: "red" } as const;
@@ -53,6 +54,8 @@ export function ExtremeRRPlanner({ alert }: { alert: Alert }) {
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const directional = alert.signal === "LONG" || alert.signal === "SHORT";
+  // The same planner for both sources; a Native plan is planning only and is generated on demand.
+  const native = isNativeAlert(alert);
 
   useEffect(() => {
     if (!directional) return;
@@ -175,6 +178,7 @@ export function ExtremeRRPlanner({ alert }: { alert: Alert }) {
         {plan && <Badge tone={STATUS_TONE[plan.status]}>{plan.status}</Badge>}
         <Badge tone="blue">AUTO-CALCULATED</Badge>
         <Badge tone="gray">FROZEN AT ALERT</Badge>
+        {native && <Badge tone="yellow">PLANNING ONLY</Badge>}
       </div>
 
       {loading ? (
@@ -182,8 +186,9 @@ export function ExtremeRRPlanner({ alert }: { alert: Alert }) {
       ) : !plan ? (
         <div className="flex flex-col gap-2">
           <p className="text-sm text-slate-500">
-            No plan exists for this alert (it predates the Extreme RR feature). Generation uses the
-            alert&apos;s original trigger time as the candle cutoff — never newer candles.
+            {native
+              ? "No plan yet. Native alerts are planned on demand, from the chart candles that closed before the alert — never newer candles. The plan is planning only: it is never executed."
+              : "No plan exists for this alert (it predates the Extreme RR feature). Generation uses the alert's original trigger time as the candle cutoff — never newer candles."}
           </p>
           <div>
             <Button variant="secondary" disabled={generating} onClick={generate}>

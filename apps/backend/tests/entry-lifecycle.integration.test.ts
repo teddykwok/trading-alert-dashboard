@@ -2943,6 +2943,7 @@ describe("production creation path freezes exchange filters", () => {
     return {
       id: planRow.id,
       alertId: alert.id,
+      alertSource: "TRADINGVIEW",
       status: "READY",
       direction: "LONG",
       entryPrice: "100",

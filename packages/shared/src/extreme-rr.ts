@@ -348,6 +348,12 @@ export interface SelectedPlanAccountOutcomeDto {
 export interface ExtremeRRPlanDto {
   id: string;
   alertId: string;
+  /**
+   * The source of the alert this plan belongs to. The plan math is the same
+   * for both; what differs is authority: a NATIVE plan is planning only and
+   * is refused by every execution path, whatever its source timeframe.
+   */
+  alertSource: "TRADINGVIEW" | "NATIVE";
   status: ExtremeRRPlanStatus;
   direction: "LONG" | "SHORT";
   entryBasis: "ALERT_PRICE";
@@ -398,6 +404,99 @@ export interface ExtremeRRPlanDto {
   generatedAt: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// The selected (frozen) plan, as read-only consumers display it
+// ---------------------------------------------------------------------------
+
+/** What every Native plan says about execution: always this, for every source timeframe. */
+export const NATIVE_PLAN_EXECUTION_STATUS = "PLANNING ONLY / EXECUTION DISABLED";
+
+/**
+ *  SELECTED                   the plan is READY and its selected lookback is a valid candidate;
+ *  PLAN_NOT_READY             the plan is PENDING, INVALID or ERROR;
+ *  NO_SELECTED_CANDIDATE      no candidate exists for the selected lookback;
+ *  SELECTED_CANDIDATE_INVALID the selected lookback's candidate is not calculable (reason kept).
+ */
+export type SelectedPlanState = "SELECTED" | "PLAN_NOT_READY" | "NO_SELECTED_CANDIDATE" | "SELECTED_CANDIDATE_INVALID";
+
+export interface SelectedPlanSummary {
+  state: SelectedPlanState;
+  alertSource: ExtremeRRPlanDto["alertSource"];
+  planStatus: ExtremeRRPlanStatus;
+  selectedLookback: ExtremeRRLookback;
+  direction: "LONG" | "SHORT";
+  entryPrice: string;
+  /** Null unless state is SELECTED: an incalculable plan never shows a fabricated SL/TP. */
+  stopLoss: string | null;
+  takeProfit: string | null;
+  riskRewardRatio: string | null;
+  actualCandles: number | null;
+  complete: boolean | null;
+  /** Why the selected plan is not usable, verbatim; null when SELECTED. */
+  reason: string | null;
+  cutoffAt: string;
+  /**
+   * NATIVE: always NATIVE_PLAN_EXECUTION_STATUS. TRADINGVIEW: execution is
+   * decided by each account's own admission, never by this summary.
+   */
+  execution: typeof NATIVE_PLAN_EXECUTION_STATUS | "DECIDED_BY_ACCOUNT_ADMISSION";
+}
+
+/**
+ * The plan exactly as selected and frozen: only the persisted selected
+ * lookback counts (another valid candidate is irrelevant), and only a READY
+ * plan with a valid selected candidate yields prices. Pure; derives nothing
+ * from current market data, accounts or runtime state.
+ */
+export function selectedPlanSummaryOf(plan: ExtremeRRPlanDto): SelectedPlanSummary {
+  const candidate = plan.candidates.find((c) => c.requestedCandles === plan.selectedLookback) ?? null;
+  const execution: SelectedPlanSummary["execution"] = plan.alertSource === "NATIVE" ? NATIVE_PLAN_EXECUTION_STATUS : "DECIDED_BY_ACCOUNT_ADMISSION";
+  const base = {
+    alertSource: plan.alertSource,
+    planStatus: plan.status,
+    selectedLookback: plan.selectedLookback,
+    direction: plan.direction,
+    entryPrice: plan.entryPrice,
+    cutoffAt: plan.cutoffAt,
+    execution,
+  };
+  const none = { stopLoss: null, takeProfit: null, riskRewardRatio: null };
+  if (plan.status !== "READY") {
+    return { ...base, ...none, state: "PLAN_NOT_READY", actualCandles: candidate?.actualCandles ?? null, complete: candidate?.complete ?? null, reason: plan.errorReason ?? `Plan is ${plan.status}` };
+  }
+  if (candidate === null) {
+    return { ...base, ...none, state: "NO_SELECTED_CANDIDATE", actualCandles: null, complete: null, reason: `No candidate exists for the selected lookback ${plan.selectedLookback}` };
+  }
+  if (!candidate.valid || candidate.stopLoss === null || candidate.takeProfit === null) {
+    return { ...base, ...none, state: "SELECTED_CANDIDATE_INVALID", actualCandles: candidate.actualCandles, complete: candidate.complete, reason: candidate.invalidReason ?? "The selected candidate is not calculable" };
+  }
+  return {
+    ...base,
+    state: "SELECTED",
+    stopLoss: candidate.stopLoss,
+    takeProfit: candidate.takeProfit,
+    riskRewardRatio: candidate.riskRewardRatio,
+    actualCandles: candidate.actualCandles,
+    complete: candidate.complete,
+    reason: null,
+  };
+}
+
+/** One Native alert's plan, as the read-only Trading Control list shows it. */
+export interface NativePlanListItemDto {
+  alertId: string;
+  symbol: string;
+  sourceTimeframe: string | null;
+  triggeredAt: string;
+  plan: SelectedPlanSummary;
+}
+
+export interface NativePlanListDto {
+  /** Hard-coded false: listing a Native plan grants nothing. */
+  nativeExecutionEnabled: false;
+  items: NativePlanListItemDto[];
 }
 
 export function buildLeverageAnalysis(

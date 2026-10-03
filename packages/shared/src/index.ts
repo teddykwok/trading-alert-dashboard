@@ -141,6 +141,10 @@ export type {
   ExtremeRRPlanStatus,
   ExtremeRRTemplateSnapshot,
   ExtremeType,
+  NativePlanListDto,
+  NativePlanListItemDto,
+  SelectedPlanState,
+  SelectedPlanSummary,
 } from "./extreme-rr";
 export {
   EXTREME_RR_DEFAULT_LOOKBACK,
@@ -158,6 +162,8 @@ export {
   calculateExtremeCandidate,
   calculateExtremeMoney,
   extremeOfDecimalStrings,
+  NATIVE_PLAN_EXECUTION_STATUS,
+  selectedPlanSummaryOf,
 } from "./extreme-rr";
 
 export { subtractDecimalStrings, isNegativeDecimalString } from "./decimal-compare";

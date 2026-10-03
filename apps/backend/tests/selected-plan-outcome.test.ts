@@ -193,6 +193,7 @@ describe("A-D. a pre-execution refusal is recorded exactly as decided", () => {
     // Enumerated from the executor's own union, so a new code added there
     // without thought here shows up as a gap rather than as silence.
     const codes = [
+      "NATIVE_ALERT_EXECUTION_FORBIDDEN",
       "PLAN_NOT_READY",
       "NO_SELECTED_CANDIDATE",
       "CANDIDATE_INCOMPLETE",
@@ -215,7 +216,7 @@ describe("A-D. a pre-execution refusal is recorded exactly as decided", () => {
     }
   });
 
-  maybe()("the executor's union still holds exactly those nine codes", () => {
+  maybe()("the executor's union still holds exactly those ten codes", () => {
     const union = EXECUTOR_SOURCE.slice(
       EXECUTOR_SOURCE.indexOf("export type SelectedPlanSkipReason"),
       EXECUTOR_SOURCE.indexOf(";", EXECUTOR_SOURCE.indexOf("export type SelectedPlanSkipReason"))
@@ -223,6 +224,7 @@ describe("A-D. a pre-execution refusal is recorded exactly as decided", () => {
     const found = [...union.matchAll(/"([A-Z_]+)"/g)].map((match) => match[1]);
     expect(found.sort()).toEqual(
       [
+        "NATIVE_ALERT_EXECUTION_FORBIDDEN",
         "PLAN_NOT_READY",
         "NO_SELECTED_CANDIDATE",
         "CANDIDATE_INCOMPLETE",

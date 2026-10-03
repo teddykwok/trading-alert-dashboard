@@ -15,6 +15,7 @@ import { AiOpinionPanel } from "../components/alerts/AiOpinionPanel";
 import { TradeOutcomePanel } from "../components/alerts/TradeOutcomePanel";
 import { TradeJournalPanel } from "../components/alerts/TradeJournalPanel";
 import { ExtremeRRPlanner } from "../components/alerts/ExtremeRRPlanner";
+import { NativeExecutionPlanPanel } from "../features/executions/NativeExecutionPlanPanel";
 import { FuturesRiskPlanner } from "../components/alerts/FuturesRiskPlanner";
 import { ScreenshotPreview } from "../components/charts/ScreenshotPreview";
 import { alertsApi } from "../api/alerts.api";
@@ -261,13 +262,13 @@ export function AlertDetailPage() {
         <TabList tabs={WORKFLOW_TABS} activeId={activeTab} onChange={setActiveTab} label="Alert workflow" />
 
         <TabPanel id="plan" activeId={activeTab}>
-          {isNativeAlert(alert) ? (
+          {isNativeAlert(alert) && (
             <Card className="p-4">
               <p className="text-sm text-slate-500">{NATIVE_ALERT_PLAN_NOTICE}</p>
             </Card>
-          ) : (
-            <ExtremeRRPlanner alert={alert} />
           )}
+          {/* One planner for both sources: same formula, same frozen cutoff. */}
+          <ExtremeRRPlanner alert={alert} />
 
           {!isDirectional && !isNativeAlert(alert) && (
             <Card className="p-4">
@@ -300,12 +301,16 @@ export function AlertDetailPage() {
         */}
         <TabPanel id="execution" activeId={activeTab}>
           {isNativeAlert(alert) ? (
-            <Card className="p-4">
-              <p className="text-sm text-slate-500">
-                Execution is disabled for Native scanner alerts, for every source timeframe. They are delivered to the
-                dashboard only.
-              </p>
-            </Card>
+            <>
+              <Card className="p-4">
+                <p className="text-sm text-slate-500">
+                  Execution is disabled for Native scanner alerts, for every source timeframe. They are delivered to the
+                  dashboard only.
+                </p>
+              </Card>
+              {/* Read only: the selected, frozen plan, as planning only. */}
+              <NativeExecutionPlanPanel alert={alert} />
+            </>
           ) : (
             <AlertExecutionPanel alert={alert} />
           )}

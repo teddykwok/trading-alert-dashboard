@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client";
 import type { PrismaClient } from "@prisma/client";
 import type { ExtremeRRPlanDto, ExtremeRRTemplateSnapshot } from "@trading-alert-dashboard/shared";
 import { logger } from "../../config/logger";
+import { EXECUTABLE_ALERT_SOURCE } from "../alerts/alert-source";
 import type { BinanceMarginPlanService } from "../binance/binance-margin-plan.service";
 import { isExactAuthorization } from "./canary-authorization.service";
 import { naturalWindowAdmitsDirection } from "./natural-authorization";
@@ -45,6 +46,7 @@ export type SelectedPlanOutcome =
   | { handled: false; reasonCode: SelectedPlanSkipReason; message: string };
 
 export type SelectedPlanSkipReason =
+  | "NATIVE_ALERT_EXECUTION_FORBIDDEN"
   | "PLAN_NOT_READY"
   | "NO_SELECTED_CANDIDATE"
   | "CANDIDATE_INCOMPLETE"
@@ -117,6 +119,18 @@ export class SelectedPlanExecutor {
    * guess.
    */
   async handleSelectedPlan(plan: ExtremeRRPlanDto, symbol: string): Promise<SelectedPlanOutcome> {
+    // --- The Native execution fence, before anything else ------------------
+    // Allowlist: only a plan that positively belongs to a TRADINGVIEW alert
+    // goes on. A NATIVE plan — READY, selected, of any source timeframe — is
+    // refused here, before any canary lookup, signed margin read or creation.
+    if (plan.alertSource !== EXECUTABLE_ALERT_SOURCE) {
+      return {
+        handled: false,
+        reasonCode: "NATIVE_ALERT_EXECUTION_FORBIDDEN",
+        message: `The plan belongs to a ${String(plan.alertSource)} alert; native plans are planning only and never executed.`,
+      };
+    }
+
     // --- Eligibility, from the persisted plan only -------------------------
     if (plan.status !== "READY") {
       return { handled: false, reasonCode: "PLAN_NOT_READY", message: `Plan is ${plan.status}.` };
