@@ -1,4 +1,5 @@
 import type { PropsWithChildren } from "react";
+import type { OperatorAccountId } from "../../api/operator-account";
 
 import type {
   HistoricalFillInterpretationDto,
@@ -143,9 +144,9 @@ function Section({ section }: { section: MetricSection }) {
   );
 }
 
-export function HistoricalFillOperationsCard() {
+export function HistoricalFillOperationsCard({ account }: { account: OperatorAccountId }) {
   const { snapshot, error, loading, refreshing, authenticated, refresh } =
-    useHistoricalFillOperations();
+    useHistoricalFillOperations(account);
 
   return (
     <Card className="space-y-3 p-4" data-testid="historical-fill-operations-card">

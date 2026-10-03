@@ -1,5 +1,6 @@
 import type { ApiErrorBody } from "../types/api";
 import { operatorAuthHeaders } from "./operator-token";
+import { accountScopedOperatorPath, type OperatorAccountId } from "./operator-account";
 
 // An explicit VITE_API_URL overrides everything (e.g. pointing at a separate
 // API host). When empty/unset we use same-origin relative requests ("/api/…"),
@@ -93,21 +94,28 @@ function assertOperatorPath(path: string): void {
   }
 }
 
+/**
+ * Every operator request names exactly ONE account. The path is rewritten to
+ * that account's gateway route and only that account's token is attached, so a
+ * request for Account A can never carry Account B's credential or reach B.
+ */
 export const operatorApiClient = {
-  get: <T>(path: string): Promise<T> => {
+  get: <T>(account: OperatorAccountId, path: string): Promise<T> => {
     assertOperatorPath(path);
-    return request<T>(path, { method: "GET", headers: operatorAuthHeaders() });
+    const scoped = accountScopedOperatorPath(account, path);
+    return request<T>(scoped, { method: "GET", headers: operatorAuthHeaders(account) });
   },
   /**
    * Operator mutations. The credential travels in the Authorization header and
    * never in the body, so a request log or a proxy trace cannot capture it.
    */
-  post: <T>(path: string, data?: unknown): Promise<T> => {
+  post: <T>(account: OperatorAccountId, path: string, data?: unknown): Promise<T> => {
     assertOperatorPath(path);
-    return request<T>(path, {
+    const scoped = accountScopedOperatorPath(account, path);
+    return request<T>(scoped, {
       method: "POST",
       body: JSON.stringify(data ?? {}),
-      headers: operatorAuthHeaders(),
+      headers: operatorAuthHeaders(account),
     });
   },
 };

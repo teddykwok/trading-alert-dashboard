@@ -7,6 +7,7 @@ import {
   type SourceTimeframeSaveDto,
   type TradingControlStatusDto,
 } from "../../api/operator";
+import type { OperatorAccountId } from "../../api/operator-account";
 import { hasOperatorToken } from "../../api/operator-token";
 import {
   canEditSourceTimeframes,
@@ -34,9 +35,12 @@ import {
  * still cannot write.
  */
 export function SourceTimeframesEditor({
+  account,
   status,
   onSaved,
 }: {
+  /** The ONE account this editor reads and writes. */
+  account: OperatorAccountId;
   status: TradingControlStatusDto | null;
   onSaved: () => void;
 }) {
@@ -62,14 +66,14 @@ export function SourceTimeframesEditor({
   const editable = canEditSourceTimeframes(status);
   const savable = canSaveSourceTimeframes({ selection, inForce, editable: editable.allowed });
   const dirty = !sameSelection(selection, inForce);
-  const authenticated = hasOperatorToken();
+  const authenticated = hasOperatorToken(account);
 
   const submit = async () => {
     if (busy || !savable.allowed) return;
     setBusy(true);
     setError(null);
     try {
-      const result = await postSourceTimeframes(selection);
+      const result = await postSourceTimeframes(account, selection);
       setSave(result);
       if (result.ok) {
         // The server is the authority on what is now in force; re-read rather

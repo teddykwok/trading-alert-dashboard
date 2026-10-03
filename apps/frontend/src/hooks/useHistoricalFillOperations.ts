@@ -4,6 +4,7 @@ import {
   fetchHistoricalFillOperations,
   type HistoricalFillOperationsDto,
 } from "../api/operator";
+import type { OperatorAccountId } from "../api/operator-account";
 import { hasOperatorToken, subscribeOperatorToken } from "../api/operator-token";
 import { isSessionEnded } from "../features/operator/operatorSession";
 
@@ -41,21 +42,21 @@ export const LOAD_FAILED_MESSAGE = "Unable to load historical fill operations.";
  * queries. The timer is cleared on unmount and a late response from an
  * unmounted panel is discarded.
  */
-export function useHistoricalFillOperations(): HistoricalFillOperationsHandle {
+export function useHistoricalFillOperations(account: OperatorAccountId): HistoricalFillOperationsHandle {
   const [snapshot, setSnapshot] = useState<HistoricalFillOperationsDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [authenticated, setAuthenticated] = useState(hasOperatorToken);
+  const [authenticated, setAuthenticated] = useState(() => hasOperatorToken(account));
   const inFlight = useRef(false);
   const mounted = useRef(true);
 
   const read = useCallback(async () => {
     if (inFlight.current) return;
-    if (!hasOperatorToken()) return;
+    if (!hasOperatorToken(account)) return;
     inFlight.current = true;
     setRefreshing(true);
     try {
-      const next = await fetchHistoricalFillOperations();
+      const next = await fetchHistoricalFillOperations(account);
       if (!mounted.current) return;
       // The server snapshot REPLACES what was shown. Nothing is accumulated
       // client-side: the previous numbers describe a moment that has passed.
@@ -77,7 +78,7 @@ export function useHistoricalFillOperations(): HistoricalFillOperationsHandle {
       inFlight.current = false;
       if (mounted.current) setRefreshing(false);
     }
-  }, []);
+  }, [account]);
 
   useEffect(() => {
     mounted.current = true;
@@ -86,7 +87,14 @@ export function useHistoricalFillOperations(): HistoricalFillOperationsHandle {
     };
   }, []);
 
-  useEffect(() => subscribeOperatorToken(setAuthenticated), []);
+  // Only THIS account's token changes this panel's auth state.
+  useEffect(
+    () =>
+      subscribeOperatorToken((changed, hasToken) => {
+        if (changed === account) setAuthenticated(hasToken);
+      }),
+    [account]
+  );
 
   useEffect(() => {
     if (!authenticated) {

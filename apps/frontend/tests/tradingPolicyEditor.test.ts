@@ -113,14 +113,14 @@ describe("G-K. edit, review, apply", () => {
   });
 
   it("J. Review asks the server and shows current → proposed", () => {
-    expect(editorCode).toContain("postValidatePolicy(changedValues(draft, read))");
+    expect(editorCode).toContain("postValidatePolicy(account, changedValues(draft, read))");
     expect(editor).toContain("Review changes");
     expect(editor).toContain("{change.from}");
     expect(editor).toContain("{change.to}");
   });
 
   it("K. Apply writes once, with the version it loaded", () => {
-    expect(editorCode).toContain("postSavePolicy(changedValues(draft, read), read.version)");
+    expect(editorCode).toContain("postSavePolicy(account, changedValues(draft, read), read.version)");
     expect(editorCode.match(/postSavePolicy\(/g) ?? []).toHaveLength(1);
   });
 

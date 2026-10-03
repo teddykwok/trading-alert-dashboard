@@ -29,7 +29,7 @@ import {
   type TradingControlStatusDto,
 } from "../src/api/operator";
 import { ApiRequestError, operatorApiClient } from "../src/api/client";
-import { clearOperatorToken, hasOperatorToken } from "../src/api/operator-token";
+import {clearAllOperatorTokens, clearOperatorToken, hasOperatorToken } from "../src/api/operator-token";
 import { authenticateOperator, isSessionEnded } from "../src/features/operator/operatorSession";
 
 /**
@@ -75,11 +75,11 @@ function statusFixture(overrides: Partial<TradingControlStatusDto> = {}): Tradin
 }
 
 beforeEach(() => {
-  clearOperatorToken();
+  clearAllOperatorTokens();
 });
 
 afterEach(() => {
-  clearOperatorToken();
+  clearAllOperatorTokens();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -454,12 +454,12 @@ describe("operator actions: requests", () => {
 
   it("posts the confirmation phrase in the body and the token in the header", async () => {
     const calls = stubFetch();
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
 
-    await postStartTrading(START_TRADING_CONFIRMATION);
+    await postStartTrading("A", START_TRADING_CONFIRMATION);
 
     const [url, init] = calls[0];
-    expect(url).toBe("/api/operator/trading-control/start");
+    expect(url).toBe("/api/operator/accounts/A/trading-control/start");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual({ confirmation: "START TRADING" });
     // The credential travels in the header, never in the body a proxy logs.
@@ -469,14 +469,14 @@ describe("operator actions: requests", () => {
 
   it("posts stop and safe-off with no credential in the payload", async () => {
     const calls = stubFetch();
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
 
-    await postStopNewTrades();
-    await postSafeOff();
+    await postStopNewTrades("A");
+    await postSafeOff("A");
 
     expect(calls.map(([url]) => url)).toEqual([
-      "/api/operator/trading-control/stop-new-trades",
-      "/api/operator/trading-control/safe-off",
+      "/api/operator/accounts/A/trading-control/stop-new-trades",
+      "/api/operator/accounts/A/trading-control/safe-off",
     ]);
     for (const [, init] of calls) {
       expect(init.body as string).not.toContain(TOKEN);
@@ -485,16 +485,16 @@ describe("operator actions: requests", () => {
   });
 
   it("refuses to post the operator token to a non-operator path", async () => {
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
     for (const path of ["/api/executions", "/api/alerts", "https://example.com/api/operator/start"]) {
-      expect(() => operatorApiClient.post(path, {})).toThrow(/non-operator path/);
+      expect(() => operatorApiClient.post("A", path, {})).toThrow(/non-operator path/);
     }
   });
 
   it("never puts the phrase or the token in the URL", async () => {
     const calls = stubFetch();
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
-    await postStartTrading(START_TRADING_CONFIRMATION);
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
+    await postStartTrading("A", START_TRADING_CONFIRMATION);
     const [url] = calls[0];
     expect(url).not.toContain("START");
     expect(url).not.toContain(TOKEN);
@@ -516,11 +516,11 @@ describe("operator actions: failures and the operator session", () => {
   });
 
   it("keeps the token when an action is refused", async () => {
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
-    expect(hasOperatorToken()).toBe(true);
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
+    expect(hasOperatorToken("A")).toBe(true);
     // A 409 does not touch the credential.
     expect(isSessionEnded(new ApiRequestError(409))).toBe(false);
-    expect(hasOperatorToken()).toBe(true);
+    expect(hasOperatorToken("A")).toBe(true);
   });
 
   it("never persists the token while acting", async () => {
@@ -537,8 +537,8 @@ describe("operator actions: failures and the operator session", () => {
     vi.stubGlobal("sessionStorage", fake);
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true }) }));
 
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
-    await postStartTrading(START_TRADING_CONFIRMATION);
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
+    await postStartTrading("A", START_TRADING_CONFIRMATION);
 
     expect(fake.setItem).not.toHaveBeenCalled();
     expect(store.size).toBe(0);
@@ -565,7 +565,10 @@ describe("operator actions: structural guarantees", () => {
       card.indexOf("})}", card.indexOf("TRADING_CONTROL_ACTIONS.map("))
     );
     expect(buttonRow.length).toBeGreaterThan(0);
-    expect(buttonRow).toContain("pendingAction !== null");
+    // The buttons honour the single mutation gate, and that gate includes the
+    // in-flight check (plus account, auth and control-plane reachability).
+    expect(buttonRow).toContain("!mutationsOffered");
+    expect(card).toContain("requestInFlight: pendingAction !== null");
   });
 
   it("refreshes status after every action", () => {
@@ -578,11 +581,18 @@ describe("operator actions: structural guarantees", () => {
     // Readiness stays a question the operator asks. The timer body must still
     // call refresh and nothing else.
     const hook = src("hooks/useTradingControl.ts");
-    const timer = hook.slice(hook.indexOf("setInterval("), hook.indexOf("}, pollMs)"));
+    // The AUTHENTICATED poll: status only.
+    const authed = hook.indexOf('if (authState !== "AUTHENTICATED") return;');
+    const timer = hook.slice(hook.indexOf("setInterval(", authed), hook.indexOf("}, pollMs)", authed));
     expect(timer).toContain("void refresh()");
     expect(timer).not.toContain("checkReadiness");
     expect(timer).not.toContain("fetchTradingControlReadiness");
     expect(timer).not.toContain("runAction");
+    // The PRE-AUTH poll: token-free liveness only — no status, readiness or action.
+    const preAuth = hook.indexOf('if (authState === "AUTHENTICATED") return;');
+    const probe = hook.slice(hook.indexOf("setInterval(", preAuth), hook.indexOf("}, pollMs)", preAuth));
+    expect(probe).toContain("void probeHealth()");
+    for (const forbidden of ["refresh()", "checkReadiness", "fetchTradingControlReadiness", "runAction"]) expect(probe).not.toContain(forbidden);
   });
 
   it("drops the stale readiness snapshot after an action", () => {

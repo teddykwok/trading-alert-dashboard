@@ -27,7 +27,7 @@ import type { Alert } from "../types/alert";
 function matchesFilters(alert: Alert, filters: ReturnType<typeof useFilters>["filters"]): boolean {
   if (filters.status && alert.status !== filters.status) return false;
   if (filters.signal && alert.signal !== filters.signal) return false;
-  // Multi-signal filter from the dashboard dropdown: "Actionable only"
+  // Multi-signal filter from the dashboard dropdown: "Long + Short only" (a signal-direction filter)
   // (the default) = ["LONG", "SHORT"]; a single choice = one-element array;
   // undefined = "All signals" (nothing excluded, WATCH/EXIT included).
   if (filters.signals && filters.signals.length > 0 && !filters.signals.includes(alert.signal)) {

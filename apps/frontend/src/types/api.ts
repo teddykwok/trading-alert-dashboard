@@ -15,7 +15,7 @@ export interface AlertListQuery {
   /**
    * Multi-signal filter, sent to the server as comma-separated values
    * (`signals=LONG,SHORT`). Wins over `signal` when both are set.
-   * "Actionable only" = ["LONG", "SHORT"]; undefined = all signals.
+   * "Long + Short only" (signal direction, every source) = ["LONG", "SHORT"]; undefined = all signals.
    */
   signals?: SignalType[];
   assetType?: AssetType;

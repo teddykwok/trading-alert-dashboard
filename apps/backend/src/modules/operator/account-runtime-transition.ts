@@ -3,7 +3,7 @@ import {
   type PreShutdownCounts,
 } from "../binance/pre-shutdown-exchange-check";
 import { ROLE_CONTRACTS, type DualRole, type DualVerdict, type RuntimeAccount } from "./dual-account-topology";
-import type { Observation } from "./runtime-launcher";
+import { verifyRuntimeMode, type AttestationStatusView, type Observation } from "./runtime-launcher";
 import {
   executeFencedStart,
   executeFencedStop,
@@ -403,6 +403,78 @@ export function effectiveModeFromWire(body: unknown): ObservedMode | null {
   if (kill && !live && !protection) return "SAFE";
   if (!kill && live && protection) return "LIVE_READY";
   return "INVALID";
+}
+
+// ---------------------------------------------------------------------------
+// Per-role mode proof: DEPLOYMENT attestation, never the arming verdict
+// ---------------------------------------------------------------------------
+
+/**
+ * What one role's mode proof is judged on.
+ *
+ * `controlStatus` is the account control plane's own status body (null when it
+ * could not be read). `deployment` is the account's DEPLOYMENT attestation,
+ * read with the TARGET mode's expected gate snapshot (null when it could not be
+ * read); only the worker leg requires it, because the worker is not running
+ * yet when the control plane's own leg is proven.
+ */
+export interface RoleModeEvidence {
+  readonly controlStatus: unknown | null;
+  readonly deployment: AttestationStatusView | null;
+}
+
+export type RoleModeVerdict = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+
+/**
+ * Whether ONE role of an account is proven to be running `mode`.
+ *
+ * ## The defect this replaced
+ *
+ * The worker leg used to require the control plane's `runtimeAttestation` to
+ * be PASS. That field is the ARMING verdict: it adds `gatesAreLive()` on top of
+ * the deployment checks, and SAFE (kill on, entry off, protection off) can by
+ * design never satisfy it. A perfectly healthy return-to-SAFE therefore
+ * reached WORKER_STARTED and then failed with "the execution worker has not
+ * attested to the SAFE gates" -- the arming question asked of a deployment.
+ *
+ * ## What is proven now
+ *
+ * The question a transition asks is "is this account DEPLOYED in mode X?", so
+ * it is answered by the deployment attestation, judged against X's exact gate
+ * snapshot (`verifyRuntimeMode`): exactly one fresh BACKEND and one fresh
+ * WORKER, both attesting precisely the gates X declares. That is as strict as
+ * before for LIVE_READY (whose exact snapshot already implies every live gate)
+ * and is now correct for SAFE. Missing, stale, duplicated, malformed,
+ * unreadable and wrong-mode attestations all still fail closed.
+ *
+ * ARMING is untouched: Trading Control's arming paths keep the arming reader,
+ * and LIVE_READY is a deployment mode, never an armed state.
+ */
+export function judgeRoleMode(
+  account: Exclude<RuntimeAccount, "GENERIC">,
+  role: DualRole,
+  mode: RuntimeMode,
+  evidence: RoleModeEvidence
+): RoleModeVerdict {
+  const { control, worker } = rolesForAccount(account);
+  if (role !== control && role !== worker) return { ok: false, reason: `${role} is not a role of ${account}` };
+  if (evidence.controlStatus === null) return { ok: false, reason: "the control plane did not answer" };
+  // The same classifier the mode proof uses, so "running LIVE-READY" means one
+  // thing in this tool rather than two.
+  const loaded = effectiveModeFromWire(evidence.controlStatus);
+  if (loaded !== mode) return { ok: false, reason: `${role} is running gates that do not match ${mode}` };
+  const systemState = selectedAccountStateFromWire(evidence.controlStatus).systemState;
+  if (systemState !== "SAFE_OFF") {
+    // The transition changes the RUNTIME, never the trading state.
+    return { ok: false, reason: `${role} reports ${systemState ?? "an unreadable state"}; it must stay SAFE_OFF` };
+  }
+  if (role === worker) {
+    const deployed = verifyRuntimeMode(evidence.deployment, mode);
+    if (!deployed.ok) {
+      return { ok: false, reason: `the execution worker has not attested to the ${mode} deployment (${deployed.reason})` };
+    }
+  }
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------

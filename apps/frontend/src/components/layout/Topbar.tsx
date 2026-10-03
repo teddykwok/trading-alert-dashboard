@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
 import { getSocket } from "../../sockets/socket";
 import { classNames } from "../../utils/classNames";
+import { OperatorAccountSelector } from "../operator/OperatorAccountSelector";
 
 export function Topbar() {
   const [connected, setConnected] = useState(false);
@@ -37,7 +38,13 @@ export function Topbar() {
         </NavLink>
       </nav>
 
-      <div className="ml-auto flex items-center gap-2 text-xs text-slate-400">
+      {/* The persistent account target for Trading Control. Presentation only:
+          each account keeps its own control plane, credentials and gates. */}
+      <div className="ml-auto mr-4 hidden md:block">
+        <OperatorAccountSelector />
+      </div>
+
+      <div className="flex items-center gap-2 text-xs text-slate-400">
         <span
           className={classNames(
             "h-2 w-2 rounded-full",

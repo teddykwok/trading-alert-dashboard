@@ -30,7 +30,7 @@ import {
   isSessionEnded,
 } from "../src/features/operator/operatorSession";
 import { ApiRequestError, operatorApiClient } from "../src/api/client";
-import { clearOperatorToken, hasOperatorToken, operatorAuthHeaders } from "../src/api/operator-token";
+import {clearAllOperatorTokens, clearOperatorToken, hasOperatorToken, operatorAuthHeaders } from "../src/api/operator-token";
 import {
   fetchTradingControlReadiness,
   fetchTradingControlStatus,
@@ -111,11 +111,11 @@ function statusFixture(overrides: Partial<TradingControlStatusDto> = {}): Tradin
 }
 
 beforeEach(() => {
-  clearOperatorToken();
+  clearAllOperatorTokens();
 });
 
 afterEach(() => {
-  clearOperatorToken();
+  clearAllOperatorTokens();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -523,36 +523,36 @@ describe("trading control panel: polling calls status only", () => {
 
   it("polls the cheap status route and never the readiness route", async () => {
     const calls = stubFetch();
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
 
     // Ten polls, exactly as the fifteen-second timer would drive them.
-    for (let poll = 0; poll < 10; poll += 1) await fetchTradingControlStatus();
+    for (let poll = 0; poll < 10; poll += 1) await fetchTradingControlStatus("A");
 
     expect(calls).toHaveLength(10);
-    expect(calls.every((url) => url === "/api/operator/trading-control/status")).toBe(true);
+    expect(calls.every((url) => url === "/api/operator/accounts/A/trading-control/status")).toBe(true);
     // The route that can cost signed exchange reads is never on the timer.
     expect(calls.some((url) => url.endsWith("/readiness"))).toBe(false);
   });
 
   it("hits the readiness route only when explicitly asked", async () => {
     const calls = stubFetch();
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
 
-    await fetchTradingControlStatus();
+    await fetchTradingControlStatus("A");
     expect(calls.filter((url) => url.endsWith("/readiness"))).toHaveLength(0);
 
-    await fetchTradingControlReadiness();
+    await fetchTradingControlReadiness("A");
     expect(calls.filter((url) => url.endsWith("/readiness"))).toEqual([
-      "/api/operator/trading-control/readiness",
+      "/api/operator/accounts/A/trading-control/readiness",
     ]);
   });
 
   it("sends the operator token to the readiness route too", async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => readinessFixture() });
     vi.stubGlobal("fetch", fetchMock);
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
 
-    await fetchTradingControlReadiness();
+    await fetchTradingControlReadiness("A");
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${TOKEN}`);
   });
@@ -595,32 +595,36 @@ describe("trading control panel: the actions are no longer placeholders", () => 
 
 describe("trading control panel: operator sign-in", () => {
   it("keeps the token when the probe accepts it", async () => {
-    const outcome = await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
+    const outcome = await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
     expect(outcome).toEqual({ ok: true });
-    expect(hasOperatorToken()).toBe(true);
-    expect(operatorAuthHeaders()).toEqual({ Authorization: `Bearer ${TOKEN}` });
+    expect(hasOperatorToken("A")).toBe(true);
+    expect(operatorAuthHeaders("A")).toEqual({ Authorization: `Bearer ${TOKEN}` });
   });
 
   it("drops the token when the server rejects it", async () => {
-    const outcome = await authenticateOperator(TOKEN, async () => {
+    const outcome = await authenticateOperator("A", TOKEN, async () => {
       throw new ApiRequestError(401, { error: "UnauthorizedError", message: "Operator authorization required" });
     });
-    expect(outcome).toEqual({ ok: false, state: "AUTH_FAILED", message: REJECTED_MESSAGE });
+    expect(outcome).toEqual({ ok: false, state: "AUTH_FAILED", reason: "REJECTED", message: REJECTED_MESSAGE });
     // A credential that has not been proven good must not linger where the next
     // request could send it.
-    expect(hasOperatorToken()).toBe(false);
+    expect(hasOperatorToken("A")).toBe(false);
   });
 
   it("drops the token on a network failure too, and says so differently", async () => {
-    const outcome = await authenticateOperator(TOKEN, async () => {
+    const outcome = await authenticateOperator("A", TOKEN, async () => {
       throw new TypeError("Failed to fetch");
     });
-    expect(outcome).toEqual({ ok: false, state: "AUTH_FAILED", message: UNREACHABLE_MESSAGE });
-    expect(hasOperatorToken()).toBe(false);
+    // Unreachable is never reported as a rejected token, and it names the account.
+    expect(outcome).toMatchObject({ ok: false, state: "AUTH_FAILED", reason: "UNREACHABLE" });
+    expect(outcome.ok ? "" : outcome.message).toContain(UNREACHABLE_MESSAGE);
+    expect(outcome.ok ? "" : outcome.message).toContain("Account A");
+    expect(outcome.ok ? "" : outcome.message).not.toContain(REJECTED_MESSAGE);
+    expect(hasOperatorToken("A")).toBe(false);
   });
 
   it("never puts the token in the failure message", async () => {
-    const outcome = await authenticateOperator(TOKEN, async () => {
+    const outcome = await authenticateOperator("A", TOKEN, async () => {
       throw new ApiRequestError(401, { error: "UnauthorizedError", message: "nope" });
     });
     expect(JSON.stringify(outcome)).not.toContain(TOKEN.slice(0, 12));
@@ -645,7 +649,7 @@ describe("trading control panel: operator sign-in", () => {
     vi.stubGlobal("localStorage", fake);
     vi.stubGlobal("sessionStorage", fake);
 
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
 
     expect(fake.setItem).not.toHaveBeenCalled();
     expect(store.size).toBe(0);
@@ -660,19 +664,19 @@ describe("trading control panel: requests", () => {
   it("sends the bearer token to the status route", async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => statusFixture() });
     vi.stubGlobal("fetch", fetchMock);
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
 
-    await fetchTradingControlStatus();
+    await fetchTradingControlStatus("A");
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("/api/operator/trading-control/status");
+    expect(url).toBe("/api/operator/accounts/A/trading-control/status");
     expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${TOKEN}`);
   });
 
   it("still refuses to send the operator token anywhere else", async () => {
-    await authenticateOperator(TOKEN, async () => ({ authenticated: true }));
+    await authenticateOperator("A", TOKEN, async () => ({ authenticated: true }));
     for (const path of ["/api/executions", "/api/alerts", "https://example.com/api/operator/status"]) {
-      expect(() => operatorApiClient.get(path)).toThrow(/non-operator path/);
+      expect(() => operatorApiClient.get("A", path)).toThrow(/non-operator path/);
     }
   });
 });

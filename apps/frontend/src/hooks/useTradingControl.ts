@@ -15,7 +15,10 @@ import {
 import type { StartTradingDuration } from "../api/operator";
 import type { TradingControlActionId } from "../features/operator/tradingControlActions";
 import { START_WINDOW_MINUTES } from "../features/operator/tradingControlActions";
+import { apiClient } from "../api/client";
+import { accountHealthPath, isCurrentAccountResponse, type OperatorAccountId } from "../api/operator-account";
 import { clearOperatorToken, hasOperatorToken } from "../api/operator-token";
+import { controlPlaneStateFromFailure, type ControlPlaneState } from "../features/operator/accountControlState";
 import {
   authenticateOperator,
   isSessionEnded,
@@ -35,6 +38,10 @@ export type { OperatorAuthState };
 export const TRADING_CONTROL_POLL_MS = 15_000;
 
 export interface TradingControlHandle {
+  /** The ONE account every request of this handle targets. */
+  account: OperatorAccountId;
+  /** The selected account's control plane: reachable, offline, unauthorized, error or still loading. */
+  controlPlane: ControlPlaneState;
   authState: OperatorAuthState;
   authError: string | null;
   status: TradingControlStatusDto | null;
@@ -63,16 +70,21 @@ export interface TradingControlHandle {
 }
 
 /**
- * Operator auth plus the polled Trading Control status.
+ * Operator auth plus the polled Trading Control status, for ONE account.
  *
- * The token lives only in the in-memory primitive; this hook never copies it
- * into React state, so it cannot end up in a component's props, a devtools
- * snapshot or a serialized error.
+ * The token lives only in the in-memory per-account primitive; this hook never
+ * copies it into React state, so it cannot end up in a component's props, a
+ * devtools snapshot or a serialized error. Every request names `account`, and
+ * every response is checked against the account and generation it was issued
+ * for, so a late answer for Account A can never update Account B's panel. The
+ * caller mounts one instance per account (keyed by account), so switching
+ * accounts starts from a clean slate.
  */
-export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): TradingControlHandle {
+export function useTradingControl(account: OperatorAccountId, pollMs: number = TRADING_CONTROL_POLL_MS): TradingControlHandle {
   const [authState, setAuthState] = useState<OperatorAuthState>(
-    hasOperatorToken() ? "AUTHENTICATED" : "NOT_AUTHENTICATED"
+    hasOperatorToken(account) ? "AUTHENTICATED" : "NOT_AUTHENTICATED"
   );
+  const [controlPlane, setControlPlane] = useState<ControlPlaneState>("LOADING");
   const [authError, setAuthError] = useState<string | null>(null);
   const [status, setStatus] = useState<TradingControlStatusDto | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -84,9 +96,25 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
   const [actionResult, setActionResult] = useState<TradingControlActionResult | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  // Guards against a slow response from a previous token overwriting state
-  // after the operator has already signed out.
+  // Guards against a slow response from a previous token (or account)
+  // overwriting state after the operator has signed out or switched.
   const generation = useRef(0);
+  const currentAccount = useRef<OperatorAccountId>(account);
+  currentAccount.current = account;
+  const isCurrent = (requested: { account: OperatorAccountId; generation: number }) =>
+    isCurrentAccountResponse(requested, { account: currentAccount.current, generation: generation.current });
+
+  /** Token-free liveness of the selected account's control plane, so offline is shown truthfully before sign-in. */
+  const probeHealth = useCallback(async () => {
+    const mine = { account, generation: generation.current };
+    try {
+      await apiClient.get(accountHealthPath(account));
+      if (isCurrent(mine)) setControlPlane((previous) => (previous === "UNAUTHORIZED" ? previous : "REACHABLE"));
+    } catch (error) {
+      if (isCurrent(mine)) setControlPlane(controlPlaneStateFromFailure(error));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- isCurrent reads refs only
+  }, [account]);
 
   /**
    * A 401 from EITHER operator route ends the session.
@@ -96,7 +124,8 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
    * and current look identical.
    */
   const endSession = useCallback(() => {
-    clearOperatorToken();
+    clearOperatorToken(account);
+    setControlPlane("UNAUTHORIZED");
     setAuthState("AUTH_FAILED");
     setAuthError("The operator token was rejected. Enter it again.");
     setStatus(null);
@@ -104,28 +133,32 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
     setReadinessError(null);
     setActionResult(null);
     setActionError(null);
-  }, []);
+  }, [account]);
 
   const refresh = useCallback(async () => {
-    if (!hasOperatorToken()) return;
-    const mine = generation.current;
+    if (!hasOperatorToken(account)) return;
+    const mine = { account, generation: generation.current };
     setLoading(true);
     try {
-      const next = await fetchTradingControlStatus();
-      if (generation.current !== mine) return;
+      const next = await fetchTradingControlStatus(account);
+      if (!isCurrent(mine)) return;
       setStatus(next);
       setStatusError(null);
+      setControlPlane("REACHABLE");
     } catch (error) {
-      if (generation.current !== mine) return;
+      if (!isCurrent(mine)) return;
       if (isSessionEnded(error)) {
         endSession();
         return;
       }
+      // Offline is not a bad token: the session stays, the panel says offline.
+      setControlPlane(controlPlaneStateFromFailure(error));
       setStatusError(error instanceof Error ? error.message : "Status could not be read.");
     } finally {
-      if (generation.current === mine) setLoading(false);
+      if (isCurrent(mine)) setLoading(false);
     }
-  }, [endSession]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- isCurrent reads refs only
+  }, [account, endSession]);
 
   /**
    * The explicit readiness check. Called from the button, never from the timer.
@@ -134,41 +167,47 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
    * account, so nothing else in this hook may invoke it.
    */
   const checkReadiness = useCallback(async () => {
-    if (!hasOperatorToken()) return;
-    const mine = generation.current;
+    if (!hasOperatorToken(account)) return;
+    const mine = { account, generation: generation.current };
     setCheckingReadiness(true);
     try {
-      const next = await fetchTradingControlReadiness();
-      if (generation.current !== mine) return;
+      const next = await fetchTradingControlReadiness(account);
+      if (!isCurrent(mine)) return;
       setReadiness(next);
       setReadinessError(null);
     } catch (error) {
-      if (generation.current !== mine) return;
+      if (!isCurrent(mine)) return;
       if (isSessionEnded(error)) {
         endSession();
         return;
       }
       setReadinessError(error instanceof Error ? error.message : "Readiness could not be checked.");
     } finally {
-      if (generation.current === mine) setCheckingReadiness(false);
+      if (isCurrent(mine)) setCheckingReadiness(false);
     }
-  }, [endSession]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- isCurrent reads refs only
+  }, [account, endSession]);
 
   const authenticate = useCallback(
     async (token: string) => {
       generation.current += 1;
+      const mine = { account, generation: generation.current };
       setAuthState("AUTHENTICATING");
       setAuthError(null);
-      const outcome = await authenticateOperator(token);
+      const outcome = await authenticateOperator(account, token);
+      if (!isCurrent(mine)) return;
       if (!outcome.ok) {
         setAuthState(outcome.state);
         setAuthError(outcome.message);
+        setControlPlane(outcome.reason === "REJECTED" ? "UNAUTHORIZED" : outcome.reason === "UNREACHABLE" ? "UNREACHABLE" : "ERROR");
         return;
       }
       setAuthState("AUTHENTICATED");
+      setControlPlane("REACHABLE");
       await refresh();
     },
-    [refresh]
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- isCurrent reads refs only
+    [account, refresh]
   );
 
   /**
@@ -195,9 +234,9 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
       tradeBudget?: number,
       unlimited?: boolean
     ) => {
-      if (!hasOperatorToken()) return;
+      if (!hasOperatorToken(account)) return;
       if (pendingAction !== null) return;
-      const mine = generation.current;
+      const mine = { account, generation: generation.current };
       setPendingAction(id);
       setActionError(null);
       try {
@@ -206,28 +245,28 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
         let result;
         switch (id) {
           case "START":
-            result = await postStartTrading(confirmation ?? "", durationMinutes, tradeBudget, unlimited);
+            result = await postStartTrading(account, confirmation ?? "", durationMinutes, tradeBudget, unlimited);
             break;
           case "PAUSE_NEW_TRADES":
-            result = await postPauseNewTrades();
+            result = await postPauseNewTrades(account);
             break;
           case "RESUME_NEW_TRADES":
             // The phrase is forwarded verbatim; the SERVER compares it. An
             // empty string is a refusal there, not a bypass here.
-            result = await postResumeNewTrades(confirmation ?? "");
+            result = await postResumeNewTrades(account, confirmation ?? "");
             break;
           case "STOP_NEW_TRADES":
-            result = await postStopNewTrades();
+            result = await postStopNewTrades(account);
             break;
           default:
-            result = await postSafeOff();
+            result = await postSafeOff(account);
             break;
         }
-        if (generation.current !== mine) return;
+        if (!isCurrent(mine)) return;
         setActionResult(result);
         setReadiness(null);
       } catch (error) {
-        if (generation.current !== mine) return;
+        if (!isCurrent(mine)) return;
         // Only a 401 ends the session. A refused control action is a conflict
         // with authoritative state, and logging the operator out for it would
         // be both wrong and infuriating.
@@ -237,11 +276,12 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
         }
         setActionError(error instanceof Error ? error.message : "The action could not be completed.");
       } finally {
-        if (generation.current === mine) setPendingAction(null);
+        if (isCurrent(mine)) setPendingAction(null);
       }
       await refresh();
     },
-    [endSession, pendingAction, refresh]
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- isCurrent reads refs only
+    [account, endSession, pendingAction, refresh]
   );
 
   const dismissActionResult = useCallback(() => {
@@ -251,7 +291,7 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
 
   const signOut = useCallback(() => {
     generation.current += 1;
-    clearOperatorToken();
+    clearOperatorToken(account);
     setAuthState("NOT_AUTHENTICATED");
     setAuthError(null);
     setStatus(null);
@@ -261,7 +301,19 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
     setActionResult(null);
     setActionError(null);
     setPendingAction(null);
-  }, []);
+  }, [account]);
+
+  // Before sign-in, poll only the token-free liveness route, so an offline
+  // control plane reads as offline rather than as a bad token.
+  useEffect(() => {
+    if (authState === "AUTHENTICATED") return;
+    void probeHealth();
+    const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      void probeHealth();
+    }, pollMs);
+    return () => clearInterval(timer);
+  }, [authState, pollMs, probeHealth]);
 
   useEffect(() => {
     if (authState !== "AUTHENTICATED") return;
@@ -276,6 +328,8 @@ export function useTradingControl(pollMs: number = TRADING_CONTROL_POLL_MS): Tra
   }, [authState, pollMs, refresh]);
 
   return {
+    account,
+    controlPlane,
     authState,
     authError,
     status,

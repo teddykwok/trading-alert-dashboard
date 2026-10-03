@@ -9,6 +9,7 @@ import {
   type AllowlistValidationDto,
   type TradingControlStatusDto,
 } from "../../api/operator";
+import type { OperatorAccountId } from "../../api/operator-account";
 import { hasOperatorToken } from "../../api/operator-token";
 import {
   canEditAllowlist,
@@ -31,9 +32,12 @@ import {
  * transaction, so a browser that ignores this still cannot write.
  */
 export function AllowedSymbolsEditor({
+  account,
   status,
   onSaved,
 }: {
+  /** The ONE account this editor reads and writes. */
+  account: OperatorAccountId;
   status: TradingControlStatusDto | null;
   onSaved: () => void;
 }) {
@@ -46,7 +50,7 @@ export function AllowedSymbolsEditor({
 
   const editable = canEditAllowlist(status);
   const current = status?.allowedSymbols ?? [];
-  const authenticated = hasOperatorToken();
+  const authenticated = hasOperatorToken(account);
 
   const run = async (mode: "validate" | "save") => {
     if (busy !== null) return;
@@ -55,9 +59,9 @@ export function AllowedSymbolsEditor({
     try {
       if (mode === "validate") {
         setSave(null);
-        setValidation(await postValidateAllowlist(text));
+        setValidation(await postValidateAllowlist(account, text));
       } else {
-        const result = await postSaveAllowlist(text);
+        const result = await postSaveAllowlist(account, text);
         setSave(result);
         if (result.ok) {
           setValidation(null);

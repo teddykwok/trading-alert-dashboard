@@ -27,6 +27,7 @@ export function AlertCard({ alert }: { alert: Alert }) {
         <ScreenshotPreview
           screenshotUrl={alert.screenshotUrl}
           status={alert.status}
+          source={alert.source}
           alt={`${alert.symbol} chart`}
           className="h-16 w-28 flex-shrink-0"
         />

@@ -109,7 +109,7 @@ describe("E/F. unlimited is server-driven", () => {
   it("E. is rendered only when the server permits it", () => {
     expect(cardCode).toContain("capability?.unlimitedPermitted ? (");
     // The panel asks the server; it computes nothing itself.
-    expect(cardCode).toContain("fetchSessionCapability()");
+    expect(cardCode).toContain("fetchSessionCapability(account)");
     for (const forbidden of ["TESTNET", "MAINNET", "paper", "isPaper"]) {
       expect(`${forbidden}:${cardCode.includes(forbidden)}`).toBe(`${forbidden}:false`);
     }
@@ -264,7 +264,7 @@ describe("Q-T. the rest of Trading Control", () => {
 
   it("S. the Policy Editor is still mounted and untouched", () => {
     expect(card).toContain('<Section title="Policy Limits">');
-    expect(card).toContain("<TradingPolicyEditor />");
+    expect(card).toContain("<TradingPolicyEditor account={account} />");
   });
 
   it("T. Start, Stop New Trades and Safe Off are all still wired", () => {

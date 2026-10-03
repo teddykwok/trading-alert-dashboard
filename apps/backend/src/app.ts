@@ -19,6 +19,7 @@ import { riskTemplatesRoutes } from "./routes/risk-templates.routes";
 import { extremeRRRoutes } from "./routes/extreme-rr.routes";
 import { executionsRoutes } from "./routes/executions.routes";
 import { operatorRoutes } from "./routes/operator.routes";
+import { accountOperatorGatewayRoutes } from "./modules/operator/account-operator-gateway";
 import { AppError } from "./utils/errors";
 import { ensureScreenshotDir } from "./utils/file";
 
@@ -88,6 +89,10 @@ export async function buildApp(): Promise<FastifyInstance> {
   // executionProfileId as a QUERY, which is safe because it selects what to
   // display and never what to act on.
   await app.register(executionsRoutes);
+  // The ONE frontend's same-origin path to exactly one account's loopback
+  // control plane per request. Holds no credential and decides nothing: the
+  // account control plane still authenticates and authorizes everything.
+  await app.register(accountOperatorGatewayRoutes);
 
   registerErrorHandler(app);
   return app;

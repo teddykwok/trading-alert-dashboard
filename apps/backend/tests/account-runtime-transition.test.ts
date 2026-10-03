@@ -12,6 +12,7 @@ import {
   evaluateSecondProof,
   evaluateTransitionGate,
   executeAccountTransition,
+  judgeRoleMode,
   judgeSupervisedRestart,
   executeTransitionRecovery,
   parseTransitionMarker,
@@ -31,7 +32,14 @@ import {
   type TransitionPhase,
 } from "../src/modules/operator/account-runtime-transition";
 import type { DualRole } from "../src/modules/operator/dual-account-topology";
-import type { ProcessProbe } from "../src/modules/operator/runtime-launcher";
+import { expectedGateSnapshotFor, type ProcessProbe } from "../src/modules/operator/runtime-launcher";
+import {
+  RUNTIME_ATTESTATION_SCHEMA_VERSION,
+  readRuntimeDeploymentAttestationStatus,
+  runtimeAttestationKey,
+  type RuntimeAttestationRedis,
+  type RuntimeGateSnapshot,
+} from "../src/modules/runtime/runtime-attestation";
 import { executeFencedStart, executeFencedStop } from "../src/modules/operator/worker-supervision";
 
 /**
@@ -1769,3 +1777,90 @@ describe("whether a supervision tick may restart", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// The SAFE-transition attestation defect, end to end
+// ---------------------------------------------------------------------------
+
+describe("a return to SAFE verifies the DEPLOYMENT, end to end", () => {
+  const IDENTITY = { accountIdentifier: "acct-a-e2e", environment: "MAINNET" };
+  const AT = new Date(NOW);
+
+  function attestationStore(roles: Array<"BACKEND" | "WORKER">, gates: RuntimeGateSnapshot): RuntimeAttestationRedis {
+    const store = new Map<string, string>();
+    roles.forEach((role, index) => {
+      const instanceId = `${role.toLowerCase()}-${index}`;
+      store.set(
+        runtimeAttestationKey(IDENTITY, role, instanceId),
+        JSON.stringify({
+          schemaVersion: RUNTIME_ATTESTATION_SCHEMA_VERSION, role, instanceId, startedAt: AT.toISOString(), lastSeenAt: AT.toISOString(),
+          accountIdentifier: IDENTITY.accountIdentifier, environment: IDENTITY.environment, gates,
+        })
+      );
+    });
+    return {
+      set: async () => "OK",
+      del: async () => 1,
+      get: async (key) => store.get(key) ?? null,
+      scan: async (_c, _m, pattern) => ["0", [...store.keys()].filter((k) => k.startsWith(pattern.replace(/\*$/, "")))],
+    };
+  }
+
+  /** The control plane's status body once it runs `mode`: SAFE_OFF, and the ARMING verdict BLOCKED for SAFE. */
+  const statusFor = (mode: RuntimeMode) => {
+    const g = expectedGateSnapshotFor(mode);
+    return {
+      systemState: "SAFE_OFF",
+      environmentGates: { globalKillSwitch: g.globalKillSwitch, liveEntryEnabled: g.liveEntryEnabled, protectionReady: g.protectionReady },
+      runtimeAttestation: { status: mode === "SAFE" ? "BLOCKED" : "PASS" },
+    };
+  };
+
+  /** The production verifier's decision, over a real deployment read of `redis`. */
+  const deploymentVerify = (redis: RuntimeAttestationRedis): TransitionAdapters["verify"] => async (role, mode) => {
+    const deployment = await readRuntimeDeploymentAttestationStatus({ redis, identity: IDENTITY, expected: expectedGateSnapshotFor(mode), now: AT });
+    const verdict = judgeRoleMode("ACCOUNT_A", role, mode, { controlStatus: statusFor(mode), deployment });
+    return verdict.ok ? { ok: true } : { ok: false, reasons: [verdict.reason] };
+  };
+
+  /** What the launcher USED to do: require the arming verdict to be PASS on the worker leg. */
+  const armingVerify: TransitionAdapters["verify"] = async (role, mode) =>
+    role === "account-a-worker" && statusFor(mode).runtimeAttestation.status !== "PASS"
+      ? { ok: false, reasons: [`the execution worker has not attested to the ${mode} gates`] }
+      : { ok: true };
+
+  const toSafe = (box: ReturnType<typeof harness>, verify: TransitionAdapters["verify"]) =>
+    executeAccountTransition({ account: "ACCOUNT_A", fromMode: "LIVE_READY", targetMode: "SAFE", startedAtMs: NOW }, { ...box.adapters, verify });
+
+  it("LIVE_READY -> SAFE with a healthy SAFE pair now completes and clears the marker", async () => {
+    const box = harness();
+    const result = await toSafe(box, deploymentVerify(attestationStore(["BACKEND", "WORKER"], expectedGateSnapshotFor("SAFE"))));
+    expect(result).toEqual({ ok: true, mode: "SAFE" });
+    expect(box.cleared).toBe(true);
+  });
+
+  it("the OLD arming-verdict verifier reproduces the historical defect on the very same healthy pair (WORKER_STARTED, then refused)", async () => {
+    const box = harness();
+    const result = await toSafe(box, armingVerify);
+    expect(result.ok).toBe(false);
+    expect(result.ok ? [] : result.reasons.join(" ")).toMatch(/has not attested to the SAFE gates/);
+    expect(box.cleared).toBe(false);
+  });
+
+  it("a SAFE transition whose worker never attests still fails closed and keeps its marker", async () => {
+    const box = harness();
+    const result = await toSafe(box, deploymentVerify(attestationStore(["BACKEND"], expectedGateSnapshotFor("SAFE"))));
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.state).toBe("INCOMPLETE");
+    expect(result.ok ? [] : result.reasons.join(" ")).toMatch(/has not attested to the SAFE deployment/);
+    expect(box.cleared).toBe(false);
+  });
+
+  it("a SAFE transition whose processes still run LIVE_READY gates fails closed", async () => {
+    const box = harness();
+    const result = await toSafe(box, deploymentVerify(attestationStore(["BACKEND", "WORKER"], expectedGateSnapshotFor("LIVE_READY"))));
+    expect(result.ok).toBe(false);
+    expect(box.cleared).toBe(false);
+  });
+});
+
