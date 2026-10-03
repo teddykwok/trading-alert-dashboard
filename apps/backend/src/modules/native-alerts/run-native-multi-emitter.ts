@@ -122,9 +122,15 @@ async function main(): Promise<number> {
     // Loaded only for COMMIT: a dry run never even constructs a database client.
     const { PrismaClient } = await import("@prisma/client");
     const { PrismaNativeDeliveryLedger } = await import("./native-alert-ledger");
+    // The live dashboard push for each COMMITTED delivery (presentation only, post-commit, never fatal).
+    const { openNativeAlertLivePublisher } = await import("../notifications/native-alert-live-publisher");
+    const live = await openNativeAlertLivePublisher((line) => console.warn(`  ${line}`));
     const prisma = new PrismaClient();
-    disconnect = () => prisma.$disconnect();
-    const prismaLedger = new PrismaNativeDeliveryLedger(prisma);
+    disconnect = async () => {
+      live.close();
+      await prisma.$disconnect();
+    };
+    const prismaLedger = new PrismaNativeDeliveryLedger(prisma, { onAlertCommitted: (alert) => live.publisher.publishCommitted(alert) });
     const status = await prismaLedger.status({ lineageId: run.lanes[0].lineageId, symbol: run.lanes[0].symbol, chartInterval: run.chartInterval });
     if (!status.available) {
       console.error(`native-alerts:multi-emitter: COMMIT refused — the delivery ledger is unavailable (${status.detail}). Nothing was written.`);

@@ -1,4 +1,4 @@
-import { Prisma, type NativeAlertDelivery, type PrismaClient } from "@prisma/client";
+import { Prisma, type Alert, type NativeAlertDelivery, type PrismaClient } from "@prisma/client";
 
 import { NATIVE_ALERT_SOURCE } from "../alerts/alert-source";
 import { buildNativeAlertDraft, buildNativeAlertDraftV2 } from "./native-alert-draft";
@@ -142,8 +142,32 @@ function otherPolicyWhere(decision: NativeDeliveryDecisionV2) {
   };
 }
 
+export interface PrismaNativeDeliveryLedgerOptions {
+  /**
+   * Called ONCE per V2 delivery that this call CREATED, strictly AFTER its
+   * transaction has committed, with the committed Alert row. Presentation only
+   * (the live dashboard push): it is never called for an adopted, duplicate,
+   * other-policy or rolled-back delivery, and whatever it does or throws
+   * cannot change the committed delivery or this call's result.
+   */
+  readonly onAlertCommitted?: (alert: Alert) => Promise<unknown> | unknown;
+}
+
 export class PrismaNativeDeliveryLedger implements NativeDeliveryLedger, NativeDeliveryLedgerV2 {
-  constructor(private readonly prisma: PrismaClient) {}
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly options: PrismaNativeDeliveryLedgerOptions = {}
+  ) {}
+
+  /** Post-commit only, and never able to fail the delivery that already committed. */
+  private async afterCommit(alert: Alert): Promise<void> {
+    if (this.options.onAlertCommitted === undefined) return;
+    try {
+      await this.options.onAlertCommitted(alert);
+    } catch {
+      // The delivery is durable; presentation failures are the hook's own to report.
+    }
+  }
 
   async status(scope: { lineageId: string; symbol: string; chartInterval: string }): Promise<NativeLedgerStatus> {
     try {
@@ -222,14 +246,15 @@ export class PrismaNativeDeliveryLedger implements NativeDeliveryLedger, NativeD
 
     const draft = buildNativeAlertDraftV2(decision, context);
     const p = decision.provenance;
+    let committed: { result: NativeDeliveryResult; alert: Alert | null };
     try {
-      return await this.prisma.$transaction(async (tx) => {
+      committed = await this.prisma.$transaction(async (tx) => {
         // The same canonical event already delivered under another policy (e.g. V1): write nothing.
         const other = await tx.nativeAlertDelivery.findFirst({ where: otherPolicyWhere(decision) });
         if (other !== null) {
-          return { outcome: "ALREADY_DELIVERED_UNDER_OTHER_POLICY" as const, deliveryKey: decision.deliveryKey, alertId: other.alertId };
+          return { result: { outcome: "ALREADY_DELIVERED_UNDER_OTHER_POLICY" as const, deliveryKey: decision.deliveryKey, alertId: other.alertId }, alert: null };
         }
-        const alert = await tx.alert.create({ data: draft, select: { id: true } });
+        const alert = await tx.alert.create({ data: draft });
         await tx.nativeAlertDelivery.create({
           data: {
             deliveryKey: decision.deliveryKey,
@@ -246,7 +271,7 @@ export class PrismaNativeDeliveryLedger implements NativeDeliveryLedger, NativeD
             alertId: alert.id,
           },
         });
-        return { outcome: "CREATED" as const, deliveryKey: decision.deliveryKey, alertId: alert.id };
+        return { result: { outcome: "CREATED" as const, deliveryKey: decision.deliveryKey, alertId: alert.id }, alert };
       });
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
@@ -254,5 +279,8 @@ export class PrismaNativeDeliveryLedger implements NativeDeliveryLedger, NativeD
       if (winner === null) throw error;
       return adopt(winner, decision);
     }
+    // COMMITTED. Only now may the dashboard be told, and only about an Alert this call created.
+    if (committed.result.outcome === "CREATED" && committed.alert !== null) await this.afterCommit(committed.alert);
+    return committed.result;
   }
 }

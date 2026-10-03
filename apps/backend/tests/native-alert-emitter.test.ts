@@ -632,6 +632,8 @@ const emitterSources = readdirSync(EMITTER_DIR)
   .map((file) => ({ file, text: readFileSync(path.join(EMITTER_DIR, file), "utf8") }));
 const CLI = "run-native-alert-emitter.ts";
 const MULTI_CLI = "run-native-multi-emitter.ts";
+/** The single, deliberate exception to the "no notifications" fence: the COMMIT-only live dashboard publisher. */
+const LIVE_PUBLISHER_IMPORT = 'await import("../notifications/native-alert-live-publisher")';
 /** The one non-CLI emitter module allowed to touch the file system: durable cursors and status files. */
 const STATE_FILES = "native-emitter-state-files.ts";
 const read = (rel: string) => code(readFileSync(path.join(BACKEND, rel), "utf8"));
@@ -690,8 +692,30 @@ describe("static fences", () => {
     ["actionable records", /actionable:\s*true/],
   ])("39. the emitter never references %s", (_label, pattern) => {
     for (const { file, text } of emitterSources) {
-      expect({ file, hit: code(text).match(pattern)?.[0] ?? null }).toEqual({ file, hit: null });
+      // ONE deliberate exception (test 39b pins it): the multi-symbol CLI's COMMIT branch loads the
+      // post-commit live dashboard publisher. Exactly that import string is exempt, and only there.
+      const scanned = file === MULTI_CLI ? code(text).split(LIVE_PUBLISHER_IMPORT).join("") : code(text);
+      expect({ file, hit: scanned.match(pattern)?.[0] ?? null }).toEqual({ file, hit: null });
     }
+  });
+
+  it("39b. the live dashboard push is post-commit only, COMMIT-only, injected, and the publisher reaches no pipeline", () => {
+    const multi = code(emitterSources.find((s) => s.file === MULTI_CLI)!.text);
+    // Imported once, dynamically, inside the COMMIT branch: a dry run never loads it or opens Redis.
+    expect(multi.split(LIVE_PUBLISHER_IMPORT).length - 1).toBe(1);
+    expect(multi.indexOf(LIVE_PUBLISHER_IMPORT)).toBeGreaterThan(multi.indexOf("if (commit) {"));
+    // Handed to the ledger as its post-commit hook, nothing else.
+    expect(multi).toContain("new PrismaNativeDeliveryLedger(prisma, { onAlertCommitted: (alert) => live.publisher.publishCommitted(alert) })");
+    // The ledger itself imports no publisher: it only calls the injected hook after its transaction.
+    const ledger = code(emitterSources.find((s) => s.file === "native-alert-ledger.ts")!.text);
+    expect(importsOf(ledger).some((s) => /notification|socket/i.test(s))).toBe(false);
+    // The publisher: the canonical event and serializer through the Socket.IO Redis emitter, and nothing more.
+    const publisher = read("src/modules/notifications/native-alert-live-publisher.ts");
+    expect(importsOf(publisher).sort()).toEqual(["../alerts/alert-context", "@prisma/client", "@socket.io/redis-emitter", "@trading-alert-dashboard/shared"].sort());
+    expect(publisher).toContain("SOCKET_EVENTS.NEW_ALERT, withAlertContext(alert)");
+    // Its only dynamic imports: the generic env (for the Redis URL) and the Redis client.
+    expect([...publisher.matchAll(/await import\("([^"]+)"\)/g)].map((m) => m[1]).sort()).toEqual(["../../config/env", "ioredis"]);
+    expect(publisher).not.toMatch(/\bqueue\b|jobs\/queue|enqueue|bullmq|vision|screenshot\(|extreme-rr|ExtremeRR|telegram|notifyNewAlert|handleTradingView|execution|createExecution|prisma\.|\$transaction/i);
   });
 
   it("40. only the CLIs read the environment, the clock, the file system or timers (the state-file store: the file system only); each CLI's FIRST import is the credential-free bootstrap", () => {
