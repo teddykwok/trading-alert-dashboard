@@ -231,6 +231,16 @@ export async function auditNativeAlert(prisma: PrismaClient, inputs: AuditInputs
   }
   const ledger: NativeAlertDelivery = db.byAlert[0];
   if (db.sameKey !== 1) ledgerFindings.push(`deliveryKey ${ledger.deliveryKey} has ${db.sameKey} ledger rows (must be exactly 1)`);
+  if (ledger.policyVersion !== "NATIVE_DELIVERY_V1") {
+    // This audit re-derives NATIVE_DELIVERY_V1 decisions from the legacy shadow tree. A row of any
+    // other policy version is reported as not auditable here, never judged by V1's rules.
+    const why = `policy version ${ledger.policyVersion} is not auditable by the NATIVE_DELIVERY_V1 audit`;
+    ledgerFindings.push(why);
+    shadow.push(why);
+    provenance.push(why);
+    readiness.push(why);
+    return finish();
+  }
   const identity: ShadowLogIdentity = {
     lineageId: ledger.lineageId,
     marketType: ledger.marketType as ShadowLogIdentity["marketType"],

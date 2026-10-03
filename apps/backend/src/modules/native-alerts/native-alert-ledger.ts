@@ -1,8 +1,9 @@
 import { Prisma, type NativeAlertDelivery, type PrismaClient } from "@prisma/client";
 
 import { NATIVE_ALERT_SOURCE } from "../alerts/alert-source";
-import { buildNativeAlertDraft } from "./native-alert-draft";
+import { buildNativeAlertDraft, buildNativeAlertDraftV2 } from "./native-alert-draft";
 import type { NativeDeliveryDecision } from "./native-delivery-policy";
+import type { NativeDeliveryContextV2, NativeDeliveryDecisionV2 } from "./native-delivery-policy-v2";
 
 /**
  * The native emitter's database side: the delivery LEDGER and the Alert it
@@ -27,7 +28,13 @@ export type NativeDeliveryOutcome =
   /** The key was already delivered with identical provenance; nothing was written. */
   | "ALREADY_DELIVERED"
   /** Already delivered, and that Alert was later deleted by an operator. The bar stays delivered. */
-  | "ALREADY_DELIVERED_ALERT_REMOVED";
+  | "ALREADY_DELIVERED_ALERT_REMOVED"
+  /**
+   * V2 only: this exact canonical shadow event was already delivered under ANOTHER
+   * policy version (a V1 row). Nothing was written: a policy version never
+   * re-delivers an event, and a deleted Alert never comes back through it.
+   */
+  | "ALREADY_DELIVERED_UNDER_OTHER_POLICY";
 
 export interface NativeDeliveryResult {
   readonly outcome: NativeDeliveryOutcome;
@@ -68,8 +75,25 @@ function isUniqueViolation(error: unknown): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
 }
 
+/** The provenance fields every policy version records; what an existing row is compared on. */
+interface ComparableDecision {
+  readonly deliveryKey: string;
+  readonly provenanceSha256: string;
+  readonly provenance: {
+    readonly policyVersion: string;
+    readonly deliveryKeySchema: string;
+    readonly lineageId: string;
+    readonly marketType: string;
+    readonly symbol: string;
+    readonly chartInterval: string;
+    readonly barOpenTimeMs: number;
+    readonly winningShadowEventId: string;
+    readonly evidenceClass: string;
+  };
+}
+
 /** The fields an existing ledger row must agree on before it may be adopted. */
-export function assertSameProvenance(existing: NativeAlertDelivery, decision: NativeDeliveryDecision): void {
+export function assertSameProvenance(existing: NativeAlertDelivery, decision: ComparableDecision): void {
   const p = decision.provenance;
   const checks: Array<[string, unknown, unknown]> = [
     ["provenance", existing.provenanceSha256, decision.provenanceSha256],
@@ -88,7 +112,7 @@ export function assertSameProvenance(existing: NativeAlertDelivery, decision: Na
   }
 }
 
-function adopt(existing: NativeAlertDelivery, decision: NativeDeliveryDecision): NativeDeliveryResult {
+function adopt(existing: NativeAlertDelivery, decision: ComparableDecision): NativeDeliveryResult {
   assertSameProvenance(existing, decision);
   return {
     outcome: existing.alertId === null ? "ALREADY_DELIVERED_ALERT_REMOVED" : "ALREADY_DELIVERED",
@@ -97,7 +121,28 @@ function adopt(existing: NativeAlertDelivery, decision: NativeDeliveryDecision):
   };
 }
 
-export class PrismaNativeDeliveryLedger implements NativeDeliveryLedger {
+/** The V2 ledger surface: the same table, the same unique key, one extra guard. */
+export interface NativeDeliveryLedgerV2 {
+  /** Read-only, including the cross-version check. */
+  lookupV2(decision: NativeDeliveryDecisionV2): Promise<NativeLookupResult>;
+  /** The only V2 write. */
+  deliverV2(decision: NativeDeliveryDecisionV2, context: NativeDeliveryContextV2): Promise<NativeDeliveryResult>;
+}
+
+/** A row for the same canonical shadow event under a DIFFERENT delivery key (another policy version). */
+function otherPolicyWhere(decision: NativeDeliveryDecisionV2) {
+  const p = decision.provenance;
+  return {
+    lineageId: p.lineageId,
+    symbol: p.symbol,
+    chartInterval: p.chartInterval,
+    barOpenTime: new Date(p.barOpenTimeMs),
+    winningShadowEventId: p.winningShadowEventId,
+    deliveryKey: { not: decision.deliveryKey },
+  };
+}
+
+export class PrismaNativeDeliveryLedger implements NativeDeliveryLedger, NativeDeliveryLedgerV2 {
   constructor(private readonly prisma: PrismaClient) {}
 
   async status(scope: { lineageId: string; symbol: string; chartInterval: string }): Promise<NativeLedgerStatus> {
@@ -155,6 +200,56 @@ export class PrismaNativeDeliveryLedger implements NativeDeliveryLedger {
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
       // Another emitter committed this key first; our transaction, Alert included, rolled back.
+      const winner = await this.prisma.nativeAlertDelivery.findUnique({ where: { deliveryKey: decision.deliveryKey } });
+      if (winner === null) throw error;
+      return adopt(winner, decision);
+    }
+  }
+
+  async lookupV2(decision: NativeDeliveryDecisionV2): Promise<NativeLookupResult> {
+    const existing = await this.prisma.nativeAlertDelivery.findUnique({ where: { deliveryKey: decision.deliveryKey } });
+    if (existing !== null) {
+      assertSameProvenance(existing, decision);
+      return { state: "DELIVERED", alertId: existing.alertId };
+    }
+    const other = await this.prisma.nativeAlertDelivery.findFirst({ where: otherPolicyWhere(decision) });
+    return other === null ? { state: "NOT_DELIVERED" } : { state: "DELIVERED", alertId: other.alertId };
+  }
+
+  async deliverV2(decision: NativeDeliveryDecisionV2, context: NativeDeliveryContextV2): Promise<NativeDeliveryResult> {
+    const existing = await this.prisma.nativeAlertDelivery.findUnique({ where: { deliveryKey: decision.deliveryKey } });
+    if (existing !== null) return adopt(existing, decision);
+
+    const draft = buildNativeAlertDraftV2(decision, context);
+    const p = decision.provenance;
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // The same canonical event already delivered under another policy (e.g. V1): write nothing.
+        const other = await tx.nativeAlertDelivery.findFirst({ where: otherPolicyWhere(decision) });
+        if (other !== null) {
+          return { outcome: "ALREADY_DELIVERED_UNDER_OTHER_POLICY" as const, deliveryKey: decision.deliveryKey, alertId: other.alertId };
+        }
+        const alert = await tx.alert.create({ data: draft, select: { id: true } });
+        await tx.nativeAlertDelivery.create({
+          data: {
+            deliveryKey: decision.deliveryKey,
+            deliveryKeySchema: p.deliveryKeySchema,
+            policyVersion: p.policyVersion,
+            lineageId: p.lineageId,
+            marketType: p.marketType,
+            symbol: p.symbol,
+            chartInterval: p.chartInterval,
+            barOpenTime: new Date(p.barOpenTimeMs),
+            winningShadowEventId: p.winningShadowEventId,
+            evidenceClass: p.evidenceClass,
+            provenanceSha256: decision.provenanceSha256,
+            alertId: alert.id,
+          },
+        });
+        return { outcome: "CREATED" as const, deliveryKey: decision.deliveryKey, alertId: alert.id };
+      });
+    } catch (error) {
+      if (!isUniqueViolation(error)) throw error;
       const winner = await this.prisma.nativeAlertDelivery.findUnique({ where: { deliveryKey: decision.deliveryKey } });
       if (winner === null) throw error;
       return adopt(winner, decision);

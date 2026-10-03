@@ -33,6 +33,7 @@
     "scanner:candidate-rank": "tsx src/modules/native-scanner/run-candidate-rank.ts",
     "scanner:parity-audit": "tsx src/modules/native-scanner/run-parity-audit.ts",
     "native-alerts:emitter": "tsx src/modules/native-alerts/run-native-alert-emitter.ts",
+    "native-alerts:multi-emitter": "tsx src/modules/native-alerts/run-native-multi-emitter.ts",
     "native-alerts:audit": "tsx src/modules/native-audit/run-native-alert-audit.ts",
     "execution:canary-preflight": "tsx src/modules/execution/run-canary-preflight.ts",
     "execution:ensure-profile": "tsx src/modules/execution/run-ensure-profile.ts",
