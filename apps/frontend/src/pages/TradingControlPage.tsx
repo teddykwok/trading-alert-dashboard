@@ -1,33 +1,51 @@
+import { OPERATOR_ACCOUNT_LABELS } from "../api/operator-account";
+import { AccountsOverview } from "../components/operator/AccountsOverview";
 import { HistoricalFillOperationsCard } from "../components/operator/HistoricalFillOperationsCard";
+import { OperatorAccountSelector } from "../components/operator/OperatorAccountSelector";
 import { TradingControlCard } from "../components/operator/TradingControlCard";
+import { Card } from "../components/ui/Card";
+import { useSelectedOperatorAccount } from "../hooks/useSelectedOperatorAccount";
 
 /**
- * The operator's Trading Control page.
+ * The operator's Trading Control page — for exactly ONE selected account.
  *
- * Nothing but a home for the existing card: the operator session, status
- * polling, explicit readiness check and every safety decision continue to live
- * in `TradingControlCard` and the modules behind it. Giving it its own route
- * only means it is no longer competing for attention with the alert feed.
- *
- * Width is constrained the way Settings is, because this is a focused operator
- * surface rather than a wide monitoring view — the card is unchanged.
+ * The account is chosen in the header (and here). Until one is chosen, nothing
+ * account-scoped is fetched and no control is offered. Each account-scoped card
+ * is keyed by the account, so switching A -> B (or back) remounts it from a
+ * clean slate: no status, readiness, pending action, form input or late
+ * response from the previous account can carry over. The overview above them
+ * is read-only and shows both accounts.
  */
 export function TradingControlPage() {
+  const account = useSelectedOperatorAccount();
   return (
     <div className="flex max-w-2xl flex-col gap-4">
-      <header>
+      <header className="space-y-2">
         <h1 className="text-lg font-semibold text-slate-100">Trading Control</h1>
         <p className="text-sm text-slate-400">
           Operator-only view of live trading state, the supervised activation controls, and the
-          durable symbol allowlist.
+          durable symbol allowlist — for one account at a time.
         </p>
+        <OperatorAccountSelector />
       </header>
 
-      <TradingControlCard />
+      <AccountsOverview />
 
-      {/* Read-only durable fill-ingestion state. It sits below the controls
-          because it reports what HAS happened rather than offering an action. */}
-      <HistoricalFillOperationsCard />
+      {account === null ? (
+        <Card className="p-4" data-testid="trading-control-no-account">
+          <p className="text-sm text-slate-300">Select Account A or Account B to use Trading Control.</p>
+          <p className="text-xs text-slate-500">Every control acts on exactly one account. There is no all-accounts action.</p>
+        </Card>
+      ) : (
+        <>
+          <p className="text-xs text-slate-500" data-testid="trading-control-target">
+            Every request below targets {OPERATOR_ACCOUNT_LABELS[account]} only.
+          </p>
+          <TradingControlCard key={`trading-control-${account}`} account={account} />
+          {/* Read-only durable fill-ingestion state for the same account. */}
+          <HistoricalFillOperationsCard key={`historical-fills-${account}`} account={account} />
+        </>
+      )}
     </div>
   );
 }

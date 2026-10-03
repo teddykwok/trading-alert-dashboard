@@ -1,4 +1,6 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { OPERATOR_ACCOUNT_LABELS, type OperatorAccountId } from "../../api/operator-account";
+import { canOfferMutations, presentControlPlane } from "../../features/operator/accountControlState";
 
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
@@ -158,10 +160,12 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 }
 
 function OperatorTokenForm({
+  account,
   onSubmit,
   busy,
   error,
 }: {
+  account: OperatorAccountId;
   onSubmit: (token: string) => void;
   busy: boolean;
   error: string | null;
@@ -181,7 +185,7 @@ function OperatorTokenForm({
   return (
     <form onSubmit={submit} className="space-y-2">
       <label htmlFor="operator-token" className="block text-xs uppercase tracking-wide text-slate-400">
-        Operator Token
+        Operator Token for {OPERATOR_ACCOUNT_LABELS[account]}
       </label>
       <input
         id="operator-token"
@@ -192,11 +196,12 @@ function OperatorTokenForm({
         spellCheck={false}
         value={value}
         onChange={(event) => setValue(event.target.value)}
-        placeholder="Enter operator token"
+        placeholder={`Enter the ${OPERATOR_ACCOUNT_LABELS[account]} operator token`}
         className="w-full rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-sm text-slate-200"
       />
       <p className="text-xs text-slate-500">
-        Held in memory only. A page refresh requires re-entry, which is intentional.
+        Held in memory only, for {OPERATOR_ACCOUNT_LABELS[account]} only. It is never sent to the other account.
+        A page refresh requires re-entry, which is intentional.
       </p>
       {error ? <p className="text-xs text-red-400">{error}</p> : null}
       <Button type="submit" disabled={busy || value.trim().length === 0}>
@@ -207,9 +212,11 @@ function OperatorTokenForm({
 }
 
 function StatusBody({
+  account,
   status,
   readiness,
 }: {
+  account: OperatorAccountId;
   status: TradingControlStatusDto;
   readiness: TradingControlReadinessSnapshot | null;
 }) {
@@ -326,7 +333,7 @@ function StatusBody({
             server says the system is SAFE OFF and quiet — the panel asks, it
             never decides. */}
         <Section title="Policy Limits">
-          <TradingPolicyEditor />
+          <TradingPolicyEditor account={account} />
         </Section>
 
         <Section title="Latest Execution">
@@ -379,12 +386,14 @@ function StatusBody({
  * server-side policy.
  */
 function ConfirmDialog({
+  account,
   action,
   status,
   pending,
   onCancel,
   onConfirm,
 }: {
+  account: OperatorAccountId;
   action: TradingControlAction;
   status: TradingControlStatusDto | null;
   pending: boolean;
@@ -414,7 +423,7 @@ function ConfirmDialog({
   useEffect(() => {
     if (action.id !== "START") return undefined;
     let cancelled = false;
-    void fetchSessionCapability()
+    void fetchSessionCapability(account)
       .then((next) => {
         if (!cancelled) setCapability(next);
       })
@@ -665,8 +674,9 @@ function ConfirmDialog({
   );
 }
 
-export function TradingControlCard() {
+export function TradingControlCard({ account }: { account: OperatorAccountId }) {
   const {
+    controlPlane,
     authState,
     authError,
     status,
@@ -684,8 +694,12 @@ export function TradingControlCard() {
     actionError,
     runAction,
     dismissActionResult,
-  } = useTradingControl();
+  } = useTradingControl(account);
   const [confirming, setConfirming] = useState<TradingControlAction | null>(null);
+  const plane = presentControlPlane(controlPlane);
+  // Every mutation control requires: one selected account, its control plane
+  // reachable, the operator authenticated for THAT account, nothing in flight.
+  const mutationsOffered = canOfferMutations({ account, authState, controlPlane, requestInFlight: pendingAction !== null });
   // Read from the polled status the server already sends; nothing extra is
   // fetched and no readiness check is triggered.
   const startPrerequisite = describeStartPrerequisite(status);
@@ -698,11 +712,16 @@ export function TradingControlCard() {
           {authState === "AUTHENTICATED" ? "Authenticated" : "Not Authenticated"}
         </Badge>
       </div>
+      <div className="flex flex-wrap items-center gap-2 text-sm" data-testid="trading-control-selected-account">
+        <span className="text-slate-400">Selected account:</span>
+        <span className="font-semibold text-slate-100">{OPERATOR_ACCOUNT_LABELS[account]}</span>
+        <Badge tone={plane.tone}>{plane.label}</Badge>
+      </div>
 
       {authState === "AUTHENTICATED" ? (
         <>
           {status ? (
-            <StatusBody status={status} readiness={readiness} />
+            <StatusBody account={account} status={status} readiness={readiness} />
           ) : (
             <p className="text-sm text-slate-400">Loading status…</p>
           )}
@@ -725,6 +744,7 @@ export function TradingControlCard() {
 
           {confirming ? (
             <ConfirmDialog
+              account={account}
               action={confirming}
               status={status}
               pending={pendingAction !== null}
@@ -796,7 +816,7 @@ export function TradingControlCard() {
                     variant={action.destructiveLooking ? "danger" : "secondary"}
                     // Disabled while ANY action is in flight: a second submission
                     // is pointless, and the server serializes them anyway.
-                    disabled={!eligible || pendingAction !== null}
+                    disabled={!eligible || !mutationsOffered}
                     onClick={() => setConfirming(action)}
                     title={
                       !relevant
@@ -815,18 +835,19 @@ export function TradingControlCard() {
 
           {/* The durable allowlist. Its own guards are enforced server-side;
               this only decides what is offered. */}
-          <AllowedSymbolsEditor status={status} onSaved={() => void refresh()} />
+          <AllowedSymbolsEditor account={account} status={status} onSaved={() => void refresh()} />
 
           {/* Execution eligibility by signal SOURCE timeframe. Same durable
               SAFE_OFF guard as the allowlist, enforced server-side. */}
-          <SourceTimeframesEditor status={status} onSaved={() => void refresh()} />
+          <SourceTimeframesEditor account={account} status={status} onSaved={() => void refresh()} />
 
           {/* The candle window NEW Extreme RR plans start on. Same durable
               SAFE_OFF guard, enforced server-side. */}
-          <RrLookbackEditor status={status} onSaved={() => void refresh()} />
+          <RrLookbackEditor account={account} status={status} onSaved={() => void refresh()} />
         </>
       ) : (
         <OperatorTokenForm
+          account={account}
           onSubmit={(token) => void authenticate(token)}
           busy={authState === "AUTHENTICATING"}
           error={authError}

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import type { OperatorAccountId } from "../../api/operator-account";
 
 import {
   EDITABLE_POLICY_FIELDS,
@@ -77,7 +78,7 @@ function changedValues(draft: Draft, read: PolicyReadDto): Record<string, unknow
   return values;
 }
 
-export function TradingPolicyEditor() {
+export function TradingPolicyEditor({ account }: { account: OperatorAccountId }) {
   const [read, setRead] = useState<PolicyReadDto | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [open, setOpen] = useState(false);
@@ -88,7 +89,7 @@ export function TradingPolicyEditor() {
 
   async function load() {
     try {
-      const next = await fetchPolicy();
+      const next = await fetchPolicy(account);
       setRead(next);
       setDraft(draftFrom(next));
     } catch (loadError) {
@@ -118,7 +119,7 @@ export function TradingPolicyEditor() {
     setError(null);
     setSave(null);
     try {
-      const result = await postValidatePolicy(changedValues(draft, read));
+      const result = await postValidatePolicy(account, changedValues(draft, read));
       if (!result.ok) {
         setReview(null);
         setError(result.refusal ?? "The proposed policy was refused.");
@@ -137,7 +138,7 @@ export function TradingPolicyEditor() {
     setBusy(true);
     setError(null);
     try {
-      const result = await postSavePolicy(changedValues(draft, read), read.version);
+      const result = await postSavePolicy(account, changedValues(draft, read), read.version);
       setSave(result);
       setReview(null);
       // Always reload: on success to pick up the new version and values, on

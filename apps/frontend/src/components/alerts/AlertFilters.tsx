@@ -6,27 +6,35 @@ import {
   SOURCE_TIMEFRAMES,
 } from "@trading-alert-dashboard/shared";
 import { Button } from "../ui/Button";
-import { ACTIONABLE_SIGNALS } from "../../hooks/useFilters";
+import { DIRECTIONAL_SIGNALS } from "../../hooks/useFilters";
 import { classNames } from "../../utils/classNames";
 import type { SignalType, SourceTimeframe } from "../../types/alert";
 import type { AlertListQuery } from "../../types/api";
 
 // Dropdown option value for the LONG+SHORT group. WATCH/EXIT remain fully
-// selectable — they are just not part of the default "Actionable only" view.
-const ACTIONABLE_OPTION = "ACTIONABLE";
-const ACTIONABLE_KEY = [...ACTIONABLE_SIGNALS].sort().join(",");
+// selectable — they are just not part of the default "Long + Short only" view.
+//
+// This is a SIGNAL-DIRECTION filter (the `signals` query), for every source.
+// It never meant execution eligibility: a NATIVE alert is LONG or SHORT and so
+// matches it, while remaining dashboard-only. The label says what it does.
+const DIRECTIONAL_OPTION = "DIRECTIONAL";
+const DIRECTIONAL_KEY = [...DIRECTIONAL_SIGNALS].sort().join(",");
+
+export const DIRECTIONAL_FILTER_LABEL = "Long + Short only";
+export const DIRECTIONAL_FILTER_TITLE =
+  "Signal direction filter: LONG + SHORT alerts from every source (WATCH/EXIT are available below). It is not an execution-eligibility filter — Native alerts are dashboard-only.";
 
 /** Maps the current signals filter back to the <select> value. */
 function signalSelectValue(signals: SignalType[] | undefined): string {
   if (!signals || signals.length === 0) return ""; // All signals
   if (signals.length === 1) return signals[0];
-  return [...signals].sort().join(",") === ACTIONABLE_KEY ? ACTIONABLE_OPTION : "";
+  return [...signals].sort().join(",") === DIRECTIONAL_KEY ? DIRECTIONAL_OPTION : "";
 }
 
 /** Maps a <select> value to the signals filter (undefined = all signals). */
 function signalsForSelectValue(value: string): SignalType[] | undefined {
   if (value === "") return undefined;
-  if (value === ACTIONABLE_OPTION) return [...ACTIONABLE_SIGNALS];
+  if (value === DIRECTIONAL_OPTION) return [...DIRECTIONAL_SIGNALS];
   return [value as SignalType];
 }
 
@@ -66,9 +74,9 @@ export function AlertFilters({ filters, setFilter, reset, hasActiveFilters }: Al
         value={signalSelectValue(filters.signals)}
         onChange={(e) => setFilter("signals", signalsForSelectValue(e.target.value))}
         className={selectClass}
-        title="Actionable only = LONG + SHORT; WATCH/EXIT are still available below"
+        title={DIRECTIONAL_FILTER_TITLE}
       >
-        <option value={ACTIONABLE_OPTION}>Actionable only</option>
+        <option value={DIRECTIONAL_OPTION}>{DIRECTIONAL_FILTER_LABEL}</option>
         <option value="">All signals</option>
         {SIGNAL_TYPES.map((signal) => (
           <option key={signal} value={signal}>

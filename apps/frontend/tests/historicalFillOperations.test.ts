@@ -192,12 +192,12 @@ describe("historical fill operations: the API client", () => {
   it("A. reads exactly the operator snapshot route", () => {
     expect(HISTORICAL_FILL_OPERATIONS_PATH).toBe("/api/operator/historical-fills/operations");
     expect(CLIENT).toContain(
-      "return operatorApiClient.get<HistoricalFillOperationsDto>(HISTORICAL_FILL_OPERATIONS_PATH);"
+      "return operatorApiClient.get<HistoricalFillOperationsDto>(account, HISTORICAL_FILL_OPERATIONS_PATH);"
     );
   });
 
   it("B. goes through the operator client, which is the only thing that attaches the token", () => {
-    // `operatorApiClient.get` adds `operatorAuthHeaders()` and refuses any path
+    // `operatorApiClient.get` adds `operatorAuthHeaders(account)` and refuses any path
     // outside /api/operator/. The panel never touches the token itself.
     expect(CLIENT).toContain("operatorApiClient");
     expect(CLIENT).not.toContain("operatorAuthHeaders");
@@ -209,9 +209,9 @@ describe("historical fill operations: the API client", () => {
   it("C. sends no profile, no clock and no body", () => {
     const fn = CLIENT.slice(CLIENT.indexOf("export function fetchHistoricalFillOperations"));
     const body = fn.slice(0, fn.indexOf("\n}"));
-    expect(body).toContain("fetchHistoricalFillOperations(): Promise<HistoricalFillOperationsDto>");
-    // No parameters at all, so there is nothing to smuggle a profile or a
-    // timestamp into.
+    expect(body).toContain("fetchHistoricalFillOperations(account: OperatorAccountId): Promise<HistoricalFillOperationsDto>");
+    // The ONLY parameter is the explicit account (A or B), so there is still
+    // nothing to smuggle a profile or a timestamp into.
     expect(body).not.toMatch(/executionProfileId/);
     expect(body).not.toMatch(/\bnow\b/);
     expect(body).not.toMatch(/capturedAt\s*[:=]/);
@@ -236,7 +236,7 @@ describe("historical fill operations: the API client", () => {
       }
     }
     // The hook's only network call is the snapshot read.
-    expect(HOOK.match(/fetchHistoricalFillOperations\(\)/g)).toHaveLength(1);
+    expect(HOOK.match(/fetchHistoricalFillOperations\(account\)/g)).toHaveLength(1);
     expect(CARD).not.toContain("fetch(");
   });
 });
@@ -489,10 +489,9 @@ describe("historical fill operations: observability only", () => {
   });
 
   it("T+4. is mounted on the existing operator page, below the controls", () => {
-    expect(PAGE).toContain("<HistoricalFillOperationsCard />");
-    expect(PAGE.indexOf("<TradingControlCard />")).toBeLessThan(
-      PAGE.indexOf("<HistoricalFillOperationsCard />")
-    );
+    // Account-scoped: mounted for the selected account, keyed by it, below the controls.
+    expect(PAGE).toContain("<HistoricalFillOperationsCard key={`historical-fills-${account}`} account={account} />");
+    expect(PAGE.indexOf("<TradingControlCard ")).toBeLessThan(PAGE.indexOf("<HistoricalFillOperationsCard "));
     // The profile id is a compact metadata row, not a headline metric.
     expect(CARD).toContain("Profile {snapshot.executionProfileId}");
     expect(CARD).toContain("text-xs text-slate-500");
@@ -1023,7 +1022,7 @@ describe("historical fill operations: the runbook is guidance, never a control",
     }
     // The panel's whole network surface is still the one authenticated GET.
     expect(CLIENT).toContain(
-      "operatorApiClient.get<HistoricalFillOperationsDto>(HISTORICAL_FILL_OPERATIONS_PATH)"
+      "operatorApiClient.get<HistoricalFillOperationsDto>(account, HISTORICAL_FILL_OPERATIONS_PATH)"
     );
     for (const source of [RUNBOOK_CODE, CARD_CODE, HOOK_CODE]) {
       for (const verb of [".post(", ".put(", ".patch(", ".delete("]) {

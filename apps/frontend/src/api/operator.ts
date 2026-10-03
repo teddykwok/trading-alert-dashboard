@@ -1,4 +1,5 @@
 import { operatorApiClient } from "./client";
+import type { OperatorAccountId } from "./operator-account";
 
 /**
  * The operator control API surface.
@@ -12,8 +13,8 @@ export interface OperatorAuthCheck {
   authenticated: boolean;
 }
 
-export function checkOperatorAuth(): Promise<OperatorAuthCheck> {
-  return operatorApiClient.get<OperatorAuthCheck>("/api/operator/auth-check");
+export function checkOperatorAuth(account: OperatorAccountId): Promise<OperatorAuthCheck> {
+  return operatorApiClient.get<OperatorAuthCheck>(account, "/api/operator/auth-check");
 }
 
 
@@ -135,16 +136,16 @@ export type TradingControlReadinessSnapshot = TradingControlReadinessDto & {
  * The polled feed. Cheap by construction: the server runs no preflight and
  * reaches no exchange for this.
  */
-export function fetchTradingControlStatus(): Promise<TradingControlStatusDto> {
-  return operatorApiClient.get<TradingControlStatusDto>("/api/operator/trading-control/status");
+export function fetchTradingControlStatus(account: OperatorAccountId): Promise<TradingControlStatusDto> {
+  return operatorApiClient.get<TradingControlStatusDto>(account, "/api/operator/trading-control/status");
 }
 
 /**
  * The explicit check. This is the only operator request that can cost a signed
  * exchange read, so it is never put on a timer.
  */
-export function fetchTradingControlReadiness(): Promise<TradingControlReadinessSnapshot> {
-  return operatorApiClient.get("/api/operator/trading-control/readiness");
+export function fetchTradingControlReadiness(account: OperatorAccountId): Promise<TradingControlReadinessSnapshot> {
+  return operatorApiClient.get(account, "/api/operator/trading-control/readiness");
 }
 
 
@@ -227,10 +228,8 @@ export interface SessionCapabilityDto {
   maxTradeBudget: number;
 }
 
-export function fetchSessionCapability(): Promise<SessionCapabilityDto> {
-  return operatorApiClient.get<SessionCapabilityDto>(
-    "/api/operator/trading-control/session-capability"
-  );
+export function fetchSessionCapability(account: OperatorAccountId): Promise<SessionCapabilityDto> {
+  return operatorApiClient.get<SessionCapabilityDto>(account, "/api/operator/trading-control/session-capability");
 }
 
 /**
@@ -241,12 +240,13 @@ export function fetchSessionCapability(): Promise<SessionCapabilityDto> {
  * than downgrading to a finite budget.
  */
 export function postStartTrading(
+  account: OperatorAccountId,
   confirmation: string,
   durationMinutes: number,
   tradeBudget?: number,
   unlimited?: boolean
 ): Promise<TradingControlActionResult> {
-  return operatorApiClient.post("/api/operator/trading-control/start", {
+  return operatorApiClient.post(account, "/api/operator/trading-control/start", {
     confirmation,
     durationMinutes,
     ...(unlimited ? { unlimited: true } : tradeBudget !== undefined ? { tradeBudget } : {}),
@@ -290,8 +290,8 @@ export interface AllowlistSaveDto {
 }
 
 /** Dry run. Writes nothing, so it is safe to call in any system state. */
-export function postValidateAllowlist(symbols: string): Promise<AllowlistValidationDto> {
-  return operatorApiClient.post("/api/operator/trading-control/allowlist/validate", { symbols });
+export function postValidateAllowlist(account: OperatorAccountId, symbols: string): Promise<AllowlistValidationDto> {
+  return operatorApiClient.post(account, "/api/operator/trading-control/allowlist/validate", { symbols });
 }
 
 /**
@@ -299,8 +299,8 @@ export function postValidateAllowlist(symbols: string): Promise<AllowlistValidat
  * server re-parses and re-validates, so there is no "already checked" claim
  * for a client to make.
  */
-export function postSaveAllowlist(symbols: string): Promise<AllowlistSaveDto> {
-  return operatorApiClient.post("/api/operator/trading-control/allowlist", { symbols });
+export function postSaveAllowlist(account: OperatorAccountId, symbols: string): Promise<AllowlistSaveDto> {
+  return operatorApiClient.post(account, "/api/operator/trading-control/allowlist", { symbols });
 }
 
 export interface SourceTimeframePolicyDto {
@@ -322,8 +322,8 @@ export interface SourceTimeframeSaveDto {
 }
 
 /** The policy in force. A read, so it stays available in any system state. */
-export function getSourceTimeframes(): Promise<SourceTimeframePolicyDto> {
-  return operatorApiClient.get("/api/operator/trading-control/source-timeframes");
+export function getSourceTimeframes(account: OperatorAccountId): Promise<SourceTimeframePolicyDto> {
+  return operatorApiClient.get(account, "/api/operator/trading-control/source-timeframes");
 }
 
 /**
@@ -332,9 +332,10 @@ export function getSourceTimeframes(): Promise<SourceTimeframePolicyDto> {
  * asserts that a previous read is still true.
  */
 export function postSourceTimeframes(
+  account: OperatorAccountId,
   sourceTimeframes: readonly string[]
 ): Promise<SourceTimeframeSaveDto> {
-  return operatorApiClient.post("/api/operator/trading-control/source-timeframes", {
+  return operatorApiClient.post(account, "/api/operator/trading-control/source-timeframes", {
     sourceTimeframes: [...sourceTimeframes],
   });
 }
@@ -355,8 +356,8 @@ export interface RrLookbackSaveDto {
 }
 
 /** The policy in force. A read, so it stays available in any system state. */
-export function getRrLookback(): Promise<RrLookbackPolicyDto> {
-  return operatorApiClient.get("/api/operator/trading-control/rr-lookback");
+export function getRrLookback(account: OperatorAccountId): Promise<RrLookbackPolicyDto> {
+  return operatorApiClient.get(account, "/api/operator/trading-control/rr-lookback");
 }
 
 /**
@@ -364,28 +365,28 @@ export function getRrLookback(): Promise<RrLookbackPolicyDto> {
  * safe state inside its transaction, so nothing here asserts that a previous
  * read is still true.
  */
-export function postRrLookback(lookbackCandles: number): Promise<RrLookbackSaveDto> {
-  return operatorApiClient.post("/api/operator/trading-control/rr-lookback", {
+export function postRrLookback(account: OperatorAccountId, lookbackCandles: number): Promise<RrLookbackSaveDto> {
+  return operatorApiClient.post(account, "/api/operator/trading-control/rr-lookback", {
     lookbackCandles,
   });
 }
 
 
-export function postStopNewTrades(): Promise<TradingControlActionResult> {
-  return operatorApiClient.post("/api/operator/trading-control/stop-new-trades");
+export function postStopNewTrades(account: OperatorAccountId): Promise<TradingControlActionResult> {
+  return operatorApiClient.post(account, "/api/operator/trading-control/stop-new-trades");
 }
 
 /** Pause sends no body: there is no phrase to confirm. */
-export function postPauseNewTrades(): Promise<TradingControlActionResult> {
-  return operatorApiClient.post("/api/operator/trading-control/pause-new-trades");
+export function postPauseNewTrades(account: OperatorAccountId): Promise<TradingControlActionResult> {
+  return operatorApiClient.post(account, "/api/operator/trading-control/pause-new-trades");
 }
 
-export function postResumeNewTrades(confirmation: string): Promise<TradingControlActionResult> {
-  return operatorApiClient.post("/api/operator/trading-control/resume-new-trades", { confirmation });
+export function postResumeNewTrades(account: OperatorAccountId, confirmation: string): Promise<TradingControlActionResult> {
+  return operatorApiClient.post(account, "/api/operator/trading-control/resume-new-trades", { confirmation });
 }
 
-export function postSafeOff(): Promise<TradingControlActionResult> {
-  return operatorApiClient.post("/api/operator/trading-control/safe-off");
+export function postSafeOff(account: OperatorAccountId): Promise<TradingControlActionResult> {
+  return operatorApiClient.post(account, "/api/operator/trading-control/safe-off");
 }
 
 /**
@@ -515,8 +516,8 @@ export const HISTORICAL_FILL_OPERATIONS_PATH = "/api/operator/historical-fills/o
  * instant, and offering either here would hand a browser control over which
  * account it reads or how a lease is classified.
  */
-export function fetchHistoricalFillOperations(): Promise<HistoricalFillOperationsDto> {
-  return operatorApiClient.get<HistoricalFillOperationsDto>(HISTORICAL_FILL_OPERATIONS_PATH);
+export function fetchHistoricalFillOperations(account: OperatorAccountId): Promise<HistoricalFillOperationsDto> {
+  return operatorApiClient.get<HistoricalFillOperationsDto>(account, HISTORICAL_FILL_OPERATIONS_PATH);
 }
 
 // ---------------------------------------------------------------------------
@@ -588,8 +589,8 @@ export interface PolicySaveDto {
 }
 
 /** Current limits plus whether they may be edited. Writes nothing. */
-export function fetchPolicy(): Promise<PolicyReadDto> {
-  return operatorApiClient.get<PolicyReadDto>("/api/operator/trading-control/policy");
+export function fetchPolicy(account: OperatorAccountId): Promise<PolicyReadDto> {
+  return operatorApiClient.get<PolicyReadDto>(account, "/api/operator/trading-control/policy");
 }
 
 /**
@@ -597,8 +598,8 @@ export function fetchPolicy(): Promise<PolicyReadDto> {
  * state, and it runs the SAME validator the save runs — a draft this accepts
  * is one the save accepts.
  */
-export function postValidatePolicy(policy: Record<string, unknown>): Promise<PolicyValidationDto> {
-  return operatorApiClient.post("/api/operator/trading-control/policy/validate", { policy });
+export function postValidatePolicy(account: OperatorAccountId, policy: Record<string, unknown>): Promise<PolicyValidationDto> {
+  return operatorApiClient.post(account, "/api/operator/trading-control/policy/validate", { policy });
 }
 
 /**
@@ -607,8 +608,9 @@ export function postValidatePolicy(policy: Record<string, unknown>): Promise<Pol
  * claim for a client to make.
  */
 export function postSavePolicy(
+  account: OperatorAccountId,
   policy: Record<string, unknown>,
   expectedVersion: number
 ): Promise<PolicySaveDto> {
-  return operatorApiClient.post("/api/operator/trading-control/policy", { policy, expectedVersion });
+  return operatorApiClient.post(account, "/api/operator/trading-control/policy", { policy, expectedVersion });
 }

@@ -1,12 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  clearOperatorToken,
+import {clearAllOperatorTokens, clearOperatorToken,
   hasOperatorToken,
   operatorAuthHeaders,
   setOperatorToken,
-  subscribeOperatorToken,
-} from "../src/api/operator-token";
+  subscribeOperatorToken, } from "../src/api/operator-token";
 import { operatorApiClient } from "../src/api/client";
 import { checkOperatorAuth } from "../src/api/operator";
 
@@ -22,12 +20,12 @@ import { checkOperatorAuth } from "../src/api/operator";
 const TOKEN = "operator-test-token-0123456789abcdef";
 
 beforeEach(() => {
-  clearOperatorToken();
+  clearAllOperatorTokens();
   vi.restoreAllMocks();
 });
 
 afterEach(() => {
-  clearOperatorToken();
+  clearAllOperatorTokens();
   vi.unstubAllGlobals();
 });
 
@@ -48,10 +46,10 @@ describe("operator token: it is held in memory only", () => {
     vi.stubGlobal("localStorage", fake);
     vi.stubGlobal("sessionStorage", fake);
 
-    setOperatorToken(TOKEN);
-    operatorAuthHeaders();
-    hasOperatorToken();
-    clearOperatorToken();
+    setOperatorToken("A", TOKEN);
+    operatorAuthHeaders("A");
+    hasOperatorToken("A");
+    clearAllOperatorTokens();
 
     expect(fake.setItem).not.toHaveBeenCalled();
     expect(store.size).toBe(0);
@@ -62,9 +60,9 @@ describe("operator token: it is held in memory only", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    setOperatorToken(TOKEN);
-    operatorAuthHeaders();
-    clearOperatorToken();
+    setOperatorToken("A", TOKEN);
+    operatorAuthHeaders("A");
+    clearAllOperatorTokens();
 
     for (const sink of [spy, warn, error]) {
       expect(sink).not.toHaveBeenCalled();
@@ -72,18 +70,18 @@ describe("operator token: it is held in memory only", () => {
   });
 
   it("does not expose the token through its own API", () => {
-    setOperatorToken(TOKEN);
+    setOperatorToken("A", TOKEN);
     // `hasOperatorToken` answers a yes/no question; nothing hands the value
     // back out except the Authorization header itself.
-    expect(hasOperatorToken()).toBe(true);
+    expect(hasOperatorToken("A")).toBe(true);
     const exported = { clearOperatorToken, hasOperatorToken, setOperatorToken, subscribeOperatorToken };
     expect(JSON.stringify(Object.keys(exported))).not.toContain(TOKEN);
   });
 
   it("forgets the token on clear", () => {
-    setOperatorToken(TOKEN);
-    clearOperatorToken();
-    expect(`${hasOperatorToken()}:${JSON.stringify(operatorAuthHeaders())}`).toBe("false:{}");
+    setOperatorToken("A", TOKEN);
+    clearAllOperatorTokens();
+    expect(`${hasOperatorToken("A")}:${JSON.stringify(operatorAuthHeaders("A"))}`).toBe("false:{}");
   });
 
   it.each([
@@ -91,39 +89,41 @@ describe("operator token: it is held in memory only", () => {
     ["whitespace only", "   "],
     ["null", null],
   ])("treats %s as no token", (_label, value) => {
-    setOperatorToken(TOKEN);
-    setOperatorToken(value);
-    expect(hasOperatorToken()).toBe(false);
+    setOperatorToken("A", TOKEN);
+    setOperatorToken("A", value);
+    expect(hasOperatorToken("A")).toBe(false);
   });
 
   it("notifies subscribers without handing them the value", () => {
     const seen: unknown[] = [];
-    const unsubscribe = subscribeOperatorToken((hasToken) => seen.push(hasToken));
-    setOperatorToken(TOKEN);
-    clearOperatorToken();
+    const unsubscribe = subscribeOperatorToken((account, hasToken) => seen.push(`${account}:${hasToken}`));
+    setOperatorToken("A", TOKEN);
+    clearAllOperatorTokens();
     unsubscribe();
-    setOperatorToken(TOKEN);
+    setOperatorToken("A", TOKEN);
 
-    // Subscribed for two changes, then unsubscribed before the third.
-    expect(seen).toEqual([true, false]);
+    // Subscribed for two changes, then unsubscribed before the third. Each
+    // notification names its ACCOUNT and a yes/no, never the token value.
+    expect(seen).toEqual(["A:true", "A:false"]);
+    expect(JSON.stringify(seen)).not.toContain(TOKEN);
   });
 });
 
 describe("operator token: the Authorization header", () => {
   it("is absent when no token is held", () => {
-    expect(operatorAuthHeaders()).toEqual({});
+    expect(operatorAuthHeaders("A")).toEqual({});
   });
 
   it("is a Bearer header carrying exactly the token", () => {
-    setOperatorToken(TOKEN);
-    expect(operatorAuthHeaders()).toEqual({ Authorization: `Bearer ${TOKEN}` });
+    setOperatorToken("A", TOKEN);
+    expect(operatorAuthHeaders("A")).toEqual({ Authorization: `Bearer ${TOKEN}` });
   });
 
   it("trims surrounding whitespace from a pasted token", () => {
     // Operators paste; pasting picks up a trailing newline. Sending it would
     // produce an indistinguishable 401, which is a miserable thing to debug.
-    setOperatorToken(`  ${TOKEN}\n`);
-    expect(operatorAuthHeaders()).toEqual({ Authorization: `Bearer ${TOKEN}` });
+    setOperatorToken("A", `  ${TOKEN}\n`);
+    expect(operatorAuthHeaders("A")).toEqual({ Authorization: `Bearer ${TOKEN}` });
   });
 });
 
@@ -140,12 +140,12 @@ describe("operator requests", () => {
 
   it("attaches the Bearer header to an operator call", async () => {
     const fetchMock = stubFetch();
-    setOperatorToken(TOKEN);
+    setOperatorToken("A", TOKEN);
 
-    await expect(checkOperatorAuth()).resolves.toEqual({ authenticated: true });
+    await expect(checkOperatorAuth("A")).resolves.toEqual({ authenticated: true });
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("/api/operator/auth-check");
+    expect(url).toBe("/api/operator/accounts/A/auth-check");
     expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${TOKEN}`);
   });
 
@@ -153,7 +153,7 @@ describe("operator requests", () => {
     // The server refuses either way; sending an empty or "Bearer undefined"
     // header would just be a confusing way to arrive at the same 401.
     const fetchMock = stubFetch(401, { error: "UnauthorizedError" });
-    await expect(checkOperatorAuth()).rejects.toThrow();
+    await expect(checkOperatorAuth("A")).rejects.toThrow();
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect((init.headers as Record<string, string>).Authorization).toBeUndefined();
@@ -161,8 +161,8 @@ describe("operator requests", () => {
 
   it("never puts the token in the URL", async () => {
     const fetchMock = stubFetch();
-    setOperatorToken(TOKEN);
-    await checkOperatorAuth();
+    setOperatorToken("A", TOKEN);
+    await checkOperatorAuth("A");
 
     const [url] = fetchMock.mock.calls[0] as [string];
     // A URL ends up in browser history, in the referer header and in any proxy
@@ -172,18 +172,18 @@ describe("operator requests", () => {
   });
 
   it("refuses to attach the credential to a non-operator path", () => {
-    setOperatorToken(TOKEN);
+    setOperatorToken("A", TOKEN);
     // The whole point of the prefix check: an ordinary dashboard endpoint, or a
     // fully-qualified URL pointing somewhere else entirely, must never receive
     // the operator token.
     for (const path of ["/api/alerts", "/api/settings", "https://example.com/api/operator/x", "api/operator/x"]) {
-      expect(() => operatorApiClient.get(path)).toThrow(/non-operator path/);
+      expect(() => operatorApiClient.get("A", path)).toThrow(/non-operator path/);
     }
   });
 
   it("does not leak the token through the ordinary api client", async () => {
     const fetchMock = stubFetch();
-    setOperatorToken(TOKEN);
+    setOperatorToken("A", TOKEN);
 
     const { apiClient } = await import("../src/api/client");
     await apiClient.post("/api/alerts", { hello: "world" });

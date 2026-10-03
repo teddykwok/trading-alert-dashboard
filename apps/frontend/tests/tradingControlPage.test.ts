@@ -96,7 +96,7 @@ describe("trading control page: the card moved, it was not rebuilt", () => {
   it("mounts the existing card on the dedicated page", () => {
     const page = src("pages/TradingControlPage.tsx");
     expect(page).toContain('import { TradingControlCard } from "../components/operator/TradingControlCard";');
-    expect(page).toContain("<TradingControlCard />");
+    expect(page).toContain("<TradingControlCard key={`trading-control-${account}`} account={account} />");
   });
 
   it("no longer mounts the card on the Dashboard", () => {

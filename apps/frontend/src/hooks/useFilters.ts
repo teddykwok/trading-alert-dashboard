@@ -15,12 +15,12 @@ import type { AlertListQuery } from "../types/api";
  * EXIT stay fully supported — they are just not shown by default because
  * WATCH alerts tend to clutter the feed.
  */
-export const ACTIONABLE_SIGNALS: SignalType[] = ["LONG", "SHORT"];
+export const DIRECTIONAL_SIGNALS: SignalType[] = ["LONG", "SHORT"];
 
-const ACTIONABLE_KEY = [...ACTIONABLE_SIGNALS].sort().join(",");
+const DIRECTIONAL_KEY = [...DIRECTIONAL_SIGNALS].sort().join(",");
 
 /**
- * URL sentinel for "all signals". The default (actionable) is omitted from
+ * URL sentinel for "all signals". The default (Long + Short) is omitted from
  * the URL entirely, so the explicit no-signal-filter choice needs its own
  * representation — otherwise it would collapse back into the default on
  * refresh. Never sent to the API (it parses to `signals: undefined`).
@@ -61,7 +61,7 @@ function parseEnumList<T extends string>(
  * reconstruct the same view from it. Invalid values are ignored (fail-safe),
  * never crash the parse.
  *
- * A clean URL yields the default actionable view (LONG+SHORT); `signals=ALL`
+ * A clean URL yields the default Long + Short view (LONG+SHORT); `signals=ALL`
  * is the explicit "no signal filter" choice. The legacy singular
  * `sourceTimeframe` param is accepted and folded into `sourceTimeframes` so
  * old bookmarks keep working.
@@ -71,7 +71,7 @@ export function parseFiltersFromSearch(params: URLSearchParams): AlertListQuery 
 
   const signalsRaw = params.get("signals");
   if (signalsRaw !== ALL_SIGNALS_PARAM) {
-    filters.signals = parseEnumList(SIGNAL_TYPES, signalsRaw) ?? [...ACTIONABLE_SIGNALS];
+    filters.signals = parseEnumList(SIGNAL_TYPES, signalsRaw) ?? [...DIRECTIONAL_SIGNALS];
   }
 
   const status = parseEnum(ALERT_STATUSES, params.get("status"));
@@ -108,7 +108,7 @@ function serializeFiltersToParams(
 
   if (!filters.signals) {
     params.set("signals", ALL_SIGNALS_PARAM);
-  } else if ([...filters.signals].sort().join(",") !== ACTIONABLE_KEY) {
+  } else if ([...filters.signals].sort().join(",") !== DIRECTIONAL_KEY) {
     params.set("signals", filters.signals.join(","));
   }
 
@@ -126,7 +126,7 @@ function serializeFiltersToParams(
 /**
  * Canonical string identity of a filter state — the same omit-defaults
  * serialization the URL uses, so equivalent views (e.g. explicit
- * "Actionable only" vs a clean "/") share one identity. Used to key
+ * "Long + Short only" vs a clean "/") share one identity. Used to key
  * per-filter-context UI state such as scroll restoration; "" = default view.
  */
 export function canonicalFilterSearch(filters: AlertListQuery): string {

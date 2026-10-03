@@ -7,6 +7,7 @@ import {
   type RrLookbackSaveDto,
   type TradingControlStatusDto,
 } from "../../api/operator";
+import type { OperatorAccountId } from "../../api/operator-account";
 import { hasOperatorToken } from "../../api/operator-token";
 import {
   canEditRrLookback,
@@ -39,9 +40,12 @@ import {
  * transaction under the profile advisory lock.
  */
 export function RrLookbackEditor({
+  account,
   status,
   onSaved,
 }: {
+  /** The ONE account this editor reads and writes. */
+  account: OperatorAccountId;
   status: TradingControlStatusDto | null;
   onSaved: () => void;
 }) {
@@ -66,14 +70,14 @@ export function RrLookbackEditor({
   const editable = canEditRrLookback(status);
   const savable = canSaveRrLookback({ selection, inForce, supported, editable: editable.allowed });
   const dirty = selection !== inForce;
-  const authenticated = hasOperatorToken();
+  const authenticated = hasOperatorToken(account);
 
   const submit = async () => {
     if (busy || !savable.allowed || selection === null) return;
     setBusy(true);
     setError(null);
     try {
-      const result = await postRrLookback(selection);
+      const result = await postRrLookback(account, selection);
       setSave(result);
       if (result.ok) {
         // The server is the authority on what is now in force; re-read rather

@@ -32,6 +32,7 @@ import {
   parseProcessTreeRows,
   unobserved,
   verifyOwnership,
+  type AttestationStatusView,
   type ObservedProcessNode,
   type OwnershipVerdict,
   type RoleHealth,
@@ -100,6 +101,7 @@ import {
   evaluateTransitionPreconditions,
   executeAccountTransition,
   executeTransitionRecovery,
+  judgeRoleMode,
   parseTransitionMarker,
   proveCurrentMode,
   rolesForAccount,
@@ -1769,10 +1771,6 @@ async function readControlPlane<T>(
   }
 }
 
-interface ControlPlaneStatus {
-  systemState?: string;
-  runtimeAttestation?: { status?: string };
-}
 
 /**
  * ONE status read, mapped two ways.
@@ -1906,27 +1904,44 @@ async function verifyRoleMode(
   let last = "the control plane did not answer";
 
   for (;;) {
-    const status = await readControlPlane<ControlPlaneStatus & Record<string, unknown>>(
-      account,
-      "/api/operator/trading-control/status"
-    );
-    if (status) {
-      // The same classifier the mode proof uses, so "running LIVE-READY" means
-      // one thing in this tool rather than two.
-      const loaded = effectiveModeFromWire(status);
-      if (loaded !== mode) {
-        last = `${role} is running gates that do not match ${mode}`;
-      } else if (status.systemState !== "SAFE_OFF") {
-        // The transition changes the RUNTIME, never the trading state.
-        last = `${role} reports ${status.systemState ?? "an unreadable state"}; it must stay SAFE_OFF`;
-      } else if (role === worker && status.runtimeAttestation?.status !== "PASS") {
-        last = `the execution worker has not attested to the ${mode} gates`;
-      } else {
-        return { ok: true };
-      }
-    }
+    const controlStatus = await readControlPlane<unknown>(account, "/api/operator/trading-control/status");
+    // The worker leg is proven by the DEPLOYMENT attestation for the target
+    // mode -- never by the control plane's arming verdict, which a correctly
+    // deployed SAFE runtime can never satisfy.
+    const deployment = role === worker && controlStatus !== null ? await readDeploymentForMode(account, mode) : null;
+    const verdict = judgeRoleMode(account, role, mode, { controlStatus, deployment });
+    if (verdict.ok) return { ok: true };
+    last = verdict.reason;
     if (Date.now() >= deadline) return { ok: false, reasons: [`${last}.`] };
     await new Promise((done) => setTimeout(done, 3_000));
+  }
+}
+
+/**
+ * The account's DEPLOYMENT attestation, judged against `mode`'s exact gates.
+ *
+ * Read directly from the attestation store under the account's own identity,
+ * the same way the topology view reads it. Null -- which refuses -- whenever
+ * the identity is not configured or the store cannot be read. The identifier
+ * is used to build the scan pattern and is never logged.
+ */
+async function readDeploymentForMode(
+  account: Exclude<RuntimeAccount, "GENERIC">,
+  mode: RuntimeMode
+): Promise<AttestationStatusView | null> {
+  const controlRole: DualRole = account === "ACCOUNT_A" ? "account-a-control" : "account-b-control";
+  const accountIdentifier = envValue(controlRole, "EXECUTION_PROFILE_ACCOUNT_IDENTIFIER");
+  const environment = envValue(controlRole, "EXECUTION_PROFILE_ENVIRONMENT");
+  if (accountIdentifier === null || environment === null) return null;
+  try {
+    const { readRuntimeDeploymentAttestationStatusOnce } = await import("../runtime/runtime-attestation");
+    return await readRuntimeDeploymentAttestationStatusOnce({
+      identity: { accountIdentifier, environment },
+      expected: expectedGateSnapshotFor(mode),
+    });
+  } catch {
+    // Message deliberately dropped: it can carry an endpoint.
+    return null;
   }
 }
 

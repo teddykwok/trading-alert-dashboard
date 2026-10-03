@@ -204,6 +204,7 @@ export function AlertDetailPage() {
             <ScreenshotPreview
               screenshotUrl={alert.screenshotUrl}
               status={alert.status}
+              source={alert.source}
               alt={`${alert.symbol} chart`}
               className="h-auto w-full"
             />

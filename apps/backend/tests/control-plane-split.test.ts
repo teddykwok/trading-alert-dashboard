@@ -325,21 +325,29 @@ describe("deployment shape", () => {
 // ---------------------------------------------------------------------------
 
 describe("the dashboard still reaches operator control", () => {
-  it("16. the dev proxy routes /api/operator to the account plane, longest prefix first", () => {
-    // The browser makes SAME-ORIGIN relative requests; it never learns that
-    // control moved to another process. Removing the generic backend's
-    // operator routes without this would 404 every control action, so the
-    // proxy entry is the compatibility contract and is asserted like one.
+  it("16. operator traffic is same-origin and account-explicit: /api -> generic gateway -> ONE loopback control plane", () => {
+    // The ONE frontend names the account in every operator request
+    // (/api/operator/accounts/A|B/...). It reaches the generic backend under
+    // "/api", whose gateway forwards it to exactly that account's loopback
+    // control plane. The browser holds no control-plane URL or port, and the
+    // old single-account proxy (VITE_ACCOUNT_CONTROL_URL) is gone.
     const config = readFileSync(
       path.join(BACKEND, "..", "frontend", "vite.config.ts"),
       "utf8"
     );
-    expect(config).toContain('"/api/operator"');
-    expect(config).toContain("accountControlUrl");
-    // Vite matches contexts in declaration order with url.startsWith, so the
-    // longer prefix must come first or /api swallows operator traffic.
-    expect(config.indexOf('"/api/operator"')).toBeLessThan(
-      config.indexOf('"/api": { target')
+    expect(config).toContain('"/api": { target: "http://127.0.0.1:4000", changeOrigin: true }');
+    expect(config).not.toMatch(/"\/api\/operator"\s*:/);
+    expect(config).not.toMatch(/accountControlUrl|VITE_ACCOUNT_CONTROL_URL|4001|4002/);
+    const generic = codeOf(APP).slice(
+      codeOf(APP).indexOf("export async function buildApp("),
+      codeOf(APP).indexOf("export async function buildAccountControlApp(")
     );
+    expect(generic).toContain("accountOperatorGatewayRoutes");
+    // The control planes stay loopback-only by contract.
+    const topology = codeOf("src/modules/operator/dual-account-topology.ts");
+    for (const role of ["account-a-control", "account-b-control"]) {
+      const block = topology.slice(topology.indexOf(`"${role}": {`), topology.indexOf("},", topology.indexOf(`"${role}": {`)));
+      expect(`${role}:${block.includes("loopbackOnly: true")}`).toBe(`${role}:true`);
+    }
   });
 });
