@@ -50,6 +50,7 @@ export const NATIVE_EVIDENCE_EXPLANATION: Readonly<Record<string, string>> = Obj
 
 export const NATIVE_PIPELINE_NOT_APPLICABLE = "Not applicable — Native alerts skip the TradingView screenshot and AI pipeline";
 export const NATIVE_EXECUTION_DISABLED = "Disabled — dashboard only (actionable = false)";
+export const NATIVE_PLAN_PLANNING_ONLY = "Planning only — generated on demand in Trade Plan; never executed";
 
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 
@@ -109,6 +110,7 @@ function nativeRows(alert: Alert): SignalPathRow[] {
     { label: "Source timeframe", value: alert.sourceTimeframe ?? alert.alertContext?.sourceTimeframe ?? NOT_RECORDED, tone: "gray" },
     { label: "Evidence", value: evidence ?? NOT_RECORDED, detail: evidence ? NATIVE_EVIDENCE_EXPLANATION[evidence] : undefined, tone: "gray" },
     { label: "Screenshot & AI", value: NATIVE_PIPELINE_NOT_APPLICABLE, tone: "gray" },
+    ...(alert.signal === "LONG" || alert.signal === "SHORT" ? [{ label: "Extreme RR plan", value: NATIVE_PLAN_PLANNING_ONLY, tone: "gray" as const }] : []),
     { label: "Execution", value: NATIVE_EXECUTION_DISABLED, tone: "red" },
   ];
 }

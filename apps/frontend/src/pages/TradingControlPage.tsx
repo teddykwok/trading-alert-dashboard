@@ -1,6 +1,7 @@
 import { OPERATOR_ACCOUNT_LABELS } from "../api/operator-account";
 import { AccountsOverview } from "../components/operator/AccountsOverview";
 import { HistoricalFillOperationsCard } from "../components/operator/HistoricalFillOperationsCard";
+import { NativePlansCard } from "../components/operator/NativePlansCard";
 import { OperatorAccountSelector } from "../components/operator/OperatorAccountSelector";
 import { TradingControlCard } from "../components/operator/TradingControlCard";
 import { Card } from "../components/ui/Card";
@@ -30,6 +31,9 @@ export function TradingControlPage() {
       </header>
 
       <AccountsOverview />
+
+      {/* Read-only and not account-scoped: no account can execute a Native plan. */}
+      <NativePlansCard />
 
       {account === null ? (
         <Card className="p-4" data-testid="trading-control-no-account">

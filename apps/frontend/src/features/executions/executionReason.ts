@@ -154,6 +154,8 @@ export function describeExecutionReason(context: ExecutionReasonContext): string
     // so the same code reads identically wherever it is shown, and the wording
     // says "not executed" rather than "failed": nothing was ever sent to
     // Binance on any of these paths.
+    case "NATIVE_ALERT_EXECUTION_FORBIDDEN":
+      return "Native scanner plans are planning only and are never executed";
     case "PLAN_NOT_READY":
       return "The trade plan was not ready when it was evaluated";
     case "NO_SELECTED_CANDIDATE":

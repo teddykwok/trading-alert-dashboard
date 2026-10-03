@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { ExtremeRRService } from "../modules/extreme-rr/extreme-rr.service";
+import { ExtremeRRService, NATIVE_PLAN_LIST_LIMIT } from "../modules/extreme-rr/extreme-rr.service";
 import { extremeRRSelectionSchema } from "../modules/extreme-rr/extreme-rr.schema";
 import { ValidationError } from "../utils/errors";
 
@@ -15,7 +15,19 @@ export async function extremeRRRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  // Manual generation for eligible (LONG/SHORT) alerts. Always uses the
+  // READ ONLY: the most recent Native plans, each as its selected, frozen
+  // summary, for Trading Control to display. Generates and writes nothing;
+  // every item says PLANNING ONLY / EXECUTION DISABLED.
+  app.get<{ Querystring: { limit?: string } }>("/api/extreme-rr/native-plans", async (request) => {
+    const raw = request.query.limit;
+    if (raw !== undefined && !/^\d{1,3}$/.test(raw)) {
+      throw new ValidationError(`limit must be an integer 1..${NATIVE_PLAN_LIST_LIMIT.max}`);
+    }
+    return service.listNativePlans(raw === undefined ? NATIVE_PLAN_LIST_LIMIT.default : Number(raw));
+  });
+
+  // Manual generation for eligible (LONG/SHORT) alerts — TradingView and
+  // Native alike (a Native alert is planned on demand only, never queued). Always uses the
   // alert's ORIGINAL triggeredAt as the candle cutoff; a READY plan is
   // returned unchanged (frozen). Generation failures come back as a plan
   // with status ERROR, never as a 500.

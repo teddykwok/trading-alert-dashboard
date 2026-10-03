@@ -375,17 +375,20 @@ function readyMarginPlan(symbol: string): DynamicLeveragePlan {
 describe("NATIVE alerts can never reach plans, adoption, execution or Binance", () => {
   beforeEach(() => resetRecoverySweepGuardForTests());
 
-  maybe()("54. the planner refuses a NATIVE alert before any candle fetch: no PENDING row, no READY plan", async () => {
+  maybe()("54. a NATIVE alert is never QUEUED for planning; its on-demand plan never carries the execution fan-out marker", async () => {
     const symbol = nextSymbol();
     const alert = await nativeAlert(symbol);
-    const fetchCandles = vi.fn(async () => {
-      throw new Error("a Binance kline fetch was attempted for a NATIVE alert");
-    });
+    // No candles in hand: the plan is INVALID, never fabricated.
+    const fetchCandles = vi.fn(async () => []);
     const service = new ExtremeRRService(prisma, fetchCandles, async () => 300 as const);
+    // No PENDING row, no background job: Native planning is on demand only.
     await expect(service.ensurePendingPlan(alert)).rejects.toBeInstanceOf(NativeAlertExecutionForbiddenError);
-    await expect(service.generateForAlert(alert.id)).rejects.toBeInstanceOf(NativeAlertExecutionForbiddenError);
-    expect(fetchCandles).not.toHaveBeenCalled();
     expect(await prisma.extremeRRPlan.count({ where: { alertId: alert.id } })).toBe(0);
+    // On demand: the same planner, and the plan is never eligible for any account.
+    const plan = await service.generateForAlert(alert.id);
+    expect(plan.alertSource).toBe("NATIVE");
+    expect(plan.status).toBe("INVALID");
+    expect((await prisma.extremeRRPlan.findUniqueOrThrow({ where: { alertId: alert.id } })).executionFanoutReadyAt).toBeNull();
   });
 
   maybe()("55. adoption never discovers a NATIVE plan — even a forced READY one — so the signed-read executor is never called for it", async () => {

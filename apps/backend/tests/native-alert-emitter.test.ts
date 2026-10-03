@@ -769,10 +769,24 @@ describe("static fences", () => {
     const create = execution.slice(execution.indexOf("async createExecutionFromReadyPlan("), execution.indexOf("tx.tradeExecution.create("));
     expect(create).toContain('assertExecutableAlertSource({ id: input.alertId, source: alert.source }, "execution");');
 
+    // Planning is visible for Native (on demand, the same planner) but never eligible:
+    // never QUEUED, and its plan never carries the execution fan-out marker.
     const plans = read("src/modules/extreme-rr/extreme-rr.service.ts");
-    for (const method of ["async ensurePendingPlan(", "async generateForAlert("]) {
-      const body = plans.slice(plans.indexOf(method), plans.indexOf(method) + 400);
-      expect(body).toContain('assertNotNativeAlert(alert, "Extreme RR planning");');
+    const pending = plans.slice(plans.indexOf("async ensurePendingPlan("), plans.indexOf("async ensurePendingPlan(") + 400);
+    expect(pending).toContain('assertNotNativeAlert(alert, "queued Extreme RR planning");');
+    const generate = plans.slice(plans.indexOf("async generateForAlert("), plans.indexOf("async getForAlert("));
+    expect(generate).toContain("const native = alert.source === NATIVE_ALERT_SOURCE;");
+    expect(generate).toContain('const executionFanoutReadyAt = status === "READY" && !native ? new Date() : null;');
+    expect(generate.match(/executionFanoutReadyAt(,|: null)/g)?.length).toBe(4);
+
+    // The selected-plan executor refuses anything not positively TRADINGVIEW FIRST:
+    // before eligibility, canary lookups, the signed margin planner or creation.
+    const executor = read("src/modules/execution/selected-plan-executor.ts");
+    const handle = executor.slice(executor.indexOf("async handleSelectedPlan("));
+    const fenceAt = handle.indexOf("if (plan.alertSource !== EXECUTABLE_ALERT_SOURCE) {");
+    expect(fenceAt).toBeGreaterThan(0);
+    for (const later of ['if (plan.status !== "READY")', "executionCanaryAuthorization", "marginPlanner.planForSymbolWithSnapshot", "createExecutionFromReadyPlan"]) {
+      expect(handle.indexOf(later), later).toBeGreaterThan(fenceAt);
     }
 
     expect(read("src/modules/jobs/alert-queue-recovery.service.ts")).toContain(

@@ -153,6 +153,7 @@ function buildRuntime(scenario: Scenario, rows: Row[]) {
 const PLAN = (direction: Direction) => ({
   id: "plan-1",
   alertId: "alert-1",
+  alertSource: "TRADINGVIEW" as const,
   status: "READY",
   direction,
   entryPrice: "0.2707",

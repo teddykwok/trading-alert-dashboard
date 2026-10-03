@@ -25,7 +25,8 @@ describe("native alert presentation", () => {
     expect(NATIVE_ALERT_BADGE_LABEL).toBe("Native");
     expect(NATIVE_ALERT_BADGE_TITLE).toMatch(/dashboard only/i);
     expect(NATIVE_ALERT_BADGE_TITLE).toMatch(/not a TradingView alert/i);
-    expect(NATIVE_ALERT_PLAN_NOTICE).toMatch(/execution are hard-disabled/i);
+    expect(NATIVE_ALERT_PLAN_NOTICE).toMatch(/planning only/i);
+    expect(NATIVE_ALERT_PLAN_NOTICE).toMatch(/execution is hard-disabled/i);
   });
 });
 

@@ -32,6 +32,7 @@ const vocabulary = readFileSync(
 );
 
 const SKIP_REASONS = [
+  "NATIVE_ALERT_EXECUTION_FORBIDDEN",
   "PLAN_NOT_READY",
   "NO_SELECTED_CANDIDATE",
   "CANDIDATE_INCOMPLETE",

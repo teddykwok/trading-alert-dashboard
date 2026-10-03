@@ -45,6 +45,7 @@ const FILTERS = {
 const PLAN = {
   id: "plan-1",
   alertId: "alert-1",
+  alertSource: "TRADINGVIEW" as const,
   status: "READY",
   direction: "LONG" as const,
   entryPrice: "0.2707",
