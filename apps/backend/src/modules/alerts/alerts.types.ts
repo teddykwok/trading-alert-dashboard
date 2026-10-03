@@ -47,6 +47,8 @@ export interface AlertListFilter {
   /** Multi-source-timeframe filter (OR semantics); wins over `sourceTimeframe`. */
   sourceTimeframes?: string[];
   levelColor?: LevelColor;
+  /** TRADINGVIEW or NATIVE; absent = both sources. */
+  source?: AlertSource;
   limit: number;
   offset: number;
 }

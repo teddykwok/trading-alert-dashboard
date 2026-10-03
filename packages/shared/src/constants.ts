@@ -9,6 +9,12 @@ export const ASSET_TYPES = ["CRYPTO", "STOCK"] as const;
 
 export const SIGNAL_TYPES = ["LONG", "SHORT", "WATCH", "EXIT"] as const;
 
+/**
+ * The two independent alert sources: an actual TradingView webhook delivery,
+ * and Native scanner evidence (dashboard-only, never executed).
+ */
+export const ALERT_SOURCES = ["TRADINGVIEW", "NATIVE"] as const;
+
 export const ALERT_STATUSES = [
   "RECEIVED",
   "PROCESSING_SCREENSHOT",

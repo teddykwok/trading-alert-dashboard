@@ -6,7 +6,8 @@ import { TabList, TabPanel, type TabDefinition } from "../components/ui/Tabs";
 import { AlertExecutionPanel } from "../features/executions/AlertExecutionPanel";
 import { SignalBadge } from "../components/alerts/SignalBadge";
 import { StatusBadge } from "../components/alerts/StatusBadge";
-import { NativeBadge } from "../components/alerts/NativeBadge";
+import { SourceBadge } from "../components/alerts/SourceBadge";
+import { signalPathRows } from "../features/alerts/signalPath";
 import { NATIVE_ALERT_PLAN_NOTICE, NATIVE_FUTURE_EXECUTION_NOTICE, isNativeAlert, nativeProfileOf } from "../utils/alertSource";
 import { MockAiBadge } from "../components/alerts/MockAiBadge";
 import { OpenAiBadge } from "../components/alerts/OpenAiBadge";
@@ -191,8 +192,8 @@ export function AlertDetailPage() {
         <h1 className="text-xl font-semibold text-slate-100">{alert.symbol}</h1>
         <span className="text-sm text-slate-500">{alert.timeframe}</span>
         <SignalBadge signal={alert.signal} />
-        {isNativeAlert(alert) && <NativeBadge />}
-        <StatusBadge status={alert.status} />
+        <SourceBadge alert={alert} />
+        {isNativeAlert(alert) ? null : <StatusBadge status={alert.status} />}
         {alert.aiProvider === "mock" && <MockAiBadge />}
         {alert.aiProvider === "openai" && <OpenAiBadge />}
       </div>
@@ -210,7 +211,7 @@ export function AlertDetailPage() {
             />
           </Card>
 
-          {alert.alertContext && statusTimelineCard}
+          {alert.alertContext && !isNativeAlert(alert) && statusTimelineCard}
         </div>
 
         <div className="flex flex-col gap-5">
@@ -244,9 +245,11 @@ export function AlertDetailPage() {
 
           {alert.alertContext && <LevelContextCard context={alert.alertContext} />}
 
+          <SignalPathCard alert={alert} />
+
           <NativeProfileCard alert={alert} />
 
-          {!alert.alertContext && statusTimelineCard}
+          {!alert.alertContext && !isNativeAlert(alert) && statusTimelineCard}
         </div>
       </div>
 
@@ -296,7 +299,16 @@ export function AlertDetailPage() {
           like it had simply vanished from the pipeline.
         */}
         <TabPanel id="execution" activeId={activeTab}>
-          <AlertExecutionPanel alert={alert} />
+          {isNativeAlert(alert) ? (
+            <Card className="p-4">
+              <p className="text-sm text-slate-500">
+                Execution is disabled for Native scanner alerts, for every source timeframe. They are delivered to the
+                dashboard only.
+              </p>
+            </Card>
+          ) : (
+            <AlertExecutionPanel alert={alert} />
+          )}
         </TabPanel>
 
         <TabPanel id="ai" activeId={activeTab}>
@@ -392,6 +404,29 @@ function LevelContextCard({ context }: { context: AlertContext }) {
           value={context.levelPrice !== null ? formatPrice(context.levelPrice) : "—"}
         />
         <Row label="Chart timeframe" value={context.chartTimeframe ?? "—"} />
+      </dl>
+    </Card>
+  );
+}
+
+/** The alert's own pipeline, per source: TradingView processing, or Native delivery and its stop before execution. */
+function SignalPathCard({ alert }: { alert: Alert }) {
+  const rows = signalPathRows(alert);
+  return (
+    <Card className="p-4" data-testid="signal-path">
+      <h2 className="mb-3 text-sm font-semibold text-slate-200">Signal path</h2>
+      <dl className="space-y-2 text-sm">
+        {rows.map((row) => (
+          <div key={row.label} className="flex flex-col gap-0.5">
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">{row.label}</dt>
+              <dd className={row.tone === "red" ? "text-right text-red-300" : row.tone === "yellow" ? "text-right text-yellow-300" : row.tone === "green" ? "text-right text-green-300" : "text-right text-slate-200"}>
+                {row.value}
+              </dd>
+            </div>
+            {row.detail ? <p className="text-xs text-slate-500">{row.detail}</p> : null}
+          </div>
+        ))}
       </dl>
     </Card>
   );

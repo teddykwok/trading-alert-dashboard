@@ -3,13 +3,26 @@ import { Badge } from "../ui/Badge";
 import { MockAiBadge } from "./MockAiBadge";
 import { OpenAiBadge } from "./OpenAiBadge";
 import { formatPercent } from "../../utils/formatPrice";
+import { isNativeAlert } from "../../utils/alertSource";
 import type { Alert } from "../../types/alert";
+
+export const NATIVE_AI_NOT_APPLICABLE =
+  "Not applicable: Native scanner alerts are not sent to the TradingView screenshot and AI vision pipeline.";
 
 interface AiOpinionPanelProps {
   alert: Alert;
 }
 
 export function AiOpinionPanel({ alert }: AiOpinionPanelProps) {
+  if (isNativeAlert(alert)) {
+    return (
+      <Card className="p-4">
+        <h3 className="mb-2 text-sm font-semibold text-slate-200">AI Vision Opinion</h3>
+        <p className="text-sm text-slate-500">{NATIVE_AI_NOT_APPLICABLE}</p>
+      </Card>
+    );
+  }
+
   if (alert.status === "FAILED") {
     return (
       <Card className="p-4">

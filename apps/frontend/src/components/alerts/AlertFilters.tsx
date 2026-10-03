@@ -1,4 +1,5 @@
 import {
+  ALERT_SOURCES,
   ALERT_STATUSES,
   ASSET_TYPES,
   LEVEL_COLORS,
@@ -8,7 +9,8 @@ import {
 import { Button } from "../ui/Button";
 import { DIRECTIONAL_SIGNALS } from "../../hooks/useFilters";
 import { classNames } from "../../utils/classNames";
-import type { SignalType, SourceTimeframe } from "../../types/alert";
+import { SOURCE_LABEL } from "../../features/alerts/signalPath";
+import type { AlertSource, SignalType, SourceTimeframe } from "../../types/alert";
 import type { AlertListQuery } from "../../types/api";
 
 // Dropdown option value for the LONG+SHORT group. WATCH/EXIT remain fully
@@ -21,6 +23,14 @@ const DIRECTIONAL_OPTION = "DIRECTIONAL";
 const DIRECTIONAL_KEY = [...DIRECTIONAL_SIGNALS].sort().join(",");
 
 export const DIRECTIONAL_FILTER_LABEL = "Long + Short only";
+
+/** The source filter's options: both sources, or exactly one. */
+export const SOURCE_FILTER_OPTIONS: readonly { value: "" | AlertSource; label: string }[] = [
+  { value: "", label: "All sources" },
+  ...ALERT_SOURCES.map((source) => ({ value: source, label: SOURCE_LABEL[source] })),
+];
+export const SOURCE_FILTER_TITLE =
+  "Which source produced the alert: TradingView (an actual webhook delivery) or Native (scanner evidence, dashboard only).";
 export const DIRECTIONAL_FILTER_TITLE =
   "Signal direction filter: LONG + SHORT alerts from every source (WATCH/EXIT are available below). It is not an execution-eligibility filter — Native alerts are dashboard-only.";
 
@@ -69,6 +79,20 @@ export function AlertFilters({ filters, setFilter, reset, hasActiveFilters }: Al
         onChange={(e) => setFilter("symbol", e.target.value || undefined)}
         className={selectClass}
       />
+
+      <select
+        value={filters.source ?? ""}
+        onChange={(e) => setFilter("source", (e.target.value || undefined) as AlertSource | undefined)}
+        className={selectClass}
+        title={SOURCE_FILTER_TITLE}
+        aria-label="Source"
+      >
+        {SOURCE_FILTER_OPTIONS.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
 
       <select
         value={signalSelectValue(filters.signals)}

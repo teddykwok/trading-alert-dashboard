@@ -1,4 +1,4 @@
-import type { Alert, AlertStatus, AssetType, LevelColor, SignalType, SourceTimeframe } from "./alert";
+import type { Alert, AlertSource, AlertStatus, AssetType, LevelColor, SignalType, SourceTimeframe } from "./alert";
 
 export interface AlertListResponse {
   items: Alert[];
@@ -28,6 +28,12 @@ export interface AlertListQuery {
    */
   sourceTimeframes?: SourceTimeframe[];
   levelColor?: LevelColor;
+  /**
+   * Which source produced the alert: TRADINGVIEW (an actual webhook delivery)
+   * or NATIVE (Native scanner evidence). Undefined = all sources. Independent
+   * of the signal-direction filter.
+   */
+  source?: AlertSource;
   limit?: number;
   offset?: number;
 }
