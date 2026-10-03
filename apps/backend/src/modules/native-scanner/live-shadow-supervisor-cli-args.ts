@@ -3,6 +3,7 @@ import { CONSERVATIVE_REQUEST_POLICY, REQUEST_POLICY_LIMITS } from "./kline-fetc
 import { MAX_STREAMS_PER_COMBINED_CONNECTION } from "./live-kline-stream";
 import { LINEAGE_CONFIG_OPTIONS, LiveShadowCliUsageError, parseLineageConfig, type LineageConfig } from "./live-shadow-cli-args";
 import { SUPERVISOR_LIMITS } from "./live-shadow-supervisor";
+import { ScannerProfileError, lineageConfigOf, resolveScannerProfile, type ScannerProfile } from "./scanner-profile";
 import type { UniverseSelectionSpec } from "./usdm-universe";
 
 /**
@@ -16,6 +17,12 @@ import type { UniverseSelectionSpec } from "./usdm-universe";
  * `--symbols` and `--include-symbols` are never substituted. There is no
  * account, order, alert, emitter or database option, and none can be
  * expressed: anything unlisted is refused.
+ *
+ * `--profile <name>` takes the ENGINE and UNIVERSE from an immutable profile.
+ * It is fail-closed: no lineage flag and no universe flag may accompany it
+ * (not even one with the profile's own value), so a profile run can never be
+ * silently re-parameterised. Only operational tuning and the diagnostic,
+ * never-substituting `--symbols` are accepted alongside it.
  */
 
 export class SupervisorCliUsageError extends Error {
@@ -40,7 +47,7 @@ const TUNING = [
   "--duration-minutes",
 ] as const;
 const FLAGS = ["--all-active", "--json-status"] as const;
-const VALUES: readonly string[] = [...LINEAGE_CONFIG_OPTIONS, ...SELECTION, ...TUNING];
+const VALUES: readonly string[] = [...LINEAGE_CONFIG_OPTIONS, ...SELECTION, ...TUNING, "--profile"];
 
 export const SUPERVISOR_DEFAULTS = Object.freeze({
   symbolsPerConnection: 50,
@@ -64,9 +71,13 @@ export const SUPERVISOR_CLI_USAGE = [
   `    [--queue-capacity ${SUPERVISOR_DEFAULTS.queueCapacity}] [--max-lag-ms ${SUPERVISOR_DEFAULTS.maxProcessingLagMs}] [--stale-symbol-ms ${SUPERVISOR_DEFAULTS.staleSymbolMs}]`,
   `    [--max-total-requests ${SUPERVISOR_DEFAULTS.maxTotalRequests}] [--request-spacing-ms ${CONSERVATIVE_REQUEST_POLICY.minSpacingMs}] [--status-every-s ${SUPERVISOR_DEFAULTS.statusEverySeconds}]`,
   "    [--duration-minutes N] [--json-status]",
+  "  scanner:live-shadow-supervisor --profile teddy-aggressive [--symbols A,B,...] [operational tuning flags]",
+  "    (a profile fixes the engine and the universe target; lineage and universe flags are refused with it)",
 ].join("\n");
 
 export interface SupervisorCliOptions {
+  /** The profile this run executes, or null for a legacy explicit-flag run. */
+  readonly profile: ScannerProfile | null;
   readonly lineage: LineageConfig;
   readonly selection: UniverseSelectionSpec;
   readonly symbolsPerConnection: number;
@@ -112,21 +123,38 @@ export function parseSupervisorCliArgs(argv: readonly string[]): SupervisorCliOp
     values.set(token, value);
     i += 1;
   }
-  const missing = LINEAGE_CONFIG_OPTIONS.filter((name) => !values.has(name));
-  if (missing.length > 0) usage(`missing required: ${missing.join(", ")}`);
+  let profile: ScannerProfile | null = null;
   let lineage: LineageConfig;
-  try {
-    lineage = parseLineageConfig((name) => values.get(name) as string);
-  } catch (error) {
-    if (error instanceof LiveShadowCliUsageError) usage(error.message);
-    throw error;
+  if (values.has("--profile")) {
+    const semantic = [...LINEAGE_CONFIG_OPTIONS, "--universe", "--max-symbols", "--include-symbols", "--exclude-symbols"].filter((name) => values.has(name));
+    if (flags.has("--all-active")) semantic.push("--all-active");
+    if (semantic.length > 0) usage(`--profile fixes the engine and the universe; refusing the conflicting option(s) ${semantic.join(", ")}`);
+    try {
+      profile = resolveScannerProfile(values.get("--profile") as string);
+      lineage = lineageConfigOf(profile.engine);
+    } catch (error) {
+      if (error instanceof ScannerProfileError) usage(error.message);
+      throw error;
+    }
+  } else {
+    const missing = LINEAGE_CONFIG_OPTIONS.filter((name) => !values.has(name));
+    if (missing.length > 0) usage(`missing required: ${missing.join(", ")}`);
+    try {
+      lineage = parseLineageConfig((name) => values.get(name) as string);
+    } catch (error) {
+      if (error instanceof LiveShadowCliUsageError) usage(error.message);
+      throw error;
+    }
   }
 
-  const hasUniverse = values.has("--universe");
+  const hasUniverse = values.has("--universe") || (profile !== null && !values.has("--symbols"));
   const hasSymbols = values.has("--symbols");
   if (hasUniverse === hasSymbols) usage("give exactly one of --symbols or --universe usdt-perpetual");
   let selection: UniverseSelectionSpec;
-  if (hasUniverse) {
+  if (profile !== null && hasUniverse) {
+    // The profile's universe: walk the active USDT perpetuals and accept its target of SCANNER-ELIGIBLE symbols.
+    selection = { mode: "UNIVERSE", include: [], exclude: [], maxSymbols: profile.universe.targetEligible };
+  } else if (hasUniverse) {
     if (values.get("--universe") !== "usdt-perpetual") usage("--universe must be usdt-perpetual");
     const all = flags.has("--all-active");
     const max = values.has("--max-symbols");
@@ -146,6 +174,7 @@ export function parseSupervisorCliArgs(argv: readonly string[]): SupervisorCliOp
   }
 
   return {
+    profile,
     lineage,
     selection,
     symbolsPerConnection: bounded(values.get("--symbols-per-connection"), "--symbols-per-connection", 1, MAX_STREAMS_PER_COMBINED_CONNECTION, SUPERVISOR_DEFAULTS.symbolsPerConnection),

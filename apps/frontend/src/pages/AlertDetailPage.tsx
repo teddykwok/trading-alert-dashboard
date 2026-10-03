@@ -7,7 +7,7 @@ import { AlertExecutionPanel } from "../features/executions/AlertExecutionPanel"
 import { SignalBadge } from "../components/alerts/SignalBadge";
 import { StatusBadge } from "../components/alerts/StatusBadge";
 import { NativeBadge } from "../components/alerts/NativeBadge";
-import { NATIVE_ALERT_PLAN_NOTICE, isNativeAlert } from "../utils/alertSource";
+import { NATIVE_ALERT_PLAN_NOTICE, NATIVE_FUTURE_EXECUTION_NOTICE, isNativeAlert, nativeProfileOf } from "../utils/alertSource";
 import { MockAiBadge } from "../components/alerts/MockAiBadge";
 import { OpenAiBadge } from "../components/alerts/OpenAiBadge";
 import { AiOpinionPanel } from "../components/alerts/AiOpinionPanel";
@@ -243,6 +243,8 @@ export function AlertDetailPage() {
 
           {alert.alertContext && <LevelContextCard context={alert.alertContext} />}
 
+          <NativeProfileCard alert={alert} />
+
           {!alert.alertContext && statusTimelineCard}
         </div>
       </div>
@@ -390,6 +392,28 @@ function LevelContextCard({ context }: { context: AlertContext }) {
         />
         <Row label="Chart timeframe" value={context.chartTimeframe ?? "—"} />
       </dl>
+    </Card>
+  );
+}
+
+/** Which native scanner profile delivered this alert. Rendered only for native alerts that record one. */
+function NativeProfileCard({ alert }: { alert: Alert }) {
+  const profile = nativeProfileOf(alert);
+  if (profile === null) return null;
+  return (
+    <Card className="p-4">
+      <h2 className="mb-3 text-sm font-semibold text-slate-200">Native scanner profile</h2>
+      <dl className="space-y-2 text-sm">
+        <Row label="Profile" value={profile.profileLabel} />
+        <Row label="Profile ID" value={profile.profileId} />
+        {profile.universeTargetEligible !== null && <Row label="Scanner target" value={`${profile.universeTargetEligible} eligible symbols`} />}
+        <Row label="Engine source TFs" value={profile.engineSourceTimeframes.join(" / ")} />
+        <Row label="Dashboard delivery TFs" value={profile.dashboardSourceTimeframes.join(" / ")} />
+        <Row label="Future execution policy TFs" value={profile.futureExecutionSourceTimeframes.join(" / ")} />
+        <Row label="Engine fingerprint" value={profile.engineFingerprint.slice(0, 12)} />
+        <Row label="Scanner run" value={profile.runId} />
+      </dl>
+      <p className="mt-3 text-xs text-slate-500">{NATIVE_FUTURE_EXECUTION_NOTICE}</p>
     </Card>
   );
 }

@@ -20,6 +20,8 @@ import { LiveShadowSession, prepareLiveShadowState } from "./live-shadow-session
 import { LiveShadowEventStore } from "./live-shadow-store";
 import { REPLAY_PAGE_LIMIT, REPLAY_SETTLE_MS } from "./replay-cli-args";
 import { deriveHtfContextStartMs } from "./scanner-lineage";
+import { engineFingerprintOfConfig, engineFingerprintOfLineage, type ProfileSummary } from "./scanner-profile";
+import type { RunManifestSymbol } from "./supervisor-run-manifest";
 import { ScannerLockError, type ScannerLock } from "./scanner-lock";
 import { SymbolStreamChannel } from "./symbol-stream-channel";
 
@@ -137,8 +139,12 @@ export interface SupervisorConfig {
   readonly staleSymbolMs: number;
   /** Recovery attempts for one detachment before the symbol is FAILED for the run. */
   readonly maxRecoveryAttempts: number;
-  /** The live-shadow directory of a symbol (live-shadow/<market>/<symbol>/<interval>). */
+  /** The live-shadow directory of a symbol: its engine namespace (profile runs) or the legacy tree. */
   readonly liveDirFor: (symbol: string) => string;
+  /** This run's identity (status, manifest). Null in tests that do not care. */
+  readonly runId?: string | null;
+  /** The profile this run executes, or null for a legacy explicit-flag run. Its engine fingerprint must match `lineage`. */
+  readonly profile?: ProfileSummary | null;
 }
 
 export interface SupervisorDeps {
@@ -192,6 +198,7 @@ interface SymbolWorker {
   session: LiveShadowSession | null;
   channel: SymbolStreamChannel | null;
   lineageId: string | null;
+  bootstrapInputSha256: string | null;
   lastValidMessageAtMs: number | null;
   /** When the symbol was last (re-)armed on a stream: the staleness baseline restarts here. */
   armedAtMs: number;
@@ -254,6 +261,8 @@ export class LiveShadowSupervisor {
   private readonly pendingCacheBars = new Map<string, NativeKline[]>();
   private stopped = false;
   readonly startedAt: string;
+  /** Every accepted symbol's lineage must belong to this engine. */
+  readonly engineFingerprint: string;
 
   constructor(
     private readonly config: SupervisorConfig,
@@ -296,6 +305,10 @@ export class LiveShadowSupervisor {
       config.symbolsPerConnection,
       config.maxConnections
     );
+    this.engineFingerprint = engineFingerprintOfConfig(config.lineage);
+    if (config.profile != null && config.profile.engineFingerprint !== this.engineFingerprint) {
+      throw new SupervisorConfigError("the profile's engine fingerprint does not match the run's engine configuration");
+    }
     this.startedAt = deps.nowIso();
   }
 
@@ -320,6 +333,7 @@ export class LiveShadowSupervisor {
       session: null,
       channel: null,
       lineageId: null,
+      bootstrapInputSha256: null,
       lastValidMessageAtMs: null,
       armedAtMs: 0,
       recoveryAttempts: 0,
@@ -564,6 +578,11 @@ export class LiveShadowSupervisor {
         boundaryMs,
         checkpoints.load()
       );
+      // Defence in depth: a lineage of another engine can never join this run (or touch its checkpoint).
+      const lineageEngine = engineFingerprintOfLineage(plan.lineage);
+      if (lineageEngine !== this.engineFingerprint) {
+        return this.fail(worker, "ENGINE_FINGERPRINT_MISMATCH", `lineage ${plan.lineageId} belongs to engine ${lineageEngine}, not ${this.engineFingerprint}`);
+      }
       checkpoints.save(plan.checkpointBody, this.deps.nowIso());
       const events = new LiveShadowEventStore(worker.dir);
       const session = new LiveShadowSession({
@@ -576,6 +595,7 @@ export class LiveShadowSupervisor {
       });
       worker.session = session;
       worker.lineageId = plan.lineageId;
+      worker.bootstrapInputSha256 = plan.lineage.bootstrapInputSha256;
       worker.channel = new SymbolStreamChannel({ session, log: (line) => this.symbolLog(worker, line) });
       worker.status = "ATTACHED";
       this.deps.log(`${worker.symbol} CATCHUP_OK lineage ${plan.lineageId.slice(0, 12)} checkpoint ${plan.checkpointStatus} hwm ${new Date(plan.hwmOpenTimeMs).toISOString()} replayed ${plan.catchUp.bars} bar(s) NON_ACTIONABLE`);
@@ -881,6 +901,14 @@ export class LiveShadowSupervisor {
     while (this.pendingCacheBars.size > 0) this.flushOneCachedSymbol();
   }
 
+  /** The running set with each symbol's lineage, for the run manifest. Symbols that never prepared are not in it. */
+  acceptedSymbols(): RunManifestSymbol[] {
+    return [...this.workers.values()]
+      .filter((w) => w.lineageId !== null && w.bootstrapInputSha256 !== null)
+      .map((w) => ({ symbol: w.symbol, lineageId: w.lineageId as string, bootstrapInputSha256: w.bootstrapInputSha256 as string }))
+      .sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0));
+  }
+
   private symbolLog(worker: SymbolWorker, line: string): void {
     this.deps.log(`${worker.symbol} ${line}`);
   }
@@ -911,11 +939,16 @@ export class LiveShadowSupervisor {
     });
     const count = (pred: (s: (typeof symbols)[number]) => boolean) => symbols.filter(pred).length;
     return {
-      schema: "teddy.native-scanner.live-shadow-supervisor-status.v2",
+      schema: "teddy.native-scanner.live-shadow-supervisor-status.v3",
       notice: ["SHADOW ONLY", "NO ALERT AUTHORITY", "NO ORDER AUTHORITY"],
       actionable: false as const,
+      runId: this.config.runId ?? null,
+      runState: this.stopped ? ("STOPPED" as const) : ("RUNNING" as const),
       startedAt: this.startedAt,
       interval: this.config.lineage.chartInterval,
+      engineFingerprint: this.engineFingerprint,
+      /** Profile identity and policy summaries (null for a legacy explicit-flag run). Future execution policy is modelling only. */
+      profile: this.config.profile ?? null,
       /** How the running set was chosen. Skipped candidates never joined and are not runtime failures. */
       selection: this.selectionSummary,
       totals: {

@@ -3,11 +3,12 @@
 import "../../config/bootstrap-generic";
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { env } from "../../config/env";
-import { EXCHANGE_INFO_PATH, ScannerDataError, assertPublicFuturesBaseUrl, buildPublicFuturesUrl } from "./binance-public-futures";
+import { EXCHANGE_INFO_PATH, SCANNER_MARKET_TYPE, ScannerDataError, assertPublicFuturesBaseUrl, buildPublicFuturesUrl } from "./binance-public-futures";
 import { CandidateRankHaltError, GovernedPublicTransport } from "./candidate-rank-runner";
 import { KlineCacheStore } from "./kline-cache";
 import { PublicRequestController, REQUEST_POLICY_LIMITS, type PublicHttpTransport } from "./kline-fetcher";
@@ -16,6 +17,16 @@ import { LiveShadowSupervisor, SupervisorConfigError, TargetNotReachedError, liv
 import { SUPERVISOR_CLI_USAGE, SupervisorCliUsageError, parseSupervisorCliArgs } from "./live-shadow-supervisor-cli-args";
 import { ScannerPathError, assertOutsideRepository, scannerKlineCacheDir, scannerRootDir } from "./scanner-paths";
 import { acquireLiveShadowLock } from "./scanner-lock";
+import {
+  ENGINE_NAMESPACE_MANIFEST,
+  ScannerProfileError,
+  assertEngineNamespace,
+  engineNamespaceDir,
+  engineNamespaceManifestOf,
+  liveShadowEngineDir,
+  profileSummaryOf,
+} from "./scanner-profile";
+import { RunManifestError, SUPERVISOR_RUN_MANIFEST_SCHEMA, buildRunManifest, makeRunId, runManifestText } from "./supervisor-run-manifest";
 import { UniverseSelectionError, parseExchangeInfoContracts, selectSymbols, selectUsdtPerpetualUniverse, universeWalk } from "./usdm-universe";
 
 /**
@@ -109,6 +120,28 @@ async function main(): Promise<void> {
   console.log(`git ${gitHead}${git(["status", "--porcelain"]) === "" ? "" : " (worktree NOT clean)"}`);
 
   const root = assertOutsideRepository(scannerRootDir(process.env), REPO_ROOT);
+  const runId = makeRunId(Date.now(), randomBytes(4).toString("hex"));
+  const profile = options.profile === null ? null : profileSummaryOf(options.profile);
+  if (profile !== null && options.profile !== null) {
+    // The profile's own state namespace: verified (never shared with another engine), or created.
+    const namespace = assertOutsideRepository(engineNamespaceDir(root, profile.engineFingerprint), REPO_ROOT);
+    const manifestFile = path.join(namespace, ENGINE_NAMESPACE_MANIFEST);
+    assertEngineNamespace(existsSync(manifestFile) ? readFileSync(manifestFile, "utf8") : null, profile.engineFingerprint);
+    if (!existsSync(manifestFile)) {
+      mkdirSync(namespace, { recursive: true });
+      writeFileSync(`${manifestFile}.tmp`, `${JSON.stringify(engineNamespaceManifestOf(options.profile), null, 2)}\n`, "utf8");
+      renameSync(`${manifestFile}.tmp`, manifestFile);
+    }
+    console.log(`profile: ${profile.profileLabel} (${profile.profileId})`);
+    console.log(`  engine fingerprint:           ${profile.engineFingerprint}`);
+    console.log(`  delivery-policy fingerprint:  ${profile.deliveryPolicyFingerprint}`);
+    console.log(`  execution-policy fingerprint: ${profile.executionPolicyFingerprint}`);
+    console.log(`  engine: min move ${profile.engine.minMovePercent}%, tolerance ${profile.engine.touchTolerancePercent}%, source TFs ${profile.engine.engineSourceTimeframes.join(",")}`);
+    console.log(`  dashboard delivery TFs: ${profile.delivery.dashboardSourceTimeframes.join(",")} (${profile.delivery.policyVersion})`);
+    console.log(`  future execution policy TFs: ${profile.execution.futureExecutionSourceTimeframes.join(",")} — ${profile.execution.notice}`);
+    console.log(`  state namespace: ${namespace}`);
+  }
+  console.log(`run id: ${runId}`);
   const baseUrl = assertPublicFuturesBaseUrl(env.BINANCE_FUTURES_REST_BASE_URL);
   const governor = new GovernedPublicTransport(publicTransport, { maxTotalRequests: options.maxTotalRequests, minSpacingMs: options.minSpacingMs, nowMs: () => Date.now(), sleep });
   const fetchDeps = {
@@ -144,7 +177,15 @@ async function main(): Promise<void> {
       maxProcessingLagMs: options.maxProcessingLagMs,
       staleSymbolMs: options.staleSymbolMs,
       maxRecoveryAttempts: options.maxRecoveryAttempts,
-      liveDirFor: (symbol) => assertOutsideRepository(liveShadowDir(root, symbol, options.lineage.chartInterval), REPO_ROOT),
+      liveDirFor: (symbol) =>
+        assertOutsideRepository(
+          profile === null
+            ? liveShadowDir(root, symbol, options.lineage.chartInterval)
+            : liveShadowEngineDir(root, profile.engineFingerprint, SCANNER_MARKET_TYPE, symbol, options.lineage.chartInterval),
+          REPO_ROOT
+        ),
+      runId,
+      profile,
     },
     {
       openStream: openPublicStream,
@@ -170,14 +211,23 @@ async function main(): Promise<void> {
 
   const statusDir = assertOutsideRepository(path.join(root, "live-shadow-supervisor"), REPO_ROOT);
   const statusFile = path.join(statusDir, "status.json");
+  // Per-run files: the immutable manifest a pinned consumer binds to, and this run's own status.
+  const runDir = assertOutsideRepository(path.join(statusDir, "runs", runId), REPO_ROOT);
+  const runStatusFile = path.join(runDir, "status.json");
   const writeStatus = (status: SupervisorStatus) => {
     // Observational only: a failure here is logged and never touches scanning.
-    try {
-      mkdirSync(statusDir, { recursive: true });
-      writeFileSync(`${statusFile}.tmp`, `${JSON.stringify({ ...status, gitHead, pid: process.pid, writtenAt: iso(Date.now()) }, null, 2)}\n`, "utf8");
-      renameSync(`${statusFile}.tmp`, statusFile);
-    } catch (error) {
-      console.error(`status file not written (${error instanceof Error ? error.name : "unknown"}); scanning continues`);
+    const text = `${JSON.stringify({ ...status, gitHead, pid: process.pid, writtenAt: iso(Date.now()) }, null, 2)}\n`;
+    for (const [dir, file] of [
+      [statusDir, statusFile],
+      [runDir, runStatusFile],
+    ]) {
+      try {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(`${file}.tmp`, text, "utf8");
+        renameSync(`${file}.tmp`, file);
+      } catch (error) {
+        console.error(`status file not written (${error instanceof Error ? error.name : "unknown"}); scanning continues`);
+      }
     }
   };
 
@@ -196,6 +246,39 @@ async function main(): Promise<void> {
 
   await supervisor.start();
   const sel = supervisor.status().selection;
+  // The run manifest: written ONCE (flag wx: never overwritten), after selection, so a pinned consumer
+  // can bind to exactly this run's accepted symbols, profile and engine.
+  const counts = sel ?? {
+    mode: "EXPLICIT", universeActive: null, targetEligible: null, candidatesTested: 0, acceptedEligible: 0,
+    skippedTooNew: 0, skippedInsufficientHistory: 0, skippedOther: 0, universeExhausted: true,
+  };
+  const manifest = buildRunManifest({
+    schema: SUPERVISOR_RUN_MANIFEST_SCHEMA,
+    runId,
+    startedAt: supervisor.startedAt,
+    gitHead,
+    marketType: SCANNER_MARKET_TYPE,
+    chartInterval: options.lineage.chartInterval,
+    engineFingerprint: supervisor.engineFingerprint,
+    profile,
+    stateLayout: profile === null ? "LEGACY" : "ENGINE_NAMESPACE",
+    selection: {
+      mode: counts.mode,
+      universeActive: counts.universeActive,
+      targetEligible: counts.targetEligible,
+      candidatesTested: counts.candidatesTested,
+      acceptedEligible: supervisor.acceptedSymbols().length,
+      skippedTooNew: counts.skippedTooNew,
+      skippedInsufficientHistory: counts.skippedInsufficientHistory,
+      skippedOther: counts.skippedOther,
+      universeExhausted: counts.universeExhausted,
+    },
+    symbols: supervisor.acceptedSymbols(),
+    actionable: false,
+  });
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(path.join(runDir, "manifest.json"), runManifestText(manifest), { encoding: "utf8", flag: "wx" });
+  console.log(`run manifest: ${path.join(runDir, "manifest.json")} (${manifest.body.symbols.length} symbols, sha256 ${manifest.bodySha256.slice(0, 12)})`);
   if (sel !== null) {
     console.log(`tested candidates: ${sel.candidatesTested}`);
     console.log(`accepted eligible: ${sel.acceptedEligible}`);
@@ -235,7 +318,9 @@ void main().catch((error: unknown) => {
     error instanceof UniverseSelectionError ||
     error instanceof SupervisorConfigError ||
     error instanceof CandidateRankHaltError ||
-    error instanceof TargetNotReachedError
+    error instanceof TargetNotReachedError ||
+    error instanceof ScannerProfileError ||
+    error instanceof RunManifestError
   ) {
     if (error instanceof TargetNotReachedError) {
       const s = error.summary;

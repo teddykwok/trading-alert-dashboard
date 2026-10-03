@@ -631,17 +631,25 @@ const emitterSources = readdirSync(EMITTER_DIR)
   .filter((f) => f.endsWith(".ts"))
   .map((file) => ({ file, text: readFileSync(path.join(EMITTER_DIR, file), "utf8") }));
 const CLI = "run-native-alert-emitter.ts";
+const MULTI_CLI = "run-native-multi-emitter.ts";
+/** The one non-CLI emitter module allowed to touch the file system: durable cursors and status files. */
+const STATE_FILES = "native-emitter-state-files.ts";
 const read = (rel: string) => code(readFileSync(path.join(BACKEND, rel), "utf8"));
 
 describe("static fences", () => {
   it("38. the emitter is exactly these modules, importing only node built-ins, Prisma, the shared package, scanner evidence readers and the alert source/types", () => {
     expect(emitterSources.map((s) => s.file).sort()).toEqual([
+      "multi-emitter-cli-args.ts",
+      "multi-symbol-emitter.ts",
       "native-alert-cli-args.ts",
       "native-alert-draft.ts",
       "native-alert-emitter.ts",
       "native-alert-ledger.ts",
+      "native-delivery-policy-v2.ts",
       "native-delivery-policy.ts",
+      "native-emitter-state-files.ts",
       "run-native-alert-emitter.ts",
+      "run-native-multi-emitter.ts",
       "shadow-log-reader.ts",
     ]);
     const allowed = new Set([
@@ -651,6 +659,8 @@ describe("static fences", () => {
       "../native-scanner/live-shadow-store",
       "../native-scanner/live-shadow-checkpoint",
       "../native-scanner/scanner-paths",
+      "../native-scanner/scanner-profile",
+      "../native-scanner/supervisor-run-manifest",
       "../alerts/alert-source",
       "../alerts/alerts.types",
     ]);
@@ -658,13 +668,13 @@ describe("static fences", () => {
       for (const specifier of importsOf(text)) {
         const ok =
           specifier.startsWith("node:") ||
-          /^\.\/[a-z-]+$/.test(specifier) ||
+          /^\.\/[a-z0-9-]+$/.test(specifier) ||
           allowed.has(specifier) ||
-          (file === CLI && specifier === "../../config/bootstrap-generic");
+          ([CLI, MULTI_CLI].includes(file) && specifier === "../../config/bootstrap-generic");
         expect({ file, specifier, ok }).toEqual({ file, specifier, ok: true });
       }
-      // Only the ledger and the CLI may touch the database client at all.
-      if (!["native-alert-ledger.ts", CLI].includes(file)) {
+      // Only the ledger and the CLIs may touch the database client at all.
+      if (!["native-alert-ledger.ts", CLI, MULTI_CLI].includes(file)) {
         expect({ file, hit: /PrismaClient|\$transaction/.test(code(text).replace(/import[^;]*;/g, "")) }).toEqual({ file, hit: false });
       }
     }
@@ -684,15 +694,21 @@ describe("static fences", () => {
     }
   });
 
-  it("40. only the CLI reads the environment, the clock, the file system or timers; its FIRST import is the credential-free bootstrap", () => {
+  it("40. only the CLIs read the environment, the clock, the file system or timers (the state-file store: the file system only); each CLI's FIRST import is the credential-free bootstrap", () => {
     for (const { file, text } of emitterSources) {
-      if (file === CLI) continue;
-      expect({ file, hit: code(text).match(/process\.env|Date\.now|new Date\(\)|setTimeout|setInterval|readFileSync|existsSync|"node:fs"/)?.[0] ?? null }).toEqual({ file, hit: null });
+      if (file === CLI || file === MULTI_CLI) continue;
+      const pattern = file === STATE_FILES ? /process\.env|Date\.now|new Date\(\)|setTimeout|setInterval/ : /process\.env|Date\.now|new Date\(\)|setTimeout|setInterval|readFileSync|existsSync|"node:fs"/;
+      expect({ file, hit: code(text).match(pattern)?.[0] ?? null }).toEqual({ file, hit: null });
     }
     const cli = emitterSources.find((s) => s.file === CLI)!.text;
     expect(importsOf(cli)[0]).toBe("../../config/bootstrap-generic");
     for (const banner of ["NATIVE ALERT EMITTER", "DASHBOARD WRITES ONLY", "EXECUTION FOR NATIVE ALERTS IS HARD-DISABLED"]) {
       expect(cli).toContain(`console.log("${banner}")`);
+    }
+    const multi = emitterSources.find((s) => s.file === MULTI_CLI)!.text;
+    expect(importsOf(multi)[0]).toBe("../../config/bootstrap-generic");
+    for (const banner of ["NATIVE MULTI-SYMBOL EMITTER", "EXECUTION FOR NATIVE ALERTS IS HARD-DISABLED"]) {
+      expect(multi).toContain(`console.log("${banner}")`);
     }
   });
 
@@ -706,10 +722,11 @@ describe("static fences", () => {
     }
   });
 
-  it("42. the package exposes exactly one emitter script (and the separate read-only audit), outside the scanner script namespace", () => {
+  it("42. the package exposes exactly the single-symbol and multi-symbol emitter scripts (and the separate read-only audit), outside the scanner script namespace", () => {
     const scripts = (JSON.parse(readFileSync(path.join(BACKEND, "package.json"), "utf8")) as { scripts: Record<string, string> }).scripts;
     expect(Object.entries(scripts).filter(([name, command]) => /native-alerts/.test(name) || /native-alerts/.test(command))).toEqual([
       ["native-alerts:emitter", "tsx src/modules/native-alerts/run-native-alert-emitter.ts"],
+      ["native-alerts:multi-emitter", "tsx src/modules/native-alerts/run-native-multi-emitter.ts"],
       ["native-alerts:audit", "tsx src/modules/native-audit/run-native-alert-audit.ts"],
     ]);
   });

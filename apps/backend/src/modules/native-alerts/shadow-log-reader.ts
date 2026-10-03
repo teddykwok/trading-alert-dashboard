@@ -314,6 +314,20 @@ export class ShadowLogTail {
 
   /** `text` null: the log does not exist (yet). Returns the newly completed records, validated. */
   read(text: string | null): ShadowRecord[] {
+    return this.readWithOffsets(text).map((entry) => entry.record);
+  }
+
+  /** Characters of the log consumed so far (always a line boundary). */
+  get consumedLength(): number {
+    return this.consumedChars;
+  }
+
+  /**
+   * As `read`, with each record's END offset: the character position just past
+   * its newline. A cursor that stores such an offset always sits on a line
+   * boundary, after a record that was completely processed.
+   */
+  readWithOffsets(text: string | null): { readonly record: ShadowRecord; readonly endChars: number }[] {
     if (text === null) {
       if (this.consumedChars > 0) fail("LOG_REWRITTEN", "the event log disappeared after it was read");
       return [];
@@ -333,11 +347,13 @@ export class ShadowLogTail {
     if (end <= this.consumedChars) return [];
 
     const fresh = text.slice(this.consumedChars, end - 1).split("\n");
-    const records: ShadowRecord[] = [];
+    const records: { record: ShadowRecord; endChars: number }[] = [];
+    let position = this.consumedChars;
     for (const line of fresh) {
       this.lines += 1;
       if (line === "") fail("TORN_LINE", `line ${this.lines} is empty`);
-      records.push(this.validator.acceptLine(line, this.lines));
+      position += line.length + 1;
+      records.push({ record: this.validator.acceptLine(line, this.lines), endChars: position });
     }
     this.consumedChars = end;
     this.consumedSha256 = sha256(text.slice(0, end));
