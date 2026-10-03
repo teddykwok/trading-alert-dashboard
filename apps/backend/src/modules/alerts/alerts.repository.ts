@@ -81,6 +81,7 @@ export class AlertsRepository {
         ? { in: filter.sourceTimeframes }
         : filter.sourceTimeframe,
       levelColor: filter.levelColor,
+      source: filter.source,
     };
   }
 

@@ -1,6 +1,7 @@
 import { useCallback, useMemo } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
+  ALERT_SOURCES,
   ALERT_STATUSES,
   ASSET_TYPES,
   LEVEL_COLORS,
@@ -36,6 +37,7 @@ const FILTER_PARAM_KEYS = [
   "sourceTimeframe",
   "sourceTimeframes",
   "levelColor",
+  "source",
 ] as const;
 
 function parseEnum<T extends string>(allowed: readonly T[], value: string | null): T | undefined {
@@ -91,6 +93,10 @@ export function parseFiltersFromSearch(params: URLSearchParams): AlertListQuery 
   const levelColor = parseEnum(LEVEL_COLORS, params.get("levelColor"));
   if (levelColor) filters.levelColor = levelColor;
 
+  // Source (TradingView / Native). Absent = all sources; independent of signals.
+  const source = parseEnum(ALERT_SOURCES, params.get("source"));
+  if (source) filters.source = source;
+
   return filters;
 }
 
@@ -119,6 +125,7 @@ function serializeFiltersToParams(
     params.set("sourceTimeframes", filters.sourceTimeframes.join(","));
   }
   if (filters.levelColor) params.set("levelColor", filters.levelColor);
+  if (filters.source) params.set("source", filters.source);
 
   return params;
 }

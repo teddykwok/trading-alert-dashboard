@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import {
+  ALERT_SOURCES,
   ALERT_STATUSES,
   ASSET_TYPES,
   LEVEL_COLORS,
@@ -20,7 +21,8 @@ export const listQuerySchema = z.object({
   symbol: z.string().min(1).optional(),
   signal: z.enum(SIGNAL_TYPES).optional(),
   // Comma-separated multi-signal filter, e.g. "LONG,SHORT" for the
-  // dashboard's "Actionable only" view. Wins over `signal` when present.
+  // dashboard's "Long + Short only" (signal-direction) view. Wins over
+  // `signal` when present.
   signals: z
     .string()
     .min(1)
@@ -54,6 +56,9 @@ export const listQuerySchema = z.object({
     )
     .pipe(z.array(z.enum(SOURCE_TIMEFRAMES)).min(1).optional()),
   levelColor: z.enum(LEVEL_COLORS).optional(),
+  // Which SOURCE produced the alert: an actual TradingView webhook delivery, or
+  // Native scanner evidence. Absent = both. Independent of every other filter.
+  source: z.enum(ALERT_SOURCES).optional(),
   limit: z.coerce
     .number()
     .int()

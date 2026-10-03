@@ -3,7 +3,8 @@ import { Card } from "../ui/Card";
 import { SignalBadge } from "./SignalBadge";
 import { StatusBadge } from "./StatusBadge";
 import { MockAiBadge } from "./MockAiBadge";
-import { NativeBadge } from "./NativeBadge";
+import { SourceBadge } from "./SourceBadge";
+import { Badge } from "../ui/Badge";
 import { OpenAiBadge } from "./OpenAiBadge";
 import { MinMovementBadge } from "./MinMovementBadge";
 import { DuplicateBadge } from "./DuplicateBadge";
@@ -37,8 +38,16 @@ export function AlertCard({ alert }: { alert: Alert }) {
             <span className="font-semibold text-slate-100">{alert.symbol}</span>
             <span className="text-xs text-slate-500">{alert.timeframe}</span>
             <SignalBadge signal={alert.signal} />
-            {isNativeAlert(alert) && <NativeBadge />}
-            <StatusBadge status={alert.status} />
+            <SourceBadge alert={alert} />
+            {/* Native alerts never enter the TradingView screenshot/AI pipeline, so
+                its processing status would read as "pending" forever. */}
+            {isNativeAlert(alert) ? (
+              <Badge tone="gray" title="Native scanner evidence: dashboard only, execution disabled">
+                Dashboard only
+              </Badge>
+            ) : (
+              <StatusBadge status={alert.status} />
+            )}
             {alert.aiProvider === "mock" && <MockAiBadge />}
             {alert.aiProvider === "openai" && <OpenAiBadge />}
             <MinMovementBadge indicatorName={alert.indicatorName} value={alert.indicatorValue} />
