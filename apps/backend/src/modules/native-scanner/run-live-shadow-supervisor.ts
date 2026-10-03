@@ -8,12 +8,12 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import path from "node:path";
 
 import { env } from "../../config/env";
-import { EXCHANGE_INFO_PATH, SCANNER_MARKET_TYPE, ScannerDataError, assertPublicFuturesBaseUrl, buildPublicFuturesUrl } from "./binance-public-futures";
+import { EXCHANGE_INFO_PATH, ScannerDataError, assertPublicFuturesBaseUrl, buildPublicFuturesUrl } from "./binance-public-futures";
 import { CandidateRankHaltError, GovernedPublicTransport } from "./candidate-rank-runner";
 import { KlineCacheStore } from "./kline-cache";
 import { PublicRequestController, REQUEST_POLICY_LIMITS, type PublicHttpTransport } from "./kline-fetcher";
 import type { OpenPublicStream } from "./live-shadow-runner";
-import { LiveShadowSupervisor, SupervisorConfigError, TargetNotReachedError, liveShadowDir, type SupervisorSelection, type SupervisorStatus } from "./live-shadow-supervisor";
+import { LiveShadowSupervisor, SupervisorConfigError, TargetNotReachedError, type SupervisorStatus } from "./live-shadow-supervisor";
 import { SUPERVISOR_CLI_USAGE, SupervisorCliUsageError, parseSupervisorCliArgs } from "./live-shadow-supervisor-cli-args";
 import { ScannerPathError, assertOutsideRepository, scannerKlineCacheDir, scannerRootDir } from "./scanner-paths";
 import { acquireLiveShadowLock } from "./scanner-lock";
@@ -23,11 +23,11 @@ import {
   assertEngineNamespace,
   engineNamespaceDir,
   engineNamespaceManifestOf,
-  liveShadowEngineDir,
   profileSummaryOf,
 } from "./scanner-profile";
-import { RunManifestError, SUPERVISOR_RUN_MANIFEST_SCHEMA, buildRunManifest, makeRunId, runManifestText } from "./supervisor-run-manifest";
-import { UniverseSelectionError, parseExchangeInfoContracts, selectSymbols, selectUsdtPerpetualUniverse, universeWalk } from "./usdm-universe";
+import { RunManifestError, makeRunId, runManifestText } from "./supervisor-run-manifest";
+import { connectionCapacityOf, supervisorLiveDirFor, supervisorRunManifestOf, supervisorSelectionOf } from "./supervisor-run-plan";
+import { UniverseSelectionError, parseExchangeInfoContracts, selectUsdtPerpetualUniverse } from "./usdm-universe";
 
 /**
  * MULTI-SYMBOL NATIVE LIVE-SHADOW SUPERVISOR — SHADOW ONLY.
@@ -155,16 +155,10 @@ async function main(): Promise<void> {
   // The same universe and selection rules as the ranker; explicit symbols must be active USDT perpetuals.
   const universe = selectUsdtPerpetualUniverse(parseExchangeInfoContracts(await new PublicRequestController(fetchDeps).getJson(buildPublicFuturesUrl(baseUrl, EXCHANGE_INFO_PATH))));
   // EXPLICIT: exactly the named symbols, never substituted. UNIVERSE: walk the universe and
-  // accept SCANNER-ELIGIBLE symbols until --max-symbols are accepted, or all of them (--all-active).
-  let selection: SupervisorSelection;
-  if (options.selection.mode === "EXPLICIT") {
-    const explicit = selectSymbols(universe, options.selection);
-    selection = { mode: "EXPLICIT", candidates: explicit.contracts.map((c) => ({ symbol: c.symbol, onboardDateMs: c.onboardDateMs, required: true })) };
-  } else {
-    const walk = universeWalk(universe, options.selection).map(({ contract, required }) => ({ symbol: contract.symbol, onboardDateMs: contract.onboardDateMs, required }));
-    selection = options.selection.maxSymbols === null ? { mode: "ALL_ACTIVE", candidates: walk } : { mode: "TARGET", candidates: walk, target: options.selection.maxSymbols };
-  }
+  // accept SCANNER-ELIGIBLE symbols until --max-symbols are accepted, or all of them (--all-active / an all-active profile).
+  const selection = supervisorSelectionOf(universe, options.selection);
   const started = Date.now();
+  const stateDirOf = supervisorLiveDirFor(root, profile, options.lineage.chartInterval);
   const supervisor = new LiveShadowSupervisor(
     {
       lineage: options.lineage,
@@ -177,13 +171,7 @@ async function main(): Promise<void> {
       maxProcessingLagMs: options.maxProcessingLagMs,
       staleSymbolMs: options.staleSymbolMs,
       maxRecoveryAttempts: options.maxRecoveryAttempts,
-      liveDirFor: (symbol) =>
-        assertOutsideRepository(
-          profile === null
-            ? liveShadowDir(root, symbol, options.lineage.chartInterval)
-            : liveShadowEngineDir(root, profile.engineFingerprint, SCANNER_MARKET_TYPE, symbol, options.lineage.chartInterval),
-          REPO_ROOT
-        ),
+      liveDirFor: (symbol) => assertOutsideRepository(stateDirOf(symbol), REPO_ROOT),
       runId,
       profile,
     },
@@ -208,6 +196,9 @@ async function main(): Promise<void> {
         : `explicit symbols: ${selection.candidates.length}`
   );
   console.log(`interval: ${options.lineage.chartInterval}`);
+  console.log(
+    `connection capacity: ${connectionCapacityOf(options.symbolsPerConnection, options.maxConnections)} symbols (${options.maxConnections} connections max x ${options.symbolsPerConnection} per connection; only those needed are opened; a larger accepted set is refused, never truncated)`
+  );
 
   const statusDir = assertOutsideRepository(path.join(root, "live-shadow-supervisor"), REPO_ROOT);
   const statusFile = path.join(statusDir, "status.json");
@@ -248,33 +239,15 @@ async function main(): Promise<void> {
   const sel = supervisor.status().selection;
   // The run manifest: written ONCE (flag wx: never overwritten), after selection, so a pinned consumer
   // can bind to exactly this run's accepted symbols, profile and engine.
-  const counts = sel ?? {
-    mode: "EXPLICIT", universeActive: null, targetEligible: null, candidatesTested: 0, acceptedEligible: 0,
-    skippedTooNew: 0, skippedInsufficientHistory: 0, skippedOther: 0, universeExhausted: true,
-  };
-  const manifest = buildRunManifest({
-    schema: SUPERVISOR_RUN_MANIFEST_SCHEMA,
+  const manifest = supervisorRunManifestOf({
     runId,
     startedAt: supervisor.startedAt,
     gitHead,
-    marketType: SCANNER_MARKET_TYPE,
     chartInterval: options.lineage.chartInterval,
     engineFingerprint: supervisor.engineFingerprint,
     profile,
-    stateLayout: profile === null ? "LEGACY" : "ENGINE_NAMESPACE",
-    selection: {
-      mode: counts.mode,
-      universeActive: counts.universeActive,
-      targetEligible: counts.targetEligible,
-      candidatesTested: counts.candidatesTested,
-      acceptedEligible: supervisor.acceptedSymbols().length,
-      skippedTooNew: counts.skippedTooNew,
-      skippedInsufficientHistory: counts.skippedInsufficientHistory,
-      skippedOther: counts.skippedOther,
-      universeExhausted: counts.universeExhausted,
-    },
+    selection: sel,
     symbols: supervisor.acceptedSymbols(),
-    actionable: false,
   });
   mkdirSync(runDir, { recursive: true });
   writeFileSync(path.join(runDir, "manifest.json"), runManifestText(manifest), { encoding: "utf8", flag: "wx" });

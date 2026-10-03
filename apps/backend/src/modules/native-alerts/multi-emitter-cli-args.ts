@@ -41,7 +41,7 @@ export const MULTI_EMITTER_DEFAULTS = Object.freeze({ pollMs: 2_000, queueCapaci
 
 export const MULTI_EMITTER_CLI_USAGE = [
   "Usage (DASHBOARD ALERTS ONLY — native alerts are never executed):",
-  "  native-alerts:multi-emitter --profile teddy-aggressive --run-id <supervisor run id> --expect-engine-fingerprint <sha256>",
+  "  native-alerts:multi-emitter --profile <teddy-aggressive|teddy-7-all-active> --run-id <supervisor run id> --expect-engine-fingerprint <sha256>",
   `    [--follow [--poll-ms ${MULTI_EMITTER_DEFAULTS.pollMs}]] [--duration-minutes N] [--queue-capacity ${MULTI_EMITTER_DEFAULTS.queueCapacity}] [--status-every-s ${MULTI_EMITTER_DEFAULTS.statusEverySeconds}]`,
   "    [--dry-run-from-start]                        (dry run only: evaluate each whole log; writes nothing)",
   "    [--commit-dashboard-alerts [--activate-at-eof]] (persistent delivery; first activation starts at current EOF)",

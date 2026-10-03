@@ -29,7 +29,7 @@ import { FileEmitterCursorStore, emitterCursorDir, emitterRunDir, readTextIfExis
  * MULTI-SYMBOL NATIVE ALERT EMITTER, pinned to ONE supervisor run of ONE profile.
  *
  *   DOTENV_CONFIG_PATH=<generic env file> pnpm --filter @trading-alert-dashboard/backend \
- *     native-alerts:multi-emitter --profile teddy-aggressive --run-id <id> --expect-engine-fingerprint <sha256> [--follow]
+ *     native-alerts:multi-emitter --profile <teddy-aggressive|teddy-7-all-active> --run-id <id> --expect-engine-fingerprint <sha256> [--follow]
  *
  * Reads only the durable shadow logs of the symbols that run ACCEPTED, inside
  * the profile's engine namespace. DRY RUN (the default) writes nothing — no
