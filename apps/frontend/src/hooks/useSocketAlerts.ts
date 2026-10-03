@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import { getSocket } from "../sockets/socket";
 import { SOCKET_EVENTS } from "../sockets/socket-events";
+import { insertLiveAlert } from "../features/alerts/liveAlerts";
 import type { Alert } from "../types/alert";
 
 /**
@@ -14,7 +15,7 @@ export function useSocketAlerts(setAlerts: Dispatch<SetStateAction<Alert[]>>): v
     const socket = getSocket();
 
     function handleNewAlert(alert: Alert) {
-      setAlerts((prev) => [alert, ...prev.filter((a) => a.id !== alert.id)]);
+      setAlerts((prev) => insertLiveAlert(prev, alert));
     }
 
     function handleAlertUpdated(alert: Alert) {
