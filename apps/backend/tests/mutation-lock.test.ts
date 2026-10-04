@@ -531,6 +531,9 @@ describe("what the authority records", () => {
       "RETURN_TO_SAFE",
       "RECOVER_TRANSITION",
       "SUPERVISE_RESTART",
+      // The optional Native planner role's own explicit start / stop.
+      "NATIVE_PLANNER_START",
+      "NATIVE_PLANNER_STOP",
     ]);
   });
 });

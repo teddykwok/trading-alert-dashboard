@@ -42,7 +42,7 @@ const rowsOf = (p: ExtremeRRPlanDto | null) => Object.fromEntries(presentSelecte
 describe("the selected, frozen plan as Trading Control and the Execution tab read it", () => {
   it("26. a selected Native plan: 100 candles, LONG, entry, SL, TP, 1:1.5, NATIVE, PLANNING ONLY / EXECUTION DISABLED", () => {
     expect(rowsOf(plan())).toEqual({
-      "Selected plan": "100 candles", Direction: "LONG", Entry: "100", SL: "80", TP: "130", RR: "1:1.5", Source: "NATIVE", Status: "PLANNING ONLY / EXECUTION DISABLED",
+      "Plan selection (global)": "100 candles", Direction: "LONG", Entry: "100", SL: "80", TP: "130", RR: "1:1.5", Source: "NATIVE", Status: "PLANNING ONLY / EXECUTION DISABLED",
     });
     expect(presentSelectedPlan(selectedPlanSummaryOf(plan())).headline).toBe("Selected plan");
     expect(NATIVE_PLAN_EXECUTION_STATUS).toBe("PLANNING ONLY / EXECUTION DISABLED");
@@ -50,7 +50,7 @@ describe("the selected, frozen plan as Trading Control and the Execution tab rea
 
   it("only the persisted selected lookback counts, for each of 50/100/200/300", () => {
     for (const [lookback, sl, tp] of [[50, "90", "115"], [100, "80", "130"], [200, "70", "145"], [300, "60", "160"]] as const) {
-      expect(rowsOf(plan({ selectedLookback: lookback }))).toMatchObject({ "Selected plan": `${lookback} candles`, SL: sl, TP: tp });
+      expect(rowsOf(plan({ selectedLookback: lookback }))).toMatchObject({ "Plan selection (global)": `${lookback} candles`, SL: sl, TP: tp });
     }
   });
 
@@ -64,7 +64,7 @@ describe("the selected, frozen plan as Trading Control and the Execution tab rea
     }
     expect(rowsOf(plan({ status: "ERROR", errorReason: "Binance unavailable" }))["Not calculable"]).toBe("Binance unavailable");
     expect(presentSelectedPlan(null)).toMatchObject({ headline: "No selected plan", rows: [], status: NO_SELECTED_PLAN });
-    expect(rowsOf(plan({ candidates: [candidate(100, { actualCandles: 40, complete: false })] }))["Selected plan"]).toBe("100 candles (only 40 available)");
+    expect(rowsOf(plan({ candidates: [candidate(100, { actualCandles: 40, complete: false })] }))["Plan selection (global)"]).toBe("100 candles (only 40 available)");
   });
 
   it("the summary itself (what the API returns) carries no price unless the selected plan is READY and valid", () => {

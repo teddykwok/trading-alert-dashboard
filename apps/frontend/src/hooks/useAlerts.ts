@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { alertsApi } from "../api/alerts.api";
+import { acceptLiveAlert, insertLiveAlert } from "../features/alerts/liveAlerts";
 import type { Alert } from "../types/alert";
 import type { AlertListQuery } from "../types/api";
 
@@ -41,6 +42,9 @@ export function useAlerts(filters: AlertListQuery) {
   // Bumped on every filter-driven refetch; in-flight responses that lost the
   // race check it before touching state.
   const generationRef = useRef(0);
+  // Every alert id this list has already counted (REST pages + accepted live
+  // alerts). The one place a live alert's uniqueness is decided.
+  const knownIdsRef = useRef<Set<string>>(new Set());
 
   const filtersKey = JSON.stringify(filters);
 
@@ -52,6 +56,7 @@ export function useAlerts(filters: AlertListQuery) {
       const response = await alertsApi.list({ ...filters, offset: 0 });
       if (generation !== generationRef.current) return;
       nextOffsetRef.current = response.items.length;
+      knownIdsRef.current = new Set(response.items.map((alert) => alert.id));
       setAlerts(response.items);
       setTotal(response.total);
     } catch (err) {
@@ -72,6 +77,7 @@ export function useAlerts(filters: AlertListQuery) {
       const response = await alertsApi.list({ ...filters, offset: nextOffsetRef.current });
       if (generation !== generationRef.current) return;
       nextOffsetRef.current += response.items.length;
+      for (const alert of response.items) knownIdsRef.current.add(alert.id);
       setTotal(response.total);
       setAlerts((previous) => appendDeduped(previous, response.items));
     } catch (err) {
@@ -89,7 +95,25 @@ export function useAlerts(filters: AlertListQuery) {
     return () => clearTimeout(timer);
   }, [refetch]);
 
+  /**
+   * A live socket alert: the card is inserted (or replaced) exactly as before,
+   * and a GENUINELY new alert that matches the active filters adds one to the
+   * server total. A duplicate frame changes neither the list length nor the
+   * total. The server paging offset is deliberately left alone (see above): the
+   * next page's re-served tail row is absorbed by dedupe, and the next refetch
+   * replaces the total with the server's truth.
+   */
+  const applyLiveAlert = useCallback(
+    (alert: Alert) => {
+      const { totalDelta } = acceptLiveAlert(knownIdsRef.current, alert, filters);
+      setAlerts((previous) => insertLiveAlert(previous, alert));
+      if (totalDelta === 1) setTotal((current) => current + 1);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filtersKey]
+  );
+
   const hasMore = alerts.length > 0 && nextOffsetRef.current < total;
 
-  return { alerts, setAlerts, total, loading, loadingMore, hasMore, error, refetch, loadMore };
+  return { alerts, setAlerts, total, loading, loadingMore, hasMore, error, refetch, loadMore, applyLiveAlert };
 }

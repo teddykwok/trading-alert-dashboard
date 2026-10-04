@@ -7,15 +7,17 @@ import type { Alert } from "../types/alert";
 
 /**
  * Wires the shared Socket.IO connection to an alerts state setter:
- * - new_alert: prepend to the feed
+ * - new_alert: prepend to the feed (or hand it to `onNewAlert`, which owns the
+ *   list's uniqueness and total bookkeeping, e.g. useAlerts().applyLiveAlert)
  * - alert_updated / alert_failed / alert_duplicate: patch the matching alert in place
  */
-export function useSocketAlerts(setAlerts: Dispatch<SetStateAction<Alert[]>>): void {
+export function useSocketAlerts(setAlerts: Dispatch<SetStateAction<Alert[]>>, onNewAlert?: (alert: Alert) => void): void {
   useEffect(() => {
     const socket = getSocket();
 
     function handleNewAlert(alert: Alert) {
-      setAlerts((prev) => insertLiveAlert(prev, alert));
+      if (onNewAlert) onNewAlert(alert);
+      else setAlerts((prev) => insertLiveAlert(prev, alert));
     }
 
     function handleAlertUpdated(alert: Alert) {
@@ -33,5 +35,5 @@ export function useSocketAlerts(setAlerts: Dispatch<SetStateAction<Alert[]>>): v
       socket.off(SOCKET_EVENTS.ALERT_FAILED, handleAlertUpdated);
       socket.off(SOCKET_EVENTS.ALERT_DUPLICATE, handleAlertUpdated);
     };
-  }, [setAlerts]);
+  }, [setAlerts, onNewAlert]);
 }

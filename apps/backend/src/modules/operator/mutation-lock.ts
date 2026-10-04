@@ -75,6 +75,9 @@ export const MUTATION_ACTIONS = [
   "RETURN_TO_SAFE",
   "RECOVER_TRANSITION",
   "SUPERVISE_RESTART",
+  // The OPTIONAL Native planner role's own explicit start / stop (never part of Start SAFE).
+  "NATIVE_PLANNER_START",
+  "NATIVE_PLANNER_STOP",
 ] as const;
 
 export type MutationAction = (typeof MUTATION_ACTIONS)[number];

@@ -48,6 +48,20 @@ The frontend is **not** launcher-managed. Start it separately when you need it.
 6. **Supervise Account B Worker**
 7. **Exit**
 
+### Optional: the Native planner worker
+
+Three further menu items manage one **optional** generic role, the
+planning-only Native planner worker:
+
+- **11. Start Native Planner**: starts exactly one planner, from `generic.env`.
+- **12. Supervise Native Planner**: restarts it if it exits.
+- **13. Stop Native Planner**: stops only a planner this launcher started.
+
+It is not one of the six roles. Start SAFE never starts it, topology
+verification never requires it, and Stop Runtime never touches it. Its
+ownership record lives in its own state file, so it can never block or be
+erased by the six-role runtime. See [native-planner-worker.md](native-planner-worker.md).
+
 ## Start SAFE proves SAFE before it starts anything
 
 Three proofs, in this order.
