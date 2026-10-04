@@ -20,8 +20,10 @@ import {
   type ExtremeRRPlanDto,
   type ExtremeRRPlanStatus,
   type ExtremeRRTemplateSnapshot,
+  type NativeAccountPlanPolicy,
   type NativePlanListDto,
   type SelectedPlanAccountOutcomeDto,
+  previewNativeAccountPlan,
   selectedPlanSummaryOf,
 } from "@trading-alert-dashboard/shared";
 import { getClosedCandlesBefore } from "../market-data/market-data.service";
@@ -33,6 +35,7 @@ import { NATIVE_ALERT_SOURCE, assertNotNativeAlert } from "../alerts/alert-sourc
 import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import type { ExtremeRRSelectionInput } from "./extreme-rr.schema";
+import { configuredNativeAccountPlanPolicies } from "../native-planning/native-account-plan-policy";
 
 /**
  * Injectable so tests can freeze the candle dataset. The default fetcher uses
@@ -304,9 +307,10 @@ export class ExtremeRRService {
    * existing plan.
    */
   async ensurePendingPlan(alert: Alert): Promise<void> {
-    // A NATIVE alert is never queued for background planning: its plan is
-    // generated on demand only (generateForAlert), so no worker, no Telegram
-    // and no eager row ever exist for it.
+    // A NATIVE alert never enters the TradingView planning queue: it has its
+    // own dedicated, planning-only Native queue and PENDING intent
+    // (modules/native-planning) with no Telegram, or is generated on demand
+    // (generateForAlert).
     assertNotNativeAlert(alert, "queued Extreme RR planning");
     const direction = ExtremeRRService.assertDirectional(alert);
     const existing = await this.prisma.extremeRRPlan.findUnique({ where: { alertId: alert.id } });
@@ -507,13 +511,18 @@ export class ExtremeRRService {
 
   /**
    * The most recently updated Native plans, each as its selected, frozen
-   * summary. READ ONLY: it generates nothing and writes nothing, and every
-   * item says NATIVE_PLAN_EXECUTION_STATUS.
+   * summary plus each account's DEFAULT-lookback preview. READ ONLY: it
+   * generates nothing and writes nothing (no plan, no selection, no adoption),
+   * and every item says NATIVE_PLAN_EXECUTION_STATUS.
    */
-  async listNativePlans(limit: number = NATIVE_PLAN_LIST_LIMIT.default): Promise<NativePlanListDto> {
+  async listNativePlans(
+    limit: number = NATIVE_PLAN_LIST_LIMIT.default,
+    policies?: readonly NativeAccountPlanPolicy[]
+  ): Promise<NativePlanListDto> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > NATIVE_PLAN_LIST_LIMIT.max) {
       throw new ValidationError(`limit must be an integer 1..${NATIVE_PLAN_LIST_LIMIT.max}`);
     }
+    const accountPolicies = [...(policies ?? (await configuredNativeAccountPlanPolicies()))];
     const plans = await this.prisma.extremeRRPlan.findMany({
       where: { alert: { source: NATIVE_ALERT_SOURCE } },
       orderBy: [{ updatedAt: "desc" }, { id: "asc" }],
@@ -522,13 +531,20 @@ export class ExtremeRRService {
     });
     return {
       nativeExecutionEnabled: false,
-      items: plans.map((plan) => ({
-        alertId: plan.alertId,
-        symbol: plan.alert.symbol,
-        sourceTimeframe: plan.alert.sourceTimeframe,
-        triggeredAt: plan.alert.triggeredAt.toISOString(),
-        plan: selectedPlanSummaryOf(this.serialize(plan, planAlertSourceOf(plan.alert.source))),
-      })),
+      accountPolicies,
+      items: plans.map((plan) => {
+        const dto = this.serialize(plan, planAlertSourceOf(plan.alert.source));
+        return {
+          alertId: plan.alertId,
+          symbol: plan.alert.symbol,
+          sourceTimeframe: plan.alert.sourceTimeframe,
+          triggeredAt: plan.alert.triggeredAt.toISOString(),
+          plan: selectedPlanSummaryOf(dto),
+          availableLookbacks: dto.status === "READY" ? dto.candidates.filter((c) => c.valid).map((c) => c.requestedCandles) : [],
+          // Each account from its OWN policy; the plan's global selectedLookback is not consulted.
+          accountDefaults: accountPolicies.map((policy) => previewNativeAccountPlan(dto, policy)),
+        };
+      }),
     };
   }
 

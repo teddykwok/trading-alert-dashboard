@@ -12,10 +12,10 @@ export function isNativeAlert(alert: Pick<Alert, "source">): boolean {
 export const NATIVE_ALERT_BADGE_LABEL = "Native";
 
 export const NATIVE_ALERT_BADGE_TITLE =
-  "Native scanner alert — dashboard only. Not a TradingView alert; plans and execution are disabled.";
+  "Native scanner alert — dashboard only. Not a TradingView alert; its plan is planning only and execution is disabled.";
 
 export const NATIVE_ALERT_PLAN_NOTICE =
-  "This is a native scanner alert, delivered to the dashboard only. Its Extreme RR plan is planning only, generated on demand from the same frozen pre-alert candles; execution is hard-disabled for native alerts, for every source timeframe.";
+  "This is a native scanner alert, delivered to the dashboard only. Its Extreme RR plan is planning only, generated automatically after delivery (or on demand) from the same frozen pre-alert candles; execution is hard-disabled for native alerts, for every source timeframe.";
 
 /**
  * The native scanner PROFILE a native alert was delivered under, as recorded in

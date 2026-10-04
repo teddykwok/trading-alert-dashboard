@@ -50,7 +50,7 @@ export const NATIVE_EVIDENCE_EXPLANATION: Readonly<Record<string, string>> = Obj
 
 export const NATIVE_PIPELINE_NOT_APPLICABLE = "Not applicable — Native alerts skip the TradingView screenshot and AI pipeline";
 export const NATIVE_EXECUTION_DISABLED = "Disabled — dashboard only (actionable = false)";
-export const NATIVE_PLAN_PLANNING_ONLY = "Planning only — generated on demand in Trade Plan; never executed";
+export const NATIVE_PLAN_PLANNING_ONLY = "Planning only — generated automatically after delivery (or on demand in Trade Plan); never executed";
 
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 

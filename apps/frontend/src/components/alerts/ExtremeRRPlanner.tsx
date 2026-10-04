@@ -54,7 +54,7 @@ export function ExtremeRRPlanner({ alert }: { alert: Alert }) {
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const directional = alert.signal === "LONG" || alert.signal === "SHORT";
-  // The same planner for both sources; a Native plan is planning only and is generated on demand.
+  // The same planner for both sources; a Native plan is planning only (generated automatically after delivery, or on demand).
   const native = isNativeAlert(alert);
 
   useEffect(() => {
@@ -187,7 +187,7 @@ export function ExtremeRRPlanner({ alert }: { alert: Alert }) {
         <div className="flex flex-col gap-2">
           <p className="text-sm text-slate-500">
             {native
-              ? "No plan yet. Native alerts are planned on demand, from the chart candles that closed before the alert — never newer candles. The plan is planning only: it is never executed."
+              ? "No plan yet. New Native alerts are planned automatically after delivery, and any Native alert can be planned on demand — always from the chart candles that closed before the alert, never newer candles. The plan is planning only: it is never executed."
               : "No plan exists for this alert (it predates the Extreme RR feature). Generation uses the alert's original trigger time as the candle cutoff — never newer candles."}
           </p>
           <div>

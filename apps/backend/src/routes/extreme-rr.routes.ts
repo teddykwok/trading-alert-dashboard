@@ -27,7 +27,8 @@ export async function extremeRRRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // Manual generation for eligible (LONG/SHORT) alerts — TradingView and
-  // Native alike (a Native alert is planned on demand only, never queued). Always uses the
+  // Native alike (a new Native alert is also planned automatically by the separate,
+  // planning-only Native planning worker; never the TradingView queue). Always uses the
   // alert's ORIGINAL triggeredAt as the candle cutoff; a READY plan is
   // returned unchanged (frozen). Generation failures come back as a plan
   // with status ERROR, never as a 500.
