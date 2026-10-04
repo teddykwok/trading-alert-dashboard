@@ -1,11 +1,13 @@
 import path from "node:path";
 import {
-  NATIVE_HISTORICAL_STATE_SEMANTICS,
+  NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1,
   NATIVE_SOURCE_TF_ORDER,
   NATIVE_TIMING_MODES,
   SWITCHOVER_TRUNCATED_CLOSED_BARS,
   createNativeEngineConfig,
+  historicalStateSemanticsOf,
   pinePercentInputToFraction,
+  type NativeLevelLifecycle,
   type NativePartialPeriodPolicy,
   type NativeSourceTf,
   type NativeTimingMode,
@@ -13,7 +15,7 @@ import {
 
 import { SCANNER_MARKET_TYPE, intervalMsOf, type ScannerChartInterval, type ScannerMarketType } from "./binance-public-futures";
 import { canonicalSha256 } from "./canonical-json";
-import { NATIVE_ENGINE_SEMANTICS } from "./historical-replay";
+import { engineSemanticsOf as engineSemanticsIdOf } from "./historical-replay";
 import type { LineageConfig } from "./live-shadow-cli-args";
 import { SCANNER_KLINE_SOURCE, buildScannerLineage, deriveHtfContextStartMs, type ScannerLineage } from "./scanner-lineage";
 
@@ -93,6 +95,12 @@ export interface EnginePolicy {
   readonly maxLevels: number;
   readonly timing: NativeTimingMode;
   readonly partialPeriodPolicy: NativePartialPeriodPolicy;
+  /**
+   * How source levels live (see NATIVE_LIFECYCLE_* in the shared engine).
+   * Absent = the legacy PINE_V55_EDGE_FROZEN lifecycle, so a legacy profile's
+   * engine, lineage and fingerprint are exactly what they always were.
+   */
+  readonly lifecycle?: NativeLevelLifecycle;
 }
 
 export const NATIVE_DELIVERY_V2_VERSION = "NATIVE_DELIVERY_V2" as const;
@@ -241,6 +249,9 @@ export const TEDDY_7_ALL_ACTIVE_V1: ScannerProfile = Object.freeze({
     maxLevels: 500,
     timing: "Immediate",
     partialPeriodPolicy: SWITCHOVER_TRUNCATED_CLOSED_BARS,
+    // The Teddy product rule: one dynamic candidate per source period and colour,
+    // finalized at the source close; full-bar timers; causal history.
+    lifecycle: NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1,
   }),
   delivery: Object.freeze({
     layer: "DASHBOARD_DELIVERY",
@@ -348,6 +359,7 @@ export function lineageConfigOf(engine: EnginePolicy): LineageConfig {
     maxLevels: engine.maxLevels,
     enabledSourceTfs: canonicalTfs(engine.engineSourceTimeframes, "engine source timeframes"),
     timing: engine.timing,
+    lifecycle: engine.lifecycle,
   });
   return { chartInterval: engine.chartInterval, engine: engineConfig, historyStartMs, switchoverMs };
 }
@@ -394,8 +406,8 @@ export function engineFingerprintOfConfig(config: LineageConfig, marketType: Sca
       compatibilitySwitchoverMs: config.switchoverMs,
       htfContextStartMs: deriveHtfContextStartMs(config.historyStartMs, engineConfig.enabledSourceTfs, engineConfig.calendar),
       klineSource: SCANNER_KLINE_SOURCE,
-      engineSemantics: NATIVE_ENGINE_SEMANTICS,
-      historicalStateSemantics: NATIVE_HISTORICAL_STATE_SEMANTICS,
+      engineSemantics: engineSemanticsIdOf(engineConfig),
+      historicalStateSemantics: historicalStateSemanticsOf(engineConfig),
       engineConfig,
       partialPeriodPolicy: SWITCHOVER_TRUNCATED_CLOSED_BARS,
     })
@@ -466,6 +478,8 @@ export interface ProfileSummary {
     readonly maxLevels: number;
     readonly timing: string;
     readonly partialPeriodPolicy: string;
+    /** Present only for a non-legacy lifecycle, so a legacy profile's summary is unchanged. */
+    readonly lifecycle?: NativeLevelLifecycle;
   };
   readonly delivery: { readonly policyVersion: string; readonly dashboardSourceTimeframes: readonly string[]; readonly evidenceClasses: readonly string[] };
   readonly execution: { readonly futureExecutionSourceTimeframes: readonly string[]; readonly nativeExecutionEnabled: false; readonly notice: string };
@@ -497,6 +511,7 @@ export function profileSummaryOf(profile: ScannerProfile): ProfileSummary {
       maxLevels: e.maxLevels,
       timing: e.timing,
       partialPeriodPolicy: e.partialPeriodPolicy,
+      ...(e.lifecycle === NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1 ? { lifecycle: e.lifecycle } : {}),
     },
     delivery: {
       policyVersion: profile.delivery.policyVersion,

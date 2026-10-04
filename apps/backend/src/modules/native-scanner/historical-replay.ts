@@ -1,6 +1,7 @@
 import {
   NATIVE_SOURCE_TF_ORDER,
   htfPeriodStartMs,
+  isDynamicLifecycle,
   replayNativeEngineWithImmediate,
   type NativeCandidate,
   type NativeEngineConfig,
@@ -39,6 +40,19 @@ import { findKlineGaps, serializeKlines, sha256Hex } from "./kline-cache";
 export const NATIVE_REPLAY_VERSION = "teddy-native-replay/1";
 /** The engine semantics this replay drives (Slice 1 + Slice 1b). */
 export const NATIVE_ENGINE_SEMANTICS = "pine-v5.5/continuous-realtime-committed+immediate-intrabar-reconstruction";
+/**
+ * The TEDDY_DYNAMIC_SOURCE_LEVEL_V1 engine: one forming candidate per source
+ * period and colour that follows the extreme and finalizes (or is discarded)
+ * at the source close; N-FULL-bar timers; an emitted Immediate alert always
+ * consumes its cooldown.
+ */
+export const NATIVE_DYNAMIC_ENGINE_SEMANTICS = "teddy-dynamic-source-level/v1/committed+immediate-intrabar-reconstruction+full-bar-timers";
+export type NativeEngineSemantics = typeof NATIVE_ENGINE_SEMANTICS | typeof NATIVE_DYNAMIC_ENGINE_SEMANTICS;
+
+/** The engine semantics a canonical config's lifecycle implies. */
+export function engineSemanticsOf(config: Pick<NativeEngineConfig, "lifecycle">): NativeEngineSemantics {
+  return isDynamicLifecycle(config) ? NATIVE_DYNAMIC_ENGINE_SEMANTICS : NATIVE_ENGINE_SEMANTICS;
+}
 export const REPLAY_RECORD_SCHEMA = "teddy.native-replay.candidate.v1";
 export const REPLAY_MANIFEST_SCHEMA = "teddy.native-replay.manifest.v1";
 

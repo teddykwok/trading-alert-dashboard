@@ -60,6 +60,29 @@ export const NATIVE_SOURCE_TF_ORDER: readonly NativeSourceTf[] = Object.freeze([
 export const NATIVE_LEVEL_CONDITIONS = ["GOR", "ROR", "GOG", "ROG"] as const;
 export type NativeLevelCondition = (typeof NATIVE_LEVEL_CONDITIONS)[number];
 
+/**
+ * HOW SOURCE LEVELS LIVE. Two versioned lifecycles, selected per engine config:
+ *
+ *  PINE_V55_EDGE_FROZEN (the legacy default; the config carries NO `lifecycle`
+ *  key, so every legacy config and fingerprint is byte-identical to before):
+ *    every FALSE->TRUE qualification edge pushes a level frozen at the running
+ *    extreme of that moment; timers count `bars since >= N`.
+ *
+ *  TEDDY_DYNAMIC_SOURCE_LEVEL_V1 (the Teddy product rule):
+ *    one FORMING candidate per (source TF, source period, colour). It is active
+ *    while that colour qualifies (GREEN = GOR or GOG, RED = ROR or ROG), its
+ *    price follows the period's running high (GREEN) / low (RED), it keeps its
+ *    first-qualification anchor through any off/on flicker, and it is never
+ *    armed, retested or alerted. When the source candle closes, a candidate that
+ *    still qualifies becomes exactly ONE persistent level at the final extreme;
+ *    one that does not is discarded. Only persistent levels arm and retest, and
+ *    timers require N FULL chart bars after the anchor (`bars since > N`).
+ */
+export const NATIVE_LIFECYCLE_PINE_V55_EDGE = "PINE_V55_EDGE_FROZEN" as const;
+export const NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1 = "TEDDY_DYNAMIC_SOURCE_LEVEL_V1" as const;
+export type NativeLevelLifecycle = typeof NATIVE_LIFECYCLE_PINE_V55_EDGE | typeof NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1;
+export const NATIVE_LEVEL_LIFECYCLES: readonly NativeLevelLifecycle[] = Object.freeze([NATIVE_LIFECYCLE_PINE_V55_EDGE, NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1] as const);
+
 /** Pine `touchAlertTiming` (line 89), spelled exactly as the webhook note does. */
 export type NativeTimingMode = "Immediate" | "Bar Close";
 export const NATIVE_TIMING_MODES: readonly NativeTimingMode[] = Object.freeze(["Immediate", "Bar Close"] as const);
@@ -144,6 +167,16 @@ export interface NativeEngineConfig {
   /** `touchAlertTiming` (line 89). Does not change committed state; see file header. */
   readonly timing: NativeTimingMode;
   readonly calendar: CalendarAlignment;
+  /**
+   * Present ONLY for the dynamic lifecycle. Absent means PINE_V55_EDGE_FROZEN,
+   * so a legacy config (and everything hashed from it) is unchanged.
+   */
+  readonly lifecycle?: typeof NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1;
+}
+
+/** The lifecycle a canonical config selects. */
+export function nativeLevelLifecycleOf(config: Pick<NativeEngineConfig, "lifecycle">): NativeLevelLifecycle {
+  return config.lifecycle === NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1 ? NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1 : NATIVE_LIFECYCLE_PINE_V55_EDGE;
 }
 
 /**
@@ -164,7 +197,7 @@ export const PINE_V55_INPUT_DEFAULTS = Object.freeze({
 });
 
 export type NativeEngineConfigInput = Pick<NativeEngineConfig, "minMovePct"> &
-  Partial<Omit<NativeEngineConfig, "minMovePct">>;
+  Partial<Omit<NativeEngineConfig, "minMovePct" | "lifecycle">> & { readonly lifecycle?: NativeLevelLifecycle };
 
 /** Pine's own conversion: a percentage-point input divided by 100, once. */
 export function pinePercentInputToFraction(percentPoints: number): number {
@@ -207,6 +240,30 @@ export interface NativeHtfAggregate {
 
 export type NativeConditionFlags = Readonly<Record<NativeLevelCondition, boolean>>;
 
+/**
+ * TEDDY_DYNAMIC_SOURCE_LEVEL_V1: the one forming candidate of a colour in the
+ * current source period. Engine state only — never persisted as a row, never
+ * armed, never retested, never alerted.
+ */
+export interface NativeFormingCandidate {
+  readonly color: NativeLevelColor;
+  readonly periodStartMs: number;
+  /** The creation anchor: the chart bar whose close FIRST qualified this colour. Never reset by flicker. */
+  readonly firstQualifiedBarIndex: number;
+  readonly firstQualifiedBarOpenTimeMs: number;
+  /** Does the colour qualify at the latest close? Inactive candidates are not tradable. */
+  readonly active: boolean;
+  /** The period's running high (GREEN) or low (RED) at the latest close. */
+  readonly price: number;
+  /** The condition qualifying at the latest active close (GOR/GOG or ROR/ROG). */
+  readonly condition: NativeLevelCondition;
+}
+
+export interface NativeFormingCandidates {
+  readonly GREEN: NativeFormingCandidate | null;
+  readonly RED: NativeFormingCandidate | null;
+}
+
 export interface NativeHtfTrack {
   readonly aggregate: NativeHtfAggregate | null;
   /**
@@ -215,6 +272,8 @@ export interface NativeHtfTrack {
    * previous value never enables an edge.
    */
   readonly previousFlags: NativeConditionFlags | null;
+  /** Dynamic lifecycle only (absent for the legacy one): this period's forming candidates. */
+  readonly candidates?: NativeFormingCandidates;
 }
 
 export interface NativeEngineState {
@@ -491,7 +550,11 @@ export function createNativeEngineConfig(input: NativeEngineConfigInput): Native
     refuseConfig("calendar.multiMonthAnchorMonth must be an integer 0..11");
   }
 
+  const lifecycle = input.lifecycle ?? NATIVE_LIFECYCLE_PINE_V55_EDGE;
+  if (!NATIVE_LEVEL_LIFECYCLES.includes(lifecycle)) refuseConfig(`lifecycle must be one of: ${NATIVE_LEVEL_LIFECYCLES.join(", ")}`);
+
   return Object.freeze({
+    ...(lifecycle === NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1 ? { lifecycle: NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1 } : {}),
     minMovePct: input.minMovePct,
     touchTolerancePct,
     touchCooldownBars,
@@ -522,6 +585,21 @@ export function createNativeEngineConfig(input: NativeEngineConfigInput): Native
 
 /** Bumped whenever historical reconstruction semantics change. */
 export const NATIVE_HISTORICAL_STATE_SEMANTICS = "pine-v5.5/historical-lookahead-on/v1";
+
+/**
+ * TEDDY_DYNAMIC_SOURCE_LEVEL_V1 history: NO look-ahead. The chart history is
+ * replayed forward bar by bar through the very same engine step the live
+ * scanner uses; context bars only establish each source candle's real open.
+ * No HTF extreme can appear before it was printed, and nothing is truncated at
+ * the switchover — the switchover is only where live evidence begins.
+ */
+export const NATIVE_DYNAMIC_HISTORICAL_STATE_SEMANTICS = "teddy-dynamic-source-level/causal-history/v1";
+export type NativeHistoricalStateSemantics = typeof NATIVE_HISTORICAL_STATE_SEMANTICS | typeof NATIVE_DYNAMIC_HISTORICAL_STATE_SEMANTICS;
+
+/** The historical semantics a config's lifecycle implies. */
+export function historicalStateSemanticsOf(config: Pick<NativeEngineConfig, "lifecycle">): NativeHistoricalStateSemantics {
+  return nativeLevelLifecycleOf(config) === NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1 ? NATIVE_DYNAMIC_HISTORICAL_STATE_SEMANTICS : NATIVE_HISTORICAL_STATE_SEMANTICS;
+}
 
 /**
  * Pine v5 at the first chart-history bar: `tf_s[1]` is na, na is false as a
@@ -607,7 +685,7 @@ export interface NativeHistoricalTouch {
 }
 
 export interface NativeHistoricalReport {
-  readonly semantics: typeof NATIVE_HISTORICAL_STATE_SEMANTICS;
+  readonly semantics: NativeHistoricalStateSemantics;
   readonly firstHistoryBar: typeof PINE_V5_FIRST_HISTORY_BAR_NO_EDGE;
   readonly partialPeriodPolicy: NativePartialPeriodPolicy;
   readonly historyStartMs: number;

@@ -98,11 +98,13 @@ describe("profile identity: Teddy 7% All Active", () => {
     expect(config.engine).toEqual(
       createNativeEngineConfig({
         minMovePct: 0.07, touchTolerancePct: 0.01, touchCooldownBars: 10, minBarsAfterCreation: 5, minBarsAfterArming: 4, maxLevels: 500,
-        enabledSourceTfs: ["1D", "1W", "1M", "3M", "6M", "12M"], timing: "Immediate",
+        enabledSourceTfs: ["1D", "1W", "1M", "3M", "6M", "12M"], timing: "Immediate", lifecycle: "TEDDY_DYNAMIC_SOURCE_LEVEL_V1",
       })
     );
-    // The same engine the equivalent explicit flags build: the profile cannot reinterpret the signal semantics.
-    expect(config).toEqual(parseLineageConfig((name) => FLAGS_7[name]));
+    // The equivalent explicit flags PLUS the dynamic source-level lifecycle: the four 7% formulas and
+    // every input are unchanged; only how a level lives (one dynamic candidate per period) differs.
+    const explicit = parseLineageConfig((name) => FLAGS_7[name]);
+    expect(config).toEqual({ ...explicit, engine: createNativeEngineConfig({ ...explicit.engine, lifecycle: "TEDDY_DYNAMIC_SOURCE_LEVEL_V1" }) });
   });
 
   it("timeframes: engine 1D..12M, dashboard 1D/1W/1M (NATIVE_DELIVERY_V2), future execution 1D/1W, never enabled", () => {
@@ -165,10 +167,15 @@ describe("Teddy Aggressive is unchanged", () => {
 describe("fingerprints and state namespace", () => {
   const engine7 = engineFingerprintOf(N);
 
-  it("the engine fingerprint is derived canonically: the explicit 7% flags, and Teddy Aggressive with only the min move changed", () => {
+  it("the engine fingerprint is derived canonically: the explicit 7% flags with the dynamic lifecycle — not the legacy 7% engine", () => {
     expect(engine7).toMatch(/^[0-9a-f]{64}$/);
-    expect(engine7).toBe(engineFingerprintOfConfig(parseLineageConfig((name) => FLAGS_7[name])));
-    expect(engine7).toBe(engineFingerprintOf({ ...T, engine: { ...T.engine, minMovePercent: 7 } } as ScannerProfile));
+    const explicit = parseLineageConfig((name) => FLAGS_7[name]);
+    expect(engine7).toBe(engineFingerprintOfConfig({ ...explicit, engine: createNativeEngineConfig({ ...explicit.engine, lifecycle: "TEDDY_DYNAMIC_SOURCE_LEVEL_V1" }) }));
+    // The legacy 7% engine (explicit flags; Teddy Aggressive with only the min move changed) is the OLD fingerprint.
+    const legacy7 = "47d661a531c9d724d0bfbcb85ff68ea7dd85418464f959be2d0cb1340f4c5179";
+    expect(engineFingerprintOfConfig(explicit)).toBe(legacy7);
+    expect(engineFingerprintOf({ ...T, engine: { ...T.engine, minMovePercent: 7 } } as ScannerProfile)).toBe(legacy7);
+    expect(engine7).not.toBe(legacy7);
     expect(engine7).not.toBe(TEDDY_18_FINGERPRINT);
     // The universe, its ceiling and the label are in no fingerprint.
     expect(engineFingerprintOf({ ...N, universe: T.universe, operations: undefined, label: "x" } as ScannerProfile)).toBe(engine7);

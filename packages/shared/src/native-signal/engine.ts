@@ -1,11 +1,14 @@
-import { advanceHtfAggregate, barFitsHtfPeriod } from "./htf-aggregate";
+import { advanceHtfAggregate, barFitsHtfPeriod, htfPeriodStartMs } from "./htf-aggregate";
 import {
   NATIVE_LEVEL_CONDITIONS,
+  NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1,
   NativeSignalInputError,
   type NativeConditionFlags,
   type NativeEngineConfig,
   type NativeEngineDiagnosticSnapshot,
   type NativeEngineState,
+  type NativeFormingCandidate,
+  type NativeFormingCandidates,
   type NativeHtfAggregate,
   type NativeHtfTrack,
   type NativeImmediateCandidate,
@@ -64,10 +67,47 @@ const LEVEL_SHAPE: Readonly<Record<NativeLevelCondition, { color: "GREEN" | "RED
     ROG: { color: "RED", at: "low" },
   });
 
+/** True for the TEDDY_DYNAMIC_SOURCE_LEVEL_V1 lifecycle. */
+export function isDynamicLifecycle(config: Pick<NativeEngineConfig, "lifecycle">): boolean {
+  return config.lifecycle === NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1;
+}
+
+const NO_CANDIDATES: NativeFormingCandidates = Object.freeze({ GREEN: null, RED: null });
+
+/** A track as it starts: the dynamic lifecycle carries (empty) forming candidates, the legacy one carries none. */
+function emptyTrack(config: NativeEngineConfig): NativeHtfTrack {
+  return isDynamicLifecycle(config) ? { aggregate: null, previousFlags: null, candidates: NO_CANDIDATES } : { aggregate: null, previousFlags: null };
+}
+
+/**
+ * Pine 4B's three timer gates for `level` on the bar with index `barIndex`.
+ *
+ * PINE_V55_EDGE_FROZEN: `barIndex - anchor >= N` (Pine's own comparison). That
+ * lets an Immediate alert fire INSIDE the Nth bar, i.e. after only N-1 full
+ * bars have completed since the anchoring close.
+ *
+ * TEDDY_DYNAMIC_SOURCE_LEVEL_V1: N FULL chart bars must complete after the
+ * anchoring close, so eligibility starts with bar anchor + N + 1
+ * (`barIndex - anchor > N`): on 15m, creation 5 -> 75 min, arming 4 -> 60 min,
+ * cooldown 10 -> ten complete bars (150 min) after the alerting bar.
+ */
+export function retestTimerGates(
+  config: NativeEngineConfig,
+  level: Pick<NativeLevel, "armed" | "armedBarIndex" | "createdBarIndex" | "lastTouchBarIndex">,
+  barIndex: number
+): { readonly armedReady: boolean; readonly oldEnough: boolean; readonly cooledDown: boolean } {
+  const passed = (anchor: number, bars: number) => (isDynamicLifecycle(config) ? barIndex - anchor > bars : barIndex - anchor >= bars);
+  return {
+    armedReady: level.armed && level.armedBarIndex >= 0 && passed(level.armedBarIndex, config.minBarsAfterArming),
+    oldEnough: passed(level.createdBarIndex, config.minBarsAfterCreation),
+    cooledDown: level.lastTouchBarIndex < 0 || passed(level.lastTouchBarIndex, config.touchCooldownBars),
+  };
+}
+
 /** A fresh engine over `config`, before any bar. */
 export function createNativeEngineState(config: NativeEngineConfig): NativeEngineState {
   const htf: Partial<Record<NativeSourceTf, NativeHtfTrack>> = {};
-  for (const tf of config.enabledSourceTfs) htf[tf] = { aggregate: null, previousFlags: null };
+  for (const tf of config.enabledSourceTfs) htf[tf] = emptyTrack(config);
   return {
     config,
     barIndex: 0,
@@ -104,6 +144,14 @@ export function cloneWorkingState(state: NativeEngineState): WorkingState {
     htf[tf] = {
       aggregate: track?.aggregate ? { ...track.aggregate } : null,
       previousFlags: track?.previousFlags ? { ...track.previousFlags } : null,
+      ...(track?.candidates !== undefined
+        ? {
+            candidates: {
+              GREEN: track.candidates.GREEN === null ? null : { ...track.candidates.GREEN },
+              RED: track.candidates.RED === null ? null : { ...track.candidates.RED },
+            },
+          }
+        : {}),
     };
   }
   return {
@@ -188,15 +236,36 @@ export function registerLevelInPlace(
   out: Pick<BarOutputs, "registered" | "evicted">
 ): void {
   const shape = LEVEL_SHAPE[condition];
+  pushLevelInPlace(
+    state,
+    {
+      price: shape.at === "high" ? source.high : source.low,
+      color: shape.color,
+      sourceTf: tf,
+      condition,
+      htfPeriodStartMs: source.periodStartMs,
+      createdBarIndex: barIndex,
+      createdBarOpenTimeMs: bar.openTimeMs,
+    },
+    out
+  );
+}
+
+/** Pushes one persistent level (new id, unarmed, never touched), then applies MAX_LEVELS. */
+function pushLevelInPlace(
+  state: WorkingState,
+  fields: Pick<NativeLevel, "price" | "color" | "sourceTf" | "condition" | "htfPeriodStartMs" | "createdBarIndex" | "createdBarOpenTimeMs">,
+  out: Pick<BarOutputs, "registered" | "evicted">
+): void {
   const level: Mutable<NativeLevel> = {
     id: state.nextLevelId,
-    price: shape.at === "high" ? source.high : source.low,
-    color: shape.color,
-    sourceTf: tf,
-    condition,
-    htfPeriodStartMs: source.periodStartMs,
-    createdBarIndex: barIndex,
-    createdBarOpenTimeMs: bar.openTimeMs,
+    price: fields.price,
+    color: fields.color,
+    sourceTf: fields.sourceTf,
+    condition: fields.condition,
+    htfPeriodStartMs: fields.htfPeriodStartMs,
+    createdBarIndex: fields.createdBarIndex,
+    createdBarOpenTimeMs: fields.createdBarOpenTimeMs,
     lastTouchBarIndex: -1,
     armed: false,
     armedBarIndex: -1,
@@ -208,6 +277,74 @@ export function registerLevelInPlace(
     const dropped = state.levels.shift() as Mutable<NativeLevel>;
     out.evicted.push({ ...dropped });
   }
+}
+
+/**
+ * @internal TEDDY_DYNAMIC_SOURCE_LEVEL_V1: one source timeframe's forming
+ * candidates after this bar's close, then — if this bar closes the source
+ * candle — finalization.
+ *
+ *  - GREEN qualifies when GOR or GOG holds; RED when ROR or ROG holds. A body
+ *    colour change (GOR -> GOG) is the SAME GREEN candidate.
+ *  - A qualifying colour without a candidate creates one, anchored at this bar
+ *    (its first qualification). An existing candidate's price follows the
+ *    running high / low on every close, and `active` mirrors qualification:
+ *    flicker off/on never creates a second candidate and never moves the anchor.
+ *  - On the source candle's LAST chart bar (the next bar opens a new period) an
+ *    active candidate becomes exactly one persistent level at the final
+ *    extreme; an inactive one is discarded. Either way the period's candidates
+ *    are then cleared.
+ *
+ * GREEN before RED within a timeframe; timeframes in canonical order (caller).
+ */
+function advanceDynamicCandidatesInPlace(
+  state: WorkingState,
+  tf: NativeSourceTf,
+  aggregate: NativeHtfAggregate,
+  flags: NativeConditionFlags | null,
+  bar: NativeKline,
+  barIndex: number,
+  out: Pick<BarOutputs, "registered" | "evicted">
+): NativeFormingCandidates {
+  const previous = (state.htf[tf] as NativeHtfTrack).candidates ?? NO_CANDIDATES;
+  const next: { GREEN: NativeFormingCandidate | null; RED: NativeFormingCandidate | null } = { GREEN: null, RED: null };
+  for (const color of ["GREEN", "RED"] as const) {
+    // A candidate belongs to exactly one source period: a new period starts with none.
+    const held = previous[color] !== null && previous[color]!.periodStartMs === aggregate.periodStartMs ? previous[color] : null;
+    const condition: NativeLevelCondition | null =
+      flags === null ? null : color === "GREEN" ? (flags.GOR ? "GOR" : flags.GOG ? "GOG" : null) : flags.ROR ? "ROR" : flags.ROG ? "ROG" : null;
+    const price = color === "GREEN" ? aggregate.high : aggregate.low;
+    if (held === null) {
+      next[color] =
+        condition === null
+          ? null
+          : { color, periodStartMs: aggregate.periodStartMs, firstQualifiedBarIndex: barIndex, firstQualifiedBarOpenTimeMs: bar.openTimeMs, active: true, price, condition };
+    } else {
+      next[color] = { ...held, active: condition !== null, price, condition: condition ?? held.condition };
+    }
+  }
+
+  // Finalization: this bar closes the source candle when the next bar opens a new period.
+  const closesPeriod = htfPeriodStartMs(tf, bar.closeTimeMs + 1, state.config.calendar) !== aggregate.periodStartMs;
+  if (!closesPeriod) return next;
+  for (const color of ["GREEN", "RED"] as const) {
+    const candidate = next[color];
+    if (candidate === null || !candidate.active) continue; // no qualification at the close: no level at all
+    pushLevelInPlace(
+      state,
+      {
+        price: candidate.price,
+        color,
+        sourceTf: tf,
+        condition: candidate.condition,
+        htfPeriodStartMs: candidate.periodStartMs,
+        createdBarIndex: candidate.firstQualifiedBarIndex,
+        createdBarOpenTimeMs: candidate.firstQualifiedBarOpenTimeMs,
+      },
+      out
+    );
+  }
+  return NO_CANDIDATES;
 }
 
 /**
@@ -256,11 +393,7 @@ export function retestInPlace(
     for (const level of state.levels) {
       const upperBand = level.price * (1 + tolerance);
       const lowerBand = level.price * (1 - tolerance);
-      const armedReady =
-        level.armed && level.armedBarIndex >= 0 && barIndex - level.armedBarIndex >= config.minBarsAfterArming;
-      const oldEnough = barIndex - level.createdBarIndex >= config.minBarsAfterCreation;
-      const cooledDown =
-        level.lastTouchBarIndex < 0 || barIndex - level.lastTouchBarIndex >= config.touchCooldownBars;
+      const { armedReady, oldEnough, cooledDown } = retestTimerGates(config, level, barIndex);
       const inBand = bar.low <= upperBand && bar.high >= lowerBand;
       const longRetest = level.color === "GREEN" && previousClose > upperBand && inBand;
       const shortRetest = level.color === "RED" && previousClose < lowerBand && inBand;
@@ -289,15 +422,30 @@ export function applyBarInPlace(state: WorkingState, bar: NativeKline, out: BarO
   const intervalMs = assertBarAcceptable(state, bar);
   const { config } = state;
   const barIndex = state.barIndex;
+  const dynamic = isDynamicLifecycle(config);
 
-  // ---- 1. BAGIAN 3: registration ------------------------------------------
-  // Timeframes in canonical order; within each, GOR -> ROR -> GOG -> ROG.
-  // Pine: `if show and tf_sX and not tf_sX[1]` — the previous CHART bar's
-  // projected flag, which must be KNOWN false for an edge.
+  // Dynamic lifecycle: the levels an IMMEDIATE alert may have been emitted for
+  // during this bar, from the pre-bar committed state (exactly what the live
+  // session evaluates). Their cooldown is written below AFTER the close-tick
+  // steps, so a later same-bar disarm can never erase an emitted alert.
+  const immediateLevelIds = dynamic ? new Set(reconstructImmediateCandidates(state, bar).map((c) => c.level.id)) : null;
+
+  // ---- 1. Source levels ------------------------------------------------------
+  // Timeframes in canonical order.
+  //  Legacy: within each, GOR -> ROR -> GOG -> ROG, Pine's `if show and tf_sX and
+  //   not tf_sX[1]` — the previous CHART bar's projected flag, which must be
+  //   KNOWN false for an edge.
+  //  Dynamic: update this period's forming candidates, finalize on the period's
+  //   last bar (advanceDynamicCandidatesInPlace).
   for (const tf of config.enabledSourceTfs) {
     const track = state.htf[tf] as NativeHtfTrack;
     const aggregate = advanceHtfAggregate(track.aggregate, bar, tf, config.calendar);
     const flags = evaluateLevelConditions(aggregate, config.minMovePct);
+    if (dynamic) {
+      const candidates = advanceDynamicCandidatesInPlace(state, tf, aggregate, flags, bar, barIndex, out);
+      state.htf[tf] = { aggregate, previousFlags: flags, candidates };
+      continue;
+    }
     const previous = track.previousFlags;
 
     if (flags !== null && previous !== null) {
@@ -334,6 +482,11 @@ export function applyBarInPlace(state: WorkingState, bar: NativeKline, out: BarO
     });
   });
 
+  // ---- 3b. Dynamic: an emitted Immediate alert always consumes its cooldown --
+  if (immediateLevelIds !== null && immediateLevelIds.size > 0) {
+    for (const level of state.levels) if (immediateLevelIds.has(level.id)) level.lastTouchBarIndex = barIndex;
+  }
+
   // ---- 4. advance ----------------------------------------------------------
   advanceBarInPlace(state, bar, intervalMs);
 }
@@ -369,6 +522,9 @@ export function stepNativeEngine(state: NativeEngineState, bar: NativeKline): Na
  * might not have been.
  */
 function levelsAtIntrabarEvictionRisk(preBar: NativeEngineState): number {
+  // Dynamic lifecycle: levels are only ever pushed at a confirmed close (source
+  // candle finalization), never transiently intrabar, so no level is at risk.
+  if (isDynamicLifecycle(preBar.config)) return 0;
   let maxPushesPerUpdate = 0;
   for (const tf of preBar.config.enabledSourceTfs) {
     const previous = preBar.htf[tf]?.previousFlags ?? null;
@@ -422,11 +578,7 @@ export function reconstructImmediateCandidates(
     // Pine's 4B conditions, operand for operand — against the PRE-BAR state.
     const upperBand = level.price * (1 + tolerance);
     const lowerBand = level.price * (1 - tolerance);
-    const armedReady =
-      level.armed && level.armedBarIndex >= 0 && barIndex - level.armedBarIndex >= config.minBarsAfterArming;
-    const oldEnough = barIndex - level.createdBarIndex >= config.minBarsAfterCreation;
-    const cooledDown =
-      level.lastTouchBarIndex < 0 || barIndex - level.lastTouchBarIndex >= config.touchCooldownBars;
+    const { armedReady, oldEnough, cooledDown } = retestTimerGates(config, level, barIndex);
     const inBand = bar.low <= upperBand && bar.high >= lowerBand;
     const longRetest = level.color === "GREEN" && previousClose > upperBand && inBand;
     const shortRetest = level.color === "RED" && previousClose < lowerBand && inBand;
@@ -485,11 +637,7 @@ export function snapshotNativeEngineForNextBar(state: NativeEngineState): Native
     // Pine's 4B conditions, operand for operand, as in reconstructImmediateCandidates.
     const upperBand = level.price * (1 + tolerance);
     const lowerBand = level.price * (1 - tolerance);
-    const armedReady =
-      level.armed && level.armedBarIndex >= 0 && barIndex - level.armedBarIndex >= config.minBarsAfterArming;
-    const oldEnough = barIndex - level.createdBarIndex >= config.minBarsAfterCreation;
-    const cooledDown =
-      level.lastTouchBarIndex < 0 || barIndex - level.lastTouchBarIndex >= config.touchCooldownBars;
+    const { armedReady, oldEnough, cooledDown } = retestTimerGates(config, level, barIndex);
     const approachSide =
       previousClose !== null && (level.color === "GREEN" ? previousClose > upperBand : previousClose < lowerBand);
     return Object.freeze({

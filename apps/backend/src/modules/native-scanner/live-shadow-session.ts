@@ -1,6 +1,6 @@
 import {
+  reconstructHistoricalState,
   reconstructImmediateCandidates,
-  reconstructPineHistoricalState,
   stepNativeEngine,
   type NativeEngineConfig,
   type NativeEngineState,
@@ -133,7 +133,8 @@ export function prepareLiveShadowState(
   if (request.expectedLineageId !== null && request.expectedLineageId !== lineageId) {
     throw new LiveShadowError("LINEAGE_MISMATCH", `the configured inputs and bytes build lineage ${lineageId}, not the expected ${request.expectedLineageId}`);
   }
-  const historical = reconstructPineHistoricalState({
+  // The lifecycle decides: Pine look-ahead history (legacy) or causal history (dynamic).
+  const historical = reconstructHistoricalState({
     config: lineage.engineConfig,
     historyStartMs: request.historyStartMs,
     switchoverMs: request.switchoverMs,

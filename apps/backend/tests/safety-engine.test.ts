@@ -1184,3 +1184,38 @@ describe("a resting LIMIT take profit that could never be placed is refused befo
     expect(reasonCodes(result)).not.toContain("PROTECTION_QUANTITY_UNSUPPORTED" as never);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Same symbol + side = 1 per account: a PENDING entry occupies the slot
+// ---------------------------------------------------------------------------
+
+describe("same symbol + side: a submitted but unfilled entry occupies the slot", () => {
+  it("every non-terminal status counts (pending LIMIT included); every terminal one frees the slot", () => {
+    for (const status of ["PREFLIGHT", "ENTRY_SUBMITTING", "ENTRY_PENDING", "PARTIALLY_FILLED", "ENTRY_FILLED", "PLACING_PROTECTION", "PROTECTED", "MANUAL_INTERVENTION"] as const) {
+      expect(consumesTotalActive(status), status).toBe(true);
+    }
+    for (const status of ["PLAN_READY", "ENTRY_EXPIRED", "CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "CANCELED", "SKIPPED", "FAILED"] as const) {
+      expect(consumesTotalActive(status), status).toBe(false);
+    }
+  });
+
+  it("the admission snapshot keys EVERY active execution of THIS account by symbol + side", async () => {
+    const { readFileSync } = await import("node:fs");
+    const path = await import("node:path");
+    const source = readFileSync(path.join(__dirname, "../src/modules/execution/safety-admission.service.ts"), "utf8").replace(/\r\n/g, "\n");
+    const snapshot = source.slice(source.indexOf("private async buildLocalSnapshot("), source.indexOf("const admitted = await tx.safetyAdmission.count("));
+    expect(snapshot).toContain("executionProfileId: execution.executionProfileId,");
+    expect(snapshot).toContain("status: { in: TOTAL_ACTIVE_STATUSES as unknown as TradeExecution[\"status\"][] },");
+    expect(snapshot).toContain("activeSymbolSideKeys.push(symbolSideKey(row.symbol, row.positionSide));");
+  });
+
+  it("LONG #1 pending (unfilled LIMIT) -> LONG #2 on the same symbol is refused in that account; the SHORT side is not blocked by it", () => {
+    const roomy = policy({ maxOpenPositions: 3, maxPendingEntries: 3, maxTotalActiveTrades: 3, softOpenPositionTarget: 3 });
+    const pendingLong = local({ totalActiveCount: 1, pendingEntryCount: 1, activeSymbolSideKeys: [symbolSideKey(SYMBOL, "LONG")] });
+    expect(reasonCodes(evaluate({ policy: roomy, local: pendingLong }))).toContain("SYMBOL_SIDE_ALREADY_ACTIVE");
+    const pendingShort = local({ totalActiveCount: 1, pendingEntryCount: 1, activeSymbolSideKeys: [symbolSideKey(SYMBOL, "SHORT")] });
+    expect(reasonCodes(evaluate({ policy: roomy, local: pendingShort }))).not.toContain("SYMBOL_SIDE_ALREADY_ACTIVE");
+    // After the first execution is terminal it leaves the snapshot, and the slot is free again.
+    expect(reasonCodes(evaluate({ policy: roomy, local: local() }))).not.toContain("SYMBOL_SIDE_ALREADY_ACTIVE");
+  });
+});

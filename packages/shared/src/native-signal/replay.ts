@@ -6,13 +6,15 @@ import {
   cloneWorkingState,
   createNativeEngineState,
   evaluateLevelConditions,
+  isDynamicLifecycle,
   reconstructImmediateCandidates,
   registerLevelInPlace,
   retestInPlace,
   type BarOutputs,
 } from "./engine";
-import { projectPineHistoricalHtf } from "./htf-aggregate";
+import { advanceHtfAggregate, projectPineHistoricalHtf } from "./htf-aggregate";
 import {
+  NATIVE_DYNAMIC_HISTORICAL_STATE_SEMANTICS,
   NATIVE_HISTORICAL_STATE_SEMANTICS,
   NATIVE_LEVEL_CONDITIONS,
   NativeSignalInputError,
@@ -98,6 +100,108 @@ export function replayNativeEngineWithImmediate(
 }
 
 // ---------------------------------------------------------------------------
+// Historical state for either lifecycle
+// ---------------------------------------------------------------------------
+
+/**
+ * The committed state at the switchover, by the config's lifecycle:
+ * PINE_V55_EDGE_FROZEN -> the Pine look-ahead reconstruction (unchanged);
+ * TEDDY_DYNAMIC_SOURCE_LEVEL_V1 -> the causal reconstruction.
+ */
+export function reconstructHistoricalState(input: NativeHistoricalInput): NativeHistoricalResult {
+  return isDynamicLifecycle(input.config) ? reconstructCausalHistoricalState(input) : reconstructPineHistoricalState(input);
+}
+
+/**
+ * TEDDY_DYNAMIC_SOURCE_LEVEL_V1 history: the chart history [historyStart,
+ * switchover) replayed FORWARD through `applyBarInPlace` — the same step the
+ * live scanner commits with — so history and live can never disagree, and no
+ * source extreme exists before it was printed.
+ *
+ * Context bars only advance each source candle's aggregate, so a candle that
+ * began before the history has its real open: they get no bar index and create
+ * no candidate, level, arming or retest. Retests on history bars are reported
+ * as non-actionable state writes, exactly like the legacy reconstruction.
+ */
+export function reconstructCausalHistoricalState(input: NativeHistoricalInput): NativeHistoricalResult {
+  const { config, historyStartMs, switchoverMs, contextBars, bars } = input;
+  if (!isDynamicLifecycle(config)) refuseHistory("causal history reconstruction is defined for the dynamic source-level lifecycle only");
+  if (input.partialPeriodPolicy !== SWITCHOVER_TRUNCATED_CLOSED_BARS) {
+    refuseHistory(`partialPeriodPolicy must be ${SWITCHOVER_TRUNCATED_CLOSED_BARS}`);
+  }
+  if (!Number.isSafeInteger(historyStartMs) || !Number.isSafeInteger(switchoverMs) || historyStartMs >= switchoverMs) {
+    refuseHistory("historyStartMs and switchoverMs must be integer times with historyStartMs < switchoverMs");
+  }
+  if (bars.length === 0 || bars[0].openTimeMs !== historyStartMs) {
+    refuseHistory("chart bars must begin exactly at historyStartMs");
+  }
+  const intervalMs = bars[0].closeTimeMs - bars[0].openTimeMs + 1;
+  if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0 || (switchoverMs - historyStartMs) % intervalMs !== 0) {
+    refuseHistory("switchoverMs must be a chart-bar open boundary after historyStartMs");
+  }
+  const historyBarCount = (switchoverMs - historyStartMs) / intervalMs;
+  if (bars.length < historyBarCount) refuseHistory("chart bars end before the switchover");
+  const history = bars.slice(0, historyBarCount);
+
+  // Context: valid, contiguous, same interval, ending right before the history; aggregates only.
+  const working = cloneWorkingState(createNativeEngineState(config));
+  let context: Pick<NativeEngineState, "config" | "intervalMs" | "lastBar"> = { config, intervalMs: null, lastBar: null };
+  for (const bar of contextBars) {
+    const contextIntervalMs = assertBarAcceptable(context, bar);
+    context = { config, intervalMs: contextIntervalMs, lastBar: { openTimeMs: bar.openTimeMs, closeTimeMs: bar.closeTimeMs, close: bar.close } };
+    for (const tf of config.enabledSourceTfs) {
+      const track = working.htf[tf]!;
+      working.htf[tf] = { ...track, aggregate: advanceHtfAggregate(track.aggregate, bar, tf, config.calendar) };
+    }
+  }
+  if (context.lastBar !== null && (context.intervalMs !== intervalMs || context.lastBar.closeTimeMs + 1 !== historyStartMs)) {
+    refuseHistory("context bars must share the chart interval and end immediately before historyStartMs");
+  }
+
+  const out: BarOutputs = { registered: [], evicted: [], candidates: [] };
+  const touches: NativeHistoricalTouch[] = [];
+  for (const bar of history) {
+    const before = out.candidates.length;
+    applyBarInPlace(working, bar, out);
+    for (const c of out.candidates.slice(before)) {
+      touches.push({
+        actionable: false,
+        basis: "HISTORICAL_STATE_WRITE",
+        signal: c.signal,
+        touchDirection: c.touchDirection,
+        levelColor: c.levelColor,
+        sourceTf: c.sourceTf,
+        levelPrice: c.levelPrice,
+        chartBarIndex: c.chartBarIndex,
+        chartBarOpenTimeMs: c.chartBarOpenTimeMs,
+        chartBarCloseTimeMs: c.chartBarCloseTimeMs,
+        level: c.level,
+      });
+    }
+  }
+
+  const report: NativeHistoricalReport = {
+    semantics: NATIVE_DYNAMIC_HISTORICAL_STATE_SEMANTICS,
+    firstHistoryBar: PINE_V5_FIRST_HISTORY_BAR_NO_EDGE,
+    partialPeriodPolicy: SWITCHOVER_TRUNCATED_CLOSED_BARS,
+    historyStartMs,
+    switchoverMs,
+    contextStartMs: contextBars.length > 0 ? contextBars[0].openTimeMs : null,
+    contextBarCount: contextBars.length,
+    chartBarCount: history.length,
+    registrations: out.registered,
+    evictions: out.evicted,
+    touches,
+    firstHistoryBarFlags: [],
+    unknownPreviousFlagEdges: [],
+    incompletePeriods: [],
+    // No projection exists in causal history: the handoff IS the live state.
+    handoffPeriods: [],
+  };
+  return { state: working, report };
+}
+
+// ---------------------------------------------------------------------------
 // Slice 2B-1 — Pine-compatible HISTORICAL state reconstruction
 // ---------------------------------------------------------------------------
 
@@ -129,6 +233,9 @@ function refuseHistory(message: string): never {
  * would hold after the last historical bar.
  */
 export function reconstructPineHistoricalState(input: NativeHistoricalInput): NativeHistoricalResult {
+  if (isDynamicLifecycle(input.config)) {
+    refuseHistory("the dynamic source-level lifecycle never uses look-ahead history; use reconstructHistoricalState / reconstructCausalHistoricalState");
+  }
   const { config, historyStartMs, switchoverMs, contextBars, bars } = input;
   if (input.partialPeriodPolicy !== SWITCHOVER_TRUNCATED_CLOSED_BARS) {
     refuseHistory(`partialPeriodPolicy must be ${SWITCHOVER_TRUNCATED_CLOSED_BARS}`);

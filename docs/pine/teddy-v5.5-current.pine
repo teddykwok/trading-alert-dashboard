@@ -19,6 +19,28 @@
 //     warna & timeframe) TIDAK diubah.
 //   - "timeframe" di JSON = timeframe CHART (format backend, mis. "1h") agar
 //     screenshot Binance memakai interval yang valid; detail level ada di "note".
+// Versi 5.5-dynamic (aturan produk Teddy; sama dengan engine Native
+// TEDDY_DYNAMIC_SOURCE_LEVEL_V1):
+//   - 7% HANYA gerbang kualifikasi (GOR/ROR/GOG/ROG tidak diubah), BUKAN harga level.
+//   - Per timeframe sumber + candle sumber + warna hanya ada SATU kandidat yang
+//     sedang terbentuk: GREEN (GOR atau GOG) mengikuti HIGH berjalan candle sumber,
+//     RED (ROR atau ROG) mengikuti LOW berjalan. Perubahan warna body (GOR->GOG)
+//     tetap kandidat yang sama.
+//   - Kandidat aktif hanya selama kualifikasinya benar; kalau hilang ia NONAKTIF
+//     (tersembunyi, tidak bisa armed/retest/alert); kalau kembali benar di candle
+//     sumber yang sama, kandidat yang SAMA aktif lagi (anchor pembuatan = kualifikasi
+//     pertama, tidak di-reset). Tidak ada level duplikat dari kedipan kualifikasi.
+//   - Saat candle sumber selesai: kandidat yang MASIH lolos menjadi tepat SATU level
+//     permanen di ekstrem final; yang tidak lolos DIBUANG (tidak ada level sama sekali).
+//   - Hanya level permanen yang masuk array retest (MAX_LEVELS hanya untuk level
+//     permanen), yang bisa ARMED / disarm / retest.
+//   - Timer = N bar chart PENUH setelah close anchor: alert boleh paling cepat di
+//     bar ke-(N+1) (15m: creation 5 = 75 menit, arming 4 = 60 menit, cooldown 10 =
+//     sepuluh bar penuh). Sebelumnya `>= N` mengizinkan alert Immediate satu bar lebih awal.
+//   - Mode Immediate: loop retest dijalankan SEBELUM ARMED/DISARM pada tick
+//     konfirmasi, sehingga cooldown alert yang sudah terkirim ikut tercommit walau
+//     candle yang sama lalu ditutup menembus level (disarm). alert.freq_once_per_bar
+//     mencegah alert ganda di bar yang sama.
 indicator("teddy v5.5 (Sinar Final)",overlay=true,max_lines_count=500,max_labels_count=500)
 
 // =================================================================================
@@ -27,7 +49,7 @@ indicator("teddy v5.5 (Sinar Final)",overlay=true,max_lines_count=500,max_labels
 
 // (Bagian ini tidak ada perubahan)
 var GRP_GENERAL = "Pengaturan Umum"
-minPercentInput = input.float(15.0, "Persentase Pergerakan Harga Minimal (%)", group = GRP_GENERAL) / 100
+minPercentInput = input.float(7.0, "Persentase Pergerakan Harga Minimal (%)", group = GRP_GENERAL) / 100
 labelTextColor = input.color(color.white, "Warna Teks Label", group = GRP_GENERAL)
 labelTextSizeInput = input.string("small", "Ukuran Teks Label", options=["tiny", "small", "normal", "large"], group = GRP_GENERAL)
 
@@ -137,8 +159,8 @@ f_formatPrice(value) =>
 // waktu peristiwa yang benar. `time` tetap dikirim terpisah supaya konteks
 // candle tidak hilang.
 // "indicatorValue" = input "Persentase Pergerakan Harga Minimal (%)" dalam
-// POIN PERSEN (input 15.0 -> 15, 12.5 -> 12.5), BUKAN pecahan 0.15 — dashboard
-// menampilkannya sebagai "MOVE ≥15%". Format "#.####" menjaga angka JSON tetap
+// POIN PERSEN (input 7.0 -> 7, 12.5 -> 12.5), BUKAN pecahan 0.07 — dashboard
+// menampilkannya sebagai "MOVE ≥7%". Format "#.####" menjaga angka JSON tetap
 // valid: tanpa notasi ilmiah, tanpa ekor desimal float, desimal berguna utuh.
 f_buildWebhookJson(signal, levelPrice, note) =>
     '{'
@@ -160,8 +182,9 @@ f_buildWebhookJson(signal, levelPrice, note) =>
 // BAGIAN 1C: PENYIMPANAN LEVEL (BARU)
 // =================================================================================
 
-// Setiap level "sinar" yang tergambar juga disimpan di array paralel ini,
-// supaya bisa dideteksi saat harga kembali menyentuhnya di masa depan.
+// Setiap level PERMANEN (candle sumber sudah selesai dan masih lolos 7%) disimpan
+// di array paralel ini, supaya bisa dideteksi saat harga kembali menyentuhnya.
+// Kandidat yang masih terbentuk TIDAK pernah masuk sini.
 var MAX_LEVELS = 500
 var lvlPrice = array.new_float()
 var lvlColor = array.new_string()      // "GREEN" / "RED"
@@ -175,11 +198,12 @@ var lvlLastTouchBar = array.new_int()  // -1 = belum pernah kirim alert retest
 var lvlArmed = array.new_bool()
 var lvlArmedBar = array.new_int()      // -1 = belum/tidak armed
 
-f_registerLevel(levelPrice, colorName, tfLabel) =>
+// createdBar = anchor pembuatan: bar kualifikasi PERTAMA kandidat di candle sumbernya.
+f_registerLevel(levelPrice, colorName, tfLabel, createdBar) =>
     array.push(lvlPrice, levelPrice)
     array.push(lvlColor, colorName)
     array.push(lvlTf, tfLabel)
-    array.push(lvlCreatedBar, bar_index)
+    array.push(lvlCreatedBar, createdBar)
     array.push(lvlLastTouchBar, -1)
     array.push(lvlArmed, false)
     array.push(lvlArmedBar, -1)
@@ -208,34 +232,95 @@ f_processTimeframe(timeframe, labelText, show, colorRed, colorGreen, width) =>
     signalGreenOnGreen = isGreenCandle and (math.abs(high - close) / open >= minPercentInput)
     signalRedOnGreen   = isGreenCandle and (math.abs(open - low) / open >= minPercentInput)
 
-    [tf_high, tf_low, tf_sGOR, tf_sROR, tf_sGOG, tf_sROG] = request.security(syminfo.tickerid, timeframe,
-     [high, low, signalGreenOnRed, signalRedOnRed, signalGreenOnGreen, signalRedOnGreen], lookahead=barmerge.lookahead_on)
+    // tf_time = waktu BUKA candle sumber: berubah tepat saat candle sumber baru dimulai.
+    [tf_time, tf_high, tf_low, tf_sGOR, tf_sROR, tf_sGOG, tf_sROG] = request.security(syminfo.tickerid, timeframe,
+     [time, high, low, signalGreenOnRed, signalRedOnRed, signalGreenOnGreen, signalRedOnGreen], lookahead=barmerge.lookahead_on)
 
-    // --- PERBAIKAN DI 4 BLOK DI BAWAH INI ---
-    // Menambahkan `x2` dan `y2` agar fungsi `line.new` valid
-    // --- Pembentukan level murni visual + registrasi (f_registerLevel);
-    //     TIDAK ada alert apa pun di sini. Alert entry LONG/SHORT hanya
-    //     dikirim oleh loop retest di BAGIAN 4. ---
+    // --- Kandidat yang sedang terbentuk: SATU GREEN dan SATU RED per candle sumber.
+    //     `var` di dalam fungsi disimpan per pemanggilan, jadi tiap timeframe punya
+    //     state sendiri. Pembentukan/update/finalisasi TIDAK mengirim alert apa pun;
+    //     alert entry LONG/SHORT hanya dari loop retest di BAGIAN 4. ---
+    var bool  gExists = false
+    var bool  gActive = false
+    var float gPrice = na
+    var int   gFirstBar = na
+    var int   gFirstTime = na
+    var line  gLine = na
+    var label gLabel = na
+    var bool  rExists = false
+    var bool  rActive = false
+    var float rPrice = na
+    var int   rFirstBar = na
+    var int   rFirstTime = na
+    var line  rLine = na
+    var label rLabel = na
 
-    if show and tf_sGOR and not tf_sGOR[1]
-        line.new(x1=bar_index, y1=tf_high, x2=bar_index + 1, y2=tf_high, color=colorGreen, style=line.style_solid, width=width, extend=extend.right)
-        label.new(bar_index, tf_high, text=labelText + " " + str.tostring(tf_high, format.mintick), color=colorGreen, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
-        f_registerLevel(tf_high, "GREEN", labelText)
+    // 1. Candle sumber sebelumnya SELESAI: finalisasi atau buang kandidatnya.
+    //    Nilai g*/r* di sini masih dari close bar terakhir candle sumber itu.
+    newSourceCandle = not na(tf_time[1]) and tf_time != tf_time[1]
+    if newSourceCandle
+        line.delete(gLine)
+        label.delete(gLabel)
+        line.delete(rLine)
+        label.delete(rLabel)
+        if gExists and gActive
+            line.new(x1=gFirstTime, y1=gPrice, x2=time, y2=gPrice, xloc=xloc.bar_time, color=colorGreen, style=line.style_solid, width=width, extend=extend.right)
+            label.new(gFirstTime, gPrice, text=labelText + " " + str.tostring(gPrice, format.mintick), xloc=xloc.bar_time, color=colorGreen, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
+            f_registerLevel(gPrice, "GREEN", labelText, gFirstBar)
+        if rExists and rActive
+            line.new(x1=rFirstTime, y1=rPrice, x2=time, y2=rPrice, xloc=xloc.bar_time, color=colorRed, style=line.style_solid, width=width, extend=extend.right)
+            label.new(rFirstTime, rPrice, text=labelText + " " + str.tostring(rPrice, format.mintick), xloc=xloc.bar_time, color=colorRed, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
+            f_registerLevel(rPrice, "RED", labelText, rFirstBar)
+        gExists := false
+        gActive := false
+        gPrice := na
+        gLine := na
+        gLabel := na
+        rExists := false
+        rActive := false
+        rPrice := na
+        rLine := na
+        rLabel := na
 
-    if show and tf_sROR and not tf_sROR[1]
-        line.new(x1=bar_index, y1=tf_low, x2=bar_index + 1, y2=tf_low, color=colorRed, style=line.style_solid, width=width, extend=extend.right)
-        label.new(bar_index, tf_low, text=labelText + " " + str.tostring(tf_low, format.mintick), color=colorRed, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
-        f_registerLevel(tf_low, "RED", labelText)
-
-    if show and tf_sGOG and not tf_sGOG[1]
-        line.new(x1=bar_index, y1=tf_high, x2=bar_index + 1, y2=tf_high, color=colorGreen, style=line.style_solid, width=width, extend=extend.right)
-        label.new(bar_index, tf_high, text=labelText + " " + str.tostring(tf_high, format.mintick), color=colorGreen, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
-        f_registerLevel(tf_high, "GREEN", labelText)
-
-    if show and tf_sROG and not tf_sROG[1]
-        line.new(x1=bar_index, y1=tf_low, x2=bar_index + 1, y2=tf_low, color=colorRed, style=line.style_solid, width=width, extend=extend.right)
-        label.new(bar_index, tf_low, text=labelText + " " + str.tostring(tf_low, format.mintick), color=colorRed, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
-        f_registerLevel(tf_low, "RED", labelText)
+    // 2. Candle sumber yang sedang berjalan: buat / ikuti ekstrem / aktif-nonaktif.
+    greenQualifies = show and (tf_sGOR or tf_sGOG)
+    redQualifies = show and (tf_sROR or tf_sROG)
+    if greenQualifies and not gExists
+        gExists := true
+        gFirstBar := bar_index
+        gFirstTime := time
+    if gExists
+        gActive := greenQualifies
+        gPrice := tf_high
+        if na(gLine)
+            gLine := line.new(x1=gFirstTime, y1=gPrice, x2=time, y2=gPrice, xloc=xloc.bar_time, color=colorGreen, style=line.style_dashed, width=width, extend=extend.right)
+            gLabel := label.new(time, gPrice, text=labelText + " forming", xloc=xloc.bar_time, color=colorGreen, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
+        line.set_y1(gLine, gPrice)
+        line.set_y2(gLine, gPrice)
+        line.set_x2(gLine, time)
+        line.set_color(gLine, gActive ? colorGreen : color.new(colorGreen, 100))
+        label.set_xy(gLabel, time, gPrice)
+        label.set_text(gLabel, labelText + " forming " + str.tostring(gPrice, format.mintick))
+        label.set_color(gLabel, gActive ? colorGreen : color.new(colorGreen, 100))
+        label.set_textcolor(gLabel, gActive ? labelTextColor : color.new(labelTextColor, 100))
+    if redQualifies and not rExists
+        rExists := true
+        rFirstBar := bar_index
+        rFirstTime := time
+    if rExists
+        rActive := redQualifies
+        rPrice := tf_low
+        if na(rLine)
+            rLine := line.new(x1=rFirstTime, y1=rPrice, x2=time, y2=rPrice, xloc=xloc.bar_time, color=colorRed, style=line.style_dashed, width=width, extend=extend.right)
+            rLabel := label.new(time, rPrice, text=labelText + " forming", xloc=xloc.bar_time, color=colorRed, textcolor=labelTextColor, style=label.style_label_left, size=labelTextSize)
+        line.set_y1(rLine, rPrice)
+        line.set_y2(rLine, rPrice)
+        line.set_x2(rLine, time)
+        line.set_color(rLine, rActive ? colorRed : color.new(colorRed, 100))
+        label.set_xy(rLabel, time, rPrice)
+        label.set_text(rLabel, labelText + " forming " + str.tostring(rPrice, format.mintick))
+        label.set_color(rLabel, rActive ? colorRed : color.new(colorRed, 100))
+        label.set_textcolor(rLabel, rActive ? labelTextColor : color.new(labelTextColor, 100))
 
 // =================================================================================
 // BAGIAN 3: MENJALANKAN FUNGSI UNTUK SETIAP TIMEFRAME
@@ -261,77 +346,99 @@ f_processTimeframe("12M", "12M", showM12, colorRedM12, colorGreenM12, widthM12)
 // bar selama harga bertahan), supaya minBarsAfterArming mengukur umur arming.
 // Status ini selalu di-update, terlepas dari toggle webhook, agar state tetap
 // benar saat alert diaktifkan kembali.
-if barstate.isconfirmed and array.size(lvlPrice) > 0
-    for i = 0 to array.size(lvlPrice) - 1
-        levelPrice = array.get(lvlPrice, i)
-        upperBand = levelPrice * (1 + touchTolerancePct)
-        lowerBand = levelPrice * (1 - touchTolerancePct)
-        isGreen = array.get(lvlColor, i) == "GREEN"
-        armed = array.get(lvlArmed, i)
+f_armDisarm() =>
+    if barstate.isconfirmed and array.size(lvlPrice) > 0
+        for i = 0 to array.size(lvlPrice) - 1
+            levelPrice = array.get(lvlPrice, i)
+            upperBand = levelPrice * (1 + touchTolerancePct)
+            lowerBand = levelPrice * (1 - touchTolerancePct)
+            isGreen = array.get(lvlColor, i) == "GREEN"
+            armed = array.get(lvlArmed, i)
 
-        armNow = isGreen ? close > upperBand : close < lowerBand
-        breakNow = isGreen ? close < lowerBand : close > upperBand
+            armNow = isGreen ? close > upperBand : close < lowerBand
+            breakNow = isGreen ? close < lowerBand : close > upperBand
 
-        if not armed and armNow
-            array.set(lvlArmed, i, true)
-            array.set(lvlArmedBar, i, bar_index)
-        else if armed and breakNow
-            array.set(lvlArmed, i, false)
-            array.set(lvlArmedBar, i, -1)
+            if not armed and armNow
+                array.set(lvlArmed, i, true)
+                array.set(lvlArmedBar, i, bar_index)
+            else if armed and breakNow
+                array.set(lvlArmed, i, false)
+                array.set(lvlArmedBar, i, -1)
 
 // =================================================================================
 // BAGIAN 4B: DETEKSI RETEST LEVEL ARMED -> ALERT ENTRY LONG/SHORT
 // =================================================================================
 
 // Retest valid harus memenuhi SEMUA syarat:
-// - level armed, dan arming berumur >= minBarsAfterArming (tidak boleh di bar
-//   yang sama dengan arming — di close tick, 4A di atas berjalan lebih dulu);
-// - level berumur >= minBarsAfterCreation sejak dibuat;
-// - cooldown touchCooldownBars terpenuhi;
+// - level armed, dan sudah lewat minBarsAfterArming bar PENUH sejak bar arming
+//   (bar_index - armedBar > minBarsAfterArming);
+// - sudah lewat minBarsAfterCreation bar PENUH sejak anchor pembuatan;
+// - cooldown: sudah lewat touchCooldownBars bar PENUH sejak alert terakhir;
 // - geometri approach benar: close bar SEBELUMNYA masih di luar pita pada sisi
 //   yang benar, dan bar INI masuk ke pita toleransi. GREEN disentuh dari bawah
 //   atau RED dari atas TIDAK menghasilkan apa pun — tanpa alert, tanpa marker,
 //   dan TANPA memakai cooldown (lvlLastTouchBar hanya di-set saat alert
 //   LONG/SHORT benar-benar terkirim).
 // Duplicate suppression backend tetap menjadi lapisan kedua.
-if enableWebhookAlerts and enableLevelTouchedAlerts and webhookSecret != "" and array.size(lvlPrice) > 0
-    for i = 0 to array.size(lvlPrice) - 1
-        levelPrice = array.get(lvlPrice, i)
-        upperBand = levelPrice * (1 + touchTolerancePct)
-        lowerBand = levelPrice * (1 - touchTolerancePct)
-        levelColor = array.get(lvlColor, i)
+f_retestLoop(prevClose) =>
+    if enableWebhookAlerts and enableLevelTouchedAlerts and webhookSecret != "" and array.size(lvlPrice) > 0
+        for i = 0 to array.size(lvlPrice) - 1
+            levelPrice = array.get(lvlPrice, i)
+            upperBand = levelPrice * (1 + touchTolerancePct)
+            lowerBand = levelPrice * (1 - touchTolerancePct)
+            levelColor = array.get(lvlColor, i)
 
-        armedBar = array.get(lvlArmedBar, i)
-        armedReady = array.get(lvlArmed, i) and armedBar >= 0 and bar_index - armedBar >= minBarsAfterArming
-        oldEnough = bar_index - array.get(lvlCreatedBar, i) >= minBarsAfterCreation
-        lastTouch = array.get(lvlLastTouchBar, i)
-        cooledDown = lastTouch < 0 or bar_index - lastTouch >= touchCooldownBars
-        inBand = low <= upperBand and high >= lowerBand
+            // Timer = N bar PENUH: paling cepat di bar ke-(N+1) setelah anchor.
+            armedBar = array.get(lvlArmedBar, i)
+            armedReady = array.get(lvlArmed, i) and armedBar >= 0 and bar_index - armedBar > minBarsAfterArming
+            oldEnough = bar_index - array.get(lvlCreatedBar, i) > minBarsAfterCreation
+            lastTouch = array.get(lvlLastTouchBar, i)
+            cooledDown = lastTouch < 0 or bar_index - lastTouch > touchCooldownBars
+            inBand = low <= upperBand and high >= lowerBand
 
-        // LONG: support GREEN diretest TURUN dari atas — close sebelumnya di
-        // atas pita, bar ini turun menyentuh pita. Naik dari bawah menembus
-        // level tidak akan lolos karena close[1] tidak di atas pita.
-        longRetest = levelColor == "GREEN" and close[1] > upperBand and inBand
-        // SHORT: resistance RED diretest NAIK dari bawah (cermin LONG).
-        shortRetest = levelColor == "RED" and close[1] < lowerBand and inBand
+            // LONG: support GREEN diretest TURUN dari atas — close sebelumnya di
+            // atas pita, bar ini turun menyentuh pita. Naik dari bawah menembus
+            // level tidak akan lolos karena close[1] tidak di atas pita.
+            longRetest = levelColor == "GREEN" and prevClose > upperBand and inBand
+            // SHORT: resistance RED diretest NAIK dari bawah (cermin LONG).
+            shortRetest = levelColor == "RED" and prevClose < lowerBand and inBand
 
-        if (longRetest or shortRetest) and armedReady and oldEnough and cooledDown
-            touchSignal = longRetest ? "LONG" : "SHORT"
-            touchDirection = longRetest ? "FROM_ABOVE" : "FROM_BELOW"
-            touchNote = "eventType=LEVEL_TOUCHED | levelColor=" + levelColor + " | sourceTf=" + array.get(lvlTf, i) + " | touchDirection=" + touchDirection + " | levelPrice=" + f_formatPrice(levelPrice) + " | chartTf=" + chartTfForBackend + " | alertTiming=" + touchAlertTiming
+            if (longRetest or shortRetest) and armedReady and oldEnough and cooledDown
+                touchSignal = longRetest ? "LONG" : "SHORT"
+                touchDirection = longRetest ? "FROM_ABOVE" : "FROM_BELOW"
+                touchNote = "eventType=LEVEL_TOUCHED | levelColor=" + levelColor + " | sourceTf=" + array.get(lvlTf, i) + " | touchDirection=" + touchDirection + " | levelPrice=" + f_formatPrice(levelPrice) + " | chartTf=" + chartTfForBackend + " | alertTiming=" + touchAlertTiming
 
-            // "Immediate" boleh intrabar KARENA arming sudah dari close
-            // confirmed sebelumnya: breakout terkonfirmasi + retest instan.
-            if touchAlertTiming == "Immediate"
-                alert(f_buildWebhookJson(touchSignal, levelPrice, touchNote), alert.freq_once_per_bar)
-            else
-                alert(f_buildWebhookJson(touchSignal, levelPrice, touchNote), alert.freq_once_per_bar_close)
-            array.set(lvlLastTouchBar, i, bar_index)
+                // "Immediate" boleh intrabar KARENA arming sudah dari close
+                // confirmed sebelumnya: breakout terkonfirmasi + retest instan.
+                // Entry = levelPrice (level PERSIS), bukan harga sentuhan pita.
+                if touchAlertTiming == "Immediate"
+                    alert(f_buildWebhookJson(touchSignal, levelPrice, touchNote), alert.freq_once_per_bar)
+                else
+                    alert(f_buildWebhookJson(touchSignal, levelPrice, touchNote), alert.freq_once_per_bar_close)
+                array.set(lvlLastTouchBar, i, bar_index)
 
-            // Marker visual: hanya untuk event LONG/SHORT yang sama persis
-            // dengan alert di atas. Teks ringkas: sinyal + TF sumber level.
-            markerTf = array.get(lvlTf, i)
-            if showTouchSignalMarkers and touchSignal == "LONG"
-                label.new(bar_index, low, text="LONG " + markerTf, color=longMarkerColor, textcolor=labelTextColor, style=label.style_label_up, size=touchMarkerTextSize)
-            if showTouchSignalMarkers and touchSignal == "SHORT"
-                label.new(bar_index, high, text="SHORT " + markerTf, color=shortMarkerColor, textcolor=labelTextColor, style=label.style_label_down, size=touchMarkerTextSize)
+                // Marker visual: hanya untuk event LONG/SHORT yang sama persis
+                // dengan alert di atas. Teks ringkas: sinyal + TF sumber level.
+                markerTf = array.get(lvlTf, i)
+                if showTouchSignalMarkers and touchSignal == "LONG"
+                    label.new(bar_index, low, text="LONG " + markerTf, color=longMarkerColor, textcolor=labelTextColor, style=label.style_label_up, size=touchMarkerTextSize)
+                if showTouchSignalMarkers and touchSignal == "SHORT"
+                    label.new(bar_index, high, text="SHORT " + markerTf, color=shortMarkerColor, textcolor=labelTextColor, style=label.style_label_down, size=touchMarkerTextSize)
+
+// =================================================================================
+// BAGIAN 4C: URUTAN EKSEKUSI
+// =================================================================================
+
+// Immediate: retest DULU, baru ARMED/DISARM. Pada tick konfirmasi, loop retest
+// melihat status armed yang sama dengan tick intrabar (sebelum 4A), jadi alert
+// yang sudah terkirim intrabar ikut meng-commit cooldown-nya walau close bar ini
+// lalu men-disarm level. freq_once_per_bar mencegah kiriman kedua di bar yang sama.
+// Bar Close: tetap 4A dulu (close yang menembus level tidak mengirim alert).
+// close[1] dibaca di scope global pada setiap bar, lalu diteruskan ke loop.
+prevClose = close[1]
+if touchAlertTiming == "Immediate"
+    f_retestLoop(prevClose)
+    f_armDisarm()
+else
+    f_armDisarm()
+    f_retestLoop(prevClose)
