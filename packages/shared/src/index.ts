@@ -141,6 +141,10 @@ export type {
   ExtremeRRPlanStatus,
   ExtremeRRTemplateSnapshot,
   ExtremeType,
+  NativeAccountPlanPolicy,
+  NativeAccountPlanPreview,
+  NativeAccountPlanPreviewState,
+  NativePlanAccount,
   NativePlanListDto,
   NativePlanListItemDto,
   SelectedPlanState,
@@ -162,7 +166,10 @@ export {
   calculateExtremeCandidate,
   calculateExtremeMoney,
   extremeOfDecimalStrings,
+  NATIVE_PLAN_ACCOUNTS,
   NATIVE_PLAN_EXECUTION_STATUS,
+  parseNativeAccountPlanPolicy,
+  previewNativeAccountPlan,
   selectedPlanSummaryOf,
 } from "./extreme-rr";
 

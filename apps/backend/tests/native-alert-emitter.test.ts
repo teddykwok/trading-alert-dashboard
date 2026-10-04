@@ -634,6 +634,7 @@ const CLI = "run-native-alert-emitter.ts";
 const MULTI_CLI = "run-native-multi-emitter.ts";
 /** The single, deliberate exception to the "no notifications" fence: the COMMIT-only live dashboard publisher. */
 const LIVE_PUBLISHER_IMPORT = 'await import("../notifications/native-alert-live-publisher")';
+const PLANNING_REQUEST_IMPORT = 'await import("../native-planning/native-plan-request")';
 /** The one non-CLI emitter module allowed to touch the file system: durable cursors and status files. */
 const STATE_FILES = "native-emitter-state-files.ts";
 const read = (rel: string) => code(readFileSync(path.join(BACKEND, rel), "utf8"));
@@ -692,9 +693,10 @@ describe("static fences", () => {
     ["actionable records", /actionable:\s*true/],
   ])("39. the emitter never references %s", (_label, pattern) => {
     for (const { file, text } of emitterSources) {
-      // ONE deliberate exception (test 39b pins it): the multi-symbol CLI's COMMIT branch loads the
-      // post-commit live dashboard publisher. Exactly that import string is exempt, and only there.
-      const scanned = file === MULTI_CLI ? code(text).split(LIVE_PUBLISHER_IMPORT).join("") : code(text);
+      // TWO deliberate exceptions (tests 39b and 39c pin them): the multi-symbol CLI's COMMIT branch
+      // loads the post-commit live dashboard publisher and the post-commit Native planning request.
+      // Exactly those import strings are exempt, and only there.
+      const scanned = file === MULTI_CLI ? code(text).split(LIVE_PUBLISHER_IMPORT).join("").split(PLANNING_REQUEST_IMPORT).join("") : code(text);
       expect({ file, hit: scanned.match(pattern)?.[0] ?? null }).toEqual({ file, hit: null });
     }
   });
@@ -704,8 +706,8 @@ describe("static fences", () => {
     // Imported once, dynamically, inside the COMMIT branch: a dry run never loads it or opens Redis.
     expect(multi.split(LIVE_PUBLISHER_IMPORT).length - 1).toBe(1);
     expect(multi.indexOf(LIVE_PUBLISHER_IMPORT)).toBeGreaterThan(multi.indexOf("if (commit) {"));
-    // Handed to the ledger as its post-commit hook, nothing else.
-    expect(multi).toContain("new PrismaNativeDeliveryLedger(prisma, { onAlertCommitted: (alert) => live.publisher.publishCommitted(alert) })");
+    // Handed to the ledger as its post-commit hook, alongside (never behind) the planning request (39c).
+    expect(multi).toContain("new PrismaNativeDeliveryLedger(prisma, { onAlertCommitted: (alert) => afterNativeAlertCommitted(alert, live.publisher, planning.requester) })");
     // The ledger itself imports no publisher: it only calls the injected hook after its transaction.
     const ledger = code(emitterSources.find((s) => s.file === "native-alert-ledger.ts")!.text);
     expect(importsOf(ledger).some((s) => /notification|socket/i.test(s))).toBe(false);
@@ -716,6 +718,28 @@ describe("static fences", () => {
     // Its only dynamic imports: the generic env (for the Redis URL) and the Redis client.
     expect([...publisher.matchAll(/await import\("([^"]+)"\)/g)].map((m) => m[1]).sort()).toEqual(["../../config/env", "ioredis"]);
     expect(publisher).not.toMatch(/\bqueue\b|jobs\/queue|enqueue|bullmq|vision|screenshot\(|extreme-rr|ExtremeRR|telegram|notifyNewAlert|handleTradingView|execution|createExecution|prisma\.|\$transaction/i);
+  });
+
+  it("39c. automatic Native planning is requested post-commit only, COMMIT-only, concurrently with the push, through the dedicated Native queue", () => {
+    const multi = code(emitterSources.find((s) => s.file === MULTI_CLI)!.text);
+    // Imported once, dynamically, inside the COMMIT branch: a dry run never loads it, opens Redis or writes.
+    expect(multi.split(PLANNING_REQUEST_IMPORT).length - 1).toBe(1);
+    expect(multi.indexOf(PLANNING_REQUEST_IMPORT)).toBeGreaterThan(multi.indexOf("if (commit) {"));
+    // The emitter's delivery modules stay planning-free: only the CLI composes the hook.
+    for (const { file, text } of emitterSources) {
+      if (file === MULTI_CLI) continue;
+      expect({ file, hit: /native-planning|afterNativeAlertCommitted|requestCommitted/.test(code(text)) }).toEqual({ file, hit: false });
+    }
+    const request = read("src/modules/native-planning/native-plan-request.ts");
+    // Both follow-ups settle independently: the push is never chained behind the planning request.
+    expect(request).toContain("await Promise.allSettled([live.publishCommitted(alert), planning.requestCommitted(alert)]);");
+    // The request writes only a PENDING intent that never overwrites, and enqueues on the dedicated Native queue.
+    expect(request).toContain('status: "PENDING"');
+    expect(request).toContain("skipDuplicates: true");
+    expect(request).not.toMatch(/executionFanoutReadyAt|generateForAlert|getClosedCandlesBefore|\bfetch\s*\(|jobs\/queue|enqueueExtremeRRPlan|enqueueVisionAnalysis|telegram|notify|screenshot|vision|selected-plan|\/execution\/|createExecution|\$transaction/i);
+    const queue = read("src/modules/native-planning/native-plan-queue.ts");
+    expect(queue).toContain('NATIVE_EXTREME_RR_QUEUE_NAME = "native-extreme-rr-plan"');
+    expect(queue).not.toContain("EXTREME_RR_QUEUE_NAME }");
   });
 
   it("40. only the CLIs read the environment, the clock, the file system or timers (the state-file store: the file system only); each CLI's FIRST import is the credential-free bootstrap", () => {
@@ -746,11 +770,12 @@ describe("static fences", () => {
     }
   });
 
-  it("42. the package exposes exactly the single-symbol and multi-symbol emitter scripts (and the separate read-only audit), outside the scanner script namespace", () => {
+  it("42. the package exposes exactly the single-symbol and multi-symbol emitter scripts (and the separate Native planning worker and read-only audit), outside the scanner script namespace", () => {
     const scripts = (JSON.parse(readFileSync(path.join(BACKEND, "package.json"), "utf8")) as { scripts: Record<string, string> }).scripts;
     expect(Object.entries(scripts).filter(([name, command]) => /native-alerts/.test(name) || /native-alerts/.test(command))).toEqual([
       ["native-alerts:emitter", "tsx src/modules/native-alerts/run-native-alert-emitter.ts"],
       ["native-alerts:multi-emitter", "tsx src/modules/native-alerts/run-native-multi-emitter.ts"],
+      ["native-alerts:plan-worker", "tsx src/modules/native-planning/native-plan.worker.ts"],
       ["native-alerts:audit", "tsx src/modules/native-audit/run-native-alert-audit.ts"],
     ]);
   });

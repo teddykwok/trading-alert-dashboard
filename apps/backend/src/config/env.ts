@@ -168,6 +168,15 @@ const envSchema = z.object({
     .refine(isExtremeRRLookback, {
       message: `must be one of ${EXTREME_RR_LOOKBACKS.join(", ")}`,
     }),
+  // --- Per-account DEFAULT Native plan lookback (display / preview only) ---
+  // Which of 50/100/200/300 Account A / Account B would prefer for a Native
+  // alert's frozen plan. UNSET when absent or empty. Raw strings on purpose:
+  // they are resolved (and an invalid value REFUSED, never coerced) by
+  // native-account-plan-policy, so a bad Native display preference can never
+  // stop this process -- which also serves the TradingView webhook. Never
+  // read by any execution path; Native execution stays hard-disabled.
+  NATIVE_PLAN_DEFAULT_LOOKBACK_A: z.string().optional(),
+  NATIVE_PLAN_DEFAULT_LOOKBACK_B: z.string().optional(),
   // --- Bounded data retention (see modules/retention) ---
   // The dashboard is a short-lived inspection window; Excel (outside this app)
   // is the permanent record. Retention deletes old screenshots first, then old

@@ -484,6 +484,105 @@ export function selectedPlanSummaryOf(plan: ExtremeRRPlanDto): SelectedPlanSumma
   };
 }
 
+// ---------------------------------------------------------------------------
+// Per-account DEFAULT Native plan preference (planning / preview only)
+// ---------------------------------------------------------------------------
+
+/** The two account slots Trading Control knows. */
+export const NATIVE_PLAN_ACCOUNTS = ["A", "B"] as const;
+export type NativePlanAccount = (typeof NATIVE_PLAN_ACCOUNTS)[number];
+
+/**
+ * One account's configured default lookback for Native plans.
+ *
+ *  UNSET     nothing configured: no lookback is resolved, and none is guessed;
+ *  RESOLVED  exactly one of 50 / 100 / 200 / 300;
+ *  INVALID   something else was configured: refused (no lookback), reason kept.
+ *
+ * Deliberately NOT the plan's global `selectedLookback`: two accounts may
+ * prefer different windows for the same alert, so each preference is its own
+ * value and resolving one never reads or writes the other, or the plan.
+ */
+export type NativeAccountPlanPolicy =
+  | { account: NativePlanAccount; state: "UNSET"; lookback: null; reason: null }
+  | { account: NativePlanAccount; state: "RESOLVED"; lookback: ExtremeRRLookback; reason: null }
+  | { account: NativePlanAccount; state: "INVALID"; lookback: null; reason: string };
+
+/**
+ * Parses one account's configured value. Strict: only the exact strings
+ * "50", "100", "200" or "300" resolve; absent or empty is UNSET; anything else
+ * is INVALID — never coerced to the nearest window, never a default.
+ */
+export function parseNativeAccountPlanPolicy(account: NativePlanAccount, raw: unknown): NativeAccountPlanPolicy {
+  if (raw === undefined || raw === null || raw === "") return { account, state: "UNSET", lookback: null, reason: null };
+  if (typeof raw === "string" && /^(50|100|200|300)$/.test(raw)) {
+    const lookback = Number(raw);
+    if (isExtremeRRLookback(lookback)) return { account, state: "RESOLVED", lookback, reason: null };
+  }
+  const shown = typeof raw === "string" ? JSON.stringify(raw.slice(0, 16)) : typeof raw;
+  return { account, state: "INVALID", lookback: null, reason: `Account ${account} Native default lookback ${shown} is not one of ${EXTREME_RR_LOOKBACKS.join(", ")}` };
+}
+
+/**
+ *  UNSET              the account has no Native default;
+ *  INVALID_POLICY     the account's configured default is refused;
+ *  PLAN_NOT_READY     the plan is PENDING (still planning), INVALID or ERROR;
+ *  NO_CANDIDATE       the plan holds no candidate for the account's lookback;
+ *  CANDIDATE_INVALID  that candidate is not calculable (reason kept);
+ *  RESOLVED           the account's lookback has a valid, frozen candidate.
+ */
+export type NativeAccountPlanPreviewState = "UNSET" | "INVALID_POLICY" | "PLAN_NOT_READY" | "NO_CANDIDATE" | "CANDIDATE_INVALID" | "RESOLVED";
+
+/** What one account's Native default would pick from one frozen plan. A preview: it grants nothing. */
+export interface NativeAccountPlanPreview {
+  account: NativePlanAccount;
+  policy: NativeAccountPlanPolicy["state"];
+  /** The account's own lookback; null when UNSET or INVALID. */
+  lookback: ExtremeRRLookback | null;
+  state: NativeAccountPlanPreviewState;
+  /** Null unless state is RESOLVED: an incalculable preview never shows a fabricated SL/TP. */
+  stopLoss: string | null;
+  takeProfit: string | null;
+  riskRewardRatio: string | null;
+  actualCandles: number | null;
+  complete: boolean | null;
+  reason: string | null;
+  execution: typeof NATIVE_PLAN_EXECUTION_STATUS;
+}
+
+/**
+ * Pure. Reads ONLY the account's own policy and the plan's frozen candidates;
+ * never the plan's global selected lookback, never current market data, never
+ * an account balance, and it writes nothing.
+ */
+export function previewNativeAccountPlan(
+  plan: Pick<ExtremeRRPlanDto, "status" | "candidates" | "errorReason">,
+  policy: NativeAccountPlanPolicy
+): NativeAccountPlanPreview {
+  const base = { account: policy.account, policy: policy.state, lookback: policy.lookback, execution: NATIVE_PLAN_EXECUTION_STATUS } as const;
+  const none = { stopLoss: null, takeProfit: null, riskRewardRatio: null, actualCandles: null, complete: null };
+  if (policy.state === "UNSET") return { ...base, ...none, state: "UNSET", reason: `Account ${policy.account} has no Native default lookback configured` };
+  if (policy.state === "INVALID") return { ...base, ...none, state: "INVALID_POLICY", reason: policy.reason };
+  const candidate = plan.candidates.find((c) => c.requestedCandles === policy.lookback) ?? null;
+  if (plan.status !== "READY") {
+    return { ...base, ...none, state: "PLAN_NOT_READY", reason: plan.status === "PENDING" ? "Plan is still being generated" : plan.errorReason ?? `Plan is ${plan.status}` };
+  }
+  if (candidate === null) return { ...base, ...none, state: "NO_CANDIDATE", reason: `No candidate exists for lookback ${policy.lookback}` };
+  if (!candidate.valid || candidate.stopLoss === null || candidate.takeProfit === null) {
+    return { ...base, ...none, actualCandles: candidate.actualCandles, complete: candidate.complete, state: "CANDIDATE_INVALID", reason: candidate.invalidReason ?? "The candidate is not calculable" };
+  }
+  return {
+    ...base,
+    state: "RESOLVED",
+    stopLoss: candidate.stopLoss,
+    takeProfit: candidate.takeProfit,
+    riskRewardRatio: candidate.riskRewardRatio,
+    actualCandles: candidate.actualCandles,
+    complete: candidate.complete,
+    reason: null,
+  };
+}
+
 /** One Native alert's plan, as the read-only Trading Control list shows it. */
 export interface NativePlanListItemDto {
   alertId: string;
@@ -491,11 +590,17 @@ export interface NativePlanListItemDto {
   sourceTimeframe: string | null;
   triggeredAt: string;
   plan: SelectedPlanSummary;
+  /** The lookbacks the frozen plan holds a VALID candidate for (empty until READY). */
+  availableLookbacks: ExtremeRRLookback[];
+  /** One preview per account, in NATIVE_PLAN_ACCOUNTS order. */
+  accountDefaults: NativeAccountPlanPreview[];
 }
 
 export interface NativePlanListDto {
   /** Hard-coded false: listing a Native plan grants nothing. */
   nativeExecutionEnabled: false;
+  /** Each account's configured Native default, shown even when no plan exists. */
+  accountPolicies: NativeAccountPlanPolicy[];
   items: NativePlanListItemDto[];
 }
 
