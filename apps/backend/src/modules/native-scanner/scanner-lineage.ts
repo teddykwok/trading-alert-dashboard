@@ -1,10 +1,11 @@
 import {
-  NATIVE_HISTORICAL_STATE_SEMANTICS,
   SWITCHOVER_TRUNCATED_CLOSED_BARS,
   createNativeEngineConfig,
+  historicalStateSemanticsOf,
   htfPeriodStartMs,
   type CalendarAlignment,
   type NativeEngineConfig,
+  type NativeHistoricalStateSemantics,
   type NativePartialPeriodPolicy,
   type NativeSourceTf,
 } from "@trading-alert-dashboard/shared";
@@ -17,7 +18,7 @@ import {
   type ScannerMarketType,
 } from "./binance-public-futures";
 import { canonicalJson, canonicalSha256 } from "./canonical-json";
-import { NATIVE_ENGINE_SEMANTICS } from "./historical-replay";
+import { engineSemanticsOf, type NativeEngineSemantics } from "./historical-replay";
 
 /**
  * Scanner STATE LINEAGE: everything that shapes the committed engine state at
@@ -49,8 +50,9 @@ export interface ScannerLineage {
   /** First context bar: the start of the earliest enabled HTF period containing historyStart. */
   readonly htfContextStartMs: number;
   readonly klineSource: typeof SCANNER_KLINE_SOURCE;
-  readonly engineSemantics: typeof NATIVE_ENGINE_SEMANTICS;
-  readonly historicalStateSemantics: typeof NATIVE_HISTORICAL_STATE_SEMANTICS;
+  /** Implied by the config's lifecycle (engineSemanticsOf / historicalStateSemanticsOf), never chosen separately. */
+  readonly engineSemantics: NativeEngineSemantics;
+  readonly historicalStateSemantics: NativeHistoricalStateSemantics;
   /** The complete, canonical engine configuration, calendar included. */
   readonly engineConfig: NativeEngineConfig;
   readonly partialPeriodPolicy: NativePartialPeriodPolicy;
@@ -138,12 +140,14 @@ export function assertScannerLineage(lineage: ScannerLineage): void {
   }
   if (!(lineage.historyStartMs < lineage.compatibilitySwitchoverMs)) invalid("historyStartMs must be before compatibilitySwitchoverMs");
   if (lineage.klineSource !== SCANNER_KLINE_SOURCE) invalid("unknown kline source");
-  if (lineage.engineSemantics !== NATIVE_ENGINE_SEMANTICS) invalid("unknown engine semantics");
-  if (lineage.historicalStateSemantics !== NATIVE_HISTORICAL_STATE_SEMANTICS) invalid("unknown historical state semantics");
   if (lineage.partialPeriodPolicy !== SWITCHOVER_TRUNCATED_CLOSED_BARS) invalid(`partialPeriodPolicy must be ${SWITCHOVER_TRUNCATED_CLOSED_BARS}`);
   if (!/^[0-9a-f]{64}$/.test(lineage.bootstrapInputSha256)) invalid("bootstrapInputSha256 must be a lowercase SHA-256 hex digest");
   const canonicalConfig = createNativeEngineConfig(lineage.engineConfig);
   if (canonicalJson(canonicalConfig) !== canonicalJson(lineage.engineConfig)) invalid("engineConfig is not in canonical form");
+  // The semantics are a function of the config's lifecycle: a lineage can never pair one engine's
+  // config with another engine's semantics.
+  if (lineage.engineSemantics !== engineSemanticsOf(canonicalConfig)) invalid("unknown engine semantics");
+  if (lineage.historicalStateSemantics !== historicalStateSemanticsOf(canonicalConfig)) invalid("unknown historical state semantics");
   const expectedContext = deriveHtfContextStartMs(lineage.historyStartMs, canonicalConfig.enabledSourceTfs, canonicalConfig.calendar);
   if (lineage.htfContextStartMs !== expectedContext) invalid("htfContextStartMs does not match the enabled timeframes and calendar");
 }
@@ -167,8 +171,8 @@ export function buildScannerLineage(input: ScannerLineageInput): { readonly line
     compatibilitySwitchoverMs: input.compatibilitySwitchoverMs,
     htfContextStartMs: deriveHtfContextStartMs(input.historyStartMs, engineConfig.enabledSourceTfs, engineConfig.calendar),
     klineSource: SCANNER_KLINE_SOURCE,
-    engineSemantics: NATIVE_ENGINE_SEMANTICS,
-    historicalStateSemantics: NATIVE_HISTORICAL_STATE_SEMANTICS,
+    engineSemantics: engineSemanticsOf(engineConfig),
+    historicalStateSemantics: historicalStateSemanticsOf(engineConfig),
     engineConfig,
     partialPeriodPolicy: input.partialPeriodPolicy,
     bootstrapInputSha256: input.bootstrapInputSha256,

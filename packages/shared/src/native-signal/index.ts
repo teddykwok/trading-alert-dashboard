@@ -8,11 +8,14 @@ export type {
   NativeEngineDiagnosticSnapshot,
   NativeEngineConfigInput,
   NativeEngineState,
+  NativeFormingCandidate,
+  NativeFormingCandidates,
   NativeHistoricalInput,
   NativeHistoricalPeriod,
   NativeHistoricalProjection,
   NativeHistoricalReport,
   NativeHistoricalResult,
+  NativeHistoricalStateSemantics,
   NativeHistoricalTouch,
   NativeHtfAggregate,
   NativeHtfTrack,
@@ -25,6 +28,7 @@ export type {
   NativeLevelColor,
   NativeLevelCondition,
   NativeLevelDiagnostic,
+  NativeLevelLifecycle,
   NativePartialPeriodPolicy,
   NativeRetestCandidate,
   NativeSignal,
@@ -36,7 +40,11 @@ export type {
 } from "./types";
 export {
   DEFAULT_CALENDAR_ALIGNMENT,
+  NATIVE_DYNAMIC_HISTORICAL_STATE_SEMANTICS,
   NATIVE_HISTORICAL_STATE_SEMANTICS,
+  NATIVE_LEVEL_LIFECYCLES,
+  NATIVE_LIFECYCLE_PINE_V55_EDGE,
+  NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1,
   NATIVE_LEVEL_CONDITIONS,
   NATIVE_SOURCE_TF_ORDER,
   NATIVE_TIMING_MODES,
@@ -45,6 +53,8 @@ export {
   PINE_V5_FIRST_HISTORY_BAR_NO_EDGE,
   SWITCHOVER_TRUNCATED_CLOSED_BARS,
   createNativeEngineConfig,
+  historicalStateSemanticsOf,
+  nativeLevelLifecycleOf,
   pinePercentInputToFraction,
 } from "./types";
 
@@ -52,11 +62,19 @@ export { advanceHtfAggregate, barFitsHtfPeriod, htfPeriodStartMs, projectPineHis
 export {
   createNativeEngineState,
   evaluateLevelConditions,
+  isDynamicLifecycle,
   reconstructImmediateCandidates,
+  retestTimerGates,
   snapshotNativeEngineForNextBar,
   stepNativeEngine,
   stepNativeEngineWithImmediate,
 } from "./engine";
 
 export type { NativeImmediateReplayResult, NativeReplayResult } from "./replay";
-export { reconstructPineHistoricalState, replayNativeEngine, replayNativeEngineWithImmediate } from "./replay";
+export {
+  reconstructCausalHistoricalState,
+  reconstructHistoricalState,
+  reconstructPineHistoricalState,
+  replayNativeEngine,
+  replayNativeEngineWithImmediate,
+} from "./replay";
