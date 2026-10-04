@@ -22,9 +22,10 @@ export function DashboardPage() {
   // Filters are sent to the server, so each page is "the next 100 matching
   // alerts" (page size = backend DASHBOARD_DEFAULT_LIMIT). loadMore appends
   // older retained alerts with the same filters.
-  const { alerts, setAlerts, total, loading, loadingMore, hasMore, error, loadMore } =
+  const { alerts, setAlerts, total, loading, loadingMore, hasMore, error, loadMore, applyLiveAlert } =
     useAlerts(filters);
-  useSocketAlerts(setAlerts);
+  // A live alert updates the card list AND, when genuinely new and matching, the total.
+  useSocketAlerts(setAlerts, applyLiveAlert);
 
   const location = useLocation();
   const navigationType = useNavigationType();

@@ -22,6 +22,16 @@ export interface SelectedPlanPresentation {
   readonly status: string;
 }
 
+/**
+ * The plan's OWN global selection (its initial window comes from the deployment
+ * default EXTREME_RR_LOOKBACK_CANDLES, or a manual Trade Plan choice). It is NOT
+ * an account execution preference: Account A / B Native defaults are separate.
+ */
+export const PLAN_SELECTION_LABEL = "Plan selection (global)";
+
+/** Rows whose value is an exact decimal price, rendered compactly (exact value kept in the tooltip). */
+export const DECIMAL_ROW_LABELS: readonly string[] = ["Entry", "SL", "TP"];
+
 export const NO_SELECTED_PLAN = "No selected plan — no Extreme RR plan has been generated for this alert.";
 
 const STATE_HEADLINE: Readonly<Record<SelectedPlanSummary["state"], string>> = Object.freeze({
@@ -47,7 +57,7 @@ export function presentSelectedPlan(summary: SelectedPlanSummary | null): Select
   const status = summary.alertSource === "NATIVE" ? NATIVE_PLAN_EXECUTION_STATUS : "Execution is decided by each account's own admission";
   const lookback = `${summary.selectedLookback} candles${summary.actualCandles !== null && summary.complete === false ? ` (only ${summary.actualCandles} available)` : ""}`;
   const rows: SelectedPlanRow[] = [
-    { label: "Selected plan", value: lookback },
+    { label: PLAN_SELECTION_LABEL, value: lookback },
     { label: "Direction", value: summary.direction },
     { label: "Entry", value: summary.entryPrice },
   ];

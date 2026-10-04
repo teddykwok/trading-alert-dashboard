@@ -703,7 +703,10 @@ describe("static isolation", () => {
 
   it("11-15/35. the Native planning modules reach no TradingView queue, Telegram, screenshot, vision, adoption, execution or signed client", () => {
     const files = readdirSync(path.join(BACKEND, PLANNING_DIR)).filter((f) => f.endsWith(".ts"));
-    expect(files.sort()).toEqual(["native-account-plan-policy.ts", "native-plan-eligibility.ts", "native-plan-processor.ts", "native-plan-queue.ts", "native-plan-request.ts", "native-plan.worker.ts"]);
+    expect(files.sort()).toEqual([
+      "native-account-plan-policy.ts", "native-plan-eligibility.ts", "native-plan-processor.ts", "native-plan-queue.ts", "native-plan-request.ts", "native-plan.worker.ts",
+      "native-planner-heartbeat.ts", "native-planner-runtime.ts", "native-planner-status.ts",
+    ]);
     for (const file of files) {
       const source = read(`${PLANNING_DIR}/${file}`).replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
       expect({ file, hit: source.match(/jobs\/queue|(?<![A-Z_])EXTREME_RR_QUEUE_NAME\b|enqueueExtremeRRPlan|enqueueVisionAnalysis|notification|notify|telegram|screenshot|ai-vision|analyzeChart|selected-plan|\/execution\/|createExecution|executionFanoutReadyAt:\s*new Date|binance-execution|binance-read-only|binance-account|createHmac|X-MBX|BINANCE_API_KEY|apiSecret/i)?.[0] ?? null }).toEqual({ file, hit: null });

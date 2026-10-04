@@ -47,7 +47,8 @@ export type DualRole =
   | "account-a-control"
   | "account-a-worker"
   | "account-b-control"
-  | "account-b-worker";
+  | "account-b-worker"
+  | "native-planner";
 
 /**
  * Start order, and the reverse of it is stop order.
@@ -65,6 +66,19 @@ export const DUAL_ROLES: readonly DualRole[] = [
   "account-b-control",
   "account-b-worker",
 ] as const;
+
+/**
+ * OPTIONAL generic roles: known to the launcher (recognised in the process
+ * census, startable, supervisable and stoppable by their own menu actions) but
+ * deliberately NOT part of the six-role SAFE topology above.
+ *
+ * The Native planner is planning only and holds no account. Keeping it out of
+ * DUAL_ROLES means Start SAFE never starts it, topology verification never
+ * requires it, and a Native planner problem can never block, fail or roll back
+ * the TradingView runtime. Its ownership record lives in its own state file for
+ * the same reason (see run-runtime-launcher.ts).
+ */
+export const OPTIONAL_GENERIC_ROLES: readonly DualRole[] = ["native-planner"] as const;
 
 export interface RoleContract {
   readonly role: DualRole;
@@ -162,6 +176,24 @@ export const ROLE_CONTRACTS: Readonly<Record<DualRole, RoleContract>> = Object.f
     port: null,
     loopbackOnly: false,
     attests: "WORKER",
+  },
+  // OPTIONAL (see OPTIONAL_GENERIC_ROLES): never started by Start SAFE.
+  "native-planner": {
+    role: "native-planner",
+    label: "Native Planner Worker",
+    account: "GENERIC",
+    envAlias: "generic",
+    filter: BACKEND_FILTER,
+    // Plain `tsx`, not `tsx watch`: a watcher respawns on a file change, not on
+    // a crash, and would hide an exit from supervision.
+    script: "native-alerts:plan-worker",
+    entrypoint: "src/modules/native-planning/native-plan.worker.ts",
+    port: null,
+    loopbackOnly: false,
+    // Generic and planning only: it publishes no account attestation. Its
+    // liveness is the process census (launcher) and its own Redis heartbeat
+    // (read-only backend status).
+    attests: null,
   },
 });
 

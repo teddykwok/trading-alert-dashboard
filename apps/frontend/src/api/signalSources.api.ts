@@ -29,6 +29,29 @@ export interface SignalSourcesStatusDto {
   };
 }
 
+/**
+ * A live `new_alert` applied to the Signal Sources summary. Pure.
+ *
+ * Only a NATIVE alert moves anything, and only the Native "Last delivered"
+ * (time + symbol) — the same Alert.createdAt the backend reports on its next
+ * poll. TradingView's line is never touched here: it keeps its existing
+ * poll-only behaviour. Idempotent and monotonic: a duplicate frame, or an older
+ * alert, returns the SAME object (no re-render, nothing moves twice or
+ * backwards). Before the first poll there is nothing to update; the poll brings
+ * the backend's truth, and every later poll replaces this local hint.
+ */
+export function applyLiveNativeDelivery(
+  status: SignalSourcesStatusDto | null,
+  alert: { source?: string | null; createdAt: string; symbol: string }
+): SignalSourcesStatusDto | null {
+  if (status === null || alert.source !== "NATIVE") return status;
+  const at = Date.parse(alert.createdAt);
+  if (!Number.isFinite(at)) return status;
+  const current = status.native.lastDeliveredAt === null ? null : Date.parse(status.native.lastDeliveredAt);
+  if (current !== null && Number.isFinite(current) && current >= at) return status;
+  return { ...status, native: { ...status.native, lastDeliveredAt: alert.createdAt, lastDeliveredSymbol: alert.symbol } };
+}
+
 export const signalSourcesApi = {
   status: () => apiClient.get<SignalSourcesStatusDto>("/api/signal-sources/status"),
 };

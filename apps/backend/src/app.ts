@@ -21,6 +21,7 @@ import { executionsRoutes } from "./routes/executions.routes";
 import { operatorRoutes } from "./routes/operator.routes";
 import { accountOperatorGatewayRoutes } from "./modules/operator/account-operator-gateway";
 import { signalSourcesRoutes } from "./routes/signal-sources.routes";
+import { nativePlannerRoutes } from "./routes/native-planner.routes";
 import { AppError } from "./utils/errors";
 import { ensureScreenshotDir } from "./utils/file";
 
@@ -92,6 +93,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(executionsRoutes);
   // Read-only status of the two signal sources (TradingView webhook, Native scanner).
   await app.register(signalSourcesRoutes);
+  // Read-only health of the SEPARATE Native planner worker. Never starts it.
+  await app.register(nativePlannerRoutes);
   // The ONE frontend's same-origin path to exactly one account's loopback
   // control plane per request. Holds no credential and decides nothing: the
   // account control plane still authenticates and authorizes everything.

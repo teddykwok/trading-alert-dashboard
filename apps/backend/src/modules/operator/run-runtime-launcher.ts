@@ -134,6 +134,7 @@ import {
   genericAnalysisHealth,
   renderGenericAnalysisSupervision,
 } from "./generic-analysis-supervision";
+import { createNativePlannerLauncher, type NativePlannerLauncher } from "./native-planner-launcher";
 
 /**
  * Phase 11I — the local Windows runtime launcher for the DUAL-ACCOUNT topology.
@@ -1737,6 +1738,37 @@ async function superviseGenericAnalysis(ask: (question: string) => Promise<strin
 }
 
 // ---------------------------------------------------------------------------
+// Native planner — the OPTIONAL generic role, wired to its own module
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything about the optional Native planner lives in native-planner-launcher.ts
+ * (its own state file, its own fenced start / stop / supervision). This CLI only
+ * hands it the machine primitives it already owns -- by reference, so the
+ * six-role fences above (the ONE gate printer, the ownership-proving probes, the
+ * shared mutation lock, the durable role log) are the ones it uses. It is never
+ * part of Start SAFE, Stop Runtime or the six-role state file.
+ */
+let nativePlannerLauncher: NativePlannerLauncher | null = null;
+function nativePlanner(): NativePlannerLauncher {
+  nativePlannerLauncher ??= createNativePlannerLauncher({
+    repoRoot: REPO_ROOT,
+    statePath: `${defaultStatePath()}.native-planner.json`,
+    observeProcesses,
+    observeListeners,
+    probeProcesses,
+    terminate: terminateTree,
+    spawnRole: spawnRoleWithDurableLog,
+    gateAllows: transitionGateAllows,
+    readTransitionMarker,
+    lockAdapters,
+    log: (line) => console.log(line),
+    sleep,
+  });
+  return nativePlannerLauncher;
+}
+
+// ---------------------------------------------------------------------------
 // Menu
 // ---------------------------------------------------------------------------
 
@@ -2286,6 +2318,7 @@ async function main(): Promise<void> {
       }
       const { status, disowned, effectiveGates } = snapshot;
       for (const line of renderTopology(status, disowned, effectiveGates)) console.log(line);
+      console.log(nativePlanner().statusLine(status));
 
       console.log("");
       console.log("1. Show Status");
@@ -2298,6 +2331,9 @@ async function main(): Promise<void> {
       console.log("8. Exit");
       console.log("9. Return ONE account to SAFE");
       console.log("10. Recover an INCOMPLETE transition");
+      console.log("11. Start Native Planner (optional, generic, planning only)");
+      console.log("12. Supervise Native Planner");
+      console.log("13. Stop Native Planner");
       console.log("");
 
       const choice = (await ask("Choose: ")).trim();
@@ -2312,6 +2348,9 @@ async function main(): Promise<void> {
         else if (choice === "7") await superviseGenericAnalysis(ask);
         else if (choice === "9") await transitionAccount("SAFE", ask);
         else if (choice === "10") await recoverIncompleteTransition(ask);
+        else if (choice === "11") await nativePlanner().start();
+        else if (choice === "12") await nativePlanner().supervise(ask);
+        else if (choice === "13") await nativePlanner().stop();
         else console.log("Unrecognised choice. Nothing was changed.");
       } catch (error) {
         // Any action that needs to see the machine refuses when it cannot.
