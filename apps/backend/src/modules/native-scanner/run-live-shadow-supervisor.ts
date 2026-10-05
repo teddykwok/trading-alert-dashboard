@@ -4,7 +4,7 @@ import "../../config/bootstrap-generic";
 
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from "node:fs";
 import path from "node:path";
 
 import { env } from "../../config/env";
@@ -13,21 +13,25 @@ import { CandidateRankHaltError, GovernedPublicTransport } from "./candidate-ran
 import { KlineCacheStore } from "./kline-cache";
 import { PublicRequestController, REQUEST_POLICY_LIMITS, type PublicHttpTransport } from "./kline-fetcher";
 import type { OpenPublicStream } from "./live-shadow-runner";
-import { LiveShadowSupervisor, SupervisorConfigError, TargetNotReachedError, type SupervisorStatus } from "./live-shadow-supervisor";
+import { LiveShadowSupervisor, SupervisorConfigError, TargetNotReachedError, type MembershipChange, type SupervisorStatus } from "./live-shadow-supervisor";
 import { SUPERVISOR_CLI_USAGE, SupervisorCliUsageError, parseSupervisorCliArgs } from "./live-shadow-supervisor-cli-args";
 import { ScannerPathError, assertOutsideRepository, scannerKlineCacheDir, scannerRootDir } from "./scanner-paths";
 import { acquireLiveShadowLock } from "./scanner-lock";
+import { RUN_MEMBERSHIP_JOURNAL_FILE, membershipLine } from "./run-membership";
 import {
+  DEFAULT_UNIVERSE_REFRESH_MS,
   ENGINE_NAMESPACE_MANIFEST,
   ScannerProfileError,
   assertEngineNamespace,
   engineNamespaceDir,
   engineNamespaceManifestOf,
+  isAllActiveUniverse,
+  isDynamicUniverse,
   profileSummaryOf,
 } from "./scanner-profile";
 import { RunManifestError, makeRunId, runManifestText } from "./supervisor-run-manifest";
 import { connectionCapacityOf, supervisorLiveDirFor, supervisorRunManifestOf, supervisorSelectionOf } from "./supervisor-run-plan";
-import { UniverseSelectionError, parseExchangeInfoContracts, selectUsdtPerpetualUniverse } from "./usdm-universe";
+import { UniverseSelectionError, parseExchangeInfoContracts, selectUsdtPerpetualUniverse, type UniverseSymbolTrust } from "./usdm-universe";
 
 /**
  * MULTI-SYMBOL NATIVE LIVE-SHADOW SUPERVISOR — SHADOW ONLY.
@@ -87,6 +91,13 @@ function git(args: string[]): string {
 
 function printSummary(status: SupervisorStatus, extra: Record<string, unknown>): void {
   const t = status.totals;
+  const u = status.universe;
+  if (u !== null && "inactive" in t) {
+    console.log(
+      `[${iso(Date.now())}] universe gen ${u.generation} ${u.lastResult ?? "-"}${u.stale ? " STALE" : ""} | candidates ${u.exchangeCandidates ?? "-"} | bootstrapping ${t.bootstrapping} | waiting ${t.waitingFirstClosedBar} | unreadable ${t.bootstrapUnreadable} | quarantined ${t.quarantinedHistory} | inactive ${t.inactive} | ` +
+        `+${u.latest.added.length} -${u.latest.removed.length} | connections ${t.connectionsOpen} (rebuilds ${t.connectionRebuilds}) | capacity ${u.capacity.required}/${u.capacity.available}${u.capacity.exceeded ? " EXCEEDED" : ""}`
+    );
+  }
   console.log(
     `[${iso(Date.now())}] selected ${t.selected} | live ${t.liveEligible} | quarantined ${t.quarantined} | awaiting ${t.awaitingStream} | recovering ${t.recovering} | failed ${t.failed} | pending ${t.catchupPending} | ` +
       `observations ${t.liveObservations} | commits ${t.commits} | refused ${t.refusedMessages} | reconnects ${t.reconnects} | backpressure ${t.backpressureEvents} | REST ${t.restRequests}${t.restHalted ? " HALTED" : ""} | ${Object.entries(extra).map(([k, v]) => `${k} ${String(v)}`).join(" | ")}`
@@ -153,12 +164,40 @@ async function main(): Promise<void> {
   };
 
   // The same universe and selection rules as the ranker; explicit symbols must be active USDT perpetuals.
-  const universe = selectUsdtPerpetualUniverse(parseExchangeInfoContracts(await new PublicRequestController(fetchDeps).getJson(buildPublicFuturesUrl(baseUrl, EXCHANGE_INFO_PATH))));
+  // A dynamic-universe profile also trusts the exact caseless-Unicode symbols exchangeInfo lists.
+  const trust: UniverseSymbolTrust = options.profile !== null && isAllActiveUniverse(options.profile.universe) ? (options.profile.universe.symbolTrust ?? "ASCII") : "ASCII";
+  const fetchUniverse = async () =>
+    selectUsdtPerpetualUniverse(parseExchangeInfoContracts(await new PublicRequestController(fetchDeps).getJson(buildPublicFuturesUrl(baseUrl, EXCHANGE_INFO_PATH))), trust);
+  const universe = await fetchUniverse();
+  // DYNAMIC_UNIVERSE_V1 (with the profile's universe, never with diagnostic --symbols): refresh and onboard while running.
+  const dynamic = options.profile !== null && isDynamicUniverse(options.profile.universe) && options.selection.mode === "UNIVERSE";
+  const refreshIntervalMs = options.profile?.operations?.universeRefreshMs ?? DEFAULT_UNIVERSE_REFRESH_MS;
   // EXPLICIT: exactly the named symbols, never substituted. UNIVERSE: walk the universe and
   // accept SCANNER-ELIGIBLE symbols until --max-symbols are accepted, or all of them (--all-active / an all-active profile).
   const selection = supervisorSelectionOf(universe, options.selection);
   const started = Date.now();
   const stateDirOf = supervisorLiveDirFor(root, profile, options.lineage.chartInterval);
+  const statusDir = assertOutsideRepository(path.join(root, "live-shadow-supervisor"), REPO_ROOT);
+  // Per-run files: the immutable manifest a pinned consumer binds to, this run's own status and, for a
+  // dynamic universe, its append-only membership journal (every join, removal or return after start-up).
+  const runDir = assertOutsideRepository(path.join(statusDir, "runs", runId), REPO_ROOT);
+  const journalFile = path.join(runDir, RUN_MEMBERSHIP_JOURNAL_FILE);
+  let journalSeq = 0;
+  let journalLast: string | null = null;
+  const recordMembership = (change: MembershipChange) => {
+    const line = membershipLine(runId, journalSeq + 1, journalLast, change);
+    mkdirSync(runDir, { recursive: true });
+    const fd = openSync(journalFile, "a");
+    try {
+      writeSync(fd, line);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    journalSeq += 1;
+    journalLast = line.slice(0, -1);
+    console.log(`[${iso(Date.now())}] membership ${journalSeq}: ${change.kind} ${change.symbol}${change.reason ? ` (${change.reason})` : ""}`);
+  };
   const supervisor = new LiveShadowSupervisor(
     {
       lineage: options.lineage,
@@ -174,6 +213,7 @@ async function main(): Promise<void> {
       liveDirFor: (symbol) => assertOutsideRepository(stateDirOf(symbol), REPO_ROOT),
       runId,
       profile,
+      dynamicUniverse: dynamic ? { refreshIntervalMs } : null,
     },
     {
       openStream: openPublicStream,
@@ -185,6 +225,7 @@ async function main(): Promise<void> {
       nowIso: () => iso(Date.now()),
       schedule: (fn) => setImmediate(fn),
       log: (line) => console.log(`[${iso(Date.now())}] ${line}`),
+      ...(dynamic ? { fetchUniverse, recordMembership } : {}),
     }
   );
   console.log(`universe active: ${universe.contracts.length}`);
@@ -199,11 +240,13 @@ async function main(): Promise<void> {
   console.log(
     `connection capacity: ${connectionCapacityOf(options.symbolsPerConnection, options.maxConnections)} symbols (${options.maxConnections} connections max x ${options.symbolsPerConnection} per connection; only those needed are opened; a larger accepted set is refused, never truncated)`
   );
+  console.log(
+    dynamic
+      ? `universe: DYNAMIC_UNIVERSE_V1 — exchangeInfo refreshed every ${Math.round(refreshIntervalMs / 1000)}s; new listings bootstrap from their first real closed bar and join without a restart (symbol trust ${trust})`
+      : "universe: resolved once at start-up"
+  );
 
-  const statusDir = assertOutsideRepository(path.join(root, "live-shadow-supervisor"), REPO_ROOT);
   const statusFile = path.join(statusDir, "status.json");
-  // Per-run files: the immutable manifest a pinned consumer binds to, and this run's own status.
-  const runDir = assertOutsideRepository(path.join(statusDir, "runs", runId), REPO_ROOT);
   const runStatusFile = path.join(runDir, "status.json");
   const writeStatus = (status: SupervisorStatus) => {
     // Observational only: a failure here is logged and never touches scanning.
@@ -248,6 +291,7 @@ async function main(): Promise<void> {
     profile,
     selection: sel,
     symbols: supervisor.acceptedSymbols(),
+    dynamicMembership: dynamic,
   });
   mkdirSync(runDir, { recursive: true });
   writeFileSync(path.join(runDir, "manifest.json"), runManifestText(manifest), { encoding: "utf8", flag: "wx" });

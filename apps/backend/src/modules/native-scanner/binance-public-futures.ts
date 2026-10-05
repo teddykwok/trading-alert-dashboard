@@ -1,5 +1,7 @@
 import type { NativeKline } from "@trading-alert-dashboard/shared";
 
+import { isScannerSymbolShape } from "./exchange-symbol";
+
 /**
  * Binance USD-M Futures PUBLIC market data, as the native scanner sees it.
  *
@@ -62,10 +64,15 @@ function refuse(code: ScannerDataErrorCode, message: string): never {
   throw new ScannerDataError(code, message);
 }
 
-/** One bare Binance symbol, e.g. "BTCUSDT". No exchange prefix, no ".P", no lists. */
+/**
+ * One bare Binance symbol, e.g. "BTCUSDT" — or an exact caseless-Unicode
+ * exchange symbol such as "币安人生USDT" (exchange-symbol.ts). No exchange
+ * prefix, no ".P", no lists, no separators. SHAPE only: whether Binance lists a
+ * symbol is decided by the universe, and operators can name only ASCII symbols.
+ */
 export function assertScannerSymbol(symbol: unknown): string {
-  if (typeof symbol !== "string" || !/^[A-Z0-9]{3,30}$/.test(symbol)) {
-    refuse("INVALID_SYMBOL", "symbol must be ONE bare uppercase Binance symbol such as BTCUSDT");
+  if (!isScannerSymbolShape(symbol)) {
+    refuse("INVALID_SYMBOL", "symbol must be ONE bare uppercase Binance symbol such as BTCUSDT (or an exact caseless-Unicode exchange symbol)");
   }
   return symbol;
 }

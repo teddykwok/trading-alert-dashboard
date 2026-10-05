@@ -17,7 +17,17 @@ import { SCANNER_MARKET_TYPE, intervalMsOf, type ScannerChartInterval, type Scan
 import { canonicalSha256 } from "./canonical-json";
 import { engineSemanticsOf as engineSemanticsIdOf } from "./historical-replay";
 import type { LineageConfig } from "./live-shadow-cli-args";
-import { SCANNER_KLINE_SOURCE, buildScannerLineage, deriveHtfContextStartMs, type ScannerLineage } from "./scanner-lineage";
+import { symbolPathSegment } from "./exchange-symbol";
+import {
+  HISTORY_ORIGIN_SYMBOL_FIRST_CLOSED_BAR_V1,
+  SCANNER_KLINE_SOURCE,
+  buildScannerLineage,
+  deriveHtfContextStartMs,
+  type ScannerHistoryOrigin,
+  type ScannerLineage,
+  type SymbolOriginInput,
+} from "./scanner-lineage";
+import { SYMBOL_TRUST_EXCHANGE_INFO_UNICODE_V1, type UniverseSymbolTrust } from "./usdm-universe";
 
 /**
  * NATIVE SCANNER PROFILES — immutable, versioned, machine-identified.
@@ -101,6 +111,14 @@ export interface EnginePolicy {
    * engine, lineage and fingerprint are exactly what they always were.
    */
   readonly lifecycle?: NativeLevelLifecycle;
+  /**
+   * Where each symbol's history begins (scanner-lineage.ts). Absent = the
+   * profile's fixed history for every symbol (a later listing can never hold
+   * it), so every existing profile's engine and fingerprint are unchanged.
+   * SYMBOL_FIRST_CLOSED_BAR_V1 = the symbol's first real closed bar when that is
+   * later than the profile context start; requires the dynamic lifecycle.
+   */
+  readonly historyOrigin?: ScannerHistoryOrigin;
 }
 
 export const NATIVE_DELIVERY_V2_VERSION = "NATIVE_DELIVERY_V2" as const;
@@ -146,7 +164,21 @@ export interface AllActiveUniversePolicy {
   readonly universe: "usdt-perpetual";
   readonly selection: "ALL_ACTIVE";
   readonly targetEligible: null;
+  /**
+   * DYNAMIC_UNIVERSE_V1: the running scanner refreshes exchangeInfo, onboards new
+   * listings without a restart, stops scanning symbols that leave the universe
+   * (state preserved) and resumes them if they return. Absent = the universe is
+   * resolved once at start-up. Requires a SYMBOL_FIRST_CLOSED_BAR_V1 engine.
+   */
+  readonly lifecycle?: typeof UNIVERSE_LIFECYCLE_DYNAMIC_V1;
+  /** Which exchange symbol strings are accepted (usdm-universe.ts). Absent = ASCII. */
+  readonly symbolTrust?: UniverseSymbolTrust;
 }
+
+export const UNIVERSE_LIFECYCLE_DYNAMIC_V1 = "DYNAMIC_UNIVERSE_V1" as const;
+
+export const isDynamicUniverse = (universe: UniversePolicy): universe is AllActiveUniversePolicy & { readonly lifecycle: typeof UNIVERSE_LIFECYCLE_DYNAMIC_V1 } =>
+  isAllActiveUniverse(universe) && universe.lifecycle === UNIVERSE_LIFECYCLE_DYNAMIC_V1;
 
 export type UniversePolicy = TargetEligibleUniversePolicy | AllActiveUniversePolicy;
 
@@ -166,7 +198,13 @@ export interface ProfileOperations {
    * start-up, before any request, never truncated.
    */
   readonly maxConnections: number;
+  /** A dynamic universe's exchangeInfo refresh interval (operational; default DEFAULT_UNIVERSE_REFRESH_MS). */
+  readonly universeRefreshMs?: number;
 }
+
+/** Five minutes: one public exchangeInfo request (weight 1) per refresh; a listing joins within one refresh. */
+export const DEFAULT_UNIVERSE_REFRESH_MS = 5 * 60_000;
+export const UNIVERSE_REFRESH_LIMITS = Object.freeze({ minMs: 60_000, maxMs: 3_600_000 });
 
 /** The supervisor's own ceiling (SUPERVISOR_LIMITS.maxConnections), restated here so profiles stay import-free of it. */
 export const PROFILE_MAX_CONNECTIONS_CEILING = 32;
@@ -252,6 +290,9 @@ export const TEDDY_7_ALL_ACTIVE_V1: ScannerProfile = Object.freeze({
     // The Teddy product rule: one dynamic candidate per source period and colour,
     // finalized at the source close; full-bar timers; causal history.
     lifecycle: NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1,
+    // Each symbol's history starts at its own first real closed bar when that is later than the
+    // profile context: a new listing is scanned from its real market, never rejected as too new.
+    historyOrigin: HISTORY_ORIGIN_SYMBOL_FIRST_CLOSED_BAR_V1,
   }),
   delivery: Object.freeze({
     layer: "DASHBOARD_DELIVERY",
@@ -269,11 +310,18 @@ export const TEDDY_7_ALL_ACTIVE_V1: ScannerProfile = Object.freeze({
     futureExecutionSourceTimeframes: futureExecutionTimeframes("1D", "1W"),
     nativeExecutionEnabled: false,
   }),
-  universe: Object.freeze({ layer: "UNIVERSE", universe: "usdt-perpetual", selection: "ALL_ACTIVE", targetEligible: null }),
+  universe: Object.freeze({
+    layer: "UNIVERSE",
+    universe: "usdt-perpetual",
+    selection: "ALL_ACTIVE",
+    targetEligible: null,
+    lifecycle: UNIVERSE_LIFECYCLE_DYNAMIC_V1,
+    symbolTrust: SYMBOL_TRUST_EXCHANGE_INFO_UNICODE_V1,
+  }),
   // 16 x 50 symbols per connection = 800 symbols: room for the whole active USD-M USDT-perpetual
-  // universe (about 520 active, about 470 eligible, as of 2026-10) with headroom. Only the
-  // connections the accepted set needs are opened (about 10 today); a larger set is refused.
-  operations: Object.freeze({ maxConnections: 16 }),
+  // universe (about 530 active as of 2026-10) with headroom. Only the connections the running set
+  // needs are opened (about 11 today); a universe larger than 800 is refused or degraded, never truncated.
+  operations: Object.freeze({ maxConnections: 16, universeRefreshMs: DEFAULT_UNIVERSE_REFRESH_MS }),
 }) as ScannerProfile;
 
 /** Every profile the scanner knows, by --profile name. */
@@ -317,6 +365,14 @@ export function assertScannerProfile(profile: ScannerProfile): ScannerProfile {
     if (profile.universe.targetEligible !== null) refuse("an ALL_ACTIVE universe has no target count");
     // Every eligible symbol must fit: an all-active profile states its own connection ceiling.
     if (profile.operations === undefined) refuse("an ALL_ACTIVE profile must declare its connection ceiling (operations.maxConnections)");
+    const lifecycle = profile.universe.lifecycle;
+    if (lifecycle !== undefined && lifecycle !== UNIVERSE_LIFECYCLE_DYNAMIC_V1) refuse("unknown universe lifecycle");
+    const trust = profile.universe.symbolTrust;
+    if (trust !== undefined && trust !== "ASCII" && trust !== SYMBOL_TRUST_EXCHANGE_INFO_UNICODE_V1) refuse("unknown universe symbol trust");
+    // A universe that onboards listings at any time needs histories that start at each symbol's own origin.
+    if (lifecycle === UNIVERSE_LIFECYCLE_DYNAMIC_V1 && profile.engine.historyOrigin !== HISTORY_ORIGIN_SYMBOL_FIRST_CLOSED_BAR_V1) {
+      refuse("a dynamic universe requires the SYMBOL_FIRST_CLOSED_BAR_V1 history origin");
+    }
   } else {
     if ("selection" in profile.universe) refuse("unknown universe selection");
     if (!Number.isSafeInteger(profile.universe.targetEligible) || profile.universe.targetEligible < 1) refuse("the universe target must be a positive integer");
@@ -324,6 +380,10 @@ export function assertScannerProfile(profile: ScannerProfile): ScannerProfile {
   if (profile.operations !== undefined) {
     const max = profile.operations.maxConnections;
     if (!Number.isSafeInteger(max) || max < 1 || max > PROFILE_MAX_CONNECTIONS_CEILING) refuse(`operations.maxConnections must be 1..${PROFILE_MAX_CONNECTIONS_CEILING}`);
+    const refresh = profile.operations.universeRefreshMs;
+    if (refresh !== undefined && (!Number.isSafeInteger(refresh) || refresh < UNIVERSE_REFRESH_LIMITS.minMs || refresh > UNIVERSE_REFRESH_LIMITS.maxMs)) {
+      refuse(`operations.universeRefreshMs must be ${UNIVERSE_REFRESH_LIMITS.minMs}..${UNIVERSE_REFRESH_LIMITS.maxMs}`);
+    }
   }
   lineageConfigOf(profile.engine);
   return profile;
@@ -350,6 +410,11 @@ export function lineageConfigOf(engine: EnginePolicy): LineageConfig {
   ] as const) {
     if (typeof value !== "number" || !Number.isFinite(value) || value < 0) refuse(`${name} must be a finite number of percentage points >= 0`);
   }
+  if (engine.historyOrigin !== undefined) {
+    if (engine.historyOrigin !== HISTORY_ORIGIN_SYMBOL_FIRST_CLOSED_BAR_V1) refuse("unknown history origin");
+    // A symbol origin rests on causal history; the legacy look-ahead lifecycle cannot carry one.
+    if (engine.lifecycle !== NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1) refuse("the SYMBOL_FIRST_CLOSED_BAR_V1 history origin requires the dynamic source-level lifecycle");
+  }
   const engineConfig = createNativeEngineConfig({
     minMovePct: pinePercentInputToFraction(engine.minMovePercent),
     touchTolerancePct: pinePercentInputToFraction(engine.touchTolerancePercent),
@@ -361,7 +426,13 @@ export function lineageConfigOf(engine: EnginePolicy): LineageConfig {
     timing: engine.timing,
     lifecycle: engine.lifecycle,
   });
-  return { chartInterval: engine.chartInterval, engine: engineConfig, historyStartMs, switchoverMs };
+  return {
+    chartInterval: engine.chartInterval,
+    engine: engineConfig,
+    historyStartMs,
+    switchoverMs,
+    ...(engine.historyOrigin === undefined ? {} : { historyOrigin: engine.historyOrigin }),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +450,10 @@ export const EXECUTION_POLICY_FINGERPRINT_SCHEMA = "teddy.native-alerts.executio
  * timeframes, max levels, timing, calendar, history start, switchover, partial
  * period policy, interval, market, engine/state semantics, kline source) changes it.
  */
-function engineSemanticsOf(lineage: Omit<ScannerLineage, "schema" | "symbol" | "bootstrapInputSha256">) {
+function engineSemanticsOf(
+  lineage: Omit<ScannerLineage, "schema" | "symbol" | "bootstrapInputSha256" | "symbolHistoryOrigin">,
+  historyOrigin: ScannerHistoryOrigin | null
+) {
   return {
     schema: ENGINE_FINGERPRINT_SCHEMA,
     marketType: lineage.marketType,
@@ -392,6 +466,8 @@ function engineSemanticsOf(lineage: Omit<ScannerLineage, "schema" | "symbol" | "
     historicalStateSemantics: lineage.historicalStateSemantics,
     engineConfig: lineage.engineConfig,
     partialPeriodPolicy: lineage.partialPeriodPolicy,
+    // Only an engine with a symbol history origin carries the key, so every existing fingerprint is unchanged.
+    ...(historyOrigin === null ? {} : { historyOrigin }),
   };
 }
 
@@ -410,13 +486,13 @@ export function engineFingerprintOfConfig(config: LineageConfig, marketType: Sca
       historicalStateSemantics: historicalStateSemanticsOf(engineConfig),
       engineConfig,
       partialPeriodPolicy: SWITCHOVER_TRUNCATED_CLOSED_BARS,
-    })
+    }, config.historyOrigin ?? null)
   );
 }
 
 /** The engine fingerprint a built lineage belongs to. */
 export function engineFingerprintOfLineage(lineage: ScannerLineage): string {
-  return canonicalSha256(engineSemanticsOf(lineage));
+  return canonicalSha256(engineSemanticsOf(lineage, lineage.symbolHistoryOrigin?.semantics ?? null));
 }
 
 export const engineFingerprintOf = (profile: ScannerProfile) => engineFingerprintOfConfig(lineageConfigOf(profile.engine), profile.engine.marketType);
@@ -443,9 +519,16 @@ export function executionPolicyFingerprintOf(execution: ExecutionPolicy): string
   });
 }
 
-/** The lineage a profile builds for one symbol from its bootstrap bytes' hash. */
-export function profileLineageIdFor(profile: ScannerProfile, symbol: string, bootstrapInputSha256: string): string {
+/**
+ * The lineage a profile builds for one symbol from its bootstrap bytes' hash —
+ * and, for a SYMBOL_FIRST_CLOSED_BAR_V1 engine, the symbol's origin (required
+ * there, refused elsewhere: a lineage can never mix the two models).
+ */
+export function profileLineageIdFor(profile: ScannerProfile, symbol: string, bootstrapInputSha256: string, origin: SymbolOriginInput | null = null): string {
   const config = lineageConfigOf(profile.engine);
+  if ((config.historyOrigin === undefined) !== (origin === null)) {
+    refuse(config.historyOrigin === undefined ? "this profile's engine has no symbol history origin" : "this profile's engine needs the symbol's history origin");
+  }
   return buildScannerLineage({
     marketType: profile.engine.marketType,
     symbol,
@@ -455,6 +538,7 @@ export function profileLineageIdFor(profile: ScannerProfile, symbol: string, boo
     engineConfig: config.engine,
     partialPeriodPolicy: profile.engine.partialPeriodPolicy,
     bootstrapInputSha256,
+    symbolOrigin: origin === null || config.historyOrigin === undefined ? null : { semantics: config.historyOrigin, kind: origin.kind, firstClosedBarOpenTimeMs: origin.firstClosedBarOpenTimeMs },
   }).lineageId;
 }
 
@@ -480,11 +564,19 @@ export interface ProfileSummary {
     readonly partialPeriodPolicy: string;
     /** Present only for a non-legacy lifecycle, so a legacy profile's summary is unchanged. */
     readonly lifecycle?: NativeLevelLifecycle;
+    /** Present only for a symbol history origin. */
+    readonly historyOrigin?: ScannerHistoryOrigin;
   };
   readonly delivery: { readonly policyVersion: string; readonly dashboardSourceTimeframes: readonly string[]; readonly evidenceClasses: readonly string[] };
   readonly execution: { readonly futureExecutionSourceTimeframes: readonly string[]; readonly nativeExecutionEnabled: false; readonly notice: string };
-  /** A target profile: { universe, targetEligible: N }. An all-active profile: { universe, selection: "ALL_ACTIVE", targetEligible: null }. */
-  readonly universe: { readonly universe: string; readonly targetEligible: number | null; readonly selection?: "ALL_ACTIVE" };
+  /** A target profile: { universe, targetEligible: N }. An all-active profile: { universe, selection: "ALL_ACTIVE", targetEligible: null } (+ lifecycle / symbolTrust when dynamic). */
+  readonly universe: {
+    readonly universe: string;
+    readonly targetEligible: number | null;
+    readonly selection?: "ALL_ACTIVE";
+    readonly lifecycle?: typeof UNIVERSE_LIFECYCLE_DYNAMIC_V1;
+    readonly symbolTrust?: UniverseSymbolTrust;
+  };
 }
 
 export const FUTURE_EXECUTION_NOTICE = "Future execution policy only. Native execution is NOT enabled: it is hard-disabled in code for every source timeframe.";
@@ -512,6 +604,7 @@ export function profileSummaryOf(profile: ScannerProfile): ProfileSummary {
       timing: e.timing,
       partialPeriodPolicy: e.partialPeriodPolicy,
       ...(e.lifecycle === NATIVE_LIFECYCLE_TEDDY_DYNAMIC_V1 ? { lifecycle: e.lifecycle } : {}),
+      ...(e.historyOrigin === undefined ? {} : { historyOrigin: e.historyOrigin }),
     },
     delivery: {
       policyVersion: profile.delivery.policyVersion,
@@ -524,7 +617,13 @@ export function profileSummaryOf(profile: ScannerProfile): ProfileSummary {
       notice: FUTURE_EXECUTION_NOTICE,
     },
     universe: isAllActiveUniverse(profile.universe)
-      ? { universe: profile.universe.universe, selection: "ALL_ACTIVE", targetEligible: null }
+      ? {
+          universe: profile.universe.universe,
+          selection: "ALL_ACTIVE",
+          targetEligible: null,
+          ...(profile.universe.lifecycle === undefined ? {} : { lifecycle: profile.universe.lifecycle }),
+          ...(profile.universe.symbolTrust === undefined ? {} : { symbolTrust: profile.universe.symbolTrust }),
+        }
       : { universe: profile.universe.universe, targetEligible: profile.universe.targetEligible },
   };
 }
@@ -552,7 +651,8 @@ export function engineNamespaceDir(scannerRoot: string, engineFingerprint: strin
 
 /** A profile symbol's live-shadow directory inside its engine namespace. */
 export function liveShadowEngineDir(scannerRoot: string, engineFingerprint: string, marketType: string, symbol: string, interval: string): string {
-  return path.join(engineNamespaceDir(scannerRoot, engineFingerprint), marketType, symbol, interval);
+  // The symbol as a path-safe segment: an ASCII symbol is itself; anything else is "u-<utf8 hex>".
+  return path.join(engineNamespaceDir(scannerRoot, engineFingerprint), marketType, symbolPathSegment(symbol), interval);
 }
 
 export interface EngineNamespaceManifest {

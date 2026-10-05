@@ -657,6 +657,14 @@ export interface NativeHistoricalInput {
   /** Chart bars from historyStart. May run past the switchover; those are never read. */
   readonly bars: readonly NativeKline[];
   readonly partialPeriodPolicy: NativePartialPeriodPolicy;
+  /**
+   * Dynamic lifecycle only: the open time of the symbol's FIRST REAL market bar
+   * (its listing), when that bar is the first bar given here. No market existed
+   * before it, so every source period it opens has a known real open: the
+   * listing bar's own open. Absent = no listing in range (every period's open
+   * must be seen on its own boundary, as always). Never a fabricated bar.
+   */
+  readonly listingOpenTimeMs?: number;
 }
 
 /**

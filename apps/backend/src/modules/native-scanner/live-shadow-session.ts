@@ -29,7 +29,15 @@ import {
   type LiveShadowEventStore,
   type ShadowClassification,
 } from "./live-shadow-store";
-import { buildScannerLineage, type ScannerLineage } from "./scanner-lineage";
+import {
+  buildScannerLineage,
+  deriveHtfContextStartMs,
+  effectiveHistoryRanges,
+  effectiveSwitchoverOf,
+  type ScannerHistoryOrigin,
+  type ScannerLineage,
+  type SymbolOriginInput,
+} from "./scanner-lineage";
 
 /**
  * LIVE SHADOW scanner core: restart preparation and the live session.
@@ -58,6 +66,10 @@ export interface LiveShadowRequest {
   readonly partialPeriodPolicy: NativePartialPeriodPolicy;
   /** When given, the rebuilt lineage must hash to exactly this ID. */
   readonly expectedLineageId: string | null;
+  /** The engine's symbol history origin (a profile's LineageConfig.historyOrigin); absent = the profile's fixed history. */
+  readonly historyOrigin?: ScannerHistoryOrigin;
+  /** Required with historyOrigin, refused without it: where THIS symbol's real history begins (history-origin.ts). */
+  readonly symbolOrigin?: SymbolOriginInput | null;
 }
 
 export type CheckpointStatus = "CREATED" | "VERIFIED_UNCHANGED" | "VERIFIED_AND_EXTENDED";
@@ -116,10 +128,32 @@ export function prepareLiveShadowState(
   trustedEndMs: number,
   previous: LiveCheckpointFile | null
 ): LiveShadowPlan {
-  if (!(trustedEndMs > request.switchoverMs)) {
+  const origin = request.symbolOrigin ?? null;
+  if ((request.historyOrigin === undefined) !== (origin === null)) {
+    throw new LiveShadowError("INVALID_STATE", request.historyOrigin === undefined ? "a symbol origin was given to an engine without a symbol history origin" : "this engine needs the symbol's history origin");
+  }
+  // The symbol's effective ranges (the profile's own for PROFILE_CONTEXT; its real start for a later listing).
+  const intervalMs = intervalMsOf(request.chartInterval);
+  const profileContextStartMs = deriveHtfContextStartMs(request.historyStartMs, request.engine.enabledSourceTfs, request.engine.calendar);
+  const ranges =
+    origin === null
+      ? { effectiveContextStartMs: profileContextStartMs, effectiveHistoryStartMs: request.historyStartMs, effectiveSwitchoverMs: request.switchoverMs }
+      : effectiveHistoryRanges({ historyStartMs: request.historyStartMs, compatibilitySwitchoverMs: request.switchoverMs, htfContextStartMs: profileContextStartMs, intervalMs, origin });
+  if (!(trustedEndMs > ranges.effectiveSwitchoverMs)) {
     throw new LiveShadowError("INVALID_STATE", "no closed bar exists after the switchover yet; the live scanner starts after the first one closes");
   }
-  const bars = selectCompatReplayBars(klines, { ...request, endMs: trustedEndMs });
+  const listing = origin !== null && origin.kind === "SYMBOL_FIRST_CLOSED_BAR" ? (origin.firstClosedBarOpenTimeMs as number) : null;
+  if (listing !== null && klines.some((k) => k.openTimeMs >= profileContextStartMs && k.openTimeMs < listing)) {
+    // Real data before the claimed first bar: the origin is contradicted. Never guessed, never repaired.
+    throw new LiveShadowError("ORIGIN_CONTRADICTED", `the data holds bars before the symbol's claimed first closed bar ${new Date(listing).toISOString()}`);
+  }
+  const bars = selectCompatReplayBars(klines, {
+    ...request,
+    historyStartMs: ranges.effectiveHistoryStartMs,
+    switchoverMs: ranges.effectiveSwitchoverMs,
+    endMs: trustedEndMs,
+    ...(origin === null ? {} : { contextStartMs: ranges.effectiveContextStartMs }),
+  });
   const { lineage, lineageId } = buildScannerLineage({
     marketType: request.marketType,
     symbol: request.symbol,
@@ -129,6 +163,7 @@ export function prepareLiveShadowState(
     engineConfig: request.engine,
     partialPeriodPolicy: request.partialPeriodPolicy,
     bootstrapInputSha256: sha256Hex(serializeKlines([...bars.contextBars, ...bars.historyBars])),
+    symbolOrigin: origin === null ? null : { semantics: request.historyOrigin as ScannerHistoryOrigin, kind: origin.kind, firstClosedBarOpenTimeMs: origin.firstClosedBarOpenTimeMs },
   });
   if (request.expectedLineageId !== null && request.expectedLineageId !== lineageId) {
     throw new LiveShadowError("LINEAGE_MISMATCH", `the configured inputs and bytes build lineage ${lineageId}, not the expected ${request.expectedLineageId}`);
@@ -136,11 +171,13 @@ export function prepareLiveShadowState(
   // The lifecycle decides: Pine look-ahead history (legacy) or causal history (dynamic).
   const historical = reconstructHistoricalState({
     config: lineage.engineConfig,
-    historyStartMs: request.historyStartMs,
-    switchoverMs: request.switchoverMs,
+    historyStartMs: ranges.effectiveHistoryStartMs,
+    switchoverMs: ranges.effectiveSwitchoverMs,
     contextBars: bars.contextBars,
     bars: bars.historyBars,
     partialPeriodPolicy: request.partialPeriodPolicy,
+    // A listing's first real bar opens its source periods: their real open is that bar's open.
+    ...(listing === null ? {} : { listingOpenTimeMs: listing }),
   });
   const stateSha256AtSwitchover = engineStateSha256(historical.state);
 
@@ -176,8 +213,8 @@ export function prepareLiveShadowState(
     state = step.state;
   }
 
-  const checkpointBody = checkpointBodyFor({ lineageId, ...request, stateSha256AtSwitchover, causalBars, state });
-  const fromMs = previous === null ? request.switchoverMs : previous.body.hwmOpenTimeMs;
+  const checkpointBody = checkpointBodyFor({ lineageId, ...request, switchoverMs: ranges.effectiveSwitchoverMs, stateSha256AtSwitchover, causalBars, state });
+  const fromMs = previous === null ? ranges.effectiveSwitchoverMs : previous.body.hwmOpenTimeMs;
   return {
     lineage,
     lineageId,
@@ -427,7 +464,7 @@ export class LiveShadowSession {
       marketType: plan.lineage.marketType,
       symbol: plan.lineage.symbol,
       chartInterval: plan.lineage.chartInterval,
-      switchoverMs: plan.lineage.compatibilitySwitchoverMs,
+      switchoverMs: effectiveSwitchoverOf(plan.lineage),
       stateSha256AtSwitchover: plan.stateSha256AtSwitchover,
       causalBars: this.causalBars,
       state: this.state,

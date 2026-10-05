@@ -659,6 +659,10 @@ describe("static fences", () => {
       "@prisma/client",
       "@trading-alert-dashboard/shared",
       "../native-scanner/canonical-json",
+      // Dynamic universe: exact-symbol path segments, the run membership journal, the lineage's origin type.
+      "../native-scanner/exchange-symbol",
+      "../native-scanner/run-membership",
+      "../native-scanner/scanner-lineage",
       "../native-scanner/live-shadow-store",
       "../native-scanner/live-shadow-checkpoint",
       "../native-scanner/scanner-paths",

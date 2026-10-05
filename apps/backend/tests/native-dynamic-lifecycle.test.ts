@@ -477,8 +477,12 @@ describe("14-18/34/35. engine identity", () => {
     const fp = engineFingerprintOf(TEDDY_7_ALL_ACTIVE_V1);
     expect(fp).toMatch(/^[0-9a-f]{64}$/);
     expect(fp).not.toBe(OLD_7);
-    // The same engine without the lifecycle IS the old 7% engine: the lifecycle alone moved it.
-    expect(engineFingerprintOf({ ...TEDDY_7_ALL_ACTIVE_V1, engine: { ...TEDDY_7_ALL_ACTIVE_V1.engine, lifecycle: undefined } })).toBe(OLD_7);
+    // The same engine without the lifecycle (and so without the symbol history origin it requires) IS the old 7% engine.
+    expect(engineFingerprintOf({ ...TEDDY_7_ALL_ACTIVE_V1, engine: { ...TEDDY_7_ALL_ACTIVE_V1.engine, lifecycle: undefined, historyOrigin: undefined } })).toBe(OLD_7);
+    // With the lifecycle but without the symbol history origin it is the first dynamic engine (5cd970a6…), kept historical.
+    expect(engineFingerprintOf({ ...TEDDY_7_ALL_ACTIVE_V1, engine: { ...TEDDY_7_ALL_ACTIVE_V1.engine, historyOrigin: undefined } })).toBe(
+      "5cd970a602d283f8c019ff07701283a2b290e382563d316769f4efcbf035a041"
+    );
   });
 
   it("34. the new engine never reuses the old namespace or a checkpoint lineage of the old engine", () => {

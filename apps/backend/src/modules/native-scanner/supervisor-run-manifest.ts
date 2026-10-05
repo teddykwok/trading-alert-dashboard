@@ -1,5 +1,6 @@
 import { SCANNER_MARKET_TYPE, assertScannerSymbol, intervalMsOf, type ScannerChartInterval } from "./binance-public-futures";
 import { canonicalJson, canonicalSha256 } from "./canonical-json";
+import type { SymbolHistoryOrigin } from "./scanner-lineage";
 import type { ProfileSummary } from "./scanner-profile";
 
 /**
@@ -16,6 +17,15 @@ import type { ProfileSummary } from "./scanner-profile";
  */
 
 export const SUPERVISOR_RUN_MANIFEST_SCHEMA = "teddy.native-scanner.supervisor-run-manifest.v1";
+/**
+ * A run of a SYMBOL-HISTORY-ORIGIN engine: symbols carry their history origin
+ * (needed to recompute their lineage), and `membership` says where later
+ * changes live. A dynamic universe names its append-only membership journal
+ * (run-membership.ts): the manifest is still written once and never rewritten,
+ * and lists the running set at start-up; every later join, removal or return
+ * is appended to the journal. A fixed running set has membership null.
+ */
+export const SUPERVISOR_RUN_MANIFEST_SCHEMA_V2 = "teddy.native-scanner.supervisor-run-manifest.v2";
 
 const SHA = /^[0-9a-f]{64}$/;
 /** <UTC compact time>-<8 hex>: sortable and unique per run. */
@@ -26,10 +36,19 @@ export interface RunManifestSymbol {
   readonly lineageId: string;
   /** With the engine policy, recomputes the lineage — so a consumer can verify engine -> lineage itself. */
   readonly bootstrapInputSha256: string;
+  /** v2 (symbol history origin engines): where this symbol's history begins — also needed to recompute the lineage. */
+  readonly symbolHistoryOrigin?: SymbolHistoryOrigin;
+}
+
+export interface RunMembershipDeclaration {
+  readonly mode: "DYNAMIC_JOURNAL";
+  /** The journal file, in the run's directory. */
+  readonly journal: string;
+  readonly journalSchema: string;
 }
 
 export interface SupervisorRunManifestBody {
-  readonly schema: typeof SUPERVISOR_RUN_MANIFEST_SCHEMA;
+  readonly schema: typeof SUPERVISOR_RUN_MANIFEST_SCHEMA | typeof SUPERVISOR_RUN_MANIFEST_SCHEMA_V2;
   readonly runId: string;
   readonly startedAt: string;
   readonly gitHead: string;
@@ -54,6 +73,8 @@ export interface SupervisorRunManifestBody {
   /** The accepted running set, sorted by symbol. */
   readonly symbols: readonly RunManifestSymbol[];
   readonly actionable: false;
+  /** v2 only: where later membership changes live (a dynamic universe), or null when the running set is fixed at start-up. */
+  readonly membership?: RunMembershipDeclaration | null;
 }
 
 export interface SupervisorRunManifest {
@@ -89,10 +110,20 @@ const BODY_KEYS = [
   "actionable",
 ].sort();
 
+const BODY_KEYS_V2 = [...BODY_KEYS, "membership"].sort();
+const SYMBOL_KEYS = ["symbol", "lineageId", "bootstrapInputSha256"].sort();
+const SYMBOL_KEYS_V2 = [...SYMBOL_KEYS, "symbolHistoryOrigin"].sort();
+
 export function assertRunManifestBody(body: SupervisorRunManifestBody): void {
   if (body === null || typeof body !== "object") invalid("manifest body must be an object");
-  if (canonicalJson(Object.keys(body).sort()) !== canonicalJson(BODY_KEYS)) invalid("manifest body has missing or extra fields");
-  if (body.schema !== SUPERVISOR_RUN_MANIFEST_SCHEMA) invalid("unknown manifest schema");
+  const v2 = body.schema === SUPERVISOR_RUN_MANIFEST_SCHEMA_V2;
+  if (canonicalJson(Object.keys(body).sort()) !== canonicalJson(v2 ? BODY_KEYS_V2 : BODY_KEYS)) invalid("manifest body has missing or extra fields");
+  if (body.schema !== SUPERVISOR_RUN_MANIFEST_SCHEMA && !v2) invalid("unknown manifest schema");
+  if (v2 && body.membership !== null) {
+    const m = body.membership as RunMembershipDeclaration;
+    if (typeof m !== "object" || canonicalJson(Object.keys(m).sort()) !== canonicalJson(["journal", "journalSchema", "mode"])) invalid("membership must be null or name its mode, journal and journal schema");
+    if (m.mode !== "DYNAMIC_JOURNAL" || typeof m.journal !== "string" || !/^[a-z0-9.-]+\.jsonl$/.test(m.journal) || typeof m.journalSchema !== "string") invalid("unknown membership declaration");
+  }
   if ((body.actionable as unknown) !== false) invalid("a run manifest is never actionable");
   if (!RUN_ID_PATTERN.test(body.runId)) invalid("runId is malformed");
   if (body.marketType !== SCANNER_MARKET_TYPE) invalid(`marketType must be ${SCANNER_MARKET_TYPE}`);
@@ -106,6 +137,9 @@ export function assertRunManifestBody(body: SupervisorRunManifestBody): void {
   if (!Array.isArray(body.symbols)) invalid("symbols must be a list");
   let previous = "";
   for (const s of body.symbols) {
+    if (s === null || typeof s !== "object") invalid("a manifest symbol must be an object");
+    const keys = canonicalJson(Object.keys(s).sort());
+    if (keys !== canonicalJson(SYMBOL_KEYS) && !(v2 && keys === canonicalJson(SYMBOL_KEYS_V2))) invalid("a manifest symbol has missing or extra fields");
     if (assertScannerSymbol(s.symbol) !== s.symbol) invalid(`symbol ${s.symbol} is not canonical`);
     if (s.symbol <= previous) invalid("symbols must be sorted and unique");
     previous = s.symbol;

@@ -61,6 +61,12 @@ export interface CompatReplayRequest {
   readonly endMs: number;
   readonly engine: NativeEngineConfig;
   readonly partialPeriodPolicy: NativePartialPeriodPolicy;
+  /**
+   * A symbol-origin context start (scanner-lineage.ts effectiveHistoryRanges):
+   * the symbol's first real bar, later than the profile's HTF context start and
+   * at or before historyStart. Absent = derived from historyStart, as always.
+   */
+  readonly contextStartMs?: number;
 }
 
 export interface CompatReplayRanges {
@@ -90,7 +96,12 @@ export function compatReplayRanges(request: CompatReplayRequest): CompatReplayRa
   if (!(historyStartMs < switchoverMs && switchoverMs < endMs)) {
     throw new CompatReplayError("INVALID_RANGE", "times must satisfy historyStart < switchover < end");
   }
-  const htfContextStartMs = deriveHtfContextStartMs(historyStartMs, request.engine.enabledSourceTfs, request.engine.calendar);
+  const derivedContextStartMs = deriveHtfContextStartMs(historyStartMs, request.engine.enabledSourceTfs, request.engine.calendar);
+  const override = request.contextStartMs;
+  if (override !== undefined && (!Number.isSafeInteger(override) || override % intervalMs !== 0 || override < derivedContextStartMs || override > historyStartMs)) {
+    throw new CompatReplayError("INVALID_RANGE", "a symbol-origin context start must be a bar boundary between the HTF context start and historyStart");
+  }
+  const htfContextStartMs = override ?? derivedContextStartMs;
   return { intervalMs, htfContextStartMs, historyStartMs, switchoverMs, endMs, totalBars: (endMs - htfContextStartMs) / intervalMs };
 }
 

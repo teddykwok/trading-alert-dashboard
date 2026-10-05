@@ -24,7 +24,9 @@ export type LiveShadowErrorCode =
   | "CHECKPOINT_AHEAD_OF_DATA"
   | "SHADOW_STORE_CORRUPT"
   | "RECOVERY_REQUIRED"
-  | "INVALID_STATE";
+  | "INVALID_STATE"
+  /** Real bars exist before a symbol's claimed first closed bar: its history origin is refuted (dynamic universe). */
+  | "ORIGIN_CONTRADICTED";
 
 export class LiveShadowError extends Error {
   constructor(

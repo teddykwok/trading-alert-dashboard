@@ -1,4 +1,5 @@
 import { ScannerDataError } from "./binance-public-futures";
+import { isAsciiScannerSymbol, unicodeExchangeSymbolProblem } from "./exchange-symbol";
 
 /**
  * The Binance USD-M USDT-PERPETUAL universe, discovered from PUBLIC contract
@@ -11,8 +12,18 @@ import { ScannerDataError } from "./binance-public-futures";
 
 export const UNIVERSE_NAME = "USDM_PERPETUAL_USDT" as const;
 
-/** Exactly the scanner's symbol rule (assertScannerSymbol), as a predicate. */
+/** The ASCII symbol rule: what an operator may name, and what an ASCII-trust universe accepts. */
 const SYMBOL = /^[A-Z0-9]{3,30}$/;
+
+/**
+ * Which exchange symbol strings a universe accepts.
+ *  ASCII                    /^[A-Z0-9]{3,30}$/ only (every universe before the dynamic universe; unchanged);
+ *  EXCHANGE_INFO_UNICODE_V1 also the exact caseless-Unicode symbols Binance lists (exchange-symbol.ts).
+ * Either way the symbol is trusted ONLY because this exchangeInfo snapshot lists it as TRADING +
+ * PERPETUAL + quoteAsset USDT; the string is used exactly as Binance returned it.
+ */
+export type UniverseSymbolTrust = "ASCII" | "EXCHANGE_INFO_UNICODE_V1";
+export const SYMBOL_TRUST_EXCHANGE_INFO_UNICODE_V1 = "EXCHANGE_INFO_UNICODE_V1" as const;
 
 export interface UsdmContract {
   readonly symbol: string;
@@ -74,12 +85,13 @@ export function parseExchangeInfoContracts(payload: unknown): UsdmContract[] {
   });
 }
 
-function exclusionOf(c: UsdmContract): UniverseExclusionReason | null {
+function exclusionOf(c: UsdmContract, trust: UniverseSymbolTrust): UniverseExclusionReason | null {
   if (c.status !== "TRADING") return "NOT_TRADING";
   if (c.contractType !== "PERPETUAL") return "NOT_PERPETUAL";
   // quoteAsset decides — never the symbol's suffix.
   if (c.quoteAsset !== "USDT") return "NOT_USDT_QUOTED";
-  if (!SYMBOL.test(c.symbol)) return "INVALID_SYMBOL";
+  const validSymbol = SYMBOL.test(c.symbol) || (trust === SYMBOL_TRUST_EXCHANGE_INFO_UNICODE_V1 && !isAsciiScannerSymbol(c.symbol) && unicodeExchangeSymbolProblem(c.symbol) === null);
+  if (!validSymbol) return "INVALID_SYMBOL";
   return null;
 }
 
@@ -97,7 +109,7 @@ const sameContract = (a: UsdmContract, b: UsdmContract) =>
  * defensively: identical repeated rows collapse to one; rows that share a
  * symbol but disagree are all excluded (the metadata cannot be trusted).
  */
-export function selectUsdtPerpetualUniverse(contracts: readonly UsdmContract[]): UsdmUniverse {
+export function selectUsdtPerpetualUniverse(contracts: readonly UsdmContract[], trust: UniverseSymbolTrust = "ASCII"): UsdmUniverse {
   const excluded: Record<UniverseExclusionReason, number> = {
     NOT_TRADING: 0,
     NOT_PERPETUAL: 0,
@@ -116,7 +128,7 @@ export function selectUsdtPerpetualUniverse(contracts: readonly UsdmContract[]):
       continue;
     }
     identicalDuplicatesCollapsed += rows.length - 1;
-    const reason = exclusionOf(rows[0]);
+    const reason = exclusionOf(rows[0], trust);
     if (reason !== null) excluded[reason] += 1;
     else eligible.push(rows[0]);
   }

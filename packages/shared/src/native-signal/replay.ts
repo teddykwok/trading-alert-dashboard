@@ -143,8 +143,23 @@ export function reconstructCausalHistoricalState(input: NativeHistoricalInput): 
   if (bars.length < historyBarCount) refuseHistory("chart bars end before the switchover");
   const history = bars.slice(0, historyBarCount);
 
-  // Context: valid, contiguous, same interval, ending right before the history; aggregates only.
   const working = cloneWorkingState(createNativeEngineState(config));
+  // A listing: the symbol's first real bar opens every source period it falls in. Seeding each
+  // track with that bar's own candle (marked complete) and then applying the bar is exactly a fresh
+  // candle whose real open is known — same open, high, low and close; no bar is added or invented.
+  if (input.listingOpenTimeMs !== undefined) {
+    const first = contextBars.length > 0 ? contextBars[0] : history[0];
+    if (!Number.isSafeInteger(input.listingOpenTimeMs) || first.openTimeMs !== input.listingOpenTimeMs) {
+      refuseHistory("listingOpenTimeMs must be the open time of the first bar given (context or history)");
+    }
+    for (const tf of config.enabledSourceTfs) {
+      const track = working.htf[tf]!;
+      const fresh = advanceHtfAggregate(null, first, tf, config.calendar);
+      working.htf[tf] = { ...track, aggregate: { ...fresh, complete: true } };
+    }
+  }
+
+  // Context: valid, contiguous, same interval, ending right before the history; aggregates only.
   let context: Pick<NativeEngineState, "config" | "intervalMs" | "lastBar"> = { config, intervalMs: null, lastBar: null };
   for (const bar of contextBars) {
     const contextIntervalMs = assertBarAcceptable(context, bar);
@@ -236,6 +251,7 @@ export function reconstructPineHistoricalState(input: NativeHistoricalInput): Na
   if (isDynamicLifecycle(input.config)) {
     refuseHistory("the dynamic source-level lifecycle never uses look-ahead history; use reconstructHistoricalState / reconstructCausalHistoricalState");
   }
+  if (input.listingOpenTimeMs !== undefined) refuseHistory("a listing origin is defined for the dynamic source-level lifecycle only");
   const { config, historyStartMs, switchoverMs, contextBars, bars } = input;
   if (input.partialPeriodPolicy !== SWITCHOVER_TRUNCATED_CLOSED_BARS) {
     refuseHistory(`partialPeriodPolicy must be ${SWITCHOVER_TRUNCATED_CLOSED_BARS}`);

@@ -11,6 +11,7 @@ import {
   type ScannerChartInterval,
   type ScannerMarketType,
 } from "./binance-public-futures";
+import { symbolPathSegment } from "./exchange-symbol";
 
 /**
  * The scanner's machine-local store of CLOSED klines.
@@ -184,7 +185,7 @@ export class KlineCacheStore {
   constructor(readonly rootDir: string) {}
 
   pathsFor(marketType: ScannerMarketType, symbol: string, interval: ScannerChartInterval) {
-    const dir = path.join(this.rootDir, marketType, assertScannerSymbol(symbol), interval);
+    const dir = path.join(this.rootDir, marketType, symbolPathSegment(assertScannerSymbol(symbol)), interval);
     return { dir, rows: path.join(dir, "klines.jsonl"), manifest: path.join(dir, "manifest.json") };
   }
 

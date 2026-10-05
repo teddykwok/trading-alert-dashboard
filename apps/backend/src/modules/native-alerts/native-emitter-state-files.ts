@@ -1,6 +1,7 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import path from "node:path";
 
+import { isScannerSymbolShape, symbolPathSegment } from "../native-scanner/exchange-symbol";
 import { ENGINE_NAMESPACE_PREFIX_CHARS } from "../native-scanner/scanner-profile";
 import type { EmitterCursor, EmitterCursorReader, EmitterCursorWriter } from "./multi-symbol-emitter";
 
@@ -40,9 +41,10 @@ export const readTextIfExists = (file: string): string | null => (existsSync(fil
 export class FileEmitterCursorStore implements EmitterCursorReader, EmitterCursorWriter {
   constructor(readonly dir: string) {}
 
+  /** One file per symbol, named by its path-safe segment (an ASCII symbol is itself; anything else "u-<utf8 hex>"). */
   private fileOf(symbol: string): string {
-    if (!/^[A-Z0-9]{3,30}$/.test(symbol)) throw new Error(`not a bare symbol: ${symbol}`);
-    return path.join(this.dir, `${symbol}.json`);
+    if (!isScannerSymbolShape(symbol)) throw new Error(`not a bare symbol: ${JSON.stringify(symbol)}`);
+    return path.join(this.dir, `${symbolPathSegment(symbol)}.json`);
   }
 
   /**

@@ -1,7 +1,15 @@
 import { SCANNER_MARKET_TYPE, type ScannerChartInterval } from "./binance-public-futures";
-import { liveShadowDir, type SelectionSummary, type SupervisorSelection } from "./live-shadow-supervisor";
+import { contractIdentityOf, liveShadowDir, type SelectionSummary, type SupervisorSelection } from "./live-shadow-supervisor";
 import { liveShadowEngineDir, type ProfileSummary } from "./scanner-profile";
-import { RunManifestError, SUPERVISOR_RUN_MANIFEST_SCHEMA, buildRunManifest, type RunManifestSymbol, type SupervisorRunManifest } from "./supervisor-run-manifest";
+import { RUN_MEMBERSHIP_JOURNAL_FILE, RUN_MEMBERSHIP_SCHEMA } from "./run-membership";
+import {
+  RunManifestError,
+  SUPERVISOR_RUN_MANIFEST_SCHEMA,
+  SUPERVISOR_RUN_MANIFEST_SCHEMA_V2,
+  buildRunManifest,
+  type RunManifestSymbol,
+  type SupervisorRunManifest,
+} from "./supervisor-run-manifest";
 import { selectSymbols, universeWalk, type UniverseSelectionSpec, type UsdmUniverse } from "./usdm-universe";
 
 /**
@@ -19,9 +27,9 @@ import { selectSymbols, universeWalk, type UniverseSelectionSpec, type UsdmUnive
 export function supervisorSelectionOf(universe: UsdmUniverse, spec: UniverseSelectionSpec): SupervisorSelection {
   if (spec.mode === "EXPLICIT") {
     const explicit = selectSymbols(universe, spec);
-    return { mode: "EXPLICIT", candidates: explicit.contracts.map((c) => ({ symbol: c.symbol, onboardDateMs: c.onboardDateMs, required: true })) };
+    return { mode: "EXPLICIT", candidates: explicit.contracts.map((c) => ({ symbol: c.symbol, onboardDateMs: c.onboardDateMs, required: true, identity: contractIdentityOf(c) })) };
   }
-  const walk = universeWalk(universe, spec).map(({ contract, required }) => ({ symbol: contract.symbol, onboardDateMs: contract.onboardDateMs, required }));
+  const walk = universeWalk(universe, spec).map(({ contract, required }) => ({ symbol: contract.symbol, onboardDateMs: contract.onboardDateMs, required, identity: contractIdentityOf(contract) }));
   return spec.maxSymbols === null ? { mode: "ALL_ACTIVE", candidates: walk } : { mode: "TARGET", candidates: walk, target: spec.maxSymbols };
 }
 
@@ -62,13 +70,17 @@ export function supervisorRunManifestOf(input: {
   readonly profile: ProfileSummary | null;
   readonly selection: SelectionSummary | null;
   readonly symbols: readonly RunManifestSymbol[];
+  /** A dynamic-universe run: later joins are recorded in the run's membership journal (manifest v2). */
+  readonly dynamicMembership?: boolean;
 }): SupervisorRunManifest {
   const counts = input.selection ?? EXPLICIT_COUNTS;
   if (counts.mode !== "EXPLICIT" && counts.acceptedEligible !== input.symbols.length) {
     throw new RunManifestError(`the ${counts.mode} selection accepted ${counts.acceptedEligible} symbols but ${input.symbols.length} are listed`);
   }
+  // v2 whenever symbols carry a history origin (or membership is dynamic); every other run keeps v1 byte for byte.
+  const v2 = input.dynamicMembership === true || input.symbols.some((s) => s.symbolHistoryOrigin !== undefined);
   return buildRunManifest({
-    schema: SUPERVISOR_RUN_MANIFEST_SCHEMA,
+    schema: v2 ? SUPERVISOR_RUN_MANIFEST_SCHEMA_V2 : SUPERVISOR_RUN_MANIFEST_SCHEMA,
     runId: input.runId,
     startedAt: input.startedAt,
     gitHead: input.gitHead,
@@ -90,5 +102,6 @@ export function supervisorRunManifestOf(input: {
     },
     symbols: input.symbols,
     actionable: false,
+    ...(v2 ? { membership: input.dynamicMembership === true ? { mode: "DYNAMIC_JOURNAL" as const, journal: RUN_MEMBERSHIP_JOURNAL_FILE, journalSchema: RUN_MEMBERSHIP_SCHEMA } : null } : {}),
   });
 }
