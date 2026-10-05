@@ -130,3 +130,23 @@ is running.
   launcher's per-role log directory).
 - **What the log records:** the role and queue, the startup recovery sweep
   (always, even when it found nothing), each job outcome, and the shutdown.
+
+## Known issues (deferred)
+
+These were found by the 2026-10-05 operational smoke and are **not fixed yet**.
+
+- **pnpm dependency verification vs. a running dev backend.** pnpm 11's pre-run
+  dependency check can decide the workspace must be re-installed (for example
+  after a `package.json` edit). The launcher starts roles through `pnpm`, so that
+  install runs first. Its postinstall `prisma generate` then fails with `EPERM`
+  while a running dev backend holds the Prisma query-engine file, and the role
+  never starts.
+  - Workaround for a launcher session: set
+    `PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=false`. Only the pre-run check is
+    skipped; nothing is installed.
+  - Alternatively, run `pnpm install` once while the dev backend is stopped.
+- **Launcher role logs are empty.** Every launcher role log under
+  `%LOCALAPPDATA%\trading-alert-dashboard\logs\` is currently 0 bytes. This
+  affects all roles, not only the Native planner, and predates it. Until it is
+  fixed, the planner's startup, sweep and health evidence is available from its
+  heartbeat through `GET /api/native-planner/status`.

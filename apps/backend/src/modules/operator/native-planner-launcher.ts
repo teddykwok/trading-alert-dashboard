@@ -28,7 +28,7 @@ import {
   renderNativePlannerStatus,
   renderNativePlannerSupervision,
 } from "./native-planner-supervision";
-import { observed, verifyOwnership, type Observation, type ProcessProbe } from "./runtime-launcher";
+import { observed, verifyOwnership, type Observation, type OwnershipVerdict, type ProcessProbe } from "./runtime-launcher";
 import {
   EMPTY_RESTART_BUDGET,
   WORKER_SUPERVISION_INTERVAL_MS,
@@ -142,23 +142,51 @@ export function createNativePlannerLauncher(adapters: NativePlannerLauncherAdapt
     return probed.ok ? { observed: true, process: probed.value.get(pid) ?? null } : { observed: false };
   };
 
-  /** Our recorded root, if it is still provably ours. */
-  const ownedRecord = (state: NativePlannerState | null): Observation<NativePlannerRecord | null> => {
-    const record = state?.processes[0] ?? null;
-    if (record === null) return observed(null);
-    const probed = adapters.probeProcesses([record.pid]);
+  /**
+   * The DURABLE record and a FRESH ownership verdict for it -- the account-worker
+   * supervisor's pattern (superviseAccountWorker), reused unchanged.
+   *
+   * The record is never dropped just because its process is gone: a conclusively
+   * GONE root is exactly the evidence that authorises the ladder's start-only
+   * repair (WORKER_EXITED). Discarding it -- what this module used to do -- made
+   * the ladder read "nothing is owned here" and a crashed planner was never
+   * replaced. Every other verdict stays fail-closed: PID_REUSED / NOT_THIS_REPO
+   * reach the ladder as OWNERSHIP_UNPROVEN (nothing killed, nothing started), and
+   * an unobservable machine returns no verdict at all, because UNKNOWN must never
+   * become GONE.
+   */
+  const recordOwnership = (state: NativePlannerState | null): Observation<{ durable: NativePlannerRecord | null; verdict: OwnershipVerdict | null }> => {
+    const durable = state?.processes[0] ?? null;
+    if (durable === null) return observed({ durable: null, verdict: null });
+    const probed = adapters.probeProcesses([durable.pid]);
     if (!probed.ok) return probed;
-    return observed(verifyOwnership(record, probed.value.get(record.pid) ?? null, state!.repoRoot).owned ? record : null);
+    return observed({ durable, verdict: verifyOwnership(durable, probed.value.get(durable.pid) ?? null, state!.repoRoot) });
   };
 
-  const observe = (): Observation<{ status: TopologyStatus; record: NativePlannerRecord | null; hasState: boolean }> => {
+  /** Our recorded root, if it is still provably ours (alive). */
+  const ownedRecord = (state: NativePlannerState | null): Observation<NativePlannerRecord | null> => {
+    const seen = recordOwnership(state);
+    if (!seen.ok) return seen;
+    return observed(seen.value.verdict?.owned === true ? seen.value.durable : null);
+  };
+
+  const observe = (): Observation<{
+    status: TopologyStatus;
+    /** Our root, only while it is provably ours AND alive. */
+    record: NativePlannerRecord | null;
+    /** The stored record, alive or not, and its fresh ownership verdict. */
+    durable: NativePlannerRecord | null;
+    ownership: OwnershipVerdict | null;
+    hasState: boolean;
+  }> => {
     const state = readState();
-    const owned = ownedRecord(state);
-    if (!owned.ok) return owned;
+    const seen = recordOwnership(state);
+    if (!seen.ok) return seen;
     const processes = adapters.observeProcesses();
     if (!processes.ok) return processes;
     const status = projectTopology({ census: censusOf(processes.value, adapters.observeListeners()), ownedRoles: [], attestation: {} });
-    return observed({ status, record: owned.value, hasState: state !== null });
+    const { durable, verdict } = seen.value;
+    return observed({ status, record: verdict?.owned === true ? durable : null, durable, ownership: verdict, hasState: state !== null });
   };
 
   /**
@@ -257,12 +285,13 @@ export function createNativePlannerLauncher(adapters: NativePlannerLauncherAdapt
         say(`  ${label}: processes could not be observed (${seen.reason}) — nothing was changed.`);
         return null;
       }
-      const { status, record, hasState } = seen.value;
+      const { status, record, durable, ownership, hasState } = seen.value;
       const nowMs = Date.now();
       const observedBudget = observeWorkerHealth(from, nativePlannerHealth({ status, ownedRootAlive: record !== null }), nowMs);
       const decision = decideNativePlannerSupervision({
-        record: record === null ? null : { pid: record.pid, startedAtMs: record.startedAtMs },
-        ownership: record === null ? null : { owned: true },
+        // The DURABLE record with its verdict (GONE included), never `null` for a gone root.
+        record: durable === null ? null : { pid: durable.pid, startedAtMs: durable.startedAtMs },
+        ownership,
         status,
         budget: observedBudget,
         nowMs,
