@@ -599,6 +599,37 @@ export function previewNativeAccountPlan(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Native EXECUTION DATA INTEGRITY (read only; grants nothing)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the scanner's FINAL evidence for the operational 15m bar that
+ * produced a Native alert is clean enough for a FUTURE executor to act on.
+ * Only ELIGIBLE is clean; every other value (including UNREADABLE) blocks.
+ * It never affects the alert, its delivery or its plan, and it never enables
+ * execution: Native execution stays hard-disabled in code.
+ */
+export const NATIVE_EXECUTION_INTEGRITY_STATUSES = [
+  "PENDING_BAR_CLOSE",
+  "ELIGIBLE",
+  "INELIGIBLE_REQUARANTINED",
+  "INELIGIBLE_GAP",
+  "INELIGIBLE_DUPLICATE",
+  "INELIGIBLE_CHECKPOINT_MISMATCH",
+  "INELIGIBLE_STALE_GENERATION",
+  "UNREADABLE",
+] as const;
+export type NativeExecutionIntegrityStatus = (typeof NATIVE_EXECUTION_INTEGRITY_STATUSES)[number];
+
+export interface NativeExecutionIntegrityDto {
+  status: NativeExecutionIntegrityStatus;
+  /** Why, in one operator-readable sentence. */
+  reason: string;
+  /** The source operational bar's open time (ISO), when the alert's provenance names one. */
+  barOpenTime: string | null;
+}
+
 /** One Native alert's plan, as the read-only Trading Control list shows it. */
 export interface NativePlanListItemDto {
   alertId: string;
@@ -610,6 +641,8 @@ export interface NativePlanListItemDto {
   availableLookbacks: ExtremeRRLookback[];
   /** One preview per account, in NATIVE_PLAN_ACCOUNTS order. */
   accountDefaults: NativeAccountPlanPreview[];
+  /** Read-only: the source bar's final scanner integrity. Never a permission to execute. */
+  executionIntegrity: NativeExecutionIntegrityDto;
 }
 
 export interface NativePlanListDto {

@@ -48,7 +48,8 @@ export type DualRole =
   | "account-a-worker"
   | "account-b-control"
   | "account-b-worker"
-  | "native-planner";
+  | "native-planner"
+  | "generic-backend-nonwatch";
 
 /**
  * Start order, and the reverse of it is stop order.
@@ -79,6 +80,19 @@ export const DUAL_ROLES: readonly DualRole[] = [
  * the same reason (see run-runtime-launcher.ts).
  */
 export const OPTIONAL_GENERIC_ROLES: readonly DualRole[] = ["native-planner"] as const;
+
+/**
+ * The generic backend's OFFICIAL NON-WATCH mode: the built `node
+ * dist/src/server.js` (the package `start` script), started and stopped only by
+ * its own explicit launcher actions (generic-backend-nonwatch-launcher.ts).
+ *
+ * Not one of the six SAFE roles (Start SAFE keeps starting the watch backend,
+ * `generic-backend`) and not an optional SUPERVISED role: it is never restarted
+ * automatically. Its contract exists so the census can tell a non-watch
+ * runtime from a watch runtime by entrypoint, and so it gets the generic env
+ * file and its own durable log.
+ */
+export const GENERIC_BACKEND_NONWATCH_ROLE = "generic-backend-nonwatch" as const satisfies DualRole;
 
 export interface RoleContract {
   readonly role: DualRole;
@@ -176,6 +190,22 @@ export const ROLE_CONTRACTS: Readonly<Record<DualRole, RoleContract>> = Object.f
     port: null,
     loopbackOnly: false,
     attests: "WORKER",
+  },
+  // NON-WATCH MODE of the generic backend (see GENERIC_BACKEND_NONWATCH_ROLE):
+  // never started by Start SAFE, never supervised. Recognised by its BUILT
+  // entrypoint, which no watch runtime (src/server.ts) carries.
+  "generic-backend-nonwatch": {
+    role: "generic-backend-nonwatch",
+    label: "Generic Backend (non-watch)",
+    account: "GENERIC",
+    envAlias: "generic",
+    filter: BACKEND_FILTER,
+    // What the package `start` script runs; spawned directly as `node <repo>/apps/backend/dist/src/server.js`.
+    script: "start",
+    entrypoint: "dist/src/server.js",
+    port: 4000,
+    loopbackOnly: false,
+    attests: null,
   },
   // OPTIONAL (see OPTIONAL_GENERIC_ROLES): never started by Start SAFE.
   "native-planner": {

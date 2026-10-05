@@ -534,6 +534,9 @@ describe("what the authority records", () => {
       // The optional Native planner role's own explicit start / stop.
       "NATIVE_PLANNER_START",
       "NATIVE_PLANNER_STOP",
+      // The generic backend's explicit NON-WATCH start / stop.
+      "GENERIC_BACKEND_NONWATCH_START",
+      "GENERIC_BACKEND_NONWATCH_STOP",
     ]);
   });
 });

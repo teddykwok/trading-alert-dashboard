@@ -148,6 +148,8 @@ export type {
   NativePlanAccount,
   NativePlanListDto,
   NativePlanListItemDto,
+  NativeExecutionIntegrityDto,
+  NativeExecutionIntegrityStatus,
   SelectedPlanState,
   SelectedPlanSummary,
 } from "./extreme-rr";
@@ -169,6 +171,7 @@ export {
   extremeOfDecimalStrings,
   NATIVE_PLAN_ACCOUNTS,
   NATIVE_PLAN_BUILTIN_DEFAULTS,
+  NATIVE_EXECUTION_INTEGRITY_STATUSES,
   NATIVE_PLAN_EXECUTION_STATUS,
   parseNativeAccountPlanPolicy,
   previewNativeAccountPlan,

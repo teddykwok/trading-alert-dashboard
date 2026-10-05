@@ -62,6 +62,19 @@ verification never requires it, and Stop Runtime never touches it. Its
 ownership record lives in its own state file, so it can never block or be
 erased by the six-role runtime. See [native-planner-worker.md](native-planner-worker.md).
 
+### Optional: the generic backend in NON-WATCH mode
+
+- **14. Start Generic Backend — Non-Watch**: starts the BUILT backend
+  (`node apps\backend\dist\src\server.js`) from `generic.env`, only on a
+  provably free :4000, and only when the build is current (it never builds).
+- **15. Stop Generic Backend — Non-Watch**: stops only the non-watch backend this
+  launcher started, after proving ownership.
+
+It is never restarted automatically, and it is not part of Start SAFE (which
+still starts the watch backend). The status shows `Generic backend mode:
+RUNNING — NON-WATCH / RUNNING — WATCH / OFF / UNPROVEN / CONFLICT`. See
+[native-preexecution-safety.md](native-preexecution-safety.md).
+
 ## Start SAFE proves SAFE before it starts anything
 
 Three proofs, in this order.

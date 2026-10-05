@@ -78,6 +78,9 @@ export const MUTATION_ACTIONS = [
   // The OPTIONAL Native planner role's own explicit start / stop (never part of Start SAFE).
   "NATIVE_PLANNER_START",
   "NATIVE_PLANNER_STOP",
+  // The generic backend's explicit NON-WATCH start / stop (never part of Start SAFE).
+  "GENERIC_BACKEND_NONWATCH_START",
+  "GENERIC_BACKEND_NONWATCH_STOP",
 ] as const;
 
 export type MutationAction = (typeof MUTATION_ACTIONS)[number];
