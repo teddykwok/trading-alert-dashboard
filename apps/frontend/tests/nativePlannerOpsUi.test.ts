@@ -8,7 +8,7 @@ import { acceptLiveAlert, insertLiveAlert } from "../src/features/alerts/liveAle
 import { applyLiveNativeDelivery, type SignalSourcesStatusDto } from "../src/api/signalSources.api";
 import { presentNativePlannerStatus, type NativePlannerStatusDto } from "../src/api/nativePlanner.api";
 import { DECIMAL_ROW_LABELS, PLAN_SELECTION_LABEL, presentSelectedPlan } from "../src/features/plans/selectedPlanPresentation";
-import { NATIVE_ACCOUNT_DEFAULT_UNSET, PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT, nativePlanStatusLabel, presentNativeAccountPolicy } from "../src/features/plans/nativeAccountDefaults";
+import { PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT, nativePlanStatusLabel, presentNativeAccountPolicy } from "../src/features/plans/nativeAccountDefaults";
 import type { Alert } from "../src/types/alert";
 import type { AlertListQuery } from "../src/types/api";
 
@@ -189,15 +189,14 @@ describe("B4-B6. Trading Control says exactly what is true", () => {
     expect(PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT).toMatch(/Account A \/ B Native defaults/);
     expect(card).toContain("{PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT}");
     expect(card).toContain("item.accountDefaults.map");
-    expect(presentNativeAccountPolicy({ account: "A", state: "UNSET", lookback: null, reason: null }).label).toBe("Account A Native default");
-    expect(presentNativeAccountPolicy({ account: "B", state: "UNSET", lookback: null, reason: null }).label).toBe("Account B Native default");
+    expect(presentNativeAccountPolicy({ account: "A", state: "RESOLVED", lookback: 100, source: "BUILTIN_DEFAULT", reason: null }).label).toBe("Account A Native default");
+    expect(presentNativeAccountPolicy({ account: "B", state: "RESOLVED", lookback: 300, source: "BUILTIN_DEFAULT", reason: null }).label).toBe("Account B Native default");
     expect(PLAN_SELECTION_LABEL).not.toMatch(/Account/);
   });
 
-  it("24. A and B UNSET stay UNSET", () => {
-    for (const account of ["A", "B"] as const) {
-      expect(presentNativeAccountPolicy({ account, state: "UNSET", lookback: null, reason: null }).value).toBe(NATIVE_ACCOUNT_DEFAULT_UNSET);
-    }
+  it("24. with no override, A and B show their built-in defaults (A 100, B 300), labelled as such", () => {
+    expect(presentNativeAccountPolicy({ account: "A", state: "RESOLVED", lookback: 100, source: "BUILTIN_DEFAULT", reason: null })).toMatchObject({ value: "100 candles", source: "BUILT-IN DEFAULT" });
+    expect(presentNativeAccountPolicy({ account: "B", state: "RESOLVED", lookback: 300, source: "BUILTIN_DEFAULT", reason: null })).toMatchObject({ value: "300 candles", source: "BUILT-IN DEFAULT" });
   });
 
   it("25/26. no Execute, Start Account, adopt or selection control; only read-only API calls", () => {

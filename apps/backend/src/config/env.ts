@@ -169,8 +169,9 @@ const envSchema = z.object({
       message: `must be one of ${EXTREME_RR_LOOKBACKS.join(", ")}`,
     }),
   // --- Per-account DEFAULT Native plan lookback (display / preview only) ---
-  // Which of 50/100/200/300 Account A / Account B would prefer for a Native
-  // alert's frozen plan. UNSET when absent or empty. Raw strings on purpose:
+  // OPTIONAL overrides of which of 50/100/200/300 Account A / Account B prefers
+  // for a Native alert's frozen plan. Absent or empty -> the user-approved
+  // built-in defaults (A 100, B 300). Raw strings on purpose:
   // they are resolved (and an invalid value REFUSED, never coerced) by
   // native-account-plan-policy, so a bad Native display preference can never
   // stop this process -- which also serves the TradingView webhook. Never

@@ -3,10 +3,12 @@ import { NATIVE_PLAN_ACCOUNTS, parseNativeAccountPlanPolicy, type NativeAccountP
 /**
  * Per-account DEFAULT Native plan lookback — a read-only policy overlay.
  *
- * Each account's preference is its own configured value
- * (NATIVE_PLAN_DEFAULT_LOOKBACK_A / _B on the generic process). Absent or empty
- * is UNSET and stays UNSET: nothing is guessed. Anything other than exactly
- * 50 / 100 / 200 / 300 is INVALID and resolves no lookback.
+ * Each account resolves its own window: the user-approved built-in default
+ * (Account A 100, Account B 300 -- NATIVE_PLAN_BUILTIN_DEFAULTS) unless the
+ * generic process sets an explicit override (NATIVE_PLAN_DEFAULT_LOOKBACK_A /
+ * _B). A valid override (exactly 50 / 100 / 200 / 300) wins; any other explicit
+ * value is INVALID and resolves no lookback -- it never falls back to the
+ * built-in default, so a mistyped override fails visibly.
  *
  * It never writes and never reads the plan's global `selectedLookback`: two
  * accounts may resolve different windows for the same alert without anything
@@ -14,9 +16,10 @@ import { NATIVE_PLAN_ACCOUNTS, parseNativeAccountPlanPolicy, type NativeAccountP
  * Native execution stays hard-disabled.
  */
 
-export type NativeAccountPlanPolicySource = Partial<Record<NativePlanAccount, string | undefined>>;
+/** The optional explicit overrides, raw. */
+export type NativeAccountPlanOverrides = Partial<Record<NativePlanAccount, string | undefined>>;
 
-export function resolveNativeAccountPlanPolicies(source: NativeAccountPlanPolicySource): NativeAccountPlanPolicy[] {
+export function resolveNativeAccountPlanPolicies(source: NativeAccountPlanOverrides): NativeAccountPlanPolicy[] {
   return NATIVE_PLAN_ACCOUNTS.map((account) => parseNativeAccountPlanPolicy(account, source[account]));
 }
 

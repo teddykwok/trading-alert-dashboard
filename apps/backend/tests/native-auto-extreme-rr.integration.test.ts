@@ -15,7 +15,7 @@ import type { SnapshotCandle } from "../src/modules/market-data/market-data.type
  *
  *   V2 delivery commits (Alert + ledger)  ->  live push  ||  PENDING intent + Native queue job
  *   ->  dedicated Native worker  ->  the SAME planner as manual generation  ->  READY / INVALID / ERROR
- *   ->  per-account default preview (A / B, UNSET by default)  ->  STOP.
+ *   ->  per-account default preview (built-in A 100 / B 300, optional override)  ->  STOP.
  *
  * TEST database only; candles are fixtures; Redis is a fake; no Binance request of any kind.
  */
@@ -610,16 +610,16 @@ describe("the manual Native path still works and coexists", () => {
 // ===========================================================================
 
 describe("per-account default Native plan policy", () => {
-  it("22/24/25. each account resolves exactly 50/100/200/300; absent or empty stays UNSET; anything else is INVALID (never coerced)", () => {
-    for (const lookback of EXTREME_RR_LOOKBACKS) expect(parseNativeAccountPlanPolicy("A", String(lookback))).toEqual({ account: "A", state: "RESOLVED", lookback, reason: null });
-    for (const raw of [undefined, null, ""]) expect(parseNativeAccountPlanPolicy("B", raw)).toEqual({ account: "B", state: "UNSET", lookback: null, reason: null });
+  it("22/24/25. an explicit override resolves exactly 50/100/200/300; absent or empty is the built-in default (A 100, B 300); anything else is INVALID (never coerced)", () => {
+    for (const lookback of EXTREME_RR_LOOKBACKS) expect(parseNativeAccountPlanPolicy("A", String(lookback))).toEqual({ account: "A", state: "RESOLVED", lookback, source: "ENV_OVERRIDE", reason: null });
+    for (const raw of [undefined, null, ""]) expect(parseNativeAccountPlanPolicy("B", raw)).toEqual({ account: "B", state: "RESOLVED", lookback: 300, source: "BUILTIN_DEFAULT", reason: null });
     for (const raw of ["75", "150", "0", "-100", " 100", "100 ", "100.0", "1e2", "0100", "abc", "300;", 100, true]) {
       const policy = parseNativeAccountPlanPolicy("A", raw);
       expect(policy.state, String(raw)).toBe("INVALID");
       expect(policy.lookback).toBeNull();
       expect(policy.reason).toMatch(/not one of 50, 100, 200, 300/);
     }
-    expect(resolveNativeAccountPlanPolicies({}).map((p) => [p.account, p.state])).toEqual([["A", "UNSET"], ["B", "UNSET"]]);
+    expect(resolveNativeAccountPlanPolicies({}).map((p) => [p.account, p.state, p.lookback, p.source])).toEqual([["A", "RESOLVED", 100, "BUILTIN_DEFAULT"], ["B", "RESOLVED", 300, "BUILTIN_DEFAULT"]]);
   });
 
   it("23/26. A and B resolve DIFFERENT candidates of the same plan from their own policy; the global selected lookback is never consulted", () => {
@@ -632,8 +632,8 @@ describe("per-account default Native plan policy", () => {
     expect(a).toMatchObject({ account: "A", policy: "RESOLVED", lookback: 100, state: "RESOLVED", takeProfit: TP[100], stopLoss: "sl100", execution: NATIVE_PLAN_EXECUTION_STATUS });
     expect(b).toMatchObject({ account: "B", policy: "RESOLVED", lookback: 300, state: "RESOLVED", takeProfit: TP[300], stopLoss: "sl300" });
     expect(plan.selectedLookback).toBe(50);
-    // UNSET / INVALID never pick anything; a not-READY plan never shows prices.
-    expect(previewNativeAccountPlan(plan, parseNativeAccountPlanPolicy("A", undefined))).toMatchObject({ state: "UNSET", lookback: null, takeProfit: null, stopLoss: null });
+    // No override: the built-in default; INVALID never picks anything; a not-READY plan never shows prices.
+    expect(previewNativeAccountPlan(plan, parseNativeAccountPlanPolicy("A", undefined))).toMatchObject({ state: "RESOLVED", lookback: 100, source: "BUILTIN_DEFAULT", takeProfit: TP[100] });
     expect(previewNativeAccountPlan(plan, parseNativeAccountPlanPolicy("B", "75"))).toMatchObject({ state: "INVALID_POLICY", lookback: null, takeProfit: null });
     expect(previewNativeAccountPlan({ ...plan, status: "PENDING" }, parseNativeAccountPlanPolicy("A", "100"))).toMatchObject({ state: "PLAN_NOT_READY", takeProfit: null, reason: "Plan is still being generated" });
     expect(previewNativeAccountPlan({ ...plan, candidates: [candidate(50)] }, parseNativeAccountPlanPolicy("A", "100"))).toMatchObject({ state: "NO_CANDIDATE", takeProfit: null });
@@ -656,21 +656,21 @@ describe("per-account default Native plan policy", () => {
     expect(await prisma.selectedPlanAdoption.count({ where: { extremeRRPlanId: before!.id } })).toBe(0);
   });
 
-  maybe()("24/27. unconfigured accounts show UNSET, and a PENDING plan reads as still planning (no fake READY)", async () => {
+  maybe()("24/27. accounts with no override use the built-in defaults, and a PENDING plan reads as still planning (no fake READY, no prices)", async () => {
     const { alert } = await deliverAuto();
     const list = await new ExtremeRRService(db).listNativePlans(NATIVE_PLAN_LIST_LIMIT.max, resolveNativeAccountPlanPolicies({}));
     const item = list.items.find((i) => i.alertId === alert.id)!;
     expect(item.plan).toMatchObject({ planStatus: "PENDING", state: "PLAN_NOT_READY", stopLoss: null, takeProfit: null });
     expect(item.availableLookbacks).toEqual([]);
-    expect(item.accountDefaults.map((d) => [d.account, d.state])).toEqual([["A", "UNSET"], ["B", "UNSET"]]);
+    expect(item.accountDefaults.map((d) => [d.account, d.lookback, d.source, d.state, d.takeProfit])).toEqual([["A", 100, "BUILTIN_DEFAULT", "PLAN_NOT_READY", null], ["B", 300, "BUILTIN_DEFAULT", "PLAN_NOT_READY", null]]);
   });
 
-  maybe()("the generic process reads the two raw settings and resolves them without ever failing startup", async () => {
+  maybe()("the generic process reads the two raw settings (none set here) and resolves the built-in defaults without ever failing startup", async () => {
     const { configuredNativeAccountPlanPolicies } = await import("../src/modules/native-planning/native-account-plan-policy");
     const { env } = await import("../src/config/env");
     expect(env.NATIVE_PLAN_DEFAULT_LOOKBACK_A ?? undefined).toBeUndefined();
     expect(env.NATIVE_PLAN_DEFAULT_LOOKBACK_B ?? undefined).toBeUndefined();
-    expect((await configuredNativeAccountPlanPolicies()).map((p) => p.state)).toEqual(["UNSET", "UNSET"]);
+    expect((await configuredNativeAccountPlanPolicies()).map((p) => [p.state, p.lookback, p.source])).toEqual([["RESOLVED", 100, "BUILTIN_DEFAULT"], ["RESOLVED", 300, "BUILTIN_DEFAULT"]]);
   });
 });
 

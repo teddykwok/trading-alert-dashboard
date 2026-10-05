@@ -11,7 +11,6 @@ import {
 } from "@trading-alert-dashboard/shared";
 
 import {
-  NATIVE_ACCOUNT_DEFAULT_UNSET,
   NATIVE_EXECUTION_DISABLED_LABEL,
   NATIVE_PLANNING_ONLY_LABEL,
   nativePlanStatusLabel,
@@ -23,7 +22,7 @@ import { NATIVE_ALERT_PLAN_NOTICE } from "../src/utils/alertSource";
 
 /**
  * Trading Control's Native plans: the frozen plan (generated automatically after delivery), the global
- * selected lookback, and each account's DEFAULT lookback preview — UNSET unless configured. Read only:
+ * selected lookback, and each account's DEFAULT lookback preview — built-in A 100 / B 300 unless overridden. Read only:
  * PLANNING ONLY, NATIVE EXECUTION DISABLED, no execute or start-account control. Pure + source checks.
  */
 
@@ -43,18 +42,15 @@ describe("per-account Native default rows", () => {
   it("22/23. A=100 and B=300 show different windows of the same frozen plan", () => {
     const a = presentNativeAccountDefault(previewNativeAccountPlan(plan(), parseNativeAccountPlanPolicy("A", "100")));
     const b = presentNativeAccountDefault(previewNativeAccountPlan(plan(), parseNativeAccountPlanPolicy("B", "300")));
-    expect(a).toEqual({ label: "Account A Native default", value: "100 candles", detail: "SL sl100 · TP 0.046 · RR 1:1.5", detailExact: "SL sl100 · TP 0.046 · RR 1.5", tone: "green" });
-    expect(b).toEqual({ label: "Account B Native default", value: "300 candles", detail: "SL sl300 · TP 0.048 · RR 1:1.5", detailExact: "SL sl300 · TP 0.048 · RR 1.5", tone: "green" });
+    expect(a).toEqual({ label: "Account A Native default", value: "100 candles", source: "ENV OVERRIDE", detail: "SL sl100 · TP 0.046 · RR 1:1.5", detailExact: "SL sl100 · TP 0.046 · RR 1.5", tone: "green" });
+    expect(b).toEqual({ label: "Account B Native default", value: "300 candles", source: "ENV OVERRIDE", detail: "SL sl300 · TP 0.048 · RR 1:1.5", detailExact: "SL sl300 · TP 0.048 · RR 1.5", tone: "green" });
   });
 
-  it("24. an unconfigured account reads UNSET and never a guessed lookback; 25. an invalid one reads INVALID with its reason", () => {
-    for (const account of ["A", "B"] as const) {
-      expect(presentNativeAccountPolicy(parseNativeAccountPlanPolicy(account, undefined))).toEqual({ label: `Account ${account} Native default`, value: "UNSET", detail: null, detailExact: null, tone: "gray" });
-      const row = presentNativeAccountDefault(previewNativeAccountPlan(plan(), parseNativeAccountPlanPolicy(account, "")));
-      expect(row.value).toBe(NATIVE_ACCOUNT_DEFAULT_UNSET);
-      expect(row.detail).toBeNull();
-      expect(row.value).not.toMatch(/candles/);
-    }
+  it("24. an account with no override reads its BUILT-IN default (A 100, B 300); 25. an invalid override reads INVALID with its reason", () => {
+    expect(presentNativeAccountPolicy(parseNativeAccountPlanPolicy("A", undefined))).toEqual({ label: "Account A Native default", value: "100 candles", source: "BUILT-IN DEFAULT", detail: null, detailExact: null, tone: "green" });
+    expect(presentNativeAccountPolicy(parseNativeAccountPlanPolicy("B", ""))).toEqual({ label: "Account B Native default", value: "300 candles", source: "BUILT-IN DEFAULT", detail: null, detailExact: null, tone: "green" });
+    expect(presentNativeAccountDefault(previewNativeAccountPlan(plan(), parseNativeAccountPlanPolicy("A", "")))).toMatchObject({ value: "100 candles", source: "BUILT-IN DEFAULT", detail: "SL sl100 · TP 0.046 · RR 1:1.5" });
+    expect(presentNativeAccountDefault(previewNativeAccountPlan(plan(), parseNativeAccountPlanPolicy("B", undefined)))).toMatchObject({ value: "300 candles", source: "BUILT-IN DEFAULT", detail: "SL sl300 · TP 0.048 · RR 1:1.5" });
     const invalid = presentNativeAccountDefault(previewNativeAccountPlan(plan(), parseNativeAccountPlanPolicy("A", "75")));
     expect(invalid).toMatchObject({ value: "INVALID", tone: "red" });
     expect(invalid.detail).toMatch(/not one of 50, 100, 200, 300/);
@@ -62,7 +58,7 @@ describe("per-account Native default rows", () => {
 
   it("a still-planning or incalculable plan never shows prices for an account", () => {
     const pending = presentNativeAccountDefault(previewNativeAccountPlan(plan({ status: "PENDING", candidates: [] }), parseNativeAccountPlanPolicy("A", "100")));
-    expect(pending).toEqual({ label: "Account A Native default", value: "100 candles", detail: "Plan is still being generated", detailExact: null, tone: "yellow" });
+    expect(pending).toEqual({ label: "Account A Native default", value: "100 candles", source: "ENV OVERRIDE", detail: "Plan is still being generated", detailExact: null, tone: "yellow" });
     const bad = presentNativeAccountDefault(previewNativeAccountPlan(plan({ candidates: [candidate(100, { valid: false, stopLoss: null, takeProfit: null, invalidReason: "Highest high is not above entry" })] }), parseNativeAccountPlanPolicy("B", "100")));
     expect(bad.detail).toBe("Highest high is not above entry");
     expect(bad.detail).not.toMatch(/TP|SL/);

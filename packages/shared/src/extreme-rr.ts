@@ -493,51 +493,68 @@ export const NATIVE_PLAN_ACCOUNTS = ["A", "B"] as const;
 export type NativePlanAccount = (typeof NATIVE_PLAN_ACCOUNTS)[number];
 
 /**
- * One account's configured default lookback for Native plans.
+ * The USER-APPROVED built-in Native default lookback per account: Account A
+ * prefers the 100-candle window, Account B the 300-candle window. Used whenever
+ * no explicit override is configured. Planning / preview only: it grants no
+ * adoption and no execution, and it is NOT the plan's global selection.
+ */
+export const NATIVE_PLAN_BUILTIN_DEFAULTS: Readonly<Record<NativePlanAccount, ExtremeRRLookback>> = Object.freeze({ A: 100, B: 300 });
+
+/** Where an account's Native default came from. */
+export type NativeAccountPlanPolicySource = "BUILTIN_DEFAULT" | "ENV_OVERRIDE";
+
+/**
+ * One account's default lookback for Native plans.
  *
- *  UNSET     nothing configured: no lookback is resolved, and none is guessed;
- *  RESOLVED  exactly one of 50 / 100 / 200 / 300;
- *  INVALID   something else was configured: refused (no lookback), reason kept.
+ *  RESOLVED  exactly one of 50 / 100 / 200 / 300 -- the built-in default
+ *            (source BUILTIN_DEFAULT) or a valid explicit override (ENV_OVERRIDE);
+ *  INVALID   an explicit override that is not one of them: refused (no
+ *            lookback), reason kept. It never falls back to the built-in
+ *            default, so a mistyped override fails visibly instead of hiding.
  *
  * Deliberately NOT the plan's global `selectedLookback`: two accounts may
  * prefer different windows for the same alert, so each preference is its own
  * value and resolving one never reads or writes the other, or the plan.
  */
 export type NativeAccountPlanPolicy =
-  | { account: NativePlanAccount; state: "UNSET"; lookback: null; reason: null }
-  | { account: NativePlanAccount; state: "RESOLVED"; lookback: ExtremeRRLookback; reason: null }
-  | { account: NativePlanAccount; state: "INVALID"; lookback: null; reason: string };
+  | { account: NativePlanAccount; state: "RESOLVED"; lookback: ExtremeRRLookback; source: NativeAccountPlanPolicySource; reason: null }
+  | { account: NativePlanAccount; state: "INVALID"; lookback: null; source: "ENV_OVERRIDE"; reason: string };
 
 /**
- * Parses one account's configured value. Strict: only the exact strings
- * "50", "100", "200" or "300" resolve; absent or empty is UNSET; anything else
- * is INVALID — never coerced to the nearest window, never a default.
+ * Resolves one account's Native default from its optional explicit override.
+ *
+ *  absent or empty            -> the built-in default (A 100, B 300), BUILTIN_DEFAULT;
+ *  exactly "50"/"100"/"200"/"300" -> that window, ENV_OVERRIDE;
+ *  anything else              -> INVALID (never coerced, never the built-in fallback).
  */
 export function parseNativeAccountPlanPolicy(account: NativePlanAccount, raw: unknown): NativeAccountPlanPolicy {
-  if (raw === undefined || raw === null || raw === "") return { account, state: "UNSET", lookback: null, reason: null };
+  if (raw === undefined || raw === null || raw === "") {
+    return { account, state: "RESOLVED", lookback: NATIVE_PLAN_BUILTIN_DEFAULTS[account], source: "BUILTIN_DEFAULT", reason: null };
+  }
   if (typeof raw === "string" && /^(50|100|200|300)$/.test(raw)) {
     const lookback = Number(raw);
-    if (isExtremeRRLookback(lookback)) return { account, state: "RESOLVED", lookback, reason: null };
+    if (isExtremeRRLookback(lookback)) return { account, state: "RESOLVED", lookback, source: "ENV_OVERRIDE", reason: null };
   }
   const shown = typeof raw === "string" ? JSON.stringify(raw.slice(0, 16)) : typeof raw;
-  return { account, state: "INVALID", lookback: null, reason: `Account ${account} Native default lookback ${shown} is not one of ${EXTREME_RR_LOOKBACKS.join(", ")}` };
+  return { account, state: "INVALID", lookback: null, source: "ENV_OVERRIDE", reason: `Account ${account} Native default lookback override ${shown} is not one of ${EXTREME_RR_LOOKBACKS.join(", ")}` };
 }
 
 /**
- *  UNSET              the account has no Native default;
- *  INVALID_POLICY     the account's configured default is refused;
+ *  INVALID_POLICY     the account's explicit override is refused;
  *  PLAN_NOT_READY     the plan is PENDING (still planning), INVALID or ERROR;
  *  NO_CANDIDATE       the plan holds no candidate for the account's lookback;
  *  CANDIDATE_INVALID  that candidate is not calculable (reason kept);
  *  RESOLVED           the account's lookback has a valid, frozen candidate.
  */
-export type NativeAccountPlanPreviewState = "UNSET" | "INVALID_POLICY" | "PLAN_NOT_READY" | "NO_CANDIDATE" | "CANDIDATE_INVALID" | "RESOLVED";
+export type NativeAccountPlanPreviewState = "INVALID_POLICY" | "PLAN_NOT_READY" | "NO_CANDIDATE" | "CANDIDATE_INVALID" | "RESOLVED";
 
 /** What one account's Native default would pick from one frozen plan. A preview: it grants nothing. */
 export interface NativeAccountPlanPreview {
   account: NativePlanAccount;
   policy: NativeAccountPlanPolicy["state"];
-  /** The account's own lookback; null when UNSET or INVALID. */
+  /** Where the account's default came from (built-in A 100 / B 300, or an explicit override). */
+  source: NativeAccountPlanPolicySource;
+  /** The account's own lookback; null when its override is INVALID. */
   lookback: ExtremeRRLookback | null;
   state: NativeAccountPlanPreviewState;
   /** Null unless state is RESOLVED: an incalculable preview never shows a fabricated SL/TP. */
@@ -559,9 +576,8 @@ export function previewNativeAccountPlan(
   plan: Pick<ExtremeRRPlanDto, "status" | "candidates" | "errorReason">,
   policy: NativeAccountPlanPolicy
 ): NativeAccountPlanPreview {
-  const base = { account: policy.account, policy: policy.state, lookback: policy.lookback, execution: NATIVE_PLAN_EXECUTION_STATUS } as const;
+  const base = { account: policy.account, policy: policy.state, source: policy.source, lookback: policy.lookback, execution: NATIVE_PLAN_EXECUTION_STATUS } as const;
   const none = { stopLoss: null, takeProfit: null, riskRewardRatio: null, actualCandles: null, complete: null };
-  if (policy.state === "UNSET") return { ...base, ...none, state: "UNSET", reason: `Account ${policy.account} has no Native default lookback configured` };
   if (policy.state === "INVALID") return { ...base, ...none, state: "INVALID_POLICY", reason: policy.reason };
   const candidate = plan.candidates.find((c) => c.requestedCandles === policy.lookback) ?? null;
   if (plan.status !== "READY") {
