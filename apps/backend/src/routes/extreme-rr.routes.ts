@@ -1,10 +1,13 @@
 import type { FastifyInstance } from "fastify";
 import { ExtremeRRService, NATIVE_PLAN_LIST_LIMIT } from "../modules/extreme-rr/extreme-rr.service";
 import { extremeRRSelectionSchema } from "../modules/extreme-rr/extreme-rr.schema";
+import { fileSystemNativeScannerEvidence } from "../modules/native-integrity/native-execution-integrity";
 import { ValidationError } from "../utils/errors";
 
 export async function extremeRRRoutes(app: FastifyInstance): Promise<void> {
   const service = new ExtremeRRService(app.prisma);
+  // Read only: the machine-local scanner evidence behind each Native item's execution-integrity line.
+  const integrityEvidence = fileSystemNativeScannerEvidence(process.env);
 
   // Returns the alert's plan, or null when none exists yet (e.g. alerts that
   // predate the feature) — the UI then offers a manual "Generate plan".
@@ -17,13 +20,14 @@ export async function extremeRRRoutes(app: FastifyInstance): Promise<void> {
 
   // READ ONLY: the most recent Native plans, each as its selected, frozen
   // summary, for Trading Control to display. Generates and writes nothing;
-  // every item says PLANNING ONLY / EXECUTION DISABLED.
+  // every item says PLANNING ONLY / EXECUTION DISABLED, plus a read-only
+  // execution data-integrity status that grants nothing.
   app.get<{ Querystring: { limit?: string } }>("/api/extreme-rr/native-plans", async (request) => {
     const raw = request.query.limit;
     if (raw !== undefined && !/^\d{1,3}$/.test(raw)) {
       throw new ValidationError(`limit must be an integer 1..${NATIVE_PLAN_LIST_LIMIT.max}`);
     }
-    return service.listNativePlans(raw === undefined ? NATIVE_PLAN_LIST_LIMIT.default : Number(raw));
+    return service.listNativePlans(raw === undefined ? NATIVE_PLAN_LIST_LIMIT.default : Number(raw), undefined, integrityEvidence);
   });
 
   // Manual generation for eligible (LONG/SHORT) alerts — TradingView and

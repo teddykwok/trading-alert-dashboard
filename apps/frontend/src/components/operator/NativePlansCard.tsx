@@ -13,6 +13,7 @@ import {
   presentNativeAccountPolicy,
   type NativeAccountDefaultRow,
 } from "../../features/plans/nativeAccountDefaults";
+import { NATIVE_EXECUTION_INTEGRITY_HEADING, presentNativeExecutionIntegrity } from "../../features/plans/nativeExecutionIntegrity";
 import { SelectedPlanSummaryView } from "../alerts/SelectedPlanSummaryView";
 import { Badge } from "../ui/Badge";
 import { Card } from "../ui/Card";
@@ -26,7 +27,8 @@ import { DecimalText } from "../ui/DecimalText";
  * selected lookback, and each account's DEFAULT Native lookback preview —
  * built-in A 100 / B 300 unless overridden, with its source shown. It offers no lookback selector (the Trade Plan owns
  * that choice) and no action: Native plans are planning only and are refused
- * by every execution path, for every source timeframe.
+ * by every execution path, for every source timeframe. Each plan also shows its
+ * source bar's execution data integrity (read only; even ELIGIBLE grants nothing).
  */
 function AccountDefaultRow({ row }: { row: NativeAccountDefaultRow }) {
   return (
@@ -119,6 +121,16 @@ export function NativePlansCard() {
                     Available lookbacks: {item.availableLookbacks.length > 0 ? item.availableLookbacks.join(" / ") : "none yet"}
                   </p>
                   <SelectedPlanSummaryView summary={item.plan} />
+                  {(() => {
+                    const integrity = presentNativeExecutionIntegrity(item.executionIntegrity);
+                    return (
+                      <div className="flex flex-wrap items-baseline gap-2 text-xs" data-testid="native-execution-integrity">
+                        <span className="text-slate-400">{NATIVE_EXECUTION_INTEGRITY_HEADING}:</span>
+                        <Badge tone={integrity.tone}>{integrity.label}</Badge>
+                        <span className="min-w-0 break-words text-slate-500">{integrity.detail}</span>
+                      </div>
+                    );
+                  })()}
                   <p className="text-xs text-slate-500" data-testid="plan-selection-note">
                     {PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT}
                   </p>

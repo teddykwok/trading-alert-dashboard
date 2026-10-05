@@ -36,6 +36,7 @@ import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import type { ExtremeRRSelectionInput } from "./extreme-rr.schema";
 import { configuredNativeAccountPlanPolicies } from "../native-planning/native-account-plan-policy";
+import { nativeExecutionIntegrityOf, type NativeScannerEvidenceReader } from "../native-integrity/native-execution-integrity";
 
 /**
  * Injectable so tests can freeze the candle dataset. The default fetcher uses
@@ -517,7 +518,9 @@ export class ExtremeRRService {
    */
   async listNativePlans(
     limit: number = NATIVE_PLAN_LIST_LIMIT.default,
-    policies?: readonly NativeAccountPlanPolicy[]
+    policies?: readonly NativeAccountPlanPolicy[],
+    // Read-only scanner evidence for each item's execution-integrity line; none = UNREADABLE (never eligible).
+    integrityEvidence: NativeScannerEvidenceReader | null = null
   ): Promise<NativePlanListDto> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > NATIVE_PLAN_LIST_LIMIT.max) {
       throw new ValidationError(`limit must be an integer 1..${NATIVE_PLAN_LIST_LIMIT.max}`);
@@ -527,7 +530,7 @@ export class ExtremeRRService {
       where: { alert: { source: NATIVE_ALERT_SOURCE } },
       orderBy: [{ updatedAt: "desc" }, { id: "asc" }],
       take: limit,
-      include: { ...PLAN_OUTCOME_INCLUDE, alert: { select: { source: true, symbol: true, sourceTimeframe: true, triggeredAt: true } } },
+      include: { ...PLAN_OUTCOME_INCLUDE, alert: { select: { source: true, symbol: true, sourceTimeframe: true, triggeredAt: true, rawPayload: true } } },
     });
     return {
       nativeExecutionEnabled: false,
@@ -543,6 +546,7 @@ export class ExtremeRRService {
           availableLookbacks: dto.status === "READY" ? dto.candidates.filter((c) => c.valid).map((c) => c.requestedCandles) : [],
           // Each account from its OWN policy; the plan's global selectedLookback is not consulted.
           accountDefaults: accountPolicies.map((policy) => previewNativeAccountPlan(dto, policy)),
+          executionIntegrity: nativeExecutionIntegrityOf(plan.alert, integrityEvidence),
         };
       }),
     };

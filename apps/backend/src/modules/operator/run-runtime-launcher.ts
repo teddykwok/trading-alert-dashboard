@@ -135,6 +135,7 @@ import {
   renderGenericAnalysisSupervision,
 } from "./generic-analysis-supervision";
 import { createNativePlannerLauncher, type NativePlannerLauncher } from "./native-planner-launcher";
+import { createNonWatchBackendLauncher, type NonWatchBackendLauncher } from "./generic-backend-nonwatch-launcher";
 
 /**
  * Phase 11I — the local Windows runtime launcher for the DUAL-ACCOUNT topology.
@@ -2294,6 +2295,36 @@ async function runRecoveryAction(ask: (question: string) => Promise<string>): Pr
   }
 }
 
+// ---------------------------------------------------------------------------
+// Generic backend, official NON-WATCH mode — its own module, never Start SAFE
+// ---------------------------------------------------------------------------
+
+/**
+ * The built generic backend (node dist/src/server.js) lives in
+ * generic-backend-nonwatch-launcher.ts: its own state file, a build check that
+ * refuses (it never builds), :4000 attributed by process ancestry, the fenced
+ * start / stop, and NO supervision -- a crash stays visible. Start SAFE, Stop
+ * Runtime and the six-role state file are untouched by it.
+ */
+let nonWatchBackendLauncher: NonWatchBackendLauncher | null = null;
+function nonWatchBackend(): NonWatchBackendLauncher {
+  nonWatchBackendLauncher ??= createNonWatchBackendLauncher({
+    repoRoot: REPO_ROOT,
+    statePath: `${defaultStatePath()}.generic-backend-nonwatch.json`,
+    observeProcessTree,
+    observeListeners,
+    portOpen,
+    probeProcesses,
+    terminate: terminateTree,
+    spawnRole: spawnRoleWithDurableLog,
+    gateAllows: transitionGateAllows,
+    lockAdapters,
+    log: (line) => console.log(line),
+    sleep,
+  });
+  return nonWatchBackendLauncher;
+}
+
 async function main(): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const ask = (question: string): Promise<string> =>
@@ -2319,6 +2350,7 @@ async function main(): Promise<void> {
       const { status, disowned, effectiveGates } = snapshot;
       for (const line of renderTopology(status, disowned, effectiveGates)) console.log(line);
       console.log(nativePlanner().statusLine(status));
+      for (const line of await nonWatchBackend().statusLines(status)) console.log(line);
 
       console.log("");
       console.log("1. Show Status");
@@ -2334,6 +2366,8 @@ async function main(): Promise<void> {
       console.log("11. Start Native Planner (optional, generic, planning only)");
       console.log("12. Supervise Native Planner");
       console.log("13. Stop Native Planner");
+      console.log("14. Start Generic Backend — Non-Watch (built server, no auto-restart, not Start SAFE)");
+      console.log("15. Stop Generic Backend — Non-Watch (launcher-owned only)");
       console.log("");
 
       const choice = (await ask("Choose: ")).trim();
@@ -2351,6 +2385,8 @@ async function main(): Promise<void> {
         else if (choice === "11") await nativePlanner().start();
         else if (choice === "12") await nativePlanner().supervise(ask);
         else if (choice === "13") await nativePlanner().stop();
+        else if (choice === "14") await nonWatchBackend().start(status);
+        else if (choice === "15") await nonWatchBackend().stop(status);
         else console.log("Unrecognised choice. Nothing was changed.");
       } catch (error) {
         // Any action that needs to see the machine refuses when it cannot.
