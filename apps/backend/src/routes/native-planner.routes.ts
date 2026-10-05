@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 
-import { readNativePlannerStatus, type NativePlannerStatusDeps } from "../modules/native-planning/native-planner-status";
+import { readNativePlannerStatus, waitForRedisReady, type NativePlannerStatusDeps } from "../modules/native-planning/native-planner-status";
 
 /**
  * GET /api/native-planner/status — READ-ONLY health/readiness of the separate
@@ -30,6 +30,9 @@ export async function nativePlannerRoutes(app: FastifyInstance, opts: { deps?: N
     };
     return {
       queue: NATIVE_EXTREME_RR_QUEUE_NAME,
+      // The connection is opened lazily on the first request; without this the first read raced it and reported a
+      // false DEGRADED. Bounded: a Redis that never becomes ready is still reported truthfully.
+      redisReady: () => waitForRedisReady(client),
       readHeartbeat: () => client.get(NATIVE_PLANNER_HEARTBEAT_KEY),
       queueStats: async () => {
         const [workers, counts] = await Promise.all([queue.getWorkers(), queue.getJobCounts("waiting", "active", "delayed", "failed", "completed")]);

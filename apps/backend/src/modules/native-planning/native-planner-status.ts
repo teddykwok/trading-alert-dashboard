@@ -43,8 +43,62 @@ export interface NativePlannerStatusDto {
   readonly readiness: "READY" | "DEGRADED" | "DOWN";
 }
 
+/** How long a status read waits for its own Redis connection to become ready. Bounded: never a hang. */
+export const NATIVE_PLANNER_STATUS_REDIS_READY_TIMEOUT_MS = 2_000;
+
+/** The slice of an ioredis client the readiness wait needs (ioredis satisfies it; tests use an EventEmitter). */
+export interface ReadinessClient {
+  readonly status: string;
+  once(event: "ready" | "end", listener: () => void): unknown;
+  removeListener(event: "ready" | "end", listener: () => void): unknown;
+}
+
+const redisError = (name: string, message: string) => Object.assign(new Error(message), { name });
+
+/**
+ * Resolves once the client is READY, or rejects -- immediately for a client that
+ * has ENDED, otherwise after `timeoutMs`. It never retries and never spins: a
+ * genuinely unreachable Redis is reported as such (the status then reads
+ * DEGRADED / UNREADABLE), while a connection that is merely still establishing
+ * on the first request after startup is waited for instead of read too early.
+ */
+export function waitForRedisReady(client: ReadinessClient, timeoutMs: number = NATIVE_PLANNER_STATUS_REDIS_READY_TIMEOUT_MS): Promise<void> {
+  if (client.status === "ready") return Promise.resolve();
+  if (client.status === "end") return Promise.reject(redisError("RedisEnded", "the Redis connection has ended"));
+  return new Promise<void>((resolve, reject) => {
+    let timer: NodeJS.Timeout | undefined;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      client.removeListener("ready", onReady);
+      client.removeListener("end", onEnd);
+    };
+    function onReady() {
+      cleanup();
+      resolve();
+    }
+    function onEnd() {
+      cleanup();
+      reject(redisError("RedisEnded", "the Redis connection has ended"));
+    }
+    client.once("ready", onReady);
+    client.once("end", onEnd);
+    timer = setTimeout(() => {
+      cleanup();
+      reject(redisError("RedisNotReady", `the Redis connection was not ready within ${timeoutMs} ms`));
+    }, timeoutMs);
+    timer.unref?.();
+  });
+}
+
 export interface NativePlannerStatusDeps {
   readonly queue: string;
+  /**
+   * Resolves when the Redis connection the two Redis reads below use is ready
+   * (bounded). When it rejects, those reads are NOT attempted: the heartbeat
+   * reads UNREADABLE and the queue stats null, so a real outage stays truthful
+   * and nothing waits on a connection that is not there.
+   */
+  readonly redisReady?: () => Promise<void>;
   readonly readHeartbeat: () => Promise<string | null>;
   readonly queueStats: () => Promise<{ readonly connectedConsumers: number; readonly jobs: NativePlannerJobCounts }>;
   readonly countPendingNativePlans: () => Promise<number>;
@@ -53,11 +107,34 @@ export interface NativePlannerStatusDeps {
 
 export async function readNativePlannerStatus(deps: NativePlannerStatusDeps): Promise<NativePlannerStatusDto> {
   const now = (deps.now ?? (() => new Date()))();
-  const [heartbeat, stats, pending] = await Promise.allSettled([deps.readHeartbeat(), deps.queueStats(), deps.countPendingNativePlans()]);
+  // The route's own Redis connection may still be establishing (first request after startup): wait for it, bounded.
+  let redisNotReady: string | null = null;
+  if (deps.redisReady) {
+    try {
+      await deps.redisReady();
+    } catch (error) {
+      redisNotReady = error instanceof Error ? error.message : "the Redis connection is not ready";
+    }
+  }
+  const notReady = () => Promise.reject(redisError("RedisNotReady", redisNotReady ?? "not ready"));
+  const [heartbeat, stats, pending] = await Promise.allSettled([
+    redisNotReady === null ? deps.readHeartbeat() : notReady(),
+    redisNotReady === null ? deps.queueStats() : notReady(),
+    deps.countPendingNativePlans(),
+  ]);
   const worker: NativePlannerWorkerView =
     heartbeat.status === "fulfilled"
       ? judgeNativePlannerHeartbeat(heartbeat.value, now.getTime())
-      : { state: "UNREADABLE", reason: "The Native planner heartbeat could not be read from Redis.", startedAt: null, lastHeartbeatAt: null, ageSeconds: null, consumerRunning: null, lastSweep: null, lastSweepError: null };
+      : {
+          state: "UNREADABLE",
+          reason: redisNotReady === null ? "The Native planner heartbeat could not be read from Redis." : `The Native planner heartbeat could not be read: ${redisNotReady}.`,
+          startedAt: null,
+          lastHeartbeatAt: null,
+          ageSeconds: null,
+          consumerRunning: null,
+          lastSweep: null,
+          lastSweepError: null,
+        };
   const connectedConsumers = stats.status === "fulfilled" ? stats.value.connectedConsumers : null;
   const jobs = stats.status === "fulfilled" ? stats.value.jobs : null;
   const pendingNativePlans = pending.status === "fulfilled" ? pending.value : null;
