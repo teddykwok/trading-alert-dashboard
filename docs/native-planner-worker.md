@@ -57,10 +57,23 @@ It needs **no** Account A or Account B key, no Binance API key or secret, and no
 execution credential. The launcher strips every account identity variable from
 the child environment.
 
-`NATIVE_PLAN_DEFAULT_LOOKBACK_A` and `NATIVE_PLAN_DEFAULT_LOOKBACK_B` are
-optional display-only preferences read by the generic backend, not by the
-worker. When absent they stay `UNSET`; leave them unset unless an operator has
-decided on a value.
+**Per-account Native defaults** are a planning / Trading Control preview only.
+They are read by the generic backend, not by the worker.
+
+- **Built-in defaults (no variable needed):** Account A = **100** candles,
+  Account B = **300** candles.
+- **Optional overrides:** `NATIVE_PLAN_DEFAULT_LOOKBACK_A` and
+  `NATIVE_PLAN_DEFAULT_LOOKBACK_B`.
+  - A valid value (exactly `50`, `100`, `200` or `300`) replaces that account's
+    built-in default. Trading Control shows `ENV OVERRIDE` instead of
+    `BUILT-IN DEFAULT`.
+  - Any other explicit value shows as `INVALID` and resolves no window. It never
+    silently falls back to the built-in default.
+- **Separate from the global setting.** These are not
+  `EXTREME_RR_LOOKBACK_CANDLES` (the plan's global initial selection) and never
+  change a plan's `selectedLookback`.
+- **Nothing executable.** They create no adoption and no execution; Native
+  execution stays hard-disabled.
 
 ## Supervision and restart
 

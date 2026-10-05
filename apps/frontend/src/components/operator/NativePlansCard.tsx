@@ -24,7 +24,7 @@ import { DecimalText } from "../ui/DecimalText";
  * Trading Control displays the frozen Extreme RR plan of recent Native alerts
  * (generated automatically after delivery, or on demand), the plan's global
  * selected lookback, and each account's DEFAULT Native lookback preview —
- * UNSET unless configured. It offers no lookback selector (the Trade Plan owns
+ * built-in A 100 / B 300 unless overridden, with its source shown. It offers no lookback selector (the Trade Plan owns
  * that choice) and no action: Native plans are planning only and are refused
  * by every execution path, for every source timeframe.
  */
@@ -33,6 +33,7 @@ function AccountDefaultRow({ row }: { row: NativeAccountDefaultRow }) {
     <div className="flex flex-wrap items-baseline gap-2 text-xs" data-testid="native-account-default">
       <span className="text-slate-400">{row.label}</span>
       <Badge tone={row.tone}>{row.value}</Badge>
+      {row.source !== null && <span className="text-[10px] uppercase tracking-wide text-slate-500">{row.source}</span>}
       {row.detail !== null && (
         <span className="min-w-0 break-words text-slate-500" title={row.detailExact ?? undefined}>
           {row.detail}
