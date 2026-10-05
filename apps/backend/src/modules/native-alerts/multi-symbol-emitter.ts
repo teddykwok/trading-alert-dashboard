@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
 
 import type { ShadowRecord } from "../native-scanner/live-shadow-store";
+import { RunMembershipError, parseMembershipJournal } from "../native-scanner/run-membership";
+import type { SymbolHistoryOrigin } from "../native-scanner/scanner-lineage";
 import {
   NATIVE_DELIVERY_V2_VERSION,
+  ScannerProfileError,
   engineFingerprintOf,
   profileById,
   profileLineageIdFor,
@@ -38,6 +41,13 @@ import { ShadowLogError, ShadowLogTail, type ShadowLogErrorCode } from "./shadow
  *  - FIRST ACTIVATION never floods history: a lane without a production cursor
  *    is refused unless the operator explicitly activates it AT CURRENT EOF;
  *    everything before that point is historical and never delivered.
+ *  - DYNAMIC UNIVERSE (manifest v2): a symbol the running supervisor onboards
+ *    later is announced in the run's membership journal. The emitter binds it
+ *    with exactly the manifest's checks (lineage rebuilt from the profile and
+ *    the symbol's history origin, checkpoint identity) and activates it AT ITS
+ *    CURRENT EOF the first time it binds it — the live frontier: the symbol's
+ *    bootstrap replay never wrote a deliverable record, and nothing written
+ *    before the binding is delivered. A corrupt journal stops new bindings only.
  *
  * Pure: every file, clock and database access is injected. It holds no
  * credential, selects no account and has no path to plans or execution.
@@ -89,6 +99,51 @@ export interface PinnedRun {
   readonly engineFingerprint: string;
   readonly chartInterval: NativeDeliveryChartInterval;
   readonly lanes: readonly LaneSpec[];
+  /** Manifest v2: later joins are read from the run's membership journal. */
+  readonly dynamicMembership?: boolean;
+}
+
+/** One symbol entry to bind: from the manifest, or from a JOINED membership record. */
+export interface LaneEntry {
+  readonly symbol: string;
+  readonly lineageId: string;
+  readonly bootstrapInputSha256: string;
+  readonly symbolHistoryOrigin?: SymbolHistoryOrigin | null;
+}
+
+/**
+ * Per-symbol binding: the profile's engine must rebuild exactly this lineage
+ * (with the symbol's history origin, when the engine has one) and the
+ * symbol's checkpoint must name it. A failure fails that lane only.
+ */
+export function bindLaneSpec(
+  profile: ScannerProfile,
+  chartInterval: string,
+  entry: LaneEntry,
+  checkpointOf: (symbol: string) => CheckpointIdentity | null
+): LaneSpec {
+  let bindingFailure: string | null = null;
+  let rebuilt: string;
+  try {
+    rebuilt = profileLineageIdFor(profile, entry.symbol, entry.bootstrapInputSha256, entry.symbolHistoryOrigin ?? null);
+  } catch (error) {
+    if (!(error instanceof ScannerProfileError)) throw error;
+    return { symbol: entry.symbol, lineageId: entry.lineageId, bindingFailure: `LINEAGE_MISMATCH: ${error.message}` };
+  }
+  if (rebuilt !== entry.lineageId) bindingFailure = `LINEAGE_MISMATCH: ${profile.profileId}'s engine rebuilds lineage ${rebuilt}, the run says ${entry.lineageId}`;
+  else {
+    const checkpoint = checkpointOf(entry.symbol);
+    if (checkpoint === null) bindingFailure = "CHECKPOINT_MISSING: the symbol has no live-shadow checkpoint in the profile's engine namespace";
+    else if (
+      checkpoint.lineageId !== entry.lineageId ||
+      checkpoint.symbol !== entry.symbol ||
+      checkpoint.chartInterval !== chartInterval ||
+      checkpoint.marketType !== NATIVE_DELIVERY_MARKET_TYPE
+    ) {
+      bindingFailure = `CHECKPOINT_MISMATCH: the checkpoint names lineage ${checkpoint.lineageId} (${checkpoint.symbol} ${checkpoint.chartInterval} ${checkpoint.marketType})`;
+    }
+  }
+  return { symbol: entry.symbol, lineageId: entry.lineageId, bindingFailure };
 }
 
 /**
@@ -123,24 +178,7 @@ export function bindPinnedRun(input: {
     throw new RunBindingError("INTERVAL_UNSUPPORTED", `chart interval ${body.chartInterval} is not deliverable`);
   }
   if (body.symbols.length === 0) throw new RunBindingError("NO_SYMBOLS", `run ${body.runId} accepted no symbols`);
-  const lanes: LaneSpec[] = body.symbols.map((s) => {
-    let bindingFailure: string | null = null;
-    const rebuilt = profileLineageIdFor(profile, s.symbol, s.bootstrapInputSha256);
-    if (rebuilt !== s.lineageId) bindingFailure = `LINEAGE_MISMATCH: ${profile.profileId}'s engine rebuilds lineage ${rebuilt}, the manifest says ${s.lineageId}`;
-    else {
-      const checkpoint = input.checkpointOf(s.symbol);
-      if (checkpoint === null) bindingFailure = "CHECKPOINT_MISSING: the symbol has no live-shadow checkpoint in the profile's engine namespace";
-      else if (
-        checkpoint.lineageId !== s.lineageId ||
-        checkpoint.symbol !== s.symbol ||
-        checkpoint.chartInterval !== body.chartInterval ||
-        checkpoint.marketType !== NATIVE_DELIVERY_MARKET_TYPE
-      ) {
-        bindingFailure = `CHECKPOINT_MISMATCH: the checkpoint names lineage ${checkpoint.lineageId} (${checkpoint.symbol} ${checkpoint.chartInterval} ${checkpoint.marketType})`;
-      }
-    }
-    return { symbol: s.symbol, lineageId: s.lineageId, bindingFailure };
-  });
+  const lanes: LaneSpec[] = body.symbols.map((s) => bindLaneSpec(profile, body.chartInterval, s, input.checkpointOf));
   return {
     profile,
     summary: profileSummaryOf(profile),
@@ -148,6 +186,7 @@ export function bindPinnedRun(input: {
     engineFingerprint: codeFingerprint,
     chartInterval: body.chartInterval as NativeDeliveryChartInterval,
     lanes,
+    dynamicMembership: body.membership !== undefined && body.membership !== null,
   };
 }
 
@@ -241,6 +280,8 @@ export class NotActivatedError extends Error {
 
 export type MultiEmitterEvent =
   | { readonly type: "LANE_FAILED"; readonly symbol: string; readonly code: string; readonly message: string }
+  | { readonly type: "LANE_JOINED"; readonly symbol: string; readonly seq: number; readonly lineageId: string }
+  | { readonly type: "MEMBERSHIP_INVALID"; readonly message: string }
   | { readonly type: "LANE_ACTIVATED"; readonly symbol: string; readonly activationChars: number; readonly historicalRecords: number }
   | { readonly type: "SKIPPED"; readonly symbol: string; readonly eventId: string; readonly reason: NativeSkipReasonV2; readonly sourceTf: string | null }
   | {
@@ -276,6 +317,10 @@ export interface MultiEmitterDeps {
   readonly pendingTailPolls: number;
   readonly nowIso: () => string;
   readonly report: (event: MultiEmitterEvent) => void;
+  /** Dynamic-universe runs: the run's membership journal text (null when none exists yet). */
+  readonly readMembership?: () => string | null;
+  /** Dynamic-universe runs: a joined symbol's checkpoint identity (the same rule as the manifest's lanes). */
+  readonly checkpointOf?: (symbol: string) => CheckpointIdentity | null;
 }
 
 type FailureClass = "LINEAGE_OR_PROFILE_MISMATCH" | "MALFORMED";
@@ -327,6 +372,9 @@ function emptyTally() {
 export class MultiSymbolNativeEmitter {
   private readonly lanes: Lane[];
   private readonly context: NativeDeliveryContextV2;
+  /** The last membership record absorbed, and why absorbing stopped (a journal that does not verify). */
+  private membershipSeq = 0;
+  private membershipFailure: string | null = null;
   private queueDepth = 0;
   private maxQueueDepth = 0;
   private rotation = 0;
@@ -344,29 +392,31 @@ export class MultiSymbolNativeEmitter {
       throw new Error(`queue capacity must be ${MULTI_EMITTER_QUEUE_LIMITS.min}..${MULTI_EMITTER_QUEUE_LIMITS.max}`);
     }
     this.context = { profile: deps.run.summary, runId: deps.run.runId };
-    this.lanes = [...deps.run.lanes]
-      .sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0))
-      .map((spec) => ({
-        symbol: spec.symbol,
-        lineageId: spec.lineageId,
-        tail: new ShadowLogTail({ lineageId: spec.lineageId, marketType: NATIVE_DELIVERY_MARKET_TYPE, symbol: spec.symbol, chartInterval: deps.run.chartInterval }, deps.pendingTailPolls),
-        selector: new NativeDeliverySelectorV2(deps.run.profile.delivery),
-        state: "HEALTHY" as const,
-        failure: null,
-        failureClass: null,
-        text: "",
-        processedChars: 0,
-        savedChars: null,
-        baselineChars: 0,
-        activationChars: 0,
-        activatedAt: null,
-        activatedByRunId: null,
-        baselined: false,
-        pending: [],
-      }));
+    this.lanes = [...deps.run.lanes].sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0)).map((spec) => this.makeLane(spec));
     for (const spec of deps.run.lanes) {
       if (spec.bindingFailure !== null) this.failLane(this.lane(spec.symbol), "BINDING", spec.bindingFailure, "LINEAGE_OR_PROFILE_MISMATCH");
     }
+  }
+
+  private makeLane(spec: LaneSpec): Lane {
+    return {
+      symbol: spec.symbol,
+      lineageId: spec.lineageId,
+      tail: new ShadowLogTail({ lineageId: spec.lineageId, marketType: NATIVE_DELIVERY_MARKET_TYPE, symbol: spec.symbol, chartInterval: this.deps.run.chartInterval }, this.deps.pendingTailPolls),
+      selector: new NativeDeliverySelectorV2(this.deps.run.profile.delivery),
+      state: "HEALTHY",
+      failure: null,
+      failureClass: null,
+      text: "",
+      processedChars: 0,
+      savedChars: null,
+      baselineChars: 0,
+      activationChars: 0,
+      activatedAt: null,
+      activatedByRunId: null,
+      baselined: false,
+      pending: [],
+    };
   }
 
   private lane(symbol: string): Lane {
@@ -450,61 +500,120 @@ export class MultiSymbolNativeEmitter {
     }
 
     // Pass 2: baselines (and, for COMMIT, durable first activation at EOF).
-    for (const { lane, cursor, text } of plans) {
-      lane.text = text;
-      const eof = text.lastIndexOf("\n") + 1;
-      if (this.deps.baseline === "DRY_RUN_FROM_START") {
-        lane.baselineChars = 0;
-        lane.activationChars = 0;
-      } else if (cursor !== null) {
-        if (text.length < cursor.consumedChars || sha256(text.slice(0, cursor.consumedChars)) !== cursor.consumedSha256) {
-          this.failLane(lane, "LOG_REWRITTEN", "the log no longer matches the bytes the production cursor consumed", "MALFORMED");
-          continue;
-        }
-        lane.baselineChars = cursor.consumedChars;
-        lane.activationChars = cursor.activationChars;
-        lane.activatedAt = cursor.activatedAt;
-        lane.activatedByRunId = cursor.activatedByRunId;
-        lane.savedChars = cursor.consumedChars;
-      } else {
-        // First activation (COMMIT, durable) or its in-memory preview (DRY_RUN): at current EOF.
-        lane.baselineChars = eof;
-        lane.activationChars = eof;
-        lane.activatedAt = this.deps.nowIso();
-        lane.activatedByRunId = this.deps.run.runId;
-      }
+    for (const { lane, cursor, text } of plans) this.baselineLane(lane, cursor, text);
+    // Symbols the run onboarded after its manifest (a restart picks up every earlier join).
+    this.absorbMembership();
+  }
 
-      let entries: { record: ShadowRecord; endChars: number }[];
-      try {
-        entries = lane.tail.readWithOffsets(text);
-      } catch (error) {
-        this.refuseLaneRead(lane, error);
+  /** Establishes one lane's baseline from its production cursor, or activates it at its current EOF. */
+  private baselineLane(lane: Lane, cursor: EmitterCursor | null, text: string): void {
+    const commit = this.deps.mode === "COMMIT_DASHBOARD_ALERTS";
+    lane.text = text;
+    const eof = text.lastIndexOf("\n") + 1;
+    if (this.deps.baseline === "DRY_RUN_FROM_START") {
+      lane.baselineChars = 0;
+      lane.activationChars = 0;
+    } else if (cursor !== null) {
+      if (text.length < cursor.consumedChars || sha256(text.slice(0, cursor.consumedChars)) !== cursor.consumedSha256) {
+        this.failLane(lane, "LOG_REWRITTEN", "the log no longer matches the bytes the production cursor consumed", "MALFORMED");
+        return;
+      }
+      lane.baselineChars = cursor.consumedChars;
+      lane.activationChars = cursor.activationChars;
+      lane.activatedAt = cursor.activatedAt;
+      lane.activatedByRunId = cursor.activatedByRunId;
+      lane.savedChars = cursor.consumedChars;
+    } else {
+      // First activation (COMMIT, durable) or its in-memory preview (DRY_RUN): at current EOF.
+      lane.baselineChars = eof;
+      lane.activationChars = eof;
+      lane.activatedAt = this.deps.nowIso();
+      lane.activatedByRunId = this.deps.run.runId;
+    }
+
+    let entries: { record: ShadowRecord; endChars: number }[];
+    try {
+      entries = lane.tail.readWithOffsets(text);
+    } catch (error) {
+      this.refuseLaneRead(lane, error);
+      return;
+    }
+    if (lane.baselineChars > 0 && !entries.some((e) => e.endChars === lane.baselineChars)) {
+      this.failLane(lane, "CURSOR_NOT_ON_RECORD_BOUNDARY", `position ${lane.baselineChars} is not the end of a complete record`, "MALFORMED");
+      return;
+    }
+    lane.processedChars = lane.baselineChars;
+    let historical = 0;
+    for (const entry of entries) {
+      if (entry.endChars > lane.baselineChars) {
+        this.admit(lane, [entry]);
         continue;
       }
-      if (lane.baselineChars > 0 && !entries.some((e) => e.endChars === lane.baselineChars)) {
-        this.failLane(lane, "CURSOR_NOT_ON_RECORD_BOUNDARY", `position ${lane.baselineChars} is not the end of a complete record`, "MALFORMED");
+      // Before the baseline: rebuild slot state only. Nothing here is ever delivered.
+      this.tally.eventsRead += 1;
+      lane.selector.consider(entry.record);
+      if (entry.endChars <= lane.activationChars) {
+        this.tally.historicalBeforeActivation += 1;
+        historical += 1;
+      } else this.tally.alreadyProcessedBeforeRestart += 1;
+    }
+    lane.baselined = true;
+    if (commit && cursor === null) {
+      this.deps.report({ type: "LANE_ACTIVATED", symbol: lane.symbol, activationChars: lane.activationChars, historicalRecords: historical });
+      this.persist(lane);
+    }
+  }
+
+  /**
+   * Binds every symbol the run's membership journal announced since the last
+   * call (JOINED / REACTIVATED). A new lane is verified exactly like a manifest
+   * lane and activated at its current EOF; a known symbol must keep its lineage.
+   */
+  private absorbMembership(): void {
+    if (this.deps.run.dynamicMembership !== true || this.deps.readMembership === undefined || this.membershipFailure !== null) return;
+    let records;
+    try {
+      records = parseMembershipJournal(this.deps.readMembership(), this.deps.run.runId).records;
+    } catch (error) {
+      if (!(error instanceof RunMembershipError)) throw error;
+      // Fail closed for new bindings only; every lane already bound keeps running.
+      this.membershipFailure = error.message;
+      this.deps.report({ type: "MEMBERSHIP_INVALID", message: error.message });
+      return;
+    }
+    for (const record of records) {
+      if (record.seq <= this.membershipSeq) continue;
+      this.membershipSeq = record.seq;
+      if (record.kind !== "JOINED" && record.kind !== "REACTIVATED") continue;
+      const lineageId = record.lineageId as string;
+      const known = this.lanes.find((l) => l.symbol === record.symbol);
+      if (known !== undefined) {
+        if (known.lineageId !== lineageId) this.failLane(known, "LINEAGE_CHANGED", `the run now names lineage ${lineageId} for this symbol`, "LINEAGE_OR_PROFILE_MISMATCH");
         continue;
       }
-      lane.processedChars = lane.baselineChars;
-      let historical = 0;
-      for (const entry of entries) {
-        if (entry.endChars > lane.baselineChars) {
-          this.admit(lane, [entry]);
+      const spec = bindLaneSpec(
+        this.deps.run.profile,
+        this.deps.run.chartInterval,
+        { symbol: record.symbol, lineageId, bootstrapInputSha256: record.bootstrapInputSha256 as string, symbolHistoryOrigin: record.symbolHistoryOrigin },
+        this.deps.checkpointOf ?? (() => null)
+      );
+      const lane = this.makeLane(spec);
+      this.lanes.push(lane);
+      this.lanes.sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0));
+      this.deps.report({ type: "LANE_JOINED", symbol: lane.symbol, seq: record.seq, lineageId });
+      if (spec.bindingFailure !== null) {
+        this.failLane(lane, "BINDING", spec.bindingFailure, "LINEAGE_OR_PROFILE_MISMATCH");
+        continue;
+      }
+      const cursor = this.deps.cursors.load(lane.symbol);
+      if (cursor !== null) {
+        const why = cursorMismatch(cursor, this.expectedCursorIdentity(lane));
+        if (why !== null) {
+          this.failLane(lane, "CURSOR_MISMATCH", why, "LINEAGE_OR_PROFILE_MISMATCH");
           continue;
         }
-        // Before the baseline: rebuild slot state only. Nothing here is ever delivered.
-        this.tally.eventsRead += 1;
-        lane.selector.consider(entry.record);
-        if (entry.endChars <= lane.activationChars) {
-          this.tally.historicalBeforeActivation += 1;
-          historical += 1;
-        } else this.tally.alreadyProcessedBeforeRestart += 1;
       }
-      lane.baselined = true;
-      if (commit && cursor === null) {
-        this.deps.report({ type: "LANE_ACTIVATED", symbol: lane.symbol, activationChars: lane.activationChars, historicalRecords: historical });
-        this.persist(lane);
-      }
+      this.baselineLane(lane, cursor, this.deps.readLog(lane.symbol) ?? "");
     }
   }
 
@@ -523,6 +632,7 @@ export class MultiSymbolNativeEmitter {
   /** One cycle: read every healthy lane (sorted order), then drain fairly. */
   async poll(shouldStop: () => boolean = () => false): Promise<void> {
     if (!this.initialized) throw new Error("initialize first");
+    this.absorbMembership();
     for (const lane of this.lanes) {
       if (lane.state === "FAILED") continue;
       const text = this.deps.readLog(lane.symbol);
@@ -613,6 +723,7 @@ export class MultiSymbolNativeEmitter {
       deliveryPolicyVersion: s.delivery.policyVersion,
       dashboardSourceTimeframes: s.delivery.dashboardSourceTimeframes,
       futureExecutionPolicy: { sourceTimeframes: s.execution.futureExecutionSourceTimeframes, nativeExecutionEnabled: false, notice: s.execution.notice },
+      membership: { dynamic: this.deps.run.dynamicMembership === true, recordsAbsorbed: this.membershipSeq, failure: this.membershipFailure },
       symbolsTracked: this.lanes.length,
       symbolsHealthy: this.lanes.filter((l) => l.state === "HEALTHY").length,
       symbolsFailed: this.lanes.filter((l) => l.state === "FAILED").length,

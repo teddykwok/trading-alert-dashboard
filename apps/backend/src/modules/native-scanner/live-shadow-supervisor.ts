@@ -19,11 +19,14 @@ import { STREAM_OPEN_TIMEOUT_MS, STREAM_READINESS_TIMEOUT_MS, STREAM_STALE_TIMEO
 import { LiveShadowSession, prepareLiveShadowState } from "./live-shadow-session";
 import { LiveShadowEventStore } from "./live-shadow-store";
 import { REPLAY_PAGE_LIMIT, REPLAY_SETTLE_MS } from "./replay-cli-args";
-import { deriveHtfContextStartMs } from "./scanner-lineage";
+import { klineStreamNameOf, symbolPathSegment } from "./exchange-symbol";
+import { probeSymbolHistoryOrigin } from "./history-origin";
+import { deriveHtfContextStartMs, effectiveHistoryRanges, type SymbolHistoryOrigin, type SymbolOriginInput } from "./scanner-lineage";
 import { engineFingerprintOfConfig, engineFingerprintOfLineage, type ProfileSummary } from "./scanner-profile";
 import type { RunManifestSymbol } from "./supervisor-run-manifest";
 import { ScannerLockError, type ScannerLock } from "./scanner-lock";
 import { SymbolStreamChannel } from "./symbol-stream-channel";
+import type { UsdmContract, UsdmUniverse } from "./usdm-universe";
 
 /**
  * MULTI-SYMBOL NATIVE LIVE-SHADOW SUPERVISOR — SHADOW ONLY.
@@ -48,11 +51,68 @@ import { SymbolStreamChannel } from "./symbol-stream-channel";
  *  - each connection has a BOUNDED queue. Overflow is never a silent drop: the
  *    connection is failed closed and its symbols recover and re-quarantine.
  *
+ * DYNAMIC UNIVERSE (DYNAMIC_UNIVERSE_V1, only with a SYMBOL_FIRST_CLOSED_BAR_V1
+ * engine and an ALL_ACTIVE selection): the running supervisor refreshes the
+ * public exchangeInfo (one request, fenced: never two at once, never before
+ * start-up completes, never after stop) and reconciles its members:
+ *  - a NEW target symbol gets exactly one worker and one bootstrap at a time:
+ *    first real closed bar -> history replay (non-delivering) -> checkpoint ->
+ *    placement on a connection with room (that one connection is rebuilt; the
+ *    hwm handshake and REST recovery close any REST/WebSocket gap, and the
+ *    session dedupes closed bars by open time) -> readiness -> live;
+ *  - a symbol that LEAVES the target universe becomes INACTIVE: no further
+ *    observations, its subscription is dropped from the next connect, its
+ *    checkpoint and evidence stay exactly as they are;
+ *  - an INACTIVE symbol that RETURNS with the same contract identity resumes
+ *    its own preserved session (catching up closed bars, non-actionable); a
+ *    changed identity is QUARANTINED, never merged;
+ *  - a failed or implausible refresh (error, empty, mass removal) keeps the
+ *    last-known-good universe and is reported stale; nothing is evicted;
+ *  - a universe larger than the connection ceiling admits nobody new and is
+ *    reported CAPACITY_EXCEEDED; nothing is truncated silently.
+ * Every async step carries the worker's generation token: work that finishes
+ * after its symbol was removed, re-added or the supervisor stopped is
+ * discarded before it can write a checkpoint, a commit or a membership.
+ *
  * Nothing here can create an Alert, reach a database, a queue, an account or
  * a signed endpoint. Every record it writes is the session's own, actionable: false.
  */
 
-export type SymbolStatus = "PENDING" | "ATTACHED" | "RECOVERING" | "FAILED";
+export type SymbolStatus =
+  | "PENDING"
+  | "ATTACHED"
+  | "RECOVERING"
+  | "FAILED"
+  /** Dynamic universe: preparing history (first bar, replay, checkpoint). */
+  | "BOOTSTRAPPING"
+  /** Dynamic universe: no closed bar to start from yet (retried at the next close). */
+  | "WAITING_FIRST_CLOSED_BAR"
+  /** Dynamic universe: the first bar or history could not be read (retried later). UNKNOWN, never ABSENT. */
+  | "BOOTSTRAP_UNREADABLE"
+  /** Dynamic universe: a real post-origin gap, drift, contradiction or identity conflict. Never scanned, never guessed. */
+  | "QUARANTINED"
+  /** Dynamic universe: left the target universe. State preserved; no new observations. */
+  | "INACTIVE";
+
+/** The Binance contract metadata that names ONE contract. A change while the symbol is the same is a different contract. */
+export interface ContractIdentity {
+  readonly baseAsset: string;
+  readonly quoteAsset: string;
+  readonly contractType: string;
+  readonly onboardDateMs: number | null;
+  readonly underlyingType: string | null;
+}
+
+export const contractIdentityOf = (c: UsdmContract): ContractIdentity => ({
+  baseAsset: c.baseAsset,
+  quoteAsset: c.quoteAsset,
+  contractType: c.contractType,
+  onboardDateMs: c.onboardDateMs,
+  underlyingType: c.underlyingType,
+});
+
+const sameIdentity = (a: ContractIdentity, b: ContractIdentity) =>
+  a.baseAsset === b.baseAsset && a.quoteAsset === b.quoteAsset && a.contractType === b.contractType && a.onboardDateMs === b.onboardDateMs && a.underlyingType === b.underlyingType;
 
 /** One symbol the supervisor may try, with Binance's advisory listing time. */
 export interface SupervisorCandidate {
@@ -61,6 +121,8 @@ export interface SupervisorCandidate {
   readonly onboardDateMs: number | null;
   /** Named by the operator (--include-symbols): must be accepted, never replaced. */
   readonly required: boolean;
+  /** The contract's identity from exchangeInfo (dynamic universe: reactivation must match it). */
+  readonly identity?: ContractIdentity | null;
 }
 
 /**
@@ -145,6 +207,24 @@ export interface SupervisorConfig {
   readonly runId?: string | null;
   /** The profile this run executes, or null for a legacy explicit-flag run. Its engine fingerprint must match `lineage`. */
   readonly profile?: ProfileSummary | null;
+  /** DYNAMIC_UNIVERSE_V1: periodic universe refresh and live onboarding. Needs a symbol history origin, ALL_ACTIVE and deps.fetchUniverse. */
+  readonly dynamicUniverse?: DynamicUniverseConfig | null;
+}
+
+export interface DynamicUniverseConfig {
+  /** Between two exchangeInfo refreshes (UNIVERSE_REFRESH_LIMITS in scanner-profile.ts). */
+  readonly refreshIntervalMs: number;
+}
+
+/** One change of the running set after start-up, for the run's append-only membership journal. */
+export interface MembershipChange {
+  readonly kind: "JOINED" | "REACTIVATED" | "INACTIVE" | "QUARANTINED";
+  readonly symbol: string;
+  readonly lineageId: string | null;
+  readonly bootstrapInputSha256: string | null;
+  readonly symbolHistoryOrigin: SymbolHistoryOrigin | null;
+  readonly reason: string | null;
+  readonly at: string;
 }
 
 export interface SupervisorDeps {
@@ -158,6 +238,10 @@ export interface SupervisorDeps {
   /** Runs `fn` later on the event loop (setImmediate in the CLI; a manual queue in tests). */
   readonly schedule: (fn: () => void) => void;
   readonly log: (line: string) => void;
+  /** Dynamic universe: the current public universe (exchangeInfo through the governed transport). Throws on any failure. */
+  readonly fetchUniverse?: () => Promise<UsdmUniverse>;
+  /** Dynamic universe: called synchronously for every membership change after start-up (the CLI appends the journal). */
+  readonly recordMembership?: (change: MembershipChange) => void;
 }
 
 /** Reconnect delays per consecutive failure of one connection. */
@@ -168,6 +252,15 @@ export const DRAIN_BATCH = 500;
 export const RECOVERY_RETRY_MS = 15_000;
 /** Hard ceilings, whatever is configured. */
 export const SUPERVISOR_LIMITS = Object.freeze({ maxConnections: 32, maxSymbols: 2_000, maxQueueCapacity: 100_000 });
+/** Dynamic universe: waits after an unreadable bootstrap, per consecutive attempt. */
+export const BOOTSTRAP_RETRY_DELAYS_MS = [60_000, 300_000, 900_000, 3_600_000];
+/** Dynamic universe: a quarantined history (real gap, drift, contradiction) is re-checked this rarely. */
+export const QUARANTINE_RETRY_MS = 24 * 60 * 60 * 1000;
+/**
+ * Dynamic universe: a refresh that would remove more than max(MIN, FRACTION x members) symbols at
+ * once is refused as implausible (a truncated or wrong payload), keeping the last-known-good universe.
+ */
+export const MASS_REMOVAL_GUARD = Object.freeze({ min: 25, fraction: 0.25 });
 
 export class SupervisorConfigError extends Error {
   constructor(message: string) {
@@ -185,6 +278,7 @@ interface SymbolCounters {
   ignoredWhileDetached: number;
   recoveries: number;
   laggedUpdates: number;
+  ignoredWhileInactive: number;
 }
 
 interface SymbolWorker {
@@ -206,12 +300,29 @@ interface SymbolWorker {
   recoveryNotBeforeMs: number;
   recoveryInFlight: boolean;
   readonly counters: SymbolCounters;
+  /** Fences async work: bumped whenever the symbol is removed, re-added or quarantined. Stale work never lands. */
+  generation: number;
+  /** The contract identity it was admitted with (dynamic universe). */
+  identity: ContractIdentity | null;
+  readonly onboardDateMs: number | null;
+  origin: SymbolOriginInput | null;
+  symbolHistoryOrigin: SymbolHistoryOrigin | null;
+  onboardDiscrepancyMs: number | null;
+  bootstrapInFlight: boolean;
+  bootstrapAttempts: number;
+  /** Dynamic universe: the earliest time the next bootstrap may start. */
+  nextAttemptAtMs: number;
+  inactiveSinceMs: number | null;
+  /** Set while an INACTIVE symbol's preserved session catches up after it returned. */
+  reactivating: boolean;
+  /** True once the symbol has been part of the running set (manifest or journal). */
+  joined: boolean;
 }
 
 interface Connection {
   readonly index: number;
-  /** Every symbol ASSIGNED here (the deterministic assignment), attached or not. */
-  readonly symbols: readonly string[];
+  /** Every symbol ASSIGNED here (the deterministic assignment, plus dynamic placements), attached or not. */
+  symbols: string[];
   socket: StreamConnection | null;
   generation: number;
   lifecycle: "IDLE" | "CONNECTING" | "OPEN" | "CLOSED";
@@ -226,6 +337,8 @@ interface Connection {
   readonly queue: string[];
   draining: boolean;
   url: string | null;
+  /** Controlled rebuilds (a dynamic placement changed its subscription set). */
+  rebuilds: number;
 }
 
 /**
@@ -260,6 +373,30 @@ export class LiveShadowSupervisor {
   /** Closed bars committed live, awaiting their (non-authoritative) cache write. */
   private readonly pendingCacheBars = new Map<string, NativeKline[]>();
   private stopped = false;
+  /** Start-up has completed: the running set is known and connected. Refreshes never run before. */
+  private started = false;
+  private readonly dynamic: boolean;
+  private readonly universeState = {
+    generation: 0,
+    inFlight: false,
+    nextAtMs: 0,
+    lastAttemptAtMs: null as number | null,
+    lastSuccessAtMs: null as number | null,
+    lastResult: null as null | "OK" | "FAILED" | "REJECTED_EMPTY" | "REJECTED_MASS_REMOVAL",
+    lastError: null as string | null,
+    consecutiveFailures: 0,
+    refreshes: 0,
+    failures: 0,
+    suppressed: 0,
+    exchangeCandidates: null as number | null,
+    added: [] as string[],
+    removed: [] as string[],
+    reactivated: [] as string[],
+    identityConflicts: [] as string[],
+    capacityExceeded: false,
+    capacityRequired: null as number | null,
+    notAdmitted: [] as string[],
+  };
   readonly startedAt: string;
   /** Every accepted symbol's lineage must belong to this engine. */
   readonly engineFingerprint: string;
@@ -289,6 +426,14 @@ export class LiveShadowSupervisor {
     ] as const) {
       if (!Number.isSafeInteger(value) || value < min || value > max) throw new SupervisorConfigError(`${name} must be ${min}..${max}`);
     }
+    this.dynamic = config.dynamicUniverse != null;
+    if (this.dynamic) {
+      const refresh = (config.dynamicUniverse as DynamicUniverseConfig).refreshIntervalMs;
+      if (!Number.isSafeInteger(refresh) || refresh < 60_000 || refresh > 3_600_000) throw new SupervisorConfigError("the universe refresh interval must be 60000..3600000 ms");
+      if (config.lineage.historyOrigin === undefined) throw new SupervisorConfigError("a dynamic universe needs an engine with a symbol history origin");
+      if (this.selection.mode !== "ALL_ACTIVE") throw new SupervisorConfigError("a dynamic universe is an ALL_ACTIVE selection");
+      if (deps.fetchUniverse === undefined) throw new SupervisorConfigError("a dynamic universe needs a universe source (fetchUniverse)");
+    }
     // Capacity is checked up front for everything the run could need, so a valid config can never fail after the walk.
     // ALL_ACTIVE: every candidate the free pre-check cannot rule out might be accepted.
     const capacityNeeded =
@@ -317,12 +462,14 @@ export class LiveShadowSupervisor {
   // ---------------------------------------------------------------------------
 
   async start(): Promise<void> {
-    const accepted = this.selection.mode === "EXPLICIT" ? await this.startExplicit() : await this.walkCandidates();
+    const accepted = this.selection.mode === "EXPLICIT" ? await this.startExplicit() : this.dynamic ? await this.startDynamic() : await this.walkCandidates();
     this.assign(accepted);
     for (const connection of this.connections) this.connect(connection);
+    this.started = true;
+    if (this.dynamic) this.universeState.nextAtMs = this.deps.nowMs() + (this.config.dynamicUniverse as DynamicUniverseConfig).refreshIntervalMs;
   }
 
-  private newWorker(symbol: string): SymbolWorker {
+  private newWorker(symbol: string, candidate: SupervisorCandidate | null = null): SymbolWorker {
     return {
       symbol,
       connection: -1,
@@ -339,7 +486,19 @@ export class LiveShadowSupervisor {
       recoveryAttempts: 0,
       recoveryNotBeforeMs: 0,
       recoveryInFlight: false,
-      counters: { observations: 0, commitsLive: 0, commitsQuarantined: 0, commitsReplayed: 0, refused: 0, ignoredWhileDetached: 0, recoveries: 0, laggedUpdates: 0 },
+      counters: { observations: 0, commitsLive: 0, commitsQuarantined: 0, commitsReplayed: 0, refused: 0, ignoredWhileDetached: 0, recoveries: 0, laggedUpdates: 0, ignoredWhileInactive: 0 },
+      generation: 0,
+      identity: candidate?.identity ?? null,
+      onboardDateMs: candidate?.onboardDateMs ?? null,
+      origin: null,
+      symbolHistoryOrigin: null,
+      onboardDiscrepancyMs: null,
+      bootstrapInFlight: false,
+      bootstrapAttempts: 0,
+      nextAttemptAtMs: 0,
+      inactiveSinceMs: null,
+      reactivating: false,
+      joined: false,
     };
   }
 
@@ -355,6 +514,8 @@ export class LiveShadowSupervisor {
    * context start. Unknown or implausible metadata never excludes anything.
    */
   private tooNew(candidate: SupervisorCandidate): boolean {
+    // With a symbol history origin a listing is never "too new": its history starts at its own first bar.
+    if (this.config.lineage.historyOrigin !== undefined) return false;
     const onboard = candidate.onboardDateMs;
     if (onboard === null || onboard > this.deps.nowMs()) return false;
     return onboard > this.contextStartMs() + (this.config.onboardPrecheckMarginMs ?? ONBOARD_PRECHECK_MARGIN_MS);
@@ -372,7 +533,7 @@ export class LiveShadowSupervisor {
 
   /** EXPLICIT: exactly the named symbols; an ineligible one stays visible as FAILED and is never replaced. */
   private async startExplicit(): Promise<SymbolWorker[]> {
-    const workers = this.selection.candidates.map((c) => this.newWorker(c.symbol));
+    const workers = this.selection.candidates.map((c) => this.newWorker(c.symbol, c));
     await mapBounded(workers, this.config.restConcurrency, async (worker, i) => {
       const candidate = this.selection.candidates[i];
       if (this.tooNew(candidate)) {
@@ -417,7 +578,7 @@ export class LiveShadowSupervisor {
       const room = target === null ? this.config.restConcurrency : Math.min(this.config.restConcurrency, target - accepted.length);
       const chunk = selection.candidates.slice(next, next + room);
       next += chunk.length;
-      const workers = chunk.map((c) => this.newWorker(c.symbol));
+      const workers = chunk.map((c) => this.newWorker(c.symbol, c));
       await mapBounded(workers, this.config.restConcurrency, async (worker, i) => {
         if (this.tooNew(chunk[i])) {
           worker.status = "FAILED";
@@ -488,6 +649,56 @@ export class LiveShadowSupervisor {
     return accepted;
   }
 
+  /**
+   * DYNAMIC: every target symbol gets one worker and one bootstrap (bounded
+   * concurrency, governed REST). Those that are live-ready form the running set
+   * (deterministic assignment); the rest stay tracked members in their honest
+   * state (waiting, unreadable, quarantined) and are retried by the refresh
+   * loop — never "skipped forever". A REST halt or a spent budget leaves the
+   * universe unknown: nothing is started.
+   */
+  private async startDynamic(): Promise<SymbolWorker[]> {
+    const candidates = this.selection.candidates;
+    const workers = candidates.map((c) => this.newWorker(c.symbol, c));
+    await mapBounded(workers, this.config.restConcurrency, async (worker) => {
+      worker.status = "BOOTSTRAPPING";
+      worker.bootstrapAttempts += 1;
+      await this.prepareContained(worker);
+    });
+    const halted = workers.find((w) => w.failure !== null && /^(REST_HALTED|REQUEST_BUDGET_EXHAUSTED)\b/.test(w.failure));
+    const accepted = workers.filter((w) => w.status === "ATTACHED");
+    const notAccepted = workers.filter((w) => w.status !== "ATTACHED");
+    const classOf = (w: SymbolWorker): SkipClass =>
+      w.failure !== null && /^(INSUFFICIENT_HISTORY|INSUFFICIENT_HTF_CONTEXT|INCOMPLETE_DATA)\b/.test(w.failure) ? "INSUFFICIENT_HISTORY" : "OTHER";
+    const skipped = notAccepted.map((w) => ({ symbol: w.symbol, class: classOf(w), reason: `${w.status}: ${w.failure ?? "unknown"}` }));
+    const summary: SelectionSummary = {
+      mode: "ALL_ACTIVE",
+      universeActive: this.config.universeActive ?? null,
+      targetEligible: null,
+      candidatesTested: workers.length,
+      acceptedEligible: accepted.length,
+      skippedTooNew: 0,
+      skippedInsufficientHistory: skipped.filter((x) => x.class === "INSUFFICIENT_HISTORY").length,
+      skippedOther: skipped.filter((x) => x.class === "OTHER").length,
+      universeExhausted: halted === undefined,
+      skipped,
+    };
+    this.selectionSummary = summary;
+    if (halted !== undefined || accepted.length === 0) {
+      for (const worker of workers) worker.lock?.release();
+      throw new TargetNotReachedError(
+        halted !== undefined
+          ? `TARGET_NOT_REACHED: ${halted.failure as string}. The universe was not exhausted; nothing was started`
+          : "TARGET_NOT_REACHED: no scanner-eligible symbol in the universe; nothing was started",
+        { ...summary, requestsUsed: this.deps.governor.requestsMade, remainingUniverse: notAccepted.length }
+      );
+    }
+    for (const s of skipped) this.deps.log(`${s.symbol} NOT YET LIVE (${s.reason}) — tracked; retried by the dynamic universe`);
+    for (const worker of notAccepted) this.workers.set(worker.symbol, worker);
+    for (const worker of accepted) worker.joined = true;
+    return accepted;
+  }
+
   /** The running set is known: deterministic assignment, connections, stream routing. */
   private assign(workers: readonly SymbolWorker[]): void {
     const groups = assignConnections(
@@ -513,13 +724,15 @@ export class LiveShadowSupervisor {
       queue: [],
       draining: false,
       url: null,
+      rebuilds: 0,
     }));
     groups.forEach((symbols, index) => {
       for (const symbol of symbols) {
         const worker = byName.get(symbol) as SymbolWorker;
         worker.connection = index;
+        worker.joined = true;
         this.workers.set(symbol, worker);
-        this.streamToSymbol.set(`${symbol.toLowerCase()}@kline_${this.config.lineage.chartInterval}`, symbol);
+        this.streamToSymbol.set(klineStreamNameOf(symbol, this.config.lineage.chartInterval), symbol);
       }
     });
   }
@@ -531,17 +744,79 @@ export class LiveShadowSupervisor {
     this.deps.log(`${worker.symbol} FAILED ${code}: ${detail}`);
   }
 
+  /**
+   * A non-final outcome of a dynamic bootstrap: retried later in its honest
+   * state. Outside a dynamic universe there is no retry, so it is a FAILED
+   * symbol exactly as before.
+   */
+  private defer(worker: SymbolWorker, status: "WAITING_FIRST_CLOSED_BAR" | "BOOTSTRAP_UNREADABLE" | "QUARANTINED", code: string, detail: string, retryAtMs: number): void {
+    if (!this.dynamic) return this.fail(worker, code, detail);
+    worker.status = status;
+    worker.failure = `${code}: ${detail}`;
+    worker.nextAttemptAtMs = retryAtMs;
+    this.deps.log(`${worker.symbol} ${status} ${code}: ${detail}${Number.isFinite(retryAtMs) ? ` — retry from ${new Date(retryAtMs).toISOString()}` : " — not retried automatically"}`);
+  }
+
+  private unreadableRetryAt(worker: SymbolWorker): number {
+    return this.deps.nowMs() + BOOTSTRAP_RETRY_DELAYS_MS[Math.min(Math.max(worker.bootstrapAttempts - 1, 0), BOOTSTRAP_RETRY_DELAYS_MS.length - 1)];
+  }
+
+  /** True when async work begun under `token` must not land: the symbol moved on, or the supervisor stopped. */
+  private isStale(worker: SymbolWorker, token: number): boolean {
+    return this.stopped || worker.generation !== token;
+  }
+
   private async prepare(worker: SymbolWorker): Promise<void> {
     const { lineage } = this.config;
-    try {
-      worker.lock = this.deps.acquireLock(worker.dir);
-    } catch (error) {
-      if (error instanceof ScannerLockError) return this.fail(worker, error.code, error.message);
-      throw error;
+    const token = worker.generation;
+    if (worker.lock === null) {
+      try {
+        worker.lock = this.deps.acquireLock(worker.dir);
+      } catch (error) {
+        if (error instanceof ScannerLockError) return this.fail(worker, error.code, error.message);
+        throw error;
+      }
     }
-    const contextStartMs = this.contextStartMs();
+    let contextStartMs = this.contextStartMs();
     // Every bar before the one forming now (less the settle margin) is closed: the single-symbol CLI's rule.
     const boundaryMs = Math.floor((this.deps.nowMs() - REPLAY_SETTLE_MS) / this.intervalMs) * this.intervalMs;
+    let origin: SymbolOriginInput | null = null;
+    if (lineage.historyOrigin !== undefined) {
+      // Where this symbol's REAL history begins: from public klines, never the listing date alone.
+      let probe;
+      try {
+        probe = await probeSymbolHistoryOrigin({
+          symbol: worker.symbol,
+          chartInterval: lineage.chartInterval,
+          contextStartMs,
+          onboardDateMs: worker.onboardDateMs,
+          cache: this.deps.cache,
+          fetchDeps: this.deps.fetchDeps,
+          settleMs: REPLAY_SETTLE_MS,
+        });
+      } catch (error) {
+        if (this.isStale(worker, token)) return;
+        if (this.deps.governor.halt !== null) return this.fail(worker, "REST_HALTED", this.deps.governor.halt.message);
+        if (error instanceof ScannerDataError && error.code === "REQUEST_BUDGET_EXHAUSTED") return this.fail(worker, "REQUEST_BUDGET_EXHAUSTED", error.message);
+        throw error;
+      }
+      if (this.isStale(worker, token)) return;
+      if (probe.kind === "WAITING_FIRST_CLOSED_BAR") return this.defer(worker, "WAITING_FIRST_CLOSED_BAR", "WAITING_FIRST_CLOSED_BAR", probe.detail, probe.retryAtMs);
+      if (probe.kind === "UNREADABLE") return this.defer(worker, "BOOTSTRAP_UNREADABLE", "BOOTSTRAP_UNREADABLE", probe.detail, this.unreadableRetryAt(worker));
+      origin = probe.origin;
+      worker.origin = origin;
+      worker.onboardDiscrepancyMs = probe.onboardDiscrepancyMs;
+      if (probe.onboardDiscrepancyMs !== null) {
+        this.deps.log(`${worker.symbol} ONBOARD_DISCREPANCY: first real closed bar is ${probe.onboardDiscrepancyMs / 60_000} min from the exchangeInfo onboardDate; the real bar is used`);
+      }
+      const ranges = effectiveHistoryRanges({ historyStartMs: lineage.historyStartMs, compatibilitySwitchoverMs: lineage.switchoverMs, htfContextStartMs: contextStartMs, intervalMs: this.intervalMs, origin });
+      contextStartMs = ranges.effectiveContextStartMs;
+      if (!(boundaryMs > ranges.effectiveSwitchoverMs)) {
+        // The lineage needs one history bar and the live checkpoint one closed causal bar after it.
+        const readyAt = ranges.effectiveSwitchoverMs + this.intervalMs + REPLAY_SETTLE_MS;
+        return this.defer(worker, "WAITING_FIRST_CLOSED_BAR", "WAITING_FIRST_CLOSED_BAR", `needs a closed bar after ${new Date(ranges.effectiveSwitchoverMs - this.intervalMs).toISOString()}`, readyAt);
+      }
+    }
     let filled;
     try {
       filled = await fillClosedBarCache({
@@ -556,10 +831,21 @@ export class LiveShadowSupervisor {
         nowIso: this.deps.nowIso,
       });
     } catch (error) {
+      if (this.isStale(worker, token)) return;
       if (this.deps.governor.halt !== null) return this.fail(worker, "REST_HALTED", this.deps.governor.halt.message);
       throw error;
     }
-    if (filled.kind === "SKIP") return this.fail(worker, filled.reason, filled.detail);
+    if (this.isStale(worker, token)) return;
+    if (filled.kind === "SKIP") {
+      if (origin !== null) {
+        // From the symbol's own origin, missing bars are a REAL post-origin gap (quarantine) or an unreadable fetch (retry).
+        if (filled.reason === "INCOMPLETE_DATA" || filled.reason === "INSUFFICIENT_HISTORY" || filled.reason === "CACHE_UNUSABLE") {
+          return this.defer(worker, "QUARANTINED", filled.reason, filled.detail, this.deps.nowMs() + QUARANTINE_RETRY_MS);
+        }
+        if (filled.reason === "PUBLIC_FETCH_FAILED") return this.defer(worker, "BOOTSTRAP_UNREADABLE", "BOOTSTRAP_UNREADABLE", filled.detail, this.unreadableRetryAt(worker));
+      }
+      return this.fail(worker, filled.reason, filled.detail);
+    }
 
     const checkpoints = new LiveCheckpointStore(worker.dir);
     try {
@@ -574,6 +860,7 @@ export class LiveShadowSupervisor {
           engine: lineage.engine,
           partialPeriodPolicy: SWITCHOVER_TRUNCATED_CLOSED_BARS,
           expectedLineageId: null,
+          ...(lineage.historyOrigin === undefined ? {} : { historyOrigin: lineage.historyOrigin, symbolOrigin: origin }),
         },
         boundaryMs,
         checkpoints.load()
@@ -583,6 +870,8 @@ export class LiveShadowSupervisor {
       if (lineageEngine !== this.engineFingerprint) {
         return this.fail(worker, "ENGINE_FINGERPRINT_MISMATCH", `lineage ${plan.lineageId} belongs to engine ${lineageEngine}, not ${this.engineFingerprint}`);
       }
+      // The last fence before anything durable: a removed, re-added or stopped symbol never writes a checkpoint.
+      if (this.isStale(worker, token)) return;
       checkpoints.save(plan.checkpointBody, this.deps.nowIso());
       const events = new LiveShadowEventStore(worker.dir);
       const session = new LiveShadowSession({
@@ -596,11 +885,15 @@ export class LiveShadowSupervisor {
       worker.session = session;
       worker.lineageId = plan.lineageId;
       worker.bootstrapInputSha256 = plan.lineage.bootstrapInputSha256;
+      worker.symbolHistoryOrigin = plan.lineage.symbolHistoryOrigin ?? null;
+      worker.failure = null;
       worker.channel = new SymbolStreamChannel({ session, log: (line) => this.symbolLog(worker, line) });
       worker.status = "ATTACHED";
       this.deps.log(`${worker.symbol} CATCHUP_OK lineage ${plan.lineageId.slice(0, 12)} checkpoint ${plan.checkpointStatus} hwm ${new Date(plan.hwmOpenTimeMs).toISOString()} replayed ${plan.catchUp.bars} bar(s) NON_ACTIONABLE`);
     } catch (error) {
       if (error instanceof LiveShadowError || error instanceof CompatReplayError || error instanceof KlineCacheError || error instanceof ScannerDataError) {
+        // From its own origin, a refused rebuild is a history problem: quarantined, never guessed around.
+        if (origin !== null) return this.defer(worker, "QUARANTINED", error.code, error.message, this.deps.nowMs() + QUARANTINE_RETRY_MS);
         return this.fail(worker, error.code, error.message);
       }
       throw error;
@@ -612,7 +905,10 @@ export class LiveShadowSupervisor {
   // ---------------------------------------------------------------------------
 
   private attachedSymbols(connection: Connection): string[] {
-    return connection.symbols.filter((s) => (this.workers.get(s) as SymbolWorker).status !== "FAILED");
+    return connection.symbols.filter((s) => {
+      const status = (this.workers.get(s) as SymbolWorker).status;
+      return status !== "FAILED" && status !== "INACTIVE" && status !== "QUARANTINED";
+    });
   }
 
   private connect(connection: Connection): void {
@@ -731,6 +1027,11 @@ export class LiveShadowSupervisor {
     }
     const symbol = this.streamToSymbol.get(envelope.stream);
     const worker = symbol === undefined ? undefined : this.workers.get(symbol);
+    if (worker !== undefined && worker.status === "INACTIVE") {
+      // The generation fence for removed symbols: a late message on the old subscription is never applied.
+      worker.counters.ignoredWhileInactive += 1;
+      return;
+    }
     if (worker === undefined || worker.connection !== connection.index) {
       connection.unknownStream += 1;
       return;
@@ -787,6 +1088,7 @@ export class LiveShadowSupervisor {
   /** Fills the symbol's fully closed gap (governed REST), commits it REPLAYED_NON_ACTIONABLE, re-arms readiness. */
   private async recover(worker: SymbolWorker): Promise<void> {
     const session = worker.session as LiveShadowSession;
+    const token = worker.generation;
     worker.recoveryInFlight = true;
     worker.recoveryAttempts += 1;
     try {
@@ -805,15 +1107,24 @@ export class LiveShadowSupervisor {
               })
             ).klines
           : [];
+      // Removed, re-added or stopped meanwhile: nothing lands (no commit, no re-attachment).
+      if (this.isStale(worker, token) || worker.status !== "RECOVERING") return;
       const records = session.recoverClosedBars(bars);
       worker.counters.commitsReplayed += records.length;
       for (const record of records) worker.channel?.logCommit(record);
       worker.counters.recoveries += 1;
       worker.status = "ATTACHED";
+      worker.reactivating = false;
       this.arm(worker);
       this.deps.log(`${worker.symbol} RECOVERED ${records.length} closed bar(s) NON_ACTIONABLE; re-armed: its current bar will be QUARANTINED`);
     } catch (error) {
+      if (this.isStale(worker, token)) return;
       if (this.deps.governor.halt !== null) return this.fail(worker, "REST_HALTED", this.deps.governor.halt.message);
+      if (worker.reactivating && error instanceof LiveShadowError && error.code === "RECOVERY_REQUIRED") {
+        // The returning symbol's bars do not continue from its preserved high-water mark: a real gap. Never bridged.
+        worker.reactivating = false;
+        return this.quarantine(worker, "HISTORY_GAP_ACROSS_INACTIVITY", error.message, this.deps.nowMs() + QUARANTINE_RETRY_MS);
+      }
       const why = error instanceof Error ? `${error.name}: ${error.message}` : "unknown";
       if (worker.recoveryAttempts >= this.config.maxRecoveryAttempts) return this.fail(worker, "RECOVERY_FAILED", why);
       worker.recoveryNotBeforeMs = this.deps.nowMs() + RECOVERY_RETRY_MS;
@@ -821,6 +1132,317 @@ export class LiveShadowSupervisor {
     } finally {
       worker.recoveryInFlight = false;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dynamic universe: refresh, bootstrap, placement, removal, reactivation
+  // ---------------------------------------------------------------------------
+
+  private bootstrapDue(worker: SymbolWorker, now: number): boolean {
+    if (worker.bootstrapInFlight || now < worker.nextAttemptAtMs) return false;
+    return worker.status === "PENDING" || worker.status === "WAITING_FIRST_CLOSED_BAR" || worker.status === "BOOTSTRAP_UNREADABLE" || worker.status === "QUARANTINED";
+  }
+
+  /** One bootstrap of one symbol. At most one is in flight per symbol; a stale one never lands. */
+  private async bootstrap(worker: SymbolWorker): Promise<void> {
+    const token = worker.generation;
+    worker.bootstrapInFlight = true;
+    worker.bootstrapAttempts += 1;
+    worker.status = "BOOTSTRAPPING";
+    try {
+      await this.prepare(worker);
+    } catch (error) {
+      if (!this.isStale(worker, token)) this.fail(worker, "UNEXPECTED_ERROR", error instanceof Error ? `${error.name}: ${error.message}` : "unknown");
+    } finally {
+      worker.bootstrapInFlight = false;
+    }
+    if (this.isStale(worker, token)) return;
+    // prepare() moved the status on (narrowing does not see through the await).
+    if ((worker.status as SymbolStatus) === "ATTACHED") {
+      worker.bootstrapAttempts = 0;
+      this.deps.log(`${worker.symbol} BOOTSTRAPPED (${worker.origin?.kind ?? "PROFILE"}${worker.origin?.firstClosedBarOpenTimeMs != null ? ` from ${new Date(worker.origin.firstClosedBarOpenTimeMs).toISOString()}` : ""}): awaiting placement; history replay delivered nothing`);
+    }
+  }
+
+  /** The connection a new symbol joins: room left, fewest symbols (fewest neighbours disturbed), lowest index; else a new one under the ceiling. */
+  private connectionWithRoom(): Connection | null {
+    let best: Connection | null = null;
+    for (const c of this.connections) {
+      if (c.symbols.length >= this.config.symbolsPerConnection) continue;
+      if (best === null || c.symbols.length < best.symbols.length) best = c;
+    }
+    if (best !== null) return best;
+    if (this.connections.length >= this.config.maxConnections) return null;
+    const created: Connection = {
+      index: this.connections.length,
+      symbols: [],
+      socket: null,
+      generation: 0,
+      lifecycle: "IDLE",
+      connectStartedAtMs: null,
+      openedAtMs: null,
+      lastMessageAtMs: null,
+      reconnectNotBeforeMs: 0,
+      consecutiveFailures: 0,
+      reconnects: 0,
+      overflows: 0,
+      unknownStream: 0,
+      queue: [],
+      draining: false,
+      url: null,
+      rebuilds: 0,
+    };
+    this.connections.push(created);
+    return created;
+  }
+
+  /** Live-ready symbols not yet on a connection join one; each touched connection is rebuilt once. */
+  private placePending(): void {
+    if (this.stopped) return;
+    const pending = [...this.workers.values()].filter((w) => w.status === "ATTACHED" && w.connection === -1).sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0));
+    if (pending.length === 0) return;
+    const touched = new Map<Connection, Set<string>>();
+    for (const worker of pending) {
+      const connection = this.connectionWithRoom();
+      if (connection === null) {
+        // Unreachable while admission checks capacity; kept fail-closed and visible all the same.
+        this.universeState.capacityExceeded = true;
+        this.deps.log(`${worker.symbol} NOT PLACED: every connection is full (${this.config.maxConnections} x ${this.config.symbolsPerConnection}); CAPACITY_EXCEEDED`);
+        break;
+      }
+      connection.symbols.push(worker.symbol);
+      connection.symbols.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      worker.connection = connection.index;
+      this.streamToSymbol.set(klineStreamNameOf(worker.symbol, this.config.lineage.chartInterval), worker.symbol);
+      const kind = worker.joined ? "REACTIVATED" : "JOINED";
+      worker.joined = true;
+      this.recordChange(kind, worker, null);
+      if (!touched.has(connection)) touched.set(connection, new Set());
+      (touched.get(connection) as Set<string>).add(worker.symbol);
+    }
+    for (const [connection, added] of touched) this.rebuild(connection, added);
+  }
+
+  /**
+   * A CONTROLLED rebuild of one connection whose subscription set changed: the
+   * old socket is closed and fenced off (generation), every symbol that was live
+   * on it detaches and recovers its own closed gap by REST (none when no bar
+   * closed meanwhile), and the new socket re-establishes readiness per symbol —
+   * so the bar in progress is quarantined and no closed bar is lost or applied
+   * twice (the session sequences closed bars by open time). It is not a
+   * failure: no backoff, no failure count.
+   */
+  private rebuild(connection: Connection, added: ReadonlySet<string>): void {
+    if (connection.socket === null) {
+      // Idle: just connect. Closed and waiting out a backoff: the next reconnect carries the new set.
+      if (connection.lifecycle === "IDLE") this.connect(connection);
+      return;
+    }
+    const socket = connection.socket;
+    connection.socket = null;
+    connection.generation += 1;
+    connection.lifecycle = "CLOSED";
+    connection.queue.length = 0;
+    connection.rebuilds += 1;
+    socket.close();
+    for (const symbol of connection.symbols) {
+      if (added.has(symbol)) continue;
+      const worker = this.workers.get(symbol) as SymbolWorker;
+      if (worker.status === "ATTACHED") this.detach(worker, `connection ${connection.index} rebuilt to add ${[...added].join(",")}`);
+    }
+    this.deps.log(`connection ${connection.index} REBUILD (+${[...added].join(",")}): neighbours re-establish readiness; closed gaps recover by REST`);
+    this.connect(connection);
+  }
+
+  /** Takes a symbol off its connection (subscription dropped at the next connect; an emptied connection closes). */
+  private unplace(worker: SymbolWorker): void {
+    if (worker.connection < 0) return;
+    const connection = this.connections[worker.connection];
+    connection.symbols = connection.symbols.filter((s) => s !== worker.symbol);
+    worker.connection = -1;
+    if (this.attachedSymbols(connection).length === 0 && connection.socket !== null) {
+      const socket = connection.socket;
+      connection.socket = null;
+      connection.generation += 1;
+      connection.queue.length = 0;
+      connection.lifecycle = "IDLE";
+      socket.close();
+    }
+  }
+
+  /** Left the target universe: no new observations; checkpoint, evidence and lock kept; nothing deleted. */
+  private deactivate(worker: SymbolWorker, reason: string): void {
+    worker.generation += 1;
+    this.unplace(worker);
+    worker.session?.onDisconnect();
+    worker.status = "INACTIVE";
+    worker.failure = reason;
+    worker.inactiveSinceMs = this.deps.nowMs();
+    worker.reactivating = false;
+    if (worker.joined) this.recordChange("INACTIVE", worker, reason);
+    this.deps.log(`${worker.symbol} INACTIVE (${reason}): no longer scanned; checkpoint and evidence preserved`);
+  }
+
+  private quarantine(worker: SymbolWorker, code: string, detail: string, retryAtMs: number): void {
+    worker.generation += 1;
+    this.unplace(worker);
+    worker.session?.onDisconnect();
+    // A quarantined session is never reused: a later attempt rebuilds and re-verifies from the data.
+    worker.session = null;
+    worker.channel = null;
+    worker.status = "QUARANTINED";
+    worker.failure = `${code}: ${detail}`;
+    worker.nextAttemptAtMs = retryAtMs;
+    if (worker.joined) this.recordChange("QUARANTINED", worker, `${code}: ${detail}`);
+    this.deps.log(`${worker.symbol} QUARANTINED ${code}: ${detail}`);
+  }
+
+  /** Returned to the target universe: the same contract resumes its own session (catching up its closed bars); a different one is quarantined. */
+  private reactivate(worker: SymbolWorker, identity: ContractIdentity): void {
+    if (worker.identity !== null && !sameIdentity(worker.identity, identity)) {
+      this.universeState.identityConflicts.push(worker.symbol);
+      return this.quarantine(worker, "IDENTITY_CONFLICT", "the returning contract's exchangeInfo identity differs from the one scanned", Number.POSITIVE_INFINITY);
+    }
+    worker.generation += 1;
+    worker.identity = identity;
+    worker.inactiveSinceMs = null;
+    worker.failure = null;
+    if (worker.session !== null) {
+      worker.status = "RECOVERING";
+      worker.reactivating = true;
+      worker.recoveryAttempts = 0;
+      worker.recoveryNotBeforeMs = 0;
+    } else {
+      worker.status = "PENDING";
+      worker.nextAttemptAtMs = 0;
+    }
+    this.universeState.reactivated.push(worker.symbol);
+    this.deps.log(`${worker.symbol} RETURNED to the universe: ${worker.session !== null ? "its preserved session catches up" : "bootstrapping"}`);
+  }
+
+  private recordChange(kind: MembershipChange["kind"], worker: SymbolWorker, reason: string | null): void {
+    try {
+      this.deps.recordMembership?.({
+        kind,
+        symbol: worker.symbol,
+        lineageId: worker.lineageId,
+        bootstrapInputSha256: worker.bootstrapInputSha256,
+        symbolHistoryOrigin: worker.symbolHistoryOrigin,
+        reason,
+        at: this.deps.nowIso(),
+      });
+    } catch (error) {
+      // The journal is how the emitter learns of joins; a failure is loud, never silent.
+      this.deps.log(`${worker.symbol} MEMBERSHIP JOURNAL WRITE FAILED (${error instanceof Error ? error.name : "unknown"}): ${kind} not recorded`);
+    }
+  }
+
+  /**
+   * One universe refresh: one public exchangeInfo request, never two at once,
+   * never before start-up completed, never landing after stop. A failure, an
+   * empty universe or an implausible mass removal keeps the last-known-good
+   * universe (nothing evicted) and is reported.
+   */
+  async refreshUniverse(): Promise<void> {
+    if (!this.dynamic || this.stopped || !this.started) return;
+    const state = this.universeState;
+    if (state.inFlight) {
+      state.suppressed += 1;
+      return;
+    }
+    state.inFlight = true;
+    const generation = ++state.generation;
+    const now = this.deps.nowMs();
+    state.lastAttemptAtMs = now;
+    state.nextAtMs = now + (this.config.dynamicUniverse as DynamicUniverseConfig).refreshIntervalMs;
+    try {
+      let universe: UsdmUniverse;
+      try {
+        universe = await (this.deps.fetchUniverse as () => Promise<UsdmUniverse>)();
+      } catch (error) {
+        if (this.stopped || generation !== state.generation) return;
+        state.failures += 1;
+        state.consecutiveFailures += 1;
+        state.lastResult = "FAILED";
+        state.lastError = error instanceof Error ? `${error.name}${"code" in error ? ` ${String((error as { code: unknown }).code)}` : ""}: ${error.message}` : "unknown";
+        this.deps.log(`UNIVERSE REFRESH FAILED (${state.lastError}): the last-known-good universe is kept; retry in ${Math.round((state.nextAtMs - now) / 1000)}s`);
+        return;
+      }
+      if (this.stopped || generation !== state.generation) return;
+      this.applyUniverse(universe);
+    } finally {
+      state.inFlight = false;
+    }
+  }
+
+  private applyUniverse(universe: UsdmUniverse): void {
+    const state = this.universeState;
+    const target = new Map(universe.contracts.map((c) => [c.symbol, c]));
+    const members = [...this.workers.values()].filter((w) => w.status !== "INACTIVE" && w.status !== "FAILED");
+    if (target.size === 0) {
+      state.failures += 1;
+      state.consecutiveFailures += 1;
+      state.lastResult = "REJECTED_EMPTY";
+      state.lastError = "exchangeInfo listed no target symbol; refusing to treat that as an empty universe";
+      this.deps.log(`UNIVERSE REFRESH REJECTED: ${state.lastError}; nothing evicted`);
+      return;
+    }
+    const leaving = members.filter((w) => !target.has(w.symbol));
+    const limit = Math.max(MASS_REMOVAL_GUARD.min, Math.ceil(MASS_REMOVAL_GUARD.fraction * members.length));
+    if (leaving.length > limit) {
+      state.failures += 1;
+      state.consecutiveFailures += 1;
+      state.lastResult = "REJECTED_MASS_REMOVAL";
+      state.lastError = `the refresh would remove ${leaving.length} of ${members.length} symbols at once (limit ${limit}); treated as implausible`;
+      this.deps.log(`UNIVERSE REFRESH REJECTED: ${state.lastError}; nothing evicted`);
+      return;
+    }
+    const capacity = this.config.symbolsPerConnection * this.config.maxConnections;
+    state.capacityRequired = target.size;
+    state.capacityExceeded = target.size > capacity;
+    state.exchangeCandidates = target.size;
+    state.added = [];
+    state.removed = [];
+    state.reactivated = [];
+    state.identityConflicts = [];
+    state.notAdmitted = [];
+    for (const worker of leaving) {
+      state.removed.push(worker.symbol);
+      this.deactivate(worker, "left the target universe (not TRADING + PERPETUAL + USDT in exchangeInfo)");
+    }
+    for (const contract of universe.contracts) {
+      const identity = contractIdentityOf(contract);
+      const worker = this.workers.get(contract.symbol);
+      if (worker === undefined || worker.status === "INACTIVE") {
+        if (state.capacityExceeded) {
+          // Fail closed: nobody new is admitted while the universe does not fit; reported, never truncated silently.
+          state.notAdmitted.push(contract.symbol);
+          continue;
+        }
+        if (worker !== undefined) {
+          this.reactivate(worker, identity);
+          continue;
+        }
+        const created = this.newWorker(contract.symbol, { symbol: contract.symbol, onboardDateMs: contract.onboardDateMs, required: false, identity });
+        this.workers.set(contract.symbol, created);
+        state.added.push(contract.symbol);
+        this.deps.log(`${contract.symbol} DISCOVERED by universe refresh ${state.generation}: bootstrap scheduled`);
+        continue;
+      }
+      if (worker.status === "FAILED") continue;
+      if (worker.identity !== null && !sameIdentity(worker.identity, identity)) {
+        state.identityConflicts.push(worker.symbol);
+        this.quarantine(worker, "IDENTITY_CONFLICT", "exchangeInfo now describes a different contract under this symbol", Number.POSITIVE_INFINITY);
+      }
+    }
+    if (state.capacityExceeded) {
+      this.deps.log(`CAPACITY_EXCEEDED: the universe holds ${target.size} target symbols, the ceiling is ${capacity}; ${state.notAdmitted.length} not admitted — ALL ACTIVE is NOT satisfied`);
+    }
+    state.refreshes += 1;
+    state.consecutiveFailures = 0;
+    state.lastResult = "OK";
+    state.lastError = null;
+    state.lastSuccessAtMs = this.deps.nowMs();
   }
 
   // ---------------------------------------------------------------------------
@@ -853,11 +1475,21 @@ export class LiveShadowSupervisor {
     }
     // Recoveries: bounded concurrency; their REST is serialised by the governor anyway.
     const started: Promise<void>[] = [];
-    const inFlight = [...this.workers.values()].filter((w) => w.recoveryInFlight).length;
+    const inFlight = [...this.workers.values()].filter((w) => w.recoveryInFlight || w.bootstrapInFlight).length;
     for (const worker of this.workers.values()) {
       if (started.length + inFlight >= this.config.restConcurrency) break;
       if (worker.status !== "RECOVERING" || worker.recoveryInFlight || now < worker.recoveryNotBeforeMs) continue;
       started.push(this.recover(worker));
+    }
+    if (this.dynamic && this.started) {
+      // Bootstraps share the same bound; one in flight per symbol, at most.
+      for (const worker of [...this.workers.values()].sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0))) {
+        if (started.length + inFlight >= this.config.restConcurrency) break;
+        if (!this.bootstrapDue(worker, now)) continue;
+        started.push(this.bootstrap(worker));
+      }
+      this.placePending();
+      if (!this.universeState.inFlight && now >= this.universeState.nextAtMs) started.push(this.refreshUniverse());
     }
     for (const connection of this.connections) {
       if (connection.socket === null && connection.lifecycle !== "IDLE" && now >= connection.reconnectNotBeforeMs) {
@@ -886,6 +1518,7 @@ export class LiveShadowSupervisor {
   }
 
   stop(): void {
+    // From here: no refresh, no bootstrap and no recovery can land (generation/stop fences), and none is scheduled.
     this.stopped = true;
     for (const connection of this.connections) {
       const socket = connection.socket;
@@ -904,9 +1537,50 @@ export class LiveShadowSupervisor {
   /** The running set with each symbol's lineage, for the run manifest. Symbols that never prepared are not in it. */
   acceptedSymbols(): RunManifestSymbol[] {
     return [...this.workers.values()]
-      .filter((w) => w.lineageId !== null && w.bootstrapInputSha256 !== null)
-      .map((w) => ({ symbol: w.symbol, lineageId: w.lineageId as string, bootstrapInputSha256: w.bootstrapInputSha256 as string }))
+      .filter((w) => w.lineageId !== null && w.bootstrapInputSha256 !== null && w.joined)
+      .map((w) => ({
+        symbol: w.symbol,
+        lineageId: w.lineageId as string,
+        bootstrapInputSha256: w.bootstrapInputSha256 as string,
+        ...(w.symbolHistoryOrigin === null ? {} : { symbolHistoryOrigin: w.symbolHistoryOrigin }),
+      }))
       .sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0));
+  }
+
+  /** Observation only. `stale`: no successful refresh for two intervals (or never, past the first). */
+  universeStatus(now: number = this.deps.nowMs()) {
+    const st = this.universeState;
+    const interval = (this.config.dynamicUniverse as DynamicUniverseConfig | null | undefined)?.refreshIntervalMs ?? null;
+    const iso = (ms: number | null) => (ms === null ? null : new Date(ms).toISOString());
+    const capacity = this.config.symbolsPerConnection * this.config.maxConnections;
+    const lastGood = st.lastSuccessAtMs ?? (this.started ? Date.parse(this.startedAt) : null);
+    return {
+      lifecycle: "DYNAMIC_UNIVERSE_V1" as const,
+      refreshIntervalMs: interval,
+      generation: st.generation,
+      inFlight: st.inFlight,
+      lastAttemptAt: iso(st.lastAttemptAtMs),
+      lastSuccessAt: iso(st.lastSuccessAtMs),
+      lastResult: st.lastResult,
+      lastError: st.lastError,
+      consecutiveFailures: st.consecutiveFailures,
+      stale: interval !== null && lastGood !== null && now - lastGood > 2 * interval,
+      nextRefreshAt: this.started && !this.stopped ? iso(st.nextAtMs) : null,
+      refreshes: st.refreshes,
+      refreshFailures: st.failures,
+      refreshesSuppressed: st.suppressed,
+      exchangeCandidates: st.exchangeCandidates ?? this.config.universeActive ?? null,
+      latest: { added: [...st.added], removed: [...st.removed], reactivated: [...st.reactivated], identityConflicts: [...st.identityConflicts], notAdmitted: [...st.notAdmitted] },
+      capacity: {
+        symbolsPerConnection: this.config.symbolsPerConnection,
+        maxConnections: this.config.maxConnections,
+        available: capacity,
+        required: st.capacityRequired ?? this.selection.candidates.length,
+        exceeded: st.capacityExceeded,
+        /** ALL ACTIVE is claimed only while every target symbol fits. */
+        allActiveSatisfied: !st.capacityExceeded,
+      },
+    };
   }
 
   private symbolLog(worker: SymbolWorker, line: string): void {
@@ -923,7 +1597,15 @@ export class LiveShadowSupervisor {
       const session = w.session;
       const formingBar = Math.floor(now / this.intervalMs) * this.intervalMs;
       const readiness =
-        w.status !== "ATTACHED" || session === null ? w.status : session.phase === "READY" ? session.barStatus(formingBar) : session.phase === "RECOVERY_REQUIRED" ? "RECOVERY_REQUIRED" : "AWAITING_STREAM";
+        w.status !== "ATTACHED" || session === null
+          ? w.status
+          : w.connection < 0
+            ? "AWAITING_PLACEMENT"
+            : session.phase === "READY"
+              ? session.barStatus(formingBar)
+              : session.phase === "RECOVERY_REQUIRED"
+                ? "RECOVERY_REQUIRED"
+                : "AWAITING_STREAM";
       return {
         symbol: w.symbol,
         connection: w.connection,
@@ -935,6 +1617,15 @@ export class LiveShadowSupervisor {
         liveEligibleFrom: session?.liveEligibleFromMs == null ? null : new Date(session.liveEligibleFromMs).toISOString(),
         lastValidMessageAt: w.lastValidMessageAtMs === null ? null : new Date(w.lastValidMessageAtMs).toISOString(),
         counters: { ...w.counters },
+        ...(this.dynamic
+          ? {
+              stateDir: symbolPathSegment(w.symbol),
+              origin: w.origin,
+              onboardDiscrepancyMs: w.onboardDiscrepancyMs,
+              nextAttemptAt: w.nextAttemptAtMs > now && Number.isFinite(w.nextAttemptAtMs) ? new Date(w.nextAttemptAtMs).toISOString() : null,
+              inactiveSince: w.inactiveSinceMs === null ? null : new Date(w.inactiveSinceMs).toISOString(),
+            }
+          : {}),
       };
     });
     const count = (pred: (s: (typeof symbols)[number]) => boolean) => symbols.filter(pred).length;
@@ -952,7 +1643,7 @@ export class LiveShadowSupervisor {
       /** How the running set was chosen. Skipped candidates never joined and are not runtime failures. */
       selection: this.selectionSummary,
       totals: {
-        selected: symbols.length,
+        selected: count((s) => s.connection >= 0),
         liveEligible: count((s) => s.readiness === "LIVE_ELIGIBLE"),
         quarantined: count((s) => s.readiness === "QUARANTINED_CURRENT_BAR"),
         awaitingStream: count((s) => s.readiness === "AWAITING_STREAM" || s.readiness === "NOT_READY"),
@@ -966,11 +1657,27 @@ export class LiveShadowSupervisor {
         backpressureEvents: this.connections.reduce((n, c) => n + c.overflows, 0) + symbols.reduce((n, s) => n + s.counters.laggedUpdates, 0),
         restRequests: this.deps.governor.requestsMade,
         restHalted: this.deps.governor.halt !== null,
+        ...(this.dynamic
+          ? {
+              bootstrapping: count((s) => s.status === "BOOTSTRAPPING"),
+              waitingFirstClosedBar: count((s) => s.status === "WAITING_FIRST_CLOSED_BAR"),
+              bootstrapUnreadable: count((s) => s.status === "BOOTSTRAP_UNREADABLE"),
+              quarantinedHistory: count((s) => s.status === "QUARANTINED"),
+              inactive: count((s) => s.status === "INACTIVE"),
+              awaitingPlacement: count((s) => s.readiness === "AWAITING_PLACEMENT"),
+              ignoredWhileInactive: symbols.reduce((n, s) => n + s.counters.ignoredWhileInactive, 0),
+              connectionsOpen: this.connections.filter((c) => c.socket !== null).length,
+              connectionRebuilds: this.connections.reduce((n, c) => n + c.rebuilds, 0),
+            }
+          : {}),
       },
+      /** Dynamic universe telemetry (null for a run whose universe is fixed at start-up). */
+      universe: this.dynamic ? this.universeStatus(now) : null,
       connections: this.connections.map((c) => ({
         index: c.index,
         lifecycle: c.lifecycle,
         assigned: c.symbols.length,
+        rebuilds: c.rebuilds,
         queued: c.queue.length,
         reconnects: c.reconnects,
         overflows: c.overflows,
@@ -983,6 +1690,7 @@ export class LiveShadowSupervisor {
 }
 
 export type SupervisorStatus = ReturnType<LiveShadowSupervisor["status"]>;
+export type UniverseRefreshStatus = ReturnType<LiveShadowSupervisor["universeStatus"]>;
 
-/** live-shadow/<market>/<symbol>/<interval> under the scanner root — the single-symbol layout. */
-export const liveShadowDir = (scannerRoot: string, symbol: string, interval: string) => path.join(scannerRoot, "live-shadow", SCANNER_MARKET_TYPE, symbol, interval);
+/** live-shadow/<market>/<symbol>/<interval> under the scanner root — the single-symbol layout (symbol path-encoded, ASCII unchanged). */
+export const liveShadowDir = (scannerRoot: string, symbol: string, interval: string) => path.join(scannerRoot, "live-shadow", SCANNER_MARKET_TYPE, symbolPathSegment(symbol), interval);

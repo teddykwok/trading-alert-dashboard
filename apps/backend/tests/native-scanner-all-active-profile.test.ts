@@ -104,7 +104,13 @@ describe("profile identity: Teddy 7% All Active", () => {
     // The equivalent explicit flags PLUS the dynamic source-level lifecycle: the four 7% formulas and
     // every input are unchanged; only how a level lives (one dynamic candidate per period) differs.
     const explicit = parseLineageConfig((name) => FLAGS_7[name]);
-    expect(config).toEqual({ ...explicit, engine: createNativeEngineConfig({ ...explicit.engine, lifecycle: "TEDDY_DYNAMIC_SOURCE_LEVEL_V1" }) });
+    // Dynamic universe: each symbol's history starts at its own first real closed bar when later than the context.
+    expect(N.engine.historyOrigin).toBe("SYMBOL_FIRST_CLOSED_BAR_V1");
+    expect(config).toEqual({
+      ...explicit,
+      engine: createNativeEngineConfig({ ...explicit.engine, lifecycle: "TEDDY_DYNAMIC_SOURCE_LEVEL_V1" }),
+      historyOrigin: "SYMBOL_FIRST_CLOSED_BAR_V1",
+    });
   });
 
   it("timeframes: engine 1D..12M, dashboard 1D/1W/1M (NATIVE_DELIVERY_V2), future execution 1D/1W, never enabled", () => {
@@ -117,12 +123,14 @@ describe("profile identity: Teddy 7% All Active", () => {
     expect(profileSummaryOf(N).execution).toMatchObject({ nativeExecutionEnabled: false, notice: expect.stringMatching(/NOT enabled/) });
   });
 
-  it("the universe is ALL_ACTIVE with no count, and the profile owns a connection ceiling that fits it", () => {
-    expect(N.universe).toEqual({ layer: "UNIVERSE", universe: "usdt-perpetual", selection: "ALL_ACTIVE", targetEligible: null });
+  it("the universe is a DYNAMIC ALL_ACTIVE with no count, and the profile owns a connection ceiling and refresh interval that fit it", () => {
+    expect(N.universe).toEqual({
+      layer: "UNIVERSE", universe: "usdt-perpetual", selection: "ALL_ACTIVE", targetEligible: null, lifecycle: "DYNAMIC_UNIVERSE_V1", symbolTrust: "EXCHANGE_INFO_UNICODE_V1",
+    });
     expect(isAllActiveUniverse(N.universe)).toBe(true);
     expect(isAllActiveUniverse(T.universe)).toBe(false);
-    expect(N.operations).toEqual({ maxConnections: 16 });
-    expect(profileSummaryOf(N).universe).toEqual({ universe: "usdt-perpetual", selection: "ALL_ACTIVE", targetEligible: null });
+    expect(N.operations).toEqual({ maxConnections: 16, universeRefreshMs: 300_000 });
+    expect(profileSummaryOf(N).universe).toEqual({ universe: "usdt-perpetual", selection: "ALL_ACTIVE", targetEligible: null, lifecycle: "DYNAMIC_UNIVERSE_V1", symbolTrust: "EXCHANGE_INFO_UNICODE_V1" });
   });
 
   it("an all-active profile can carry no count and must state its connection ceiling; a bad ceiling is refused", () => {
@@ -167,10 +175,14 @@ describe("Teddy Aggressive is unchanged", () => {
 describe("fingerprints and state namespace", () => {
   const engine7 = engineFingerprintOf(N);
 
-  it("the engine fingerprint is derived canonically: the explicit 7% flags with the dynamic lifecycle — not the legacy 7% engine", () => {
+  it("the engine fingerprint is derived canonically: the explicit 7% flags with the dynamic lifecycle and the symbol history origin — not an older 7% engine", () => {
     expect(engine7).toMatch(/^[0-9a-f]{64}$/);
     const explicit = parseLineageConfig((name) => FLAGS_7[name]);
-    expect(engine7).toBe(engineFingerprintOfConfig({ ...explicit, engine: createNativeEngineConfig({ ...explicit.engine, lifecycle: "TEDDY_DYNAMIC_SOURCE_LEVEL_V1" }) }));
+    const dynamicConfig = { ...explicit, engine: createNativeEngineConfig({ ...explicit.engine, lifecycle: "TEDDY_DYNAMIC_SOURCE_LEVEL_V1" }) };
+    expect(engine7).toBe(engineFingerprintOfConfig({ ...dynamicConfig, historyOrigin: "SYMBOL_FIRST_CLOSED_BAR_V1" }));
+    // Without the symbol history origin it is the first dynamic 7% engine, historical and never reused.
+    expect(engineFingerprintOfConfig(dynamicConfig)).toBe("5cd970a602d283f8c019ff07701283a2b290e382563d316769f4efcbf035a041");
+    expect(engine7).not.toBe("5cd970a602d283f8c019ff07701283a2b290e382563d316769f4efcbf035a041");
     // The legacy 7% engine (explicit flags; Teddy Aggressive with only the min move changed) is the OLD fingerprint.
     const legacy7 = "47d661a531c9d724d0bfbcb85ff68ea7dd85418464f959be2d0cb1340f4c5179";
     expect(engineFingerprintOfConfig(explicit)).toBe(legacy7);
@@ -186,8 +198,11 @@ describe("fingerprints and state namespace", () => {
     expect(executionPolicyFingerprintOf(N.execution)).toBe(executionPolicyFingerprintOf(T.execution));
   });
 
-  it("per-symbol lineages differ from Teddy Aggressive's: no checkpoint can be shared", () => {
-    expect(profileLineageIdFor(N, "BTCUSDT", "c".repeat(64))).not.toBe(profileLineageIdFor(T, "BTCUSDT", "c".repeat(64)));
+  it("per-symbol lineages differ from Teddy Aggressive's: no checkpoint can be shared; the 7% engine needs each symbol's origin", () => {
+    const origin = { kind: "PROFILE_CONTEXT" as const, firstClosedBarOpenTimeMs: null };
+    expect(profileLineageIdFor(N, "BTCUSDT", "c".repeat(64), origin)).not.toBe(profileLineageIdFor(T, "BTCUSDT", "c".repeat(64)));
+    expect(() => profileLineageIdFor(N, "BTCUSDT", "c".repeat(64))).toThrow(/history origin/);
+    expect(() => profileLineageIdFor(T, "BTCUSDT", "c".repeat(64), origin)).toThrow(/no symbol history origin/);
   });
 
   it("state lives in the 7% engine namespace — never Teddy Aggressive's, never the legacy live-shadow tree", () => {
@@ -277,6 +292,13 @@ const LATE = FULL.filter((b) => b.openTimeMs >= D(8));
 /** E*: eligible. NEW*: listed well after the context start (free pre-check). BAD*: history starts late (canonical preparation refuses). */
 const kindOf = (symbol: string) => (symbol.startsWith("BAD") ? "INSUFFICIENT" : symbol.startsWith("NEW") ? "TOO_NEW" : "ELIGIBLE");
 const eligibleNames = (n: number) => Array.from({ length: n }, (_, i) => `E${String(i).padStart(4, "0")}USDT`);
+/** Every listing of exchangeInfo(n, { tooNew, insufficient }), sorted: all of them are scanner-eligible from their own origin. */
+const allNames = (n: number, tooNew: number, insufficient: number) =>
+  [
+    ...eligibleNames(n),
+    ...Array.from({ length: tooNew }, (_, i) => `NEW${String(i).padStart(3, "0")}USDT`),
+    ...Array.from({ length: insufficient }, (_, i) => `BAD${String(i).padStart(3, "0")}USDT`),
+  ].sort();
 
 /** A deterministic exchangeInfo payload with `eligible` eligible USDT perpetuals plus every kind of non-member. */
 function exchangeInfo(eligible: number, extra: { tooNew?: number; insufficient?: number } = {}) {
@@ -385,23 +407,26 @@ describe("ALL_ACTIVE selection over a generated 140-contract universe", () => {
     expect(JSON.stringify(selection)).not.toMatch(/USDC|DELISTED|PENDING|_2[67]/);
   });
 
-  it("accepts EXACTLY the 130 eligible symbols (far more than 50), skips too-new and insufficient-history ones by reason, and runs them all", async () => {
+  it("accepts EVERY one of the 140 listings — later listings from their own first real bar: no TOO_NEW, no pre-listing history demanded", async () => {
     const { options, selection } = profileSelection(exchangeInfo(130, { tooNew: 5, insufficient: 5 }));
     const sim = simulate(FIXTURE_ALL, selection, options);
     await sim.supervisor.start();
     const accepted = sim.supervisor.acceptedSymbols().map((s) => s.symbol);
-    expect(accepted).toEqual(eligibleNames(130));
+    expect(accepted).toEqual(allNames(130, 5, 5));
     expect(accepted.length).toBeGreaterThan(50);
     expect(sim.supervisor.status().selection).toMatchObject({
-      mode: "ALL_ACTIVE", targetEligible: null, universeActive: 140, candidatesTested: 140, acceptedEligible: 130, skippedTooNew: 5, skippedInsufficientHistory: 5, skippedOther: 0, universeExhausted: true,
+      mode: "ALL_ACTIVE", targetEligible: null, universeActive: 140, candidatesTested: 140, acceptedEligible: 140, skippedTooNew: 0, skippedInsufficientHistory: 0, skippedOther: 0, universeExhausted: true,
     });
-    const skipped = sim.supervisor.status().selection!.skipped;
-    expect(skipped.filter((s) => s.class === "TOO_NEW_PRECHECK").map((s) => s.symbol)).toEqual(["NEW000USDT", "NEW001USDT", "NEW002USDT", "NEW003USDT", "NEW004USDT"]);
-    expect(skipped.filter((s) => s.class === "INSUFFICIENT_HISTORY").map((s) => s.symbol)).toEqual(["BAD000USDT", "BAD001USDT", "BAD002USDT", "BAD003USDT", "BAD004USDT"]);
-    // Every accepted symbol is streamed, exactly once, on ceil(130/50) = 3 connections; nothing skipped is streamed.
-    expect(sim.streamed().map((g) => g.length)).toEqual([50, 50, 30]);
+    expect(sim.supervisor.status().selection!.skipped).toEqual([]);
+    // A long-listed symbol keeps the profile's history; a later listing starts at its first real closed bar.
+    const originOf = (symbol: string) => sim.supervisor.acceptedSymbols().find((s) => s.symbol === symbol)!.symbolHistoryOrigin;
+    expect(originOf("E0000USDT")).toMatchObject({ kind: "PROFILE_CONTEXT", firstClosedBarOpenTimeMs: null, effectiveContextStartMs: CTX });
+    expect(originOf("NEW000USDT")).toMatchObject({ kind: "SYMBOL_FIRST_CLOSED_BAR", firstClosedBarOpenTimeMs: D(8), effectiveContextStartMs: D(8), effectiveHistoryStartMs: D(8) });
+    expect(originOf("BAD000USDT")).toMatchObject({ kind: "SYMBOL_FIRST_CLOSED_BAR", firstClosedBarOpenTimeMs: D(8) });
+    // Every accepted symbol is streamed, exactly once, on ceil(140/50) = 3 connections.
+    expect(sim.streamed().map((g) => g.length)).toEqual([50, 50, 40]);
     expect(sim.streamed().flat().sort()).toEqual(accepted);
-    expect(sim.supervisor.status().totals).toMatchObject({ selected: 130, failed: 0 });
+    expect(sim.supervisor.status().totals).toMatchObject({ selected: 140, failed: 0 });
     // State: only the 7% fixture engine's namespace; the legacy live-shadow tree is never created.
     expect(existsSync(path.join(sim.root, "live-shadow"))).toBe(false);
     expect(existsSync(path.join(engineNamespaceDir(sim.root, sim.summary.engineFingerprint), "USDM_PERPETUAL", "E0129USDT", "15m", "checkpoint.json"))).toBe(true);
@@ -415,12 +440,16 @@ describe("ALL_ACTIVE selection over a generated 140-contract universe", () => {
     const manifest = sim.manifest();
     const body = manifest.body;
     expect(body.selection).toEqual({
-      mode: "ALL_ACTIVE", universeActive: 140, targetEligible: null, candidatesTested: 140, acceptedEligible: 130, skippedTooNew: 5, skippedInsufficientHistory: 5, skippedOther: 0, universeExhausted: true,
+      mode: "ALL_ACTIVE", universeActive: 140, targetEligible: null, candidatesTested: 140, acceptedEligible: 140, skippedTooNew: 0, skippedInsufficientHistory: 0, skippedOther: 0, universeExhausted: true,
     });
-    expect(body.symbols.map((s) => s.symbol)).toEqual(eligibleNames(130));
+    expect(body.symbols.map((s) => s.symbol)).toEqual(allNames(130, 5, 5));
     expect(body.symbols.length).toBe(body.selection.acceptedEligible);
+    // Symbols carry their history origin, so the manifest is v2 (membership null: this run's set is fixed).
+    expect(body.schema).toBe("teddy.native-scanner.supervisor-run-manifest.v2");
+    expect(body.membership).toBeNull();
+    expect(body.symbols.every((s) => s.symbolHistoryOrigin !== undefined)).toBe(true);
     expect(body.profile).toMatchObject({ profileId: "TEDDY_7_ALL_ACTIVE_V1", profileLabel: "Teddy 7% All Active", engineFingerprint: body.engineFingerprint });
-    expect(body.profile!.universe).toEqual({ universe: "usdt-perpetual", selection: "ALL_ACTIVE", targetEligible: null });
+    expect(body.profile!.universe).toEqual({ universe: "usdt-perpetual", selection: "ALL_ACTIVE", targetEligible: null, lifecycle: "DYNAMIC_UNIVERSE_V1", symbolTrust: "EXCHANGE_INFO_UNICODE_V1" });
     expect(body.engineFingerprint).toBe(engineFingerprintOf(FIXTURE_ALL));
     expect([body.stateLayout, body.chartInterval, body.actionable]).toEqual(["ENGINE_NAMESPACE", "15m", false]);
     expect(parseRunManifest(runManifestText(manifest))).toEqual(manifest);
@@ -428,6 +457,8 @@ describe("ALL_ACTIVE selection over a generated 140-contract universe", () => {
     expect(() =>
       supervisorRunManifestOf({ ...body, runId: body.runId, gitHead: "test", selection: sim.supervisor.status().selection, symbols: sim.supervisor.acceptedSymbols().slice(0, 50) })
     ).toThrow(RunManifestError);
+    // Origin-bearing symbols can never be written into a v1 manifest.
+    expect(() => buildRunManifest({ ...body, schema: "teddy.native-scanner.supervisor-run-manifest.v1", membership: undefined } as never)).toThrow(RunManifestError);
     // The manifest schema still refuses a count that differs from the list.
     expect(() => buildRunManifest({ ...body, selection: { ...body.selection, acceptedEligible: 50 } })).toThrow(/acceptedEligible/);
     sim.supervisor.stop();
@@ -454,21 +485,22 @@ describe("connection capacity: every accepted symbol runs, or start-up refuses �
     expect(() => simulate(FIXTURE_ALL, selection, { symbolsPerConnection: 10, maxConnections: 16 })).toThrow(/need 26 connections/);
   });
 
-  it.each([50, 200, 251, 520])("%i eligible symbols under the profile's defaults: all accepted, all streamed once, manifest and totals complete", async (n) => {
+  it.each([50, 200, 251, 520])("%i long-listed + 5 later listings under the profile's defaults: all accepted, all streamed once, manifest and totals complete", async (n) => {
     const { options, selection } = profileSelection(exchangeInfo(n, { tooNew: 3, insufficient: 2 }));
     const sim = simulate(FIXTURE_ALL, selection, options);
     await sim.supervisor.start();
     const accepted = sim.supervisor.acceptedSymbols().map((s) => s.symbol);
-    expect(accepted).toEqual(eligibleNames(n));
+    const total = n + 5;
+    expect(accepted).toEqual(allNames(n, 3, 2));
     const groups = sim.streamed();
-    expect(groups).toHaveLength(Math.ceil(n / 50));
+    expect(groups).toHaveLength(Math.ceil(total / 50));
     expect(groups.every((g) => g.length <= 50)).toBe(true);
     expect(groups.flat().sort()).toEqual(accepted);
-    expect(new Set(groups.flat()).size).toBe(n);
+    expect(new Set(groups.flat()).size).toBe(total);
     const status = sim.supervisor.status();
-    expect(status.connections.map((c) => c.assigned).reduce((a, b) => a + b, 0)).toBe(n);
-    expect(status.totals).toMatchObject({ selected: n, failed: 0, catchupPending: 0 });
-    expect(status.selection).toMatchObject({ acceptedEligible: n, skippedTooNew: 3, skippedInsufficientHistory: 2, universeExhausted: true });
+    expect(status.connections.map((c) => c.assigned).reduce((a, b) => a + b, 0)).toBe(total);
+    expect(status.totals).toMatchObject({ selected: total, failed: 0, catchupPending: 0 });
+    expect(status.selection).toMatchObject({ acceptedEligible: total, skippedTooNew: 0, skippedInsufficientHistory: 0, universeExhausted: true });
     expect(sim.manifest().body.symbols.map((s) => s.symbol)).toEqual(accepted);
     sim.supervisor.stop();
   }, 180_000);
@@ -483,12 +515,17 @@ describe("multi-emitter binding: --profile teddy-7-all-active --run-id <run> --e
   const RUN_ID = makeRunId(Date.UTC(2026, 9, 4, 1, 0), "7a11ac71");
   const BOOT = "d".repeat(64);
   const symbols = eligibleNames(120);
-  const lineageOf = (symbol: string) => profileLineageIdFor(N, symbol, BOOT);
+  const ORIGIN = {
+    semantics: "SYMBOL_FIRST_CLOSED_BAR_V1" as const, kind: "PROFILE_CONTEXT" as const, firstClosedBarOpenTimeMs: null,
+    effectiveContextStartMs: Date.parse("2025-12-29T00:00:00Z"), effectiveHistoryStartMs: Date.parse("2026-01-01T00:00:00Z"), effectiveSwitchoverMs: Date.parse("2026-09-12T01:00:00Z"),
+  };
+  const lineageOf = (symbol: string) => profileLineageIdFor(N, symbol, BOOT, ORIGIN);
 
   function manifestOf(over: { profile?: ReturnType<typeof profileSummaryOf>; engineFingerprint?: string; lineage?: Record<string, string> } = {}): SupervisorRunManifest {
     const profile = over.profile ?? profileSummaryOf(N);
     return buildRunManifest({
-      schema: "teddy.native-scanner.supervisor-run-manifest.v1",
+      schema: "teddy.native-scanner.supervisor-run-manifest.v2",
+      membership: null,
       runId: RUN_ID,
       startedAt: "2026-10-04T01:00:00.000Z",
       gitHead: "test",
@@ -498,7 +535,7 @@ describe("multi-emitter binding: --profile teddy-7-all-active --run-id <run> --e
       profile,
       stateLayout: "ENGINE_NAMESPACE",
       selection: { mode: "ALL_ACTIVE", universeActive: 131, targetEligible: null, candidatesTested: 131, acceptedEligible: symbols.length, skippedTooNew: 8, skippedInsufficientHistory: 3, skippedOther: 0, universeExhausted: true },
-      symbols: symbols.map((symbol) => ({ symbol, lineageId: over.lineage?.[symbol] ?? lineageOf(symbol), bootstrapInputSha256: BOOT })),
+      symbols: symbols.map((symbol) => ({ symbol, lineageId: over.lineage?.[symbol] ?? lineageOf(symbol), bootstrapInputSha256: BOOT, symbolHistoryOrigin: ORIGIN })),
       actionable: false,
     });
   }

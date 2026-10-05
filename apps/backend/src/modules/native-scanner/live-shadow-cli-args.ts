@@ -13,6 +13,7 @@ import { SCANNER_MARKET_TYPE, ScannerDataError, assertScannerSymbol, intervalMsO
 import { CONSERVATIVE_REQUEST_POLICY, assertRequestPolicy, type PublicRequestPolicy } from "./kline-fetcher";
 import { ReplayCliUsageError, parseUtcInstant } from "./replay-cli-args";
 import type { LiveShadowRequest } from "./live-shadow-session";
+import type { ScannerHistoryOrigin } from "./scanner-lineage";
 
 /**
  * Arguments for ONE live SHADOW scanner of ONE symbol.
@@ -158,6 +159,8 @@ export interface LineageConfig {
   readonly engine: NativeEngineConfig;
   readonly historyStartMs: number;
   readonly switchoverMs: number;
+  /** A profile's symbol history origin (scanner-lineage.ts); never set by explicit lineage flags. */
+  readonly historyOrigin?: ScannerHistoryOrigin;
 }
 
 /**

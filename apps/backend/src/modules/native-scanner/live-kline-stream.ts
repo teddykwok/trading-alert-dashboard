@@ -1,4 +1,5 @@
 import { assertScannerSymbol, intervalMsOf, type ScannerChartInterval } from "./binance-public-futures";
+import { isAsciiScannerSymbol, klineStreamNameOf } from "./exchange-symbol";
 
 /**
  * Binance USD-M Futures PUBLIC kline stream, as the live shadow scanner sees it.
@@ -42,9 +43,10 @@ function refuse(code: LiveStreamErrorCode, message: string): never {
   throw new LiveStreamError(code, message);
 }
 
-/** The one stream this scanner may open. */
+/** The one stream this scanner may open. Raw single-symbol mode is ASCII-only (fail closed): Unicode streams use the combined form. */
 export function buildPublicKlineStreamUrl(symbol: string, interval: ScannerChartInterval): string {
   const canonical = assertScannerSymbol(symbol);
+  if (!isAsciiScannerSymbol(canonical)) refuse("FORBIDDEN_STREAM", "the raw single-symbol stream is ASCII-only; a Unicode exchange symbol is carried by the combined stream");
   intervalMsOf(interval);
   return assertPublicKlineStreamUrl(
     `wss://${PUBLIC_FUTURES_STREAM_HOST}${PUBLIC_FUTURES_MARKET_WS_PATH}${canonical.toLowerCase()}@kline_${interval}`,
@@ -83,7 +85,10 @@ export function buildPublicCombinedKlineStreamUrl(symbols: readonly string[], in
   }
   const canonical = symbols.map((s) => assertScannerSymbol(s));
   if (new Set(canonical).size !== canonical.length) refuse("FORBIDDEN_STREAM", "a combined stream must not repeat a symbol");
-  const streams = canonical.map((s) => `${s.toLowerCase()}@kline_${interval}`).join("/");
+  const names = canonical.map((s) => klineStreamNameOf(s, interval));
+  // Two exact symbols must never share one stream name (lower-casing must stay injective).
+  if (new Set(names).size !== names.length) refuse("FORBIDDEN_STREAM", "two symbols map to the same stream name");
+  const streams = names.join("/");
   return assertPublicCombinedKlineStreamUrl(`wss://${PUBLIC_FUTURES_STREAM_HOST}${PUBLIC_FUTURES_MARKET_COMBINED_PATH}?streams=${streams}`, canonical, interval);
 }
 
@@ -101,7 +106,7 @@ export function assertPublicCombinedKlineStreamUrl(raw: string, symbols: readonl
   if (url.pathname !== PUBLIC_FUTURES_MARKET_COMBINED_PATH || url.hash !== "") refuse("FORBIDDEN_STREAM", `the combined stream path must be exactly ${PUBLIC_FUTURES_MARKET_COMBINED_PATH}`);
   const keys = [...url.searchParams.keys()];
   if (keys.length !== 1 || keys[0] !== "streams") refuse("FORBIDDEN_STREAM", "the combined stream URL must carry exactly one query parameter: streams");
-  const expected = symbols.map((s) => `${s.toLowerCase()}@kline_${interval}`).join("/");
+  const expected = symbols.map((s) => klineStreamNameOf(assertScannerSymbol(s), interval)).join("/");
   if (url.searchParams.get("streams") !== expected) refuse("FORBIDDEN_STREAM", "the combined stream must carry exactly the selected kline streams");
   return `wss://${PUBLIC_FUTURES_STREAM_HOST}${PUBLIC_FUTURES_MARKET_COMBINED_PATH}?streams=${expected}`;
 }

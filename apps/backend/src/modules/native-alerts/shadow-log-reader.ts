@@ -10,6 +10,7 @@ import {
   type ShadowRecord,
 } from "../native-scanner/live-shadow-store";
 import { canonicalJson } from "../native-scanner/canonical-json";
+import { isScannerSymbolShape } from "../native-scanner/exchange-symbol";
 import { NATIVE_DELIVERY_CHART_INTERVALS, NATIVE_DELIVERY_MARKET_TYPE, type NativeDeliveryChartInterval } from "./native-delivery-policy";
 
 /**
@@ -58,7 +59,6 @@ export interface ShadowLogIdentity {
 }
 
 const SHA = /^[0-9a-f]{64}$/;
-const SYMBOL = /^[A-Z0-9]{3,30}$/;
 const BASE_KEYS = ["schema", "kind", "eventId", "lineageId", "marketType", "symbol", "chartInterval", "barOpenTime", "barOpenTimeMs", "actionable", "classification"];
 const OBSERVATION_KEYS = [
   ...BASE_KEYS,
@@ -120,7 +120,7 @@ export class ShadowLogValidator {
   constructor(readonly identity: ShadowLogIdentity) {
     if (!SHA.test(identity.lineageId)) fail("LINEAGE_MISMATCH", "the expected lineage ID must be a SHA-256 hex digest");
     if (identity.marketType !== NATIVE_DELIVERY_MARKET_TYPE) fail("MARKET_MISMATCH", "only USDM_PERPETUAL is supported");
-    if (!SYMBOL.test(identity.symbol)) fail("SYMBOL_MISMATCH", "the expected symbol must be one bare uppercase Binance symbol");
+    if (!isScannerSymbolShape(identity.symbol)) fail("SYMBOL_MISMATCH", "the expected symbol must be one bare Binance symbol (ASCII, or an exact caseless-Unicode exchange symbol)");
     if (!Object.prototype.hasOwnProperty.call(NATIVE_DELIVERY_CHART_INTERVALS, identity.chartInterval)) {
       fail("INTERVAL_MISMATCH", `chart interval must be one of: ${Object.keys(NATIVE_DELIVERY_CHART_INTERVALS).join(", ")}`);
     }
