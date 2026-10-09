@@ -180,6 +180,85 @@ export class PublicRequestController {
   }
 }
 
+/**
+ * ONE run's shared reading of Binance's own clock.
+ *
+ * Closure has always been judged by Binance's clock, fetched first — once per
+ * symbol per fetch, which made half of every restart's requests a serverTime
+ * call. A reading stays valid evidence for as long as it is kept: Binance's
+ * clock only moves forward, so a bar proven closed by an older reading is
+ * still closed, and an older reading can only UNDER-claim closure. When the
+ * kept reading cannot prove a range closed, a fresh one is fetched (one request
+ * shared by every concurrent caller); if even that cannot prove it, the caller
+ * refuses exactly as before.
+ */
+export class BinanceServerClock {
+  private reading: { readonly serverTimeMs: number; readonly localAtMs: number } | null = null;
+  private pending: Promise<number> | null = null;
+  private fetched = 0;
+
+  constructor(
+    private readonly deps: PublicFetchDeps,
+    /** A reading older than this (by the local clock) is refreshed before it is used for anything but closure proof. */
+    readonly maxAgeMs: number
+  ) {
+    if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1_000 || maxAgeMs > 15 * 60_000) {
+      throw new ScannerDataError("INVALID_RANGE", "the server clock's maximum age must be 1000..900000 ms");
+    }
+  }
+
+  /** serverTime requests this clock has made. */
+  get requests(): number {
+    return this.fetched;
+  }
+
+  /** A fresh reading. Concurrent callers share one request. Never moves backwards. */
+  refresh(): Promise<number> {
+    this.pending ??= (async () => {
+      const controller = new PublicRequestController(this.deps);
+      try {
+        const read = parseServerTimePayload(await controller.getJson(buildPublicFuturesUrl(this.deps.baseUrl, SERVER_TIME_PATH)));
+        const serverTimeMs = Math.max(read, this.reading?.serverTimeMs ?? read);
+        this.reading = { serverTimeMs, localAtMs: this.deps.nowMs() };
+        return serverTimeMs;
+      } finally {
+        this.fetched += controller.requestCount;
+        this.pending = null;
+      }
+    })();
+    return this.pending;
+  }
+
+  /** The kept reading while younger than maxAgeMs, else a fresh one. */
+  async current(): Promise<number> {
+    const reading = this.reading;
+    if (reading !== null && this.deps.nowMs() - reading.localAtMs < this.maxAgeMs) return reading.serverTimeMs;
+    return this.refresh();
+  }
+
+  /**
+   * A Binance server time to judge closure of everything that closed before
+   * `instantMs`: the kept reading when it already lies beyond `instantMs`
+   * (whatever its age), else a fresh one — which may still not (the caller then refuses).
+   */
+  async atLeast(instantMs: number): Promise<number> {
+    const reading = this.reading;
+    if (reading !== null && reading.serverTimeMs > instantMs) return reading.serverTimeMs;
+    return this.refresh();
+  }
+}
+
+/** How a fetch may save requests without changing a single returned row. */
+export interface ClosedKlineFetchOptions {
+  /** Judge closure with the run's shared Binance clock instead of a serverTime request per fetch. */
+  readonly serverClock?: BinanceServerClock;
+  /**
+   * Ask each page for no more rows than the range still needs (lower Binance
+   * weight for short gaps). Pages and rows are the same; only `limit` shrinks.
+   */
+  readonly sizePagesToRange?: boolean;
+}
+
 export interface ClosedKlineRangeRequest {
   readonly symbol: string;
   readonly interval: ScannerChartInterval;
@@ -213,7 +292,8 @@ export interface ClosedKlineRangeResult {
  */
 export async function fetchClosedFuturesKlines(
   deps: PublicFetchDeps,
-  request: ClosedKlineRangeRequest
+  request: ClosedKlineRangeRequest,
+  options: ClosedKlineFetchOptions = {}
 ): Promise<ClosedKlineRangeResult> {
   const symbol = assertScannerSymbol(request.symbol);
   const intervalMs = intervalMsOf(request.interval);
@@ -234,7 +314,11 @@ export async function fetchClosedFuturesKlines(
   }
 
   const controller = new PublicRequestController(deps);
-  const serverTimeMs = parseServerTimePayload(await controller.getJson(buildPublicFuturesUrl(deps.baseUrl, SERVER_TIME_PATH)));
+  const serverTimeMs =
+    options.serverClock === undefined
+      ? parseServerTimePayload(await controller.getJson(buildPublicFuturesUrl(deps.baseUrl, SERVER_TIME_PATH)))
+      : // The last bar closes at endMs - 1: it is closed once Binance's clock is past endMs - 1 + settleMs.
+        await options.serverClock.atLeast(endMs - 1 + settleMs);
   const closedBefore = serverTimeMs - settleMs;
   // The last requested bar closes at endMs - 1.
   if (endMs - 1 >= closedBefore) {
@@ -252,7 +336,7 @@ export async function fetchClosedFuturesKlines(
       interval: request.interval,
       startTime: cursor,
       endTime: endMs - 1,
-      limit: pageLimit,
+      limit: options.sizePagesToRange === true ? Math.min(pageLimit, (endMs - cursor) / intervalMs) : pageLimit,
     });
     const page = parseFuturesKlinesPayload(await controller.getJson(url), intervalMs);
     if (page.length === 0) break; // nothing further exists; gaps are the caller's to judge

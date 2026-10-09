@@ -11,10 +11,10 @@ import { env } from "../../config/env";
 import { EXCHANGE_INFO_PATH, ScannerDataError, assertPublicFuturesBaseUrl, buildPublicFuturesUrl } from "./binance-public-futures";
 import { CandidateRankHaltError, GovernedPublicTransport } from "./candidate-rank-runner";
 import { KlineCacheStore } from "./kline-cache";
-import { PublicRequestController, REQUEST_POLICY_LIMITS, type PublicHttpTransport } from "./kline-fetcher";
+import { BinanceServerClock, PublicRequestController, REQUEST_POLICY_LIMITS, type PublicHttpTransport } from "./kline-fetcher";
 import type { OpenPublicStream } from "./live-shadow-runner";
-import { LiveShadowSupervisor, SupervisorConfigError, TargetNotReachedError, type MembershipChange, type SupervisorStatus } from "./live-shadow-supervisor";
-import { SUPERVISOR_CLI_USAGE, SupervisorCliUsageError, parseSupervisorCliArgs } from "./live-shadow-supervisor-cli-args";
+import { LiveShadowSupervisor, NATIVE_RECOVERY_POLICY_VERSION, SupervisorConfigError, TargetNotReachedError, type MembershipChange, type SupervisorStatus } from "./live-shadow-supervisor";
+import { FAST_RECOVERY_DEFAULTS, SUPERVISOR_CLI_USAGE, SupervisorCliUsageError, parseSupervisorCliArgs } from "./live-shadow-supervisor-cli-args";
 import { ScannerPathError, assertOutsideRepository, scannerKlineCacheDir, scannerRootDir } from "./scanner-paths";
 import { acquireLiveShadowLock } from "./scanner-lock";
 import { RUN_MEMBERSHIP_JOURNAL_FILE, membershipLine } from "./run-membership";
@@ -154,7 +154,15 @@ async function main(): Promise<void> {
   }
   console.log(`run id: ${runId}`);
   const baseUrl = assertPublicFuturesBaseUrl(env.BINANCE_FUTURES_REST_BASE_URL);
-  const governor = new GovernedPublicTransport(publicTransport, { maxTotalRequests: options.maxTotalRequests, minSpacingMs: options.minSpacingMs, nowMs: () => Date.now(), sleep });
+  const fastRecovery = options.recoveryPolicy === "FAST_RECOVERY_V1";
+  const governor = new GovernedPublicTransport(publicTransport, {
+    maxTotalRequests: options.maxTotalRequests,
+    minSpacingMs: options.minSpacingMs,
+    nowMs: () => Date.now(),
+    sleep,
+    maxInFlight: options.maxInFlight,
+    weightBudget: fastRecovery ? { maxWeightPerMinute: options.maxWeightPerMinute as number, usedWeightHighWater: FAST_RECOVERY_DEFAULTS.usedWeightHighWater } : null,
+  });
   const fetchDeps = {
     transport: governor.transport,
     baseUrl,
@@ -162,6 +170,13 @@ async function main(): Promise<void> {
     nowMs: () => Date.now(),
     sleep,
   };
+  const recoveryFetch = fastRecovery
+    ? { version: NATIVE_RECOVERY_POLICY_VERSION, serverClock: new BinanceServerClock(fetchDeps, FAST_RECOVERY_DEFAULTS.serverClockMaxAgeMs), sizePagesToRange: true }
+    : null;
+  console.log(
+    `recovery policy: ${options.recoveryPolicy} (spacing >= ${options.minSpacingMs} ms, <= ${options.maxInFlight} in flight, ` +
+      `${options.maxWeightPerMinute === null ? "no weight budget" : `<= ${options.maxWeightPerMinute} weight/min, IP pause at ${FAST_RECOVERY_DEFAULTS.usedWeightHighWater}`}, ${options.restConcurrency} symbol worker(s))`
+  );
 
   // The same universe and selection rules as the ranker; explicit symbols must be active USDT perpetuals.
   // A dynamic-universe profile also trusts the exact caseless-Unicode symbols exchangeInfo lists.
@@ -226,6 +241,7 @@ async function main(): Promise<void> {
       schedule: (fn) => setImmediate(fn),
       log: (line) => console.log(`[${iso(Date.now())}] ${line}`),
       ...(dynamic ? { fetchUniverse, recordMembership } : {}),
+      recoveryFetch,
     }
   );
   console.log(`universe active: ${universe.contracts.length}`);

@@ -2,10 +2,10 @@ import path from "node:path";
 import { SWITCHOVER_TRUNCATED_CLOSED_BARS, type NativeKline } from "@trading-alert-dashboard/shared";
 
 import { SCANNER_MARKET_TYPE, ScannerDataError, intervalMsOf } from "./binance-public-futures";
-import { GovernedPublicTransport, fillClosedBarCache, mapBounded, type KlineCacheLike } from "./candidate-rank-runner";
+import { GovernedPublicTransport, fillClosedBarCache, mapBounded, type GovernorMetrics, type KlineCacheLike } from "./candidate-rank-runner";
 import { CompatReplayError } from "./compat-replay";
 import { KlineCacheError, mergeClosedKlines } from "./kline-cache";
-import { fetchClosedFuturesKlines, type PublicFetchDeps } from "./kline-fetcher";
+import { fetchClosedFuturesKlines, type BinanceServerClock, type ClosedKlineFetchOptions, type PublicFetchDeps } from "./kline-fetcher";
 import {
   LiveStreamError,
   MAX_STREAMS_PER_COMBINED_CONNECTION,
@@ -16,7 +16,7 @@ import {
 import { LiveCheckpointStore, LiveShadowError } from "./live-shadow-checkpoint";
 import type { LineageConfig } from "./live-shadow-cli-args";
 import { STREAM_OPEN_TIMEOUT_MS, STREAM_READINESS_TIMEOUT_MS, STREAM_STALE_TIMEOUT_MS, type OpenPublicStream, type StreamConnection } from "./live-shadow-runner";
-import { LiveShadowSession, prepareLiveShadowState } from "./live-shadow-session";
+import { LiveShadowSession, prepareLiveShadowState, type CheckpointStatus } from "./live-shadow-session";
 import { LiveShadowEventStore } from "./live-shadow-store";
 import { REPLAY_PAGE_LIMIT, REPLAY_SETTLE_MS } from "./replay-cli-args";
 import { klineStreamNameOf, symbolPathSegment } from "./exchange-symbol";
@@ -242,6 +242,50 @@ export interface SupervisorDeps {
   readonly fetchUniverse?: () => Promise<UsdmUniverse>;
   /** Dynamic universe: called synchronously for every membership change after start-up (the CLI appends the journal). */
   readonly recordMembership?: (change: MembershipChange) => void;
+  /**
+   * FAST_RECOVERY_V1 request savers for bootstrap, catch-up and recovery. They
+   * change how many requests are sent, never which rows arrive or how they are
+   * replayed. Absent: every fetch asks Binance's clock itself and pages at the
+   * full page size (the original behaviour).
+   */
+  readonly recoveryFetch?: RecoveryFetchPolicy | null;
+}
+
+/** Identifies the recovery fetch policy in status and logs. Not part of any lineage, fingerprint or durable namespace. */
+export const NATIVE_RECOVERY_POLICY_VERSION = "FAST_RECOVERY_V1" as const;
+export const LEGACY_RECOVERY_POLICY = "LEGACY_SERIAL" as const;
+
+export interface RecoveryFetchPolicy {
+  readonly version: typeof NATIVE_RECOVERY_POLICY_VERSION;
+  /** One reading of Binance's clock shared by the whole run. */
+  readonly serverClock: BinanceServerClock;
+  /** Each klines page asks only for the bars the range still needs. */
+  readonly sizePagesToRange: boolean;
+}
+
+/** One start-up's recovery, as status and the start-up log report it. Observation only. */
+export interface StartupRecoverySummary {
+  readonly policy: typeof NATIVE_RECOVERY_POLICY_VERSION | typeof LEGACY_RECOVERY_POLICY;
+  readonly symbols: number;
+  readonly liveReady: number;
+  /** Checkpoint verified and extended by the closed bars missed while down. */
+  readonly recovered: number;
+  /** Checkpoint verified, nothing missed. */
+  readonly current: number;
+  /** No previous checkpoint: bootstrapped from its history. */
+  readonly bootstrapped: number;
+  /** Not live-ready (failed, waiting, unreadable, quarantined). */
+  readonly notLive: number;
+  /** Closed 15m bars replayed NON_ACTIONABLE across recovered symbols (downtime), not counting bootstraps. */
+  readonly missingBarsReplayed: number;
+  readonly restRequests: number;
+  readonly restWeight: number;
+  readonly serverClockRequests: number;
+  readonly maxRequestsInFlight: number;
+  readonly workerConcurrency: number;
+  readonly weightWaits: number;
+  readonly usedWeightPauses: number;
+  readonly elapsedMs: number;
 }
 
 /** Reconnect delays per consecutive failure of one connection. */
@@ -317,6 +361,8 @@ interface SymbolWorker {
   reactivating: boolean;
   /** True once the symbol has been part of the running set (manifest or journal). */
   joined: boolean;
+  /** The last successful preparation's checkpoint outcome and the closed bars it replayed. Observation only. */
+  catchUp: { readonly status: CheckpointStatus; readonly bars: number } | null;
 }
 
 interface Connection {
@@ -369,6 +415,9 @@ export class LiveShadowSupervisor {
   private connections: Connection[] = [];
   private readonly selection: SupervisorSelection;
   private selectionSummary: SelectionSummary | null = null;
+  /** Every worker created before the running set was known (start-up). */
+  private readonly startupWorkers: SymbolWorker[] = [];
+  private startupRecovery: StartupRecoverySummary | null = null;
   private readonly streamToSymbol = new Map<string, string>();
   /** Closed bars committed live, awaiting their (non-authoritative) cache write. */
   private readonly pendingCacheBars = new Map<string, NativeKline[]>();
@@ -462,15 +511,60 @@ export class LiveShadowSupervisor {
   // ---------------------------------------------------------------------------
 
   async start(): Promise<void> {
-    const accepted = this.selection.mode === "EXPLICIT" ? await this.startExplicit() : this.dynamic ? await this.startDynamic() : await this.walkCandidates();
+    const startedAtMs = this.deps.nowMs();
+    const before = this.deps.governor.metrics;
+    const clockBefore = this.deps.recoveryFetch?.serverClock.requests ?? 0;
+    let accepted: SymbolWorker[];
+    try {
+      accepted = this.selection.mode === "EXPLICIT" ? await this.startExplicit() : this.dynamic ? await this.startDynamic() : await this.walkCandidates();
+    } finally {
+      this.startupRecovery = this.summarizeStartup(startedAtMs, before, clockBefore);
+      const r = this.startupRecovery;
+      this.deps.log(
+        `STARTUP_RECOVERY policy ${r.policy}: ${r.symbols} symbol(s), ${r.liveReady} live-ready (${r.recovered} recovered, ${r.current} current, ${r.bootstrapped} bootstrapped), ${r.notLive} not live; ` +
+          `${r.missingBarsReplayed} missed closed bar(s) replayed NON_ACTIONABLE; REST ${r.restRequests} request(s), weight ${r.restWeight}, max ${r.maxRequestsInFlight} in flight, ${r.workerConcurrency} worker(s), ` +
+          `${r.weightWaits} weight wait(s), ${r.usedWeightPauses} IP pause(s); ${(r.elapsedMs / 1000).toFixed(1)} s`
+      );
+    }
     this.assign(accepted);
     for (const connection of this.connections) this.connect(connection);
     this.started = true;
     if (this.dynamic) this.universeState.nextAtMs = this.deps.nowMs() + (this.config.dynamicUniverse as DynamicUniverseConfig).refreshIntervalMs;
   }
 
-  private newWorker(symbol: string, candidate: SupervisorCandidate | null = null): SymbolWorker {
+  private summarizeStartup(startedAtMs: number, before: GovernorMetrics, clockBefore: number): StartupRecoverySummary {
+    const workers = this.startupWorkers;
+    const after = this.deps.governor.metrics;
+    const ready = workers.filter((w) => w.status === "ATTACHED" && w.catchUp !== null);
+    const policy = this.deps.recoveryFetch ?? null;
     return {
+      policy: policy === null ? LEGACY_RECOVERY_POLICY : policy.version,
+      symbols: workers.length,
+      liveReady: ready.length,
+      recovered: ready.filter((w) => w.catchUp?.status === "VERIFIED_AND_EXTENDED").length,
+      current: ready.filter((w) => w.catchUp?.status === "VERIFIED_UNCHANGED").length,
+      bootstrapped: ready.filter((w) => w.catchUp?.status === "CREATED").length,
+      notLive: workers.length - ready.length,
+      missingBarsReplayed: ready.filter((w) => w.catchUp?.status === "VERIFIED_AND_EXTENDED").reduce((sum, w) => sum + (w.catchUp?.bars ?? 0), 0),
+      restRequests: after.requestsMade - before.requestsMade,
+      restWeight: after.weightUsed - before.weightUsed,
+      serverClockRequests: (policy?.serverClock.requests ?? 0) - clockBefore,
+      maxRequestsInFlight: after.maxInFlightObserved,
+      workerConcurrency: this.config.restConcurrency,
+      weightWaits: after.weightWaits - before.weightWaits,
+      usedWeightPauses: after.usedWeightPauses - before.usedWeightPauses,
+      elapsedMs: this.deps.nowMs() - startedAtMs,
+    };
+  }
+
+  /** The request savers for this run's fetches; empty (the original behaviour) without a recovery policy. */
+  private fetchOptions(): ClosedKlineFetchOptions {
+    const policy = this.deps.recoveryFetch ?? null;
+    return policy === null ? {} : { serverClock: policy.serverClock, sizePagesToRange: policy.sizePagesToRange };
+  }
+
+  private newWorker(symbol: string, candidate: SupervisorCandidate | null = null): SymbolWorker {
+    const worker: SymbolWorker = {
       symbol,
       connection: -1,
       dir: this.config.liveDirFor(symbol),
@@ -499,7 +593,10 @@ export class LiveShadowSupervisor {
       inactiveSinceMs: null,
       reactivating: false,
       joined: false,
+      catchUp: null,
     };
+    if (!this.started) this.startupWorkers.push(worker);
+    return worker;
   }
 
   private contextStartMs(): number {
@@ -793,6 +890,7 @@ export class LiveShadowSupervisor {
           cache: this.deps.cache,
           fetchDeps: this.deps.fetchDeps,
           settleMs: REPLAY_SETTLE_MS,
+          ...(this.deps.recoveryFetch == null ? {} : { serverClock: this.deps.recoveryFetch.serverClock }),
         });
       } catch (error) {
         if (this.isStale(worker, token)) return;
@@ -829,6 +927,7 @@ export class LiveShadowSupervisor {
         governor: this.deps.governor,
         cacheOnly: false,
         nowIso: this.deps.nowIso,
+        fetchOptions: this.fetchOptions(),
       });
     } catch (error) {
       if (this.isStale(worker, token)) return;
@@ -887,6 +986,7 @@ export class LiveShadowSupervisor {
       worker.bootstrapInputSha256 = plan.lineage.bootstrapInputSha256;
       worker.symbolHistoryOrigin = plan.lineage.symbolHistoryOrigin ?? null;
       worker.failure = null;
+      worker.catchUp = { status: plan.checkpointStatus, bars: plan.catchUp.bars };
       worker.channel = new SymbolStreamChannel({ session, log: (line) => this.symbolLog(worker, line) });
       worker.status = "ATTACHED";
       this.deps.log(`${worker.symbol} CATCHUP_OK lineage ${plan.lineageId.slice(0, 12)} checkpoint ${plan.checkpointStatus} hwm ${new Date(plan.hwmOpenTimeMs).toISOString()} replayed ${plan.catchUp.bars} bar(s) NON_ACTIONABLE`);
@@ -1104,7 +1204,7 @@ export class LiveShadowSupervisor {
                 maxBars: Math.max(1, (currentBarOpen - session.hwmOpenTimeMs) / this.intervalMs),
                 pageLimit: REPLAY_PAGE_LIMIT,
                 settleMs: REPLAY_SETTLE_MS,
-              })
+              }, this.fetchOptions())
             ).klines
           : [];
       // Removed, re-added or stopped meanwhile: nothing lands (no commit, no re-attachment).
@@ -1642,6 +1742,7 @@ export class LiveShadowSupervisor {
       profile: this.config.profile ?? null,
       /** How the running set was chosen. Skipped candidates never joined and are not runtime failures. */
       selection: this.selectionSummary,
+      recovery: this.startupRecovery,
       totals: {
         selected: count((s) => s.connection >= 0),
         liveEligible: count((s) => s.readiness === "LIVE_ELIGIBLE"),
