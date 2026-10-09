@@ -44,7 +44,7 @@ import {
 import type { LineageConfig } from "./live-shadow-cli-args";
 import { LiveShadowError } from "./live-shadow-checkpoint";
 import { prepareLiveShadowState } from "./live-shadow-session";
-import { BINANCE_FUTURES_IP_WEIGHT_PER_MINUTE, publicRequestWeight } from "./public-request-weight";
+import { BINANCE_FUTURES_IP_WEIGHT_PER_MINUTE, USED_WEIGHT_HEADER, parseUsedWeightHeader, publicRequestWeight } from "./public-request-weight";
 import { REPLAY_PAGE_LIMIT, REPLAY_SETTLE_MS } from "./replay-cli-args";
 import { deriveHtfContextStartMs } from "./scanner-lineage";
 import {
@@ -134,8 +134,16 @@ export interface GovernorMetrics {
   readonly weightWaits: number;
   /** Times Binance reported the shared IP at or above the high-water mark (each pauses starts to the next minute). */
   readonly usedWeightPauses: number;
-  /** The highest X-MBX-USED-WEIGHT-1M seen, or null when Binance never sent it. */
+  /** The highest valid X-MBX-USED-WEIGHT-1M seen, or null when Binance never sent a valid one. */
   readonly peakReportedUsedWeight: number | null;
+}
+
+/** Observation only: the highest valid used-weight header seen while it is open. */
+export interface UsedWeightPeakTracker {
+  /** The peak so far, or null when no valid header arrived in the interval. */
+  peak(): number | null;
+  /** Stops tracking; peak() keeps its last value. */
+  stop(): void;
 }
 
 /**
@@ -158,6 +166,7 @@ export class GovernedPublicTransport {
   private readonly window: { atMs: number; weight: number }[] = [];
   private pausedUntilMs = 0;
   private readonly stats = { weightUsed: 0, maxInFlightObserved: 0, weightWaits: 0, usedWeightPauses: 0, peakReportedUsedWeight: null as number | null };
+  private readonly peakTrackers = new Set<{ peak: number | null }>();
 
   constructor(
     private readonly inner: PublicHttpTransport,
@@ -203,6 +212,13 @@ export class GovernedPublicTransport {
   }
   get metrics(): GovernorMetrics {
     return { requestsMade: this.made, ...this.stats };
+  }
+
+  /** Observation only: tracks the highest valid used-weight header from now on (e.g. over one start-up). */
+  trackReportedUsedWeight(): UsedWeightPeakTracker {
+    const tracker = { peak: null as number | null };
+    this.peakTrackers.add(tracker);
+    return { peak: () => tracker.peak, stop: () => void this.peakTrackers.delete(tracker) };
   }
 
   readonly transport: PublicHttpTransport = (url, init) => {
@@ -262,10 +278,15 @@ export class GovernedPublicTransport {
           `Binance answered ${response.status}; the whole run stopped and sent nothing further`
         );
       }
-      const header = response.header("X-MBX-USED-WEIGHT-1M");
+      const header = response.header(USED_WEIGHT_HEADER);
+      // Observation only (strict: absent or malformed stays unknown, never 0). Decisions below keep their own parse.
+      const observed = parseUsedWeightHeader(header);
+      if (observed !== null) {
+        this.stats.peakReportedUsedWeight = Math.max(this.stats.peakReportedUsedWeight ?? observed, observed);
+        for (const tracker of this.peakTrackers) tracker.peak = Math.max(tracker.peak ?? observed, observed);
+      }
       const reported = header === null ? Number.NaN : Number(header);
       if (Number.isFinite(reported)) {
-        this.stats.peakReportedUsedWeight = Math.max(this.stats.peakReportedUsedWeight ?? 0, reported);
         const budget = this.options.weightBudget ?? null;
         if (budget !== null && reported >= budget.usedWeightHighWater) {
           const nextMinute = (Math.floor(this.options.nowMs() / WEIGHT_WINDOW_MS) + 1) * WEIGHT_WINDOW_MS;

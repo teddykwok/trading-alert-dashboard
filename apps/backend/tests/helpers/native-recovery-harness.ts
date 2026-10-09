@@ -130,6 +130,8 @@ export async function startRun(input: {
   /** Called after start() returns or throws, before results are read. */
   readonly onStarted?: (supervisor: LiveShadowSupervisor) => void;
   readonly beforeStart?: (supervisor: LiveShadowSupervisor) => void;
+  /** Requests sent through the run's governor BEFORE start-up (as the CLI's first exchangeInfo is). */
+  readonly preStart?: (send: (url: string) => Promise<unknown>) => Promise<void>;
 }): Promise<RunResult> {
   const { mode, profile, market } = input;
   let now = input.nowMs;
@@ -168,7 +170,7 @@ export async function startRun(input: {
         if (market.tamperPage) rows = market.tamperPage(symbol as string, rows);
         return respond(200, rows.map(toRow), extra);
       }
-      return respond(404, {});
+      return respond(404, {}, extra);
     } finally {
       inFlight -= 1;
     }
@@ -239,6 +241,7 @@ export async function startRun(input: {
     }
   );
   input.beforeStart?.(supervisor);
+  if (input.preStart) await input.preStart((url) => governor.transport(url, { headers: {} }));
   let startError: unknown = null;
   try {
     await supervisor.start();

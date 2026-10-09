@@ -285,7 +285,11 @@ export interface StartupRecoverySummary {
   readonly workerConcurrency: number;
   readonly weightWaits: number;
   readonly usedWeightPauses: number;
+  /** Highest valid X-MBX-USED-WEIGHT-1M Binance reported during this start-up; null when none arrived (unknown, not 0). */
+  readonly peakReportedUsedWeight: number | null;
   readonly elapsedMs: number;
+  /** When the start-up recovery walk completed successfully; null when it did not complete (failed or halted). */
+  readonly completedAt: string | null;
 }
 
 /** Reconnect delays per consecutive failure of one connection. */
@@ -514,16 +518,21 @@ export class LiveShadowSupervisor {
     const startedAtMs = this.deps.nowMs();
     const before = this.deps.governor.metrics;
     const clockBefore = this.deps.recoveryFetch?.serverClock.requests ?? 0;
+    const usedWeight = this.deps.governor.trackReportedUsedWeight();
     let accepted: SymbolWorker[];
+    let completed = false;
     try {
       accepted = this.selection.mode === "EXPLICIT" ? await this.startExplicit() : this.dynamic ? await this.startDynamic() : await this.walkCandidates();
+      completed = true;
     } finally {
-      this.startupRecovery = this.summarizeStartup(startedAtMs, before, clockBefore);
+      usedWeight.stop();
+      this.startupRecovery = this.summarizeStartup(startedAtMs, before, clockBefore, completed, usedWeight.peak());
       const r = this.startupRecovery;
       this.deps.log(
         `STARTUP_RECOVERY policy ${r.policy}: ${r.symbols} symbol(s), ${r.liveReady} live-ready (${r.recovered} recovered, ${r.current} current, ${r.bootstrapped} bootstrapped), ${r.notLive} not live; ` +
           `${r.missingBarsReplayed} missed closed bar(s) replayed NON_ACTIONABLE; REST ${r.restRequests} request(s), weight ${r.restWeight}, max ${r.maxRequestsInFlight} in flight, ${r.workerConcurrency} worker(s), ` +
-          `${r.weightWaits} weight wait(s), ${r.usedWeightPauses} IP pause(s); ${(r.elapsedMs / 1000).toFixed(1)} s`
+          `${r.weightWaits} weight wait(s), ${r.usedWeightPauses} IP pause(s), peak used weight ${r.peakReportedUsedWeight ?? "unknown"}; ${(r.elapsedMs / 1000).toFixed(1)} s` +
+          (r.completedAt === null ? " — DID NOT COMPLETE" : `, completed ${r.completedAt}`)
       );
     }
     this.assign(accepted);
@@ -532,7 +541,7 @@ export class LiveShadowSupervisor {
     if (this.dynamic) this.universeState.nextAtMs = this.deps.nowMs() + (this.config.dynamicUniverse as DynamicUniverseConfig).refreshIntervalMs;
   }
 
-  private summarizeStartup(startedAtMs: number, before: GovernorMetrics, clockBefore: number): StartupRecoverySummary {
+  private summarizeStartup(startedAtMs: number, before: GovernorMetrics, clockBefore: number, completed: boolean, peakReportedUsedWeight: number | null): StartupRecoverySummary {
     const workers = this.startupWorkers;
     const after = this.deps.governor.metrics;
     const ready = workers.filter((w) => w.status === "ATTACHED" && w.catchUp !== null);
@@ -553,7 +562,9 @@ export class LiveShadowSupervisor {
       workerConcurrency: this.config.restConcurrency,
       weightWaits: after.weightWaits - before.weightWaits,
       usedWeightPauses: after.usedWeightPauses - before.usedWeightPauses,
+      peakReportedUsedWeight,
       elapsedMs: this.deps.nowMs() - startedAtMs,
+      completedAt: completed ? this.deps.nowIso() : null,
     };
   }
 
@@ -1757,6 +1768,11 @@ export class LiveShadowSupervisor {
         reconnects: this.connections.reduce((n, c) => n + c.reconnects, 0),
         backpressureEvents: this.connections.reduce((n, c) => n + c.overflows, 0) + symbols.reduce((n, s) => n + s.counters.laggedUpdates, 0),
         restRequests: this.deps.governor.requestsMade,
+        // Observation only (the governor's lifetime metrics): nothing reads these to decide anything.
+        restWeight: this.deps.governor.metrics.weightUsed,
+        restWeightWaits: this.deps.governor.metrics.weightWaits,
+        restUsedWeightPauses: this.deps.governor.metrics.usedWeightPauses,
+        restPeakReportedUsedWeight: this.deps.governor.metrics.peakReportedUsedWeight,
         restHalted: this.deps.governor.halt !== null,
         ...(this.dynamic
           ? {

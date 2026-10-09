@@ -68,6 +68,7 @@ describe("the native scanner data layer", () => {
       "scanner-lock.ts",
       "scanner-paths.ts",
       "scanner-profile.ts",
+      "startup-recovery-record.ts",
       "supervisor-run-manifest.ts",
       "supervisor-run-plan.ts",
       "symbol-stream-channel.ts",

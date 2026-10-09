@@ -46,3 +46,18 @@ export function publicRequestWeight(url: string): number {
       return UNKNOWN_ENDPOINT_WEIGHT;
   }
 }
+
+/** Binance's public response header reporting the IP's request weight used in the current minute. Read, never sent. */
+export const USED_WEIGHT_HEADER = "X-MBX-USED-WEIGHT-1M";
+
+/**
+ * OBSERVATION ONLY: the header as a plain non-negative integer, or null when it
+ * is absent or malformed ("", "abc", "1e4", "-3", "12.5"). Never guessed, never
+ * zero for "unknown". Decisions do not use this parse.
+ */
+export function parseUsedWeightHeader(value: string | null): number | null {
+  if (value === null) return null;
+  const trimmed = value.trim();
+  if (!/^\d{1,9}$/.test(trimmed)) return null;
+  return Number(trimmed);
+}

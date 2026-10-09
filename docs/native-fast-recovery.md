@@ -145,15 +145,17 @@ Structural assertions on the FAST runs:
 - at most 2 in flight;
 - at most 300 weight in every rolling minute.
 
-## Benchmark (offline, synthetic, non-gating)
+## OFFLINE STRUCTURAL MODEL (synthetic, non-gating, not a measurement)
 
 Command: `pnpm -C apps/backend exec tsx scripts/native-recovery-benchmark.ts 525 360 150`
 
-The benchmark runs the real supervisor against a fake Binance. The CPU figure
-is the measured 360 ms per symbol on real state. Wall time is an estimate:
-max(REST, CPU).
+The model runs the real supervisor against a fake Binance with a manual clock.
+Its request counts, request weight, rolling-minute weight and in-flight figures
+are exact for the synthetic universe. Its wall-clock column is **not** a
+measurement. It was computed as max(REST, CPU), using a CPU cost of 360 ms per
+symbol.
 
-| Downtime | LEGACY requests / weight | FAST requests / weight | Estimated wall time, LEGACY → FAST |
+| Downtime | LEGACY requests / weight | FAST requests / weight | Modelled wall time, LEGACY → FAST |
 | --- | --- | --- | --- |
 | 6 h | 1168 / 3268 | 585 / 585 | 19.4 → 3.1 min |
 | 1 d | 1168 / 3268 | 585 / 585 | 19.4 → 3.1 min |
@@ -161,10 +163,104 @@ max(REST, CPU).
 | 2 w | 1693 / 5893 | 1111 / 3736 | 28.2 → 12.3 min |
 | 30 d | 2218 / 8518 | 1638 / 7938 | 37.0 → 26.2 min |
 
-The LEGACY estimate of 19.4 min matches the real restarts.
+**The modelled FAST wall times are too optimistic.**
 
-Long downtimes are bound by the deliberate 300 weight/min cap. An operator can
-raise it, up to 1200, with `--max-weight-per-minute`.
+- The 360 ms CPU figure covered only the cache load and the rebuild with
+  hash-fence verification. It left out the cache save and verified reload that
+  every fetched symbol performs. Re-measured afterwards on temp copies of real
+  state, read-only, the full per-symbol cost is about 425 ms: 42 ms load, 82 ms
+  save and reload, 301 ms rebuild and verification.
+- max(REST, CPU) assumes CPU and network overlap fully. In one Node process the
+  synchronous rebuild and verification run on the same thread as the request
+  timers and responses, so in practice they largely add up.
 
-At 6 h – 3 d the bound is now CPU: the rebuild and hash-fence verification. A
-future milestone could move that work to worker threads without weakening it.
+The request-count and weight reductions are what the model got right, and the
+live run below confirms them.
+
+## LIVE PUBLIC BINANCE RESULT (measured)
+
+One approved 60-minute live public soak: public endpoints only, no signed
+calls, no DB.
+
+| | |
+| --- | --- |
+| Run | `20261009T065309Z-bbb0c078` |
+| Git | `ec6d233` |
+| Universe | 525 symbols |
+| Real downtime represented | 87,687 missed 15m bars = 167 bars × 525 symbols ≈ 41.8 hours |
+| Start-up recovery | 427,737 ms ≈ 7 min 08 s |
+| Start-up REST | 589 requests |
+| Start-up request weight | 1114 |
+| serverTime requests | 8 |
+| Max in flight | 2 |
+| Workers | 4 |
+| Weight waits | 0 |
+| Used-weight pauses | 0 |
+| Result | 525 recovered, 0 current, 0 bootstrapped, 0 not live |
+
+The figures come from the `recovery` block of the run's `status.json`.
+
+Compared with the earlier legacy restarts (real, measured the same way, from run
+start to manifest):
+
+| | Wall clock | Start-up requests |
+| --- | --- | --- |
+| LEGACY | ~19 min | ~1160 |
+| FAST | ~7 min 08 s | 589 |
+| Change | roughly **2.7× faster** | roughly **half** |
+
+Notes on the live run:
+
+- **The governor was not the limit.** There were 0 weight waits and 0
+  used-weight pauses. The REST spacing floor alone is 589 × 250 ms ≈ 147 s.
+- **No phase split is claimed.** The rest of the 7 min 08 s was most likely
+  synchronous CPU (cache save/reload, rebuild and verification) plus network
+  latency, but per-phase timing was not recorded durably.
+- **Peak used weight is unknown for this run.** It did not record the
+  `X-MBX-USED-WEIGHT-1M` peak, because that metric was added afterwards (see
+  below).
+- **The run-wide REST total of 1113 is more than start-up.** It splits exactly
+  into:
+  - 589 for start-up recovery;
+  - 1 initial exchangeInfo, made before start-up;
+  - 10 universe refreshes;
+  - 513 in-run recoveries: one 1-bar page for each symbol whose start-up
+    catch-up finished before the 07:00 bar closed, because start-up straddled a
+    15m boundary. Legacy restarts show the same effect.
+
+At 6 h – 3 d of downtime the remaining bound is CPU, the rebuild and hash-fence
+verification. A future milestone could move that work to worker threads without
+weakening it.
+
+## Start-up observability
+
+Each start-up now records the following.
+
+- **In `status.json` → `recovery`** (written by every status update, so it
+  survives terminal scrollback):
+  - the policy;
+  - symbols recovered, current, bootstrapped and not live;
+  - missed bars replayed;
+  - start-up requests, weight, serverTime requests, max in flight and workers;
+  - weight waits and used-weight pauses;
+  - `peakReportedUsedWeight`: the highest valid `X-MBX-USED-WEIGHT-1M` Binance
+    reported during start-up, or `null` when none arrived. Unknown is never
+    written as 0.
+  - `elapsedMs`;
+  - `completedAt`: when the recovery walk completed successfully; `null` if it
+    did not complete.
+- **In `status.json` → `totals`**: the governor's lifetime metrics, `restWeight`,
+  `restWeightWaits`, `restUsedWeightPauses` and `restPeakReportedUsedWeight`,
+  next to the unchanged `restRequests`.
+- **For a start-up that throws**, which never reaches `status.json`: one
+  `startup-recovery.json` in that run's own directory,
+  `live-shadow-supervisor/runs/<runId>/`. It holds the summary above, the
+  outcome and a sanitized failure: error class, code, and the message with any
+  URL or key-like token removed.
+  - It is written once, atomically, and never overwrites an existing file.
+  - A failure to write it never masks the start-up error.
+  - It is observation only. No scanner, emitter, status-page or
+    execution-integrity reader opens it.
+
+None of this affects any decision, readiness, checkpoint, engine state,
+lineage, commit, alert or execution admission.

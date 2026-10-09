@@ -29,6 +29,7 @@ import {
   isDynamicUniverse,
   profileSummaryOf,
 } from "./scanner-profile";
+import { STARTUP_RECOVERY_RECORD_FILE, startRecordingFailure, startupRecoveryRecordOf, writeStartupRecoveryRecordOnce } from "./startup-recovery-record";
 import { RunManifestError, makeRunId, runManifestText } from "./supervisor-run-manifest";
 import { connectionCapacityOf, supervisorLiveDirFor, supervisorRunManifestOf, supervisorSelectionOf } from "./supervisor-run-plan";
 import { UniverseSelectionError, parseExchangeInfoContracts, selectUsdtPerpetualUniverse, type UniverseSymbolTrust } from "./usdm-universe";
@@ -294,7 +295,16 @@ async function main(): Promise<void> {
   };
   process.on("SIGINT", () => stop("operator stop"));
 
-  await supervisor.start();
+  // A start-up that throws never reaches status.json: keep its recovery summary in this run's directory (once), then fail as before.
+  await startRecordingFailure(
+    () => supervisor.start(),
+    (error) => {
+      const record = startupRecoveryRecordOf({ runId, recovery: supervisor.status().recovery, error, writtenAt: iso(Date.now()) });
+      const outcome = writeStartupRecoveryRecordOnce(runDir, record);
+      console.error(`start-up recovery record: ${outcome === "WRITTEN" ? path.join(runDir, STARTUP_RECOVERY_RECORD_FILE) : "already present, not overwritten"}`);
+    },
+    (line) => console.error(line)
+  );
   const sel = supervisor.status().selection;
   // The run manifest: written ONCE (flag wx: never overwritten), after selection, so a pinned consumer
   // can bind to exactly this run's accepted symbols, profile and engine.
