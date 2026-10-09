@@ -1,4 +1,4 @@
-import { MAX_TOTAL_REQUESTS_CEILING } from "./candidate-rank-runner";
+import { MAX_IN_FLIGHT_CEILING, MAX_TOTAL_REQUESTS_CEILING, MAX_WEIGHT_PER_MINUTE_CEILING } from "./candidate-rank-runner";
 import { CONSERVATIVE_REQUEST_POLICY, REQUEST_POLICY_LIMITS } from "./kline-fetcher";
 import { MAX_STREAMS_PER_COMBINED_CONNECTION } from "./live-kline-stream";
 import { LINEAGE_CONFIG_OPTIONS, LiveShadowCliUsageError, parseLineageConfig, type LineageConfig } from "./live-shadow-cli-args";
@@ -45,6 +45,9 @@ const TUNING = [
   "--max-recovery-attempts",
   "--max-total-requests",
   "--request-spacing-ms",
+  "--recovery-policy",
+  "--max-in-flight",
+  "--max-weight-per-minute",
   "--status-every-s",
   "--duration-minutes",
 ] as const;
@@ -64,6 +67,35 @@ export const SUPERVISOR_DEFAULTS = Object.freeze({
   statusEverySeconds: 60,
 });
 
+/**
+ * FAST_RECOVERY_V1 (the default): how start-up and recovery reach Binance.
+ * Evidence (docs/native-fast-recovery.md): a restart was ~19 min of 1 request/s
+ * spacing over ~2.2 requests per symbol, half of them serverTime. This policy
+ * shares one Binance clock reading, sizes pages to the gap (weight 1 for gaps
+ * under 100 bars) and governs by IP WEIGHT: at most 300 weight per minute —
+ * the old worst case (60 requests x weight 5) — so the IP never carries more
+ * scanner load than before. Starts stay >= 250 ms apart (the hard floor), at most
+ * 2 responses are awaited at once, and nothing starts while Binance reports the
+ * shared IP (Account A/B included) at >= 1200 of its 2400 weight per minute.
+ * The replay, checkpoint verification and every Teddy rule are unchanged.
+ */
+export const FAST_RECOVERY_DEFAULTS = Object.freeze({
+  minSpacingMs: REQUEST_POLICY_LIMITS.minSpacingFloorMs,
+  maxInFlight: 2,
+  maxWeightPerMinute: 300,
+  usedWeightHighWater: 1_200,
+  serverClockMaxAgeMs: 60_000,
+  /** Symbols prepared at once: CPU replay of one overlaps the others' network waits. REST stays governed globally. */
+  restConcurrency: 4,
+});
+
+/** The original serial policy, kept selectable (--recovery-policy legacy) and as the equivalence baseline. */
+export const LEGACY_RECOVERY_DEFAULTS = Object.freeze({
+  minSpacingMs: CONSERVATIVE_REQUEST_POLICY.minSpacingMs,
+  maxInFlight: 1,
+  restConcurrency: SUPERVISOR_DEFAULTS.restConcurrency,
+});
+
 export const SUPERVISOR_CLI_USAGE = [
   "Usage (LIVE SHADOW ONLY — no Alert, no order, no database):",
   "  scanner:live-shadow-supervisor (--symbols A,B,... | --universe usdt-perpetual (--max-symbols N | --all-active))",
@@ -71,7 +103,8 @@ export const SUPERVISOR_CLI_USAGE = [
   "    <the scanner's lineage flags: --interval 15m --history-start ... --partial-period-policy ...>",
   `    [--symbols-per-connection ${SUPERVISOR_DEFAULTS.symbolsPerConnection}] [--max-connections ${SUPERVISOR_DEFAULTS.maxConnections}] [--rest-concurrency ${SUPERVISOR_DEFAULTS.restConcurrency}]`,
   `    [--queue-capacity ${SUPERVISOR_DEFAULTS.queueCapacity}] [--max-lag-ms ${SUPERVISOR_DEFAULTS.maxProcessingLagMs}] [--stale-symbol-ms ${SUPERVISOR_DEFAULTS.staleSymbolMs}]`,
-  `    [--max-total-requests ${SUPERVISOR_DEFAULTS.maxTotalRequests}] [--request-spacing-ms ${CONSERVATIVE_REQUEST_POLICY.minSpacingMs}] [--status-every-s ${SUPERVISOR_DEFAULTS.statusEverySeconds}]`,
+  `    [--max-total-requests ${SUPERVISOR_DEFAULTS.maxTotalRequests}] [--request-spacing-ms ${FAST_RECOVERY_DEFAULTS.minSpacingMs}] [--status-every-s ${SUPERVISOR_DEFAULTS.statusEverySeconds}]`,
+  `    [--recovery-policy fast|legacy] [--max-in-flight ${FAST_RECOVERY_DEFAULTS.maxInFlight}] [--max-weight-per-minute ${FAST_RECOVERY_DEFAULTS.maxWeightPerMinute}]   (fast is the default)`,
   "    [--duration-minutes N] [--json-status]",
   `  scanner:live-shadow-supervisor --profile <${Object.keys(SCANNER_PROFILES).join("|")}> [--symbols A,B,...] [operational tuning flags]`,
   "    (a profile fixes the engine and the universe; lineage and universe flags are refused with it)",
@@ -91,6 +124,11 @@ export interface SupervisorCliOptions {
   readonly maxRecoveryAttempts: number;
   readonly maxTotalRequests: number;
   readonly minSpacingMs: number;
+  /** FAST_RECOVERY_V1 (default) or the original LEGACY_SERIAL fetch policy. */
+  readonly recoveryPolicy: "FAST_RECOVERY_V1" | "LEGACY_SERIAL";
+  readonly maxInFlight: number;
+  /** IP-weight budget per minute (FAST_RECOVERY_V1 only); null under LEGACY_SERIAL. */
+  readonly maxWeightPerMinute: number | null;
   readonly statusEverySeconds: number;
   readonly durationMinutes: number | null;
   readonly jsonStatus: boolean;
@@ -176,19 +214,27 @@ export function parseSupervisorCliArgs(argv: readonly string[]): SupervisorCliOp
     selection = { mode: "EXPLICIT", symbols: list(values.get("--symbols") as string) };
   }
 
+  const policyName = values.get("--recovery-policy") ?? "fast";
+  if (policyName !== "fast" && policyName !== "legacy") usage("--recovery-policy must be fast or legacy");
+  const fast = policyName === "fast";
+  if (!fast && values.has("--max-weight-per-minute")) usage("--max-weight-per-minute only applies with --recovery-policy fast");
+
   return {
     profile,
     lineage,
     selection,
     symbolsPerConnection: bounded(values.get("--symbols-per-connection"), "--symbols-per-connection", 1, MAX_STREAMS_PER_COMBINED_CONNECTION, SUPERVISOR_DEFAULTS.symbolsPerConnection),
     maxConnections: bounded(values.get("--max-connections"), "--max-connections", 1, SUPERVISOR_LIMITS.maxConnections, profile?.operations?.maxConnections ?? SUPERVISOR_DEFAULTS.maxConnections),
-    restConcurrency: bounded(values.get("--rest-concurrency"), "--rest-concurrency", 1, 8, SUPERVISOR_DEFAULTS.restConcurrency),
+    restConcurrency: bounded(values.get("--rest-concurrency"), "--rest-concurrency", 1, 8, fast ? FAST_RECOVERY_DEFAULTS.restConcurrency : LEGACY_RECOVERY_DEFAULTS.restConcurrency),
     queueCapacity: bounded(values.get("--queue-capacity"), "--queue-capacity", 100, SUPERVISOR_LIMITS.maxQueueCapacity, SUPERVISOR_DEFAULTS.queueCapacity),
     maxProcessingLagMs: bounded(values.get("--max-lag-ms"), "--max-lag-ms", 1_000, 600_000, SUPERVISOR_DEFAULTS.maxProcessingLagMs),
     staleSymbolMs: bounded(values.get("--stale-symbol-ms"), "--stale-symbol-ms", 10_000, 14_400_000, SUPERVISOR_DEFAULTS.staleSymbolMs),
     maxRecoveryAttempts: bounded(values.get("--max-recovery-attempts"), "--max-recovery-attempts", 1, 100, SUPERVISOR_DEFAULTS.maxRecoveryAttempts),
     maxTotalRequests: bounded(values.get("--max-total-requests"), "--max-total-requests", 4, MAX_TOTAL_REQUESTS_CEILING, SUPERVISOR_DEFAULTS.maxTotalRequests),
-    minSpacingMs: bounded(values.get("--request-spacing-ms"), "--request-spacing-ms", REQUEST_POLICY_LIMITS.minSpacingFloorMs, 60_000, CONSERVATIVE_REQUEST_POLICY.minSpacingMs),
+    minSpacingMs: bounded(values.get("--request-spacing-ms"), "--request-spacing-ms", REQUEST_POLICY_LIMITS.minSpacingFloorMs, 60_000, fast ? FAST_RECOVERY_DEFAULTS.minSpacingMs : LEGACY_RECOVERY_DEFAULTS.minSpacingMs),
+    recoveryPolicy: fast ? "FAST_RECOVERY_V1" : "LEGACY_SERIAL",
+    maxInFlight: bounded(values.get("--max-in-flight"), "--max-in-flight", 1, MAX_IN_FLIGHT_CEILING, fast ? FAST_RECOVERY_DEFAULTS.maxInFlight : LEGACY_RECOVERY_DEFAULTS.maxInFlight),
+    maxWeightPerMinute: fast ? bounded(values.get("--max-weight-per-minute"), "--max-weight-per-minute", 10, MAX_WEIGHT_PER_MINUTE_CEILING, FAST_RECOVERY_DEFAULTS.maxWeightPerMinute) : null,
     statusEverySeconds: bounded(values.get("--status-every-s"), "--status-every-s", 5, 3_600, SUPERVISOR_DEFAULTS.statusEverySeconds),
     durationMinutes: values.has("--duration-minutes") ? bounded(values.get("--duration-minutes"), "--duration-minutes", 1, 100_000, 0) : null,
     jsonStatus: flags.has("--json-status"),

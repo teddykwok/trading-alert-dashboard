@@ -55,6 +55,7 @@ describe("the native scanner data layer", () => {
       "live-shadow-supervisor.ts",
       "parity-audit-runner.ts",
       "parity-audit.ts",
+      "public-request-weight.ts",
       "replay-cli-args.ts",
       "run-candidate-rank.ts",
       "run-compat-replay.ts",
@@ -67,6 +68,7 @@ describe("the native scanner data layer", () => {
       "scanner-lock.ts",
       "scanner-paths.ts",
       "scanner-profile.ts",
+      "startup-recovery-record.ts",
       "supervisor-run-manifest.ts",
       "supervisor-run-plan.ts",
       "symbol-stream-channel.ts",
@@ -99,7 +101,8 @@ describe("the native scanner data layer", () => {
     ["alerts service", /alerts\.service|AlertsService|alert\.create/],
     ["account bootstrap", /bootstrap-account|account-env/],
     ["credential names", /BINANCE_API_KEY|BINANCE_API_SECRET|apiSecret|OPERATOR_API_TOKEN|WEBHOOK_SECRET|DATABASE_URL|REDIS_URL/],
-    ["signing", /createHmac|X-MBX|signature/i],
+    // The ONE X-MBX name allowed is Binance's public RESPONSE header reporting the IP's used weight (read, never sent).
+    ["signing", /createHmac|X-MBX-(?!USED-WEIGHT-1M\b)|signature/i],
     // The analysis path's module and its exports (its mock fallback and its
     // TradingView interval table must never reach the scanner).
     [

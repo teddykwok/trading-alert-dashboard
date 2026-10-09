@@ -36,6 +36,7 @@ import {
   PublicRequestController,
   REQUEST_POLICY_LIMITS,
   fetchClosedFuturesKlines,
+  type ClosedKlineFetchOptions,
   type PublicHttpResponse,
   type PublicHttpTransport,
   type PublicRequestPolicy,
@@ -43,6 +44,7 @@ import {
 import type { LineageConfig } from "./live-shadow-cli-args";
 import { LiveShadowError } from "./live-shadow-checkpoint";
 import { prepareLiveShadowState } from "./live-shadow-session";
+import { BINANCE_FUTURES_IP_WEIGHT_PER_MINUTE, USED_WEIGHT_HEADER, parseUsedWeightHeader, publicRequestWeight } from "./public-request-weight";
 import { REPLAY_PAGE_LIMIT, REPLAY_SETTLE_MS } from "./replay-cli-args";
 import { deriveHtfContextStartMs } from "./scanner-lineage";
 import {
@@ -93,22 +95,78 @@ export interface GovernorOptions {
   readonly minSpacingMs: number;
   readonly nowMs: () => number;
   readonly sleep: (ms: number) => Promise<void>;
+  /**
+   * Requests that may be awaiting a response at once. Default 1: strictly
+   * serial, exactly the original governor. Starts stay spaced and in call
+   * order whatever this is; only response latency overlaps.
+   */
+  readonly maxInFlight?: number;
+  /** Optional IP-weight budget (Binance counts weight per IP per minute). Default none: spacing and request budget only. */
+  readonly weightBudget?: GovernorWeightBudget | null;
+}
+
+export interface GovernorWeightBudget {
+  /** This run's own request weight in any rolling 60 s window never exceeds this. */
+  readonly maxWeightPerMinute: number;
+  /**
+   * When Binance reports (X-MBX-USED-WEIGHT-1M) that the IP — this run AND
+   * every other process on it, Account A/B included — has used at least this
+   * much weight in the current minute, no further request starts until the
+   * next minute.
+   */
+  readonly usedWeightHighWater: number;
 }
 
 /** Hard ceiling on one run's total public requests, whatever is configured. */
 export const MAX_TOTAL_REQUESTS_CEILING = 20_000;
+/** Never more than this many requests in flight, whatever is configured. */
+export const MAX_IN_FLIGHT_CEILING = 4;
+/** One scanner run never budgets more than half of the IP's weight per minute, whatever is configured. */
+export const MAX_WEIGHT_PER_MINUTE_CEILING = BINANCE_FUTURES_IP_WEIGHT_PER_MINUTE / 2;
+export const WEIGHT_WINDOW_MS = 60_000;
+
+/** What the governor did. Observation only. */
+export interface GovernorMetrics {
+  readonly requestsMade: number;
+  readonly weightUsed: number;
+  readonly maxInFlightObserved: number;
+  /** Starts that waited for the run's own weight window. */
+  readonly weightWaits: number;
+  /** Times Binance reported the shared IP at or above the high-water mark (each pauses starts to the next minute). */
+  readonly usedWeightPauses: number;
+  /** The highest valid X-MBX-USED-WEIGHT-1M seen, or null when Binance never sent a valid one. */
+  readonly peakReportedUsedWeight: number | null;
+}
+
+/** Observation only: the highest valid used-weight header seen while it is open. */
+export interface UsedWeightPeakTracker {
+  /** The peak so far, or null when no valid header arrived in the interval. */
+  peak(): number | null;
+  /** Stops tracking; peak() keeps its last value. */
+  stop(): void;
+}
 
 /**
- * The single gate every public request of a run passes through. Serial,
- * spaced, budgeted; a 418/429 trips it permanently for the run.
+ * The single gate every public request of a run passes through. Spaced,
+ * budgeted, bounded in flight (1 by default: serial), optionally weighted;
+ * a 418/429 trips it permanently for the run: no request STARTS once a halt
+ * is known (one already in flight cannot be recalled).
  */
 export class GovernedPublicTransport {
-  private tail: Promise<unknown> = Promise.resolve();
+  /** Starts are admitted one at a time, in call order. */
+  private startTail: Promise<unknown> = Promise.resolve();
   private lastStartMs: number | null = null;
   private made = 0;
   private haltedBy: CandidateRankHaltError | null = null;
   /** Held back for the run's final price request, so kline fetching can never starve it. */
   private reserved = 1;
+  private readonly maxInFlight: number;
+  private inFlight = 0;
+  private readonly slotWaiters: Array<() => void> = [];
+  private readonly window: { atMs: number; weight: number }[] = [];
+  private pausedUntilMs = 0;
+  private readonly stats = { weightUsed: 0, maxInFlightObserved: 0, weightWaits: 0, usedWeightPauses: 0, peakReportedUsedWeight: null as number | null };
+  private readonly peakTrackers = new Set<{ peak: number | null }>();
 
   constructor(
     private readonly inner: PublicHttpTransport,
@@ -119,6 +177,20 @@ export class GovernedPublicTransport {
     }
     if (!Number.isSafeInteger(options.minSpacingMs) || options.minSpacingMs < REQUEST_POLICY_LIMITS.minSpacingFloorMs) {
       throw new ScannerDataError("INVALID_RANGE", `request spacing must be >= ${REQUEST_POLICY_LIMITS.minSpacingFloorMs} ms`);
+    }
+    this.maxInFlight = options.maxInFlight ?? 1;
+    if (!Number.isSafeInteger(this.maxInFlight) || this.maxInFlight < 1 || this.maxInFlight > MAX_IN_FLIGHT_CEILING) {
+      throw new ScannerDataError("INVALID_RANGE", `requests in flight must be 1..${MAX_IN_FLIGHT_CEILING}`);
+    }
+    const budget = options.weightBudget ?? null;
+    if (budget !== null) {
+      // The heaviest single request (weight 10) must always fit, or it could never be sent.
+      if (!Number.isSafeInteger(budget.maxWeightPerMinute) || budget.maxWeightPerMinute < 10 || budget.maxWeightPerMinute > MAX_WEIGHT_PER_MINUTE_CEILING) {
+        throw new ScannerDataError("INVALID_RANGE", `the weight budget must be 10..${MAX_WEIGHT_PER_MINUTE_CEILING} per minute`);
+      }
+      if (!Number.isSafeInteger(budget.usedWeightHighWater) || budget.usedWeightHighWater < 1 || budget.usedWeightHighWater > BINANCE_FUTURES_IP_WEIGHT_PER_MINUTE) {
+        throw new ScannerDataError("INVALID_RANGE", `the used-weight high-water mark must be 1..${BINANCE_FUTURES_IP_WEIGHT_PER_MINUTE}`);
+      }
     }
   }
 
@@ -138,32 +210,97 @@ export class GovernedPublicTransport {
   get halt(): CandidateRankHaltError | null {
     return this.haltedBy;
   }
+  get metrics(): GovernorMetrics {
+    return { requestsMade: this.made, ...this.stats };
+  }
+
+  /** Observation only: tracks the highest valid used-weight header from now on (e.g. over one start-up). */
+  trackReportedUsedWeight(): UsedWeightPeakTracker {
+    const tracker = { peak: null as number | null };
+    this.peakTrackers.add(tracker);
+    return { peak: () => tracker.peak, stop: () => void this.peakTrackers.delete(tracker) };
+  }
 
   readonly transport: PublicHttpTransport = (url, init) => {
-    const run = this.tail.then(() => this.send(url, init));
-    this.tail = run.catch(() => undefined);
-    return run;
+    // Admission is serial and in call order; the next admission waits only for this START, not its response.
+    const started = this.startTail.then(() => this.admitAndStart(url, init));
+    this.startTail = started.catch(() => undefined);
+    return started.then((box) => box.response);
   };
 
-  private async send(url: string, init: { readonly headers: Readonly<Record<string, string>> }): Promise<PublicHttpResponse> {
-    if (this.haltedBy !== null) throw this.haltedBy;
-    if (this.made >= this.options.maxTotalRequests - this.reserved) {
-      throw new ScannerDataError("REQUEST_BUDGET_EXHAUSTED", `the run's total budget of ${this.options.maxTotalRequests} public requests is spent`);
+  /** Waits for a slot, the spacing, the weight window and any IP pause; counts the start and sends in the same step. */
+  private async admitAndStart(url: string, init: { readonly headers: Readonly<Record<string, string>> }): Promise<{ response: Promise<PublicHttpResponse> }> {
+    const weight = publicRequestWeight(url);
+    while (this.inFlight >= this.maxInFlight) await new Promise<void>((resolve) => this.slotWaiters.push(resolve));
+    const budget = this.options.weightBudget ?? null;
+    for (;;) {
+      if (this.haltedBy !== null) throw this.haltedBy;
+      if (this.made >= this.options.maxTotalRequests - this.reserved) {
+        throw new ScannerDataError("REQUEST_BUDGET_EXHAUSTED", `the run's total budget of ${this.options.maxTotalRequests} public requests is spent`);
+      }
+      const now = this.options.nowMs();
+      if (this.lastStartMs !== null && this.lastStartMs + this.options.minSpacingMs > now) {
+        await this.options.sleep(this.lastStartMs + this.options.minSpacingMs - now);
+        continue;
+      }
+      if (budget !== null) {
+        if (now < this.pausedUntilMs) {
+          await this.options.sleep(this.pausedUntilMs - now);
+          continue;
+        }
+        while (this.window.length > 0 && this.window[0].atMs + WEIGHT_WINDOW_MS <= now) this.window.shift();
+        const used = this.window.reduce((sum, entry) => sum + entry.weight, 0);
+        if (used + weight > budget.maxWeightPerMinute) {
+          this.stats.weightWaits += 1;
+          await this.options.sleep(this.window[0].atMs + WEIGHT_WINDOW_MS - now);
+          continue;
+        }
+      }
+      break;
     }
-    if (this.lastStartMs !== null) {
-      const wait = this.lastStartMs + this.options.minSpacingMs - this.options.nowMs();
-      if (wait > 0) await this.options.sleep(wait);
-    }
-    this.lastStartMs = this.options.nowMs();
+    const startedAt = this.options.nowMs();
+    this.lastStartMs = startedAt;
     this.made += 1;
-    const response = await this.inner(url, init);
-    if (response.status === 418 || response.status === 429) {
-      this.haltedBy = new CandidateRankHaltError(
-        response.status === 418 ? "IP_BANNED" : "RATE_LIMITED",
-        `Binance answered ${response.status}; the whole run stopped and sent nothing further`
-      );
+    this.inFlight += 1;
+    this.stats.maxInFlightObserved = Math.max(this.stats.maxInFlightObserved, this.inFlight);
+    this.stats.weightUsed += weight;
+    if (budget !== null) this.window.push({ atMs: startedAt, weight });
+    // Sent synchronously with the recorded start: the spacing is measured between real sends.
+    return { response: this.perform(url, init) };
+  }
+
+  private async perform(url: string, init: { readonly headers: Readonly<Record<string, string>> }): Promise<PublicHttpResponse> {
+    try {
+      const response = await this.inner(url, init);
+      if (response.status === 418 || response.status === 429) {
+        this.haltedBy ??= new CandidateRankHaltError(
+          response.status === 418 ? "IP_BANNED" : "RATE_LIMITED",
+          `Binance answered ${response.status}; the whole run stopped and sent nothing further`
+        );
+      }
+      const header = response.header(USED_WEIGHT_HEADER);
+      // Observation only (strict: absent or malformed stays unknown, never 0). Decisions below keep their own parse.
+      const observed = parseUsedWeightHeader(header);
+      if (observed !== null) {
+        this.stats.peakReportedUsedWeight = Math.max(this.stats.peakReportedUsedWeight ?? observed, observed);
+        for (const tracker of this.peakTrackers) tracker.peak = Math.max(tracker.peak ?? observed, observed);
+      }
+      const reported = header === null ? Number.NaN : Number(header);
+      if (Number.isFinite(reported)) {
+        const budget = this.options.weightBudget ?? null;
+        if (budget !== null && reported >= budget.usedWeightHighWater) {
+          const nextMinute = (Math.floor(this.options.nowMs() / WEIGHT_WINDOW_MS) + 1) * WEIGHT_WINDOW_MS;
+          if (nextMinute > this.pausedUntilMs) {
+            this.pausedUntilMs = nextMinute;
+            this.stats.usedWeightPauses += 1;
+          }
+        }
+      }
+      return response;
+    } finally {
+      this.inFlight -= 1;
+      this.slotWaiters.shift()?.();
     }
-    return response;
   }
 }
 
@@ -265,6 +402,8 @@ export interface CacheFillRequest {
   readonly governor: GovernedPublicTransport;
   readonly cacheOnly: boolean;
   readonly nowIso: () => string;
+  /** Request savers that never change a returned row (shared Binance clock, range-sized pages). */
+  readonly fetchOptions?: ClosedKlineFetchOptions;
 }
 
 /**
@@ -302,7 +441,7 @@ export async function fillClosedBarCache(args: CacheFillRequest): Promise<CacheF
         maxBars: Math.max(1, (endMs - trustedEndMs) / intervalMs),
         pageLimit: REPLAY_PAGE_LIMIT,
         settleMs: REPLAY_SETTLE_MS,
-      });
+      }, args.fetchOptions);
       fetchedRequests = result.requestsMade;
       if (result.klines.length > 0) {
         klines = mergeClosedKlines(klines, result.klines);

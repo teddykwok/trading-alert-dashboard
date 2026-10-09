@@ -10,7 +10,7 @@ import {
   type ScannerChartInterval,
 } from "./binance-public-futures";
 import type { KlineCacheLike } from "./candidate-rank-runner";
-import { PublicRequestController, type PublicFetchDeps } from "./kline-fetcher";
+import { PublicRequestController, type BinanceServerClock, type PublicFetchDeps } from "./kline-fetcher";
 import type { SymbolOriginInput } from "./scanner-lineage";
 
 /**
@@ -58,6 +58,8 @@ export async function probeSymbolHistoryOrigin(input: {
   readonly cache: KlineCacheLike;
   readonly fetchDeps: PublicFetchDeps;
   readonly settleMs: number;
+  /** The run's shared Binance clock (one serverTime per round, not per probe). Absent: one serverTime request here, as before. */
+  readonly serverClock?: BinanceServerClock;
 }): Promise<OriginProbeOutcome> {
   const { symbol, chartInterval, contextStartMs, onboardDateMs, settleMs } = input;
   const intervalMs = intervalMsOf(chartInterval);
@@ -74,7 +76,10 @@ export async function probeSymbolHistoryOrigin(input: {
   let serverTimeMs: number;
   let rows;
   try {
-    serverTimeMs = parseServerTimePayload(await controller.getJson(buildPublicFuturesUrl(input.fetchDeps.baseUrl, SERVER_TIME_PATH)));
+    serverTimeMs =
+      input.serverClock === undefined
+        ? parseServerTimePayload(await controller.getJson(buildPublicFuturesUrl(input.fetchDeps.baseUrl, SERVER_TIME_PATH)))
+        : await input.serverClock.current();
     rows = parseFuturesKlinesPayload(
       await controller.getJson(buildPublicFuturesUrl(input.fetchDeps.baseUrl, KLINES_PATH, { symbol, interval: chartInterval, startTime: contextStartMs, endTime: serverTimeMs, limit: 2 })),
       intervalMs
