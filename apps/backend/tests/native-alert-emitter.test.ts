@@ -632,6 +632,8 @@ const emitterSources = readdirSync(EMITTER_DIR)
   .map((file) => ({ file, text: readFileSync(path.join(EMITTER_DIR, file), "utf8") }));
 const CLI = "run-native-alert-emitter.ts";
 const MULTI_CLI = "run-native-multi-emitter.ts";
+/** The explicit, separate production-cursor rebaseline CLI (NATIVE_EMITTER_CURSOR_REBASELINE_V1). */
+const REBASELINE_CLI = "run-native-emitter-cursor-rebaseline.ts";
 /** The single, deliberate exception to the "no notifications" fence: the COMMIT-only live dashboard publisher. */
 const LIVE_PUBLISHER_IMPORT = 'await import("../notifications/native-alert-live-publisher")';
 const PLANNING_REQUEST_IMPORT = 'await import("../native-planning/native-plan-request")';
@@ -650,8 +652,11 @@ describe("static fences", () => {
       "native-alert-ledger.ts",
       "native-delivery-policy-v2.ts",
       "native-delivery-policy.ts",
+      "native-emitter-cursor-rebaseline.ts",
+      "native-emitter-rebaseline-cli-args.ts",
       "native-emitter-state-files.ts",
       "run-native-alert-emitter.ts",
+      "run-native-emitter-cursor-rebaseline.ts",
       "run-native-multi-emitter.ts",
       "shadow-log-reader.ts",
     ]);
@@ -677,7 +682,9 @@ describe("static fences", () => {
           specifier.startsWith("node:") ||
           /^\.\/[a-z0-9-]+$/.test(specifier) ||
           allowed.has(specifier) ||
-          ([CLI, MULTI_CLI].includes(file) && specifier === "../../config/bootstrap-generic");
+          ([CLI, MULTI_CLI, REBASELINE_CLI].includes(file) && specifier === "../../config/bootstrap-generic") ||
+          // The rebaseline CLI alone holds each lane's scanner lock while it rewrites delivery cursors (no scanner may append).
+          (file === REBASELINE_CLI && specifier === "../native-scanner/scanner-lock");
         expect({ file, specifier, ok }).toEqual({ file, specifier, ok: true });
       }
       // Only the ledger and the CLIs may touch the database client at all.
@@ -748,7 +755,7 @@ describe("static fences", () => {
 
   it("40. only the CLIs read the environment, the clock, the file system or timers (the state-file store: the file system only); each CLI's FIRST import is the credential-free bootstrap", () => {
     for (const { file, text } of emitterSources) {
-      if (file === CLI || file === MULTI_CLI) continue;
+      if (file === CLI || file === MULTI_CLI || file === REBASELINE_CLI) continue;
       const pattern = file === STATE_FILES ? /process\.env|Date\.now|new Date\(\)|setTimeout|setInterval/ : /process\.env|Date\.now|new Date\(\)|setTimeout|setInterval|readFileSync|existsSync|"node:fs"/;
       expect({ file, hit: code(text).match(pattern)?.[0] ?? null }).toEqual({ file, hit: null });
     }
@@ -762,6 +769,13 @@ describe("static fences", () => {
     for (const banner of ["NATIVE MULTI-SYMBOL EMITTER", "EXECUTION FOR NATIVE ALERTS IS HARD-DISABLED"]) {
       expect(multi).toContain(`console.log("${banner}")`);
     }
+    const rebaseline = emitterSources.find((s) => s.file === REBASELINE_CLI)!.text;
+    expect(importsOf(rebaseline)[0]).toBe("../../config/bootstrap-generic");
+    for (const banner of ["NATIVE EMITTER PRODUCTION CURSOR REBASELINE", "NO ALERTS / NO DATABASE / NO BINANCE / NO EXECUTION"]) {
+      expect(rebaseline).toContain(`console.log("${banner}")`);
+    }
+    // No dynamic import at all: the rebaseline never loads the database, the push, the planning request or anything else later.
+    expect(code(rebaseline)).not.toMatch(/await import\(|@prisma|PrismaClient/);
   });
 
   it("41. the scanner stays DB-free and never imports the emitter or the alerts module", () => {
@@ -779,6 +793,7 @@ describe("static fences", () => {
     expect(Object.entries(scripts).filter(([name, command]) => /native-alerts/.test(name) || /native-alerts/.test(command))).toEqual([
       ["native-alerts:emitter", "tsx src/modules/native-alerts/run-native-alert-emitter.ts"],
       ["native-alerts:multi-emitter", "tsx src/modules/native-alerts/run-native-multi-emitter.ts"],
+      ["native-alerts:rebaseline-cursors", "tsx src/modules/native-alerts/run-native-emitter-cursor-rebaseline.ts"],
       ["native-alerts:plan-worker", "tsx src/modules/native-planning/native-plan.worker.ts"],
       ["native-alerts:audit", "tsx src/modules/native-audit/run-native-alert-audit.ts"],
     ]);
