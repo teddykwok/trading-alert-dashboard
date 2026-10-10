@@ -79,7 +79,11 @@ describe("the Trading Control Native plans card", () => {
     expect(NATIVE_PLANNING_ONLY_LABEL).toBe("PLANNING ONLY");
     expect(NATIVE_EXECUTION_DISABLED_LABEL).toBe("NATIVE EXECUTION DISABLED");
     expect(card).toContain("<Badge tone=\"yellow\">{NATIVE_PLANNING_ONLY_LABEL}</Badge>");
-    expect(card).toContain("<Badge tone=\"red\">{NATIVE_EXECUTION_DISABLED_LABEL}</Badge>");
+    // UI Scalability V1: DISABLED is a strong, always-visible safety panel — informational, deliberately not error red.
+    const panel = card.slice(card.indexOf('data-testid="native-execution-state"') - 200, card.indexOf("{NATIVE_EXECUTION_DISABLED_LABEL}") + 40);
+    expect(panel).toContain('role="status"');
+    expect(panel).toContain("border-2 border-sky-400/50");
+    expect(panel).not.toMatch(/red/);
     expect(card).toContain("{NATIVE_PLAN_EXECUTION_STATUS}");
     expect(NATIVE_PLAN_EXECUTION_STATUS).toBe("PLANNING ONLY / EXECUTION DISABLED");
   });
@@ -87,11 +91,13 @@ describe("the Trading Control Native plans card", () => {
   it("29. it exposes no execute, adopt, arm, start-account or selection control: it is read only", () => {
     expect(card).not.toMatch(/<Button|<button|onClick|onSubmit|<form|<select|<input/);
     expect(card).not.toMatch(/execute|adopt|arm\b|LIVE_READY|startAccount|accountControl|operatorApi|extremeRRApi\.(generate|updateSelection|patch)/i);
-    // Its only API call is the read-only list.
-    expect([...card.matchAll(/extremeRRApi\s*\.\s*(\w+)/g)].map((m) => m[1])).toEqual(["listNativePlans"]);
+    // Its only API call is the read-only paged list (a GET; see nativePlanTable.test for the request itself).
+    expect([...card.matchAll(/extremeRRApi\s*\.\s*(\w+)/g)].map((m) => m[1])).toEqual(["listNativePlanPage"]);
   });
 
   it("it shows symbol, direction, source TF, exact entry, plan status, available lookbacks, the global selection and both account defaults", () => {
+    // The per-plan fields live in the expandable row (NativePlanDetail); the policies stay on the card.
+    const detail = src("components/operator/NativePlanDetail.tsx");
     for (const fragment of [
       "{item.symbol}",
       "{item.plan.direction}",
@@ -101,10 +107,10 @@ describe("the Trading Control Native plans card", () => {
       "item.availableLookbacks",
       "<SelectedPlanSummaryView summary={item.plan} />",
       "item.accountDefaults.map",
-      "list.accountPolicies.map",
     ]) {
-      expect(card).toContain(fragment);
+      expect(detail).toContain(fragment);
     }
+    expect(card).toContain("list.accountPolicies.map");
   });
 
   it("the Native copy says plans are generated automatically after delivery, still planning only", () => {

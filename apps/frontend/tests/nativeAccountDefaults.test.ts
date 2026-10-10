@@ -58,10 +58,12 @@ describe("Trading Control Native account defaults", () => {
     expect(PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT).toMatch(/not an account execution preference/);
     expect(PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT).toMatch(/built-in A 100, B 300 unless overridden/);
     expect(PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT).not.toMatch(/UNSET/);
+    // UI Scalability V1: the per-plan view moved into the expandable row (NativePlanDetail); the card keeps the policies.
     const card = src("components/operator/NativePlansCard.tsx");
-    expect(card).toContain("{row.source !== null && <span");
-    expect(card).toContain("<SelectedPlanSummaryView summary={item.plan} />");
-    expect(card).toContain("item.accountDefaults.map");
+    const detail = src("components/operator/NativePlanDetail.tsx");
+    expect(detail).toContain("{row.source !== null && <span");
+    expect(detail).toContain("<SelectedPlanSummaryView summary={item.plan} />");
+    expect(detail).toContain("item.accountDefaults.map");
     expect(card).toContain("list.accountPolicies.map");
   });
 
@@ -69,7 +71,10 @@ describe("Trading Control Native account defaults", () => {
     const card = src("components/operator/NativePlansCard.tsx");
     expect(card).toContain("{NATIVE_PLANNING_ONLY_LABEL}");
     expect(card).toContain("{NATIVE_EXECUTION_DISABLED_LABEL}");
-    expect(card).not.toMatch(/<Button|<button|onClick|onSubmit|<form|<select|<input/);
-    expect(card).not.toMatch(/execute|adopt|apply|startAccount|accountControl|operatorApi|LIVE_READY/i);
+    // The card and the plan detail hold no control at all (the table's navigation controls are fenced in nativePlanTable.test).
+    for (const file of [card, src("components/operator/NativePlanDetail.tsx")]) {
+      expect(file).not.toMatch(/<Button|<button|onClick|onSubmit|<form|<select|<input/);
+      expect(file).not.toMatch(/execute|adopt|apply|startAccount|accountControl|operatorApi|LIVE_READY/i);
+    }
   });
 });

@@ -157,9 +157,14 @@ describe("Trading Control: reads the Native plan, owns no plan choice", () => {
   });
 
   it("the card only reads: no lookback selector, no buttons, no generation, no selection writes, no account calls", () => {
-    expect(card).toContain("extremeRRApi\n      .listNativePlans()");
+    // UI Scalability V1: one read-only, abortable page request (a GET) replaces the fixed list request.
+    expect(card).toContain("extremeRRApi.listNativePlanPage(query, signal)");
     expect(card).not.toMatch(/EXTREME_RR_LOOKBACKS|onClick|<Button|generate\(|updateSelection|operatorApi|api\/operator|useSelectedOperatorAccount|account=\{/);
     expect(card).toContain("{NATIVE_PLAN_EXECUTION_STATUS}");
+    // The table, its rows' detail and its state hook choose no lookback, generate nothing, write nothing, call no account.
+    for (const rel of ["components/operator/NativePlanTable.tsx", "components/operator/NativePlanDetail.tsx", "hooks/useNativePlanPage.ts"]) {
+      expect({ rel, found: src(rel).match(/EXTREME_RR_LOOKBACKS|generate\(|updateSelection|operatorApi|api\/operator|useSelectedOperatorAccount|account=\{/)?.[0] ?? null }).toEqual({ rel, found: null });
+    }
   });
 
   it("the account Trading Control card is untouched by Native planning", () => {

@@ -1,6 +1,7 @@
 import type {
   Alert,
   ExtremeRRPlan,
+  Prisma,
   PrismaClient,
   SelectedPlanAdoption,
   SelectedPlanOutcome,
@@ -8,7 +9,12 @@ import type {
 import {
   EXTREME_RR_DEFAULT_LOOKBACK,
   EXTREME_RR_LOOKBACKS,
+  EXTREME_RR_STATUSES,
+  NATIVE_PLAN_INTEGRITY_SCAN_LIMIT,
+  NATIVE_PLAN_PAGE_DEFAULT_SIZE,
+  NATIVE_PLAN_PAGE_MAX_SIZE,
   isExtremeRRLookback,
+  nativeIntegrityMatches,
   buildLeverageAnalysis,
   calculateExtremeCandidate,
   calculateExtremeMoney,
@@ -21,7 +27,13 @@ import {
   type ExtremeRRPlanStatus,
   type ExtremeRRTemplateSnapshot,
   type NativeAccountPlanPolicy,
+  type NativeExecutionIntegrityDto,
+  type NativePlanIntegrityScan,
   type NativePlanListDto,
+  type NativePlanListItemDto,
+  type NativePlanPageDto,
+  type NativePlanPageQuery,
+  type NativePlanStatusCounts,
   type SelectedPlanAccountOutcomeDto,
   previewNativeAccountPlan,
   selectedPlanSummaryOf,
@@ -36,7 +48,11 @@ import { env } from "../../config/env";
 import { logger } from "../../config/logger";
 import type { ExtremeRRSelectionInput } from "./extreme-rr.schema";
 import { configuredNativeAccountPlanPolicies } from "../native-planning/native-account-plan-policy";
-import { nativeExecutionIntegrityOf, type NativeScannerEvidenceReader } from "../native-integrity/native-execution-integrity";
+import {
+  nativeExecutionIntegrityOf,
+  type NativeScannerEvidence,
+  type NativeScannerEvidenceReader,
+} from "../native-integrity/native-execution-integrity";
 
 /**
  * Injectable so tests can freeze the candle dataset. The default fetcher uses
@@ -207,6 +223,110 @@ function planAlertSourceOf(source: unknown): ExtremeRRPlanDto["alertSource"] {
 
 /** How many Native plans the read-only list returns at most. */
 export const NATIVE_PLAN_LIST_LIMIT = { default: 20, max: 50 } as const;
+
+// ---------------------------------------------------------------------------
+// Native plan PAGES (Trading Control's table). Read only, like the list above.
+// ---------------------------------------------------------------------------
+
+/** A keyset position: the (triggeredAt, alertId) of the last plan a page returned or scanned. */
+export interface NativePlanCursor {
+  readonly triggeredAt: Date;
+  readonly alertId: string;
+}
+
+const CURSOR_TEXT = /^[A-Za-z0-9_-]{1,256}$/;
+const CURSOR_ISO_MS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const CURSOR_ALERT_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+export function encodeNativePlanCursor(position: NativePlanCursor): string {
+  return Buffer.from(JSON.stringify({ v: 1, t: position.triggeredAt.toISOString(), a: position.alertId }), "utf8").toString("base64url");
+}
+
+/**
+ * Strict: only a cursor this API issued is accepted, byte for byte. Anything
+ * else is refused, never silently read as "start from the newest page".
+ */
+export function decodeNativePlanCursor(raw: string): NativePlanCursor {
+  const refuse = (): never => {
+    throw new ValidationError("cursor is not a Native plan page cursor issued by this API");
+  };
+  if (!CURSOR_TEXT.test(raw)) return refuse();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+  } catch {
+    return refuse();
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return refuse();
+  const { v, t, a, ...rest } = parsed as Record<string, unknown>;
+  if (Object.keys(rest).length > 0 || v !== 1 || typeof t !== "string" || typeof a !== "string") return refuse();
+  if (!CURSOR_ISO_MS.test(t) || !CURSOR_ALERT_ID.test(a)) return refuse();
+  const position = { triggeredAt: new Date(t), alertId: a };
+  if (Number.isNaN(position.triggeredAt.getTime()) || position.triggeredAt.toISOString() !== t) return refuse();
+  if (encodeNativePlanCursor(position) !== raw) return refuse();
+  return position;
+}
+
+const NATIVE_PLANS_ONLY: Prisma.ExtremeRRPlanWhereInput = { alert: { source: NATIVE_ALERT_SOURCE } };
+
+/** Search and filters, in the database. Integrity is not here: it is never stored. */
+function nativePlanFilterWhere(query: NativePlanPageQuery): Prisma.ExtremeRRPlanWhereInput {
+  const and: Prisma.ExtremeRRPlanWhereInput[] = [NATIVE_PLANS_ONLY];
+  // q is letters and digits only (validated), so it can never act as a LIKE pattern.
+  if (query.q !== undefined) and.push({ OR: [{ alert: { symbol: { contains: query.q, mode: "insensitive" } } }, { alertId: query.q }] });
+  if (query.sourceTimeframe !== undefined) and.push({ alert: { sourceTimeframe: query.sourceTimeframe } });
+  if (query.direction !== undefined) and.push({ direction: query.direction });
+  if (query.planStatus !== undefined) and.push({ status: query.planStatus });
+  return { AND: and };
+}
+
+/** Strictly after `position` in NATIVE_PLAN_PAGE_ORDER. */
+function olderThan(position: NativePlanCursor): Prisma.ExtremeRRPlanWhereInput {
+  return {
+    OR: [
+      { alert: { triggeredAt: { lt: position.triggeredAt } } },
+      { alert: { triggeredAt: position.triggeredAt }, alertId: { lt: position.alertId } },
+    ],
+  };
+}
+
+/** Newest trigger first; alertId breaks ties. Both immutable, so pages never shift under new alerts. */
+const NATIVE_PLAN_PAGE_ORDER: Prisma.ExtremeRRPlanOrderByWithRelationInput[] = [{ alert: { triggeredAt: "desc" } }, { alertId: "desc" }];
+
+/** Rows read per database round trip while the integrity filter scans. */
+const NATIVE_PLAN_SCAN_CHUNK = 50;
+
+/**
+ * Integrity judgements per turn of the event loop. Each one reads and strictly
+ * parses its lane's whole event log synchronously, so a large page is judged in
+ * turns and other requests are served in between. Verdicts are unaffected.
+ */
+const NATIVE_PLAN_JUDGEMENTS_PER_TURN = 25;
+const nextTurn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+const NATIVE_PLAN_ALERT_FIELDS = { select: { source: true, symbol: true, sourceTimeframe: true, triggeredAt: true, rawPayload: true } } as const;
+
+type NativePlanRow = PlanWithOutcome & { alert: Pick<Alert, "source" | "symbol" | "sourceTimeframe" | "triggeredAt" | "rawPayload"> };
+
+const positionOf = (plan: NativePlanRow): NativePlanCursor => ({ triggeredAt: plan.alert.triggeredAt, alertId: plan.alertId });
+
+/**
+ * Each lane's scanner evidence is read once per request, and every alert of
+ * that lane is judged against that one snapshot. The verdict rule is
+ * untouched: the evidence is exactly what the reader returned.
+ */
+export function readEachLaneOnce(reader: NativeScannerEvidenceReader): NativeScannerEvidenceReader {
+  const lanes = new Map<string, NativeScannerEvidence>();
+  return (provenance) => {
+    const lane = JSON.stringify([provenance.profileId, provenance.engineFingerprint, provenance.marketType, provenance.symbol, provenance.chartInterval]);
+    let evidence = lanes.get(lane);
+    if (evidence === undefined) {
+      evidence = reader(provenance);
+      lanes.set(lane, evidence);
+    }
+    return evidence;
+  };
+}
 
 type PlanWithOutcome = ExtremeRRPlan & {
   selectedPlanOutcome?: SelectedPlanOutcome | null;
@@ -535,20 +655,136 @@ export class ExtremeRRService {
     return {
       nativeExecutionEnabled: false,
       accountPolicies,
-      items: plans.map((plan) => {
-        const dto = this.serialize(plan, planAlertSourceOf(plan.alert.source));
-        return {
-          alertId: plan.alertId,
-          symbol: plan.alert.symbol,
-          sourceTimeframe: plan.alert.sourceTimeframe,
-          triggeredAt: plan.alert.triggeredAt.toISOString(),
-          plan: selectedPlanSummaryOf(dto),
-          availableLookbacks: dto.status === "READY" ? dto.candidates.filter((c) => c.valid).map((c) => c.requestedCandles) : [],
-          // Each account from its OWN policy; the plan's global selectedLookback is not consulted.
-          accountDefaults: accountPolicies.map((policy) => previewNativeAccountPlan(dto, policy)),
-          executionIntegrity: nativeExecutionIntegrityOf(plan.alert, integrityEvidence),
-        };
-      }),
+      items: plans.map((plan) => this.nativePlanItemOf(plan, accountPolicies, nativeExecutionIntegrityOf(plan.alert, integrityEvidence))),
+    };
+  }
+
+  /**
+   * One PAGE of Native plans for Trading Control's table: search and filters
+   * in the database, newest trigger first, keyset-paged, with plan-status
+   * counts over the whole data set and over the filtered set. READ ONLY,
+   * exactly like listNativePlans: it generates, selects, adopts and writes
+   * nothing, and every item still says NATIVE_PLAN_EXECUTION_STATUS.
+   *
+   * Integrity is rebuilt from scanner files for the plans on the page only.
+   * With the integrity filter, plans are judged newest first until the page is
+   * full or NATIVE_PLAN_INTEGRITY_SCAN_LIMIT plans were judged; the response
+   * says how many were, and its next cursor resumes from the last one.
+   */
+  async listNativePlanPage(
+    query: NativePlanPageQuery,
+    policies?: readonly NativeAccountPlanPolicy[],
+    integrityEvidence: NativeScannerEvidenceReader | null = null
+  ): Promise<NativePlanPageDto> {
+    const pageSize = query.pageSize ?? NATIVE_PLAN_PAGE_DEFAULT_SIZE;
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > NATIVE_PLAN_PAGE_MAX_SIZE) {
+      throw new ValidationError(`pageSize must be an integer 1..${NATIVE_PLAN_PAGE_MAX_SIZE}`);
+    }
+    const start = query.cursor === undefined ? null : decodeNativePlanCursor(query.cursor);
+    const accountPolicies = [...(policies ?? (await configuredNativeAccountPlanPolicies()))];
+    const filtered = nativePlanFilterWhere(query);
+    const after = (position: NativePlanCursor | null): Prisma.ExtremeRRPlanWhereInput =>
+      position === null ? filtered : { AND: [filtered, olderThan(position)] };
+    const read = (position: NativePlanCursor | null, take: number): Promise<NativePlanRow[]> =>
+      this.prisma.extremeRRPlan.findMany({ where: after(position), orderBy: NATIVE_PLAN_PAGE_ORDER, take, include: { alert: NATIVE_PLAN_ALERT_FIELDS } });
+    const reader = integrityEvidence === null ? null : readEachLaneOnce(integrityEvidence);
+    const judge = (plan: NativePlanRow): NativeExecutionIntegrityDto => nativeExecutionIntegrityOf(plan.alert, reader);
+
+    const [allNativePlans, matchingFilters] = await Promise.all([
+      this.nativePlanStatusCounts(NATIVE_PLANS_ONLY),
+      this.nativePlanStatusCounts(filtered),
+    ]);
+
+    const page: Array<{ plan: NativePlanRow; integrity: NativeExecutionIntegrityDto }> = [];
+    let last: NativePlanCursor | null = null;
+    let hasMore: boolean;
+    let integrityScan: NativePlanIntegrityScan | null = null;
+
+    if (query.integrity === undefined) {
+      const rows = await read(start, pageSize + 1);
+      hasMore = rows.length > pageSize;
+      for (const plan of rows.slice(0, pageSize)) {
+        if (page.length > 0 && page.length % NATIVE_PLAN_JUDGEMENTS_PER_TURN === 0) await nextTurn();
+        page.push({ plan, integrity: judge(plan) });
+      }
+      last = page.length > 0 ? positionOf(page[page.length - 1].plan) : null;
+    } else {
+      const wanted = query.integrity;
+      let scanned = 0;
+      let position = start;
+      let reachedEnd = false;
+      scan: while (scanned < NATIVE_PLAN_INTEGRITY_SCAN_LIMIT) {
+        const take = Math.min(NATIVE_PLAN_SCAN_CHUNK, NATIVE_PLAN_INTEGRITY_SCAN_LIMIT - scanned);
+        const rows = await read(position, take);
+        for (const plan of rows) {
+          if (scanned > 0 && scanned % NATIVE_PLAN_JUDGEMENTS_PER_TURN === 0) await nextTurn();
+          scanned += 1;
+          position = positionOf(plan);
+          const integrity = judge(plan);
+          if (nativeIntegrityMatches(wanted, integrity.status)) {
+            page.push({ plan, integrity });
+            if (page.length === pageSize) break scan;
+          }
+        }
+        if (rows.length < take) {
+          reachedEnd = true;
+          break;
+        }
+      }
+      hasMore =
+        !reachedEnd &&
+        position !== null &&
+        (await this.prisma.extremeRRPlan.findFirst({ where: after(position), orderBy: NATIVE_PLAN_PAGE_ORDER, select: { id: true } })) !== null;
+      last = position;
+      integrityScan = { scanned, limit: NATIVE_PLAN_INTEGRITY_SCAN_LIMIT, exhausted: !hasMore };
+    }
+
+    return {
+      nativeExecutionEnabled: false,
+      accountPolicies,
+      items: page.map(({ plan, integrity }) => this.nativePlanItemOf(plan, accountPolicies, integrity)),
+      pagination: {
+        order: "TRIGGERED_AT_DESC",
+        pageSize,
+        cursor: query.cursor ?? null,
+        nextCursor: hasMore && last !== null ? encodeNativePlanCursor(last) : null,
+        hasMore,
+        totalMatching: query.integrity === undefined ? matchingFilters.total : null,
+        integrityScan,
+      },
+      summary: { allNativePlans, matchingFilters },
+    };
+  }
+
+  /** Every plan status present as a key (0 when none), counted in the database. */
+  private async nativePlanStatusCounts(where: Prisma.ExtremeRRPlanWhereInput): Promise<NativePlanStatusCounts> {
+    const groups = await this.prisma.extremeRRPlan.groupBy({ by: ["status"], where, _count: { _all: true } });
+    const byPlanStatus = Object.fromEntries(EXTREME_RR_STATUSES.map((status) => [status, 0])) as Record<ExtremeRRPlanStatus, number>;
+    let total = 0;
+    for (const group of groups) {
+      byPlanStatus[group.status] = group._count._all;
+      total += group._count._all;
+    }
+    return { total, byPlanStatus };
+  }
+
+  /** One list item, identical for the original list and for a page. */
+  private nativePlanItemOf(
+    plan: NativePlanRow,
+    accountPolicies: readonly NativeAccountPlanPolicy[],
+    executionIntegrity: NativeExecutionIntegrityDto
+  ): NativePlanListItemDto {
+    const dto = this.serialize(plan, planAlertSourceOf(plan.alert.source));
+    return {
+      alertId: plan.alertId,
+      symbol: plan.alert.symbol,
+      sourceTimeframe: plan.alert.sourceTimeframe,
+      triggeredAt: plan.alert.triggeredAt.toISOString(),
+      plan: selectedPlanSummaryOf(dto),
+      availableLookbacks: dto.status === "READY" ? dto.candidates.filter((c) => c.valid).map((c) => c.requestedCandles) : [],
+      // Each account from its OWN policy; the plan's global selectedLookback is not consulted.
+      accountDefaults: accountPolicies.map((policy) => previewNativeAccountPlan(dto, policy)),
+      executionIntegrity,
     };
   }
 
