@@ -34,6 +34,7 @@
     "scanner:parity-audit": "tsx src/modules/native-scanner/run-parity-audit.ts",
     "native-alerts:emitter": "tsx src/modules/native-alerts/run-native-alert-emitter.ts",
     "native-alerts:multi-emitter": "tsx src/modules/native-alerts/run-native-multi-emitter.ts",
+    "native-alerts:rebaseline-cursors": "tsx src/modules/native-alerts/run-native-emitter-cursor-rebaseline.ts",
     "native-alerts:plan-worker": "tsx src/modules/native-planning/native-plan.worker.ts",
     "native-alerts:audit": "tsx src/modules/native-audit/run-native-alert-audit.ts",
     "execution:canary-preflight": "tsx src/modules/execution/run-canary-preflight.ts",
