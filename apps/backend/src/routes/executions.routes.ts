@@ -41,6 +41,9 @@ const listQuerySchema = z.object({
     .optional()
     .transform((value) => (value === undefined ? undefined : value === "true")),
   lifecycle: z.enum(["active", "closed"]).optional(),
+  // A symbol fragment or an exact execution / alert id: letters and digits only, so never a LIKE pattern.
+  q: z.string().trim().min(1).max(64).regex(/^[\p{L}\p{N}]+$/u, "q accepts letters and digits only").optional(),
+  source: z.enum(["TRADINGVIEW", "NATIVE"]).optional(),
   page: z.coerce.number().int().positive().max(10_000).default(1),
   // Bounded so a caller cannot request an unbounded page.
   pageSize: z.coerce.number().int().positive().max(MAX_PAGE_SIZE).default(25),
@@ -56,11 +59,13 @@ export async function executionsRoutes(app: FastifyInstance): Promise<void> {
       throw new ValidationError("Invalid execution list query", parsed.error.flatten());
     }
     const filters = parsed.data as ExecutionListFilters;
-    const [result, metrics] = await Promise.all([
+    const [result, metrics, profiles] = await Promise.all([
       service.listExecutions(filters),
       service.getExecutionSummaryMetrics(filters),
+      // The account filter's options: profiles that own executions (name and environment only).
+      service.listExecutionProfiles(),
     ]);
-    return { ...result, metrics };
+    return { ...result, metrics, profiles };
   });
 
   app.get<{ Params: { executionId: string } }>("/api/executions/:executionId", async (request) => {

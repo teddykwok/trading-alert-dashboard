@@ -253,6 +253,8 @@ export interface ExecutionProfileSummaryDto {
 export interface ExecutionListItemDto {
   id: string;
   alertId: string | null;
+  /** The linked alert's source, or null when retention removed the alert (unknown, never assumed). */
+  alertSource: string | null;
   symbol: string;
   direction: string;
   positionSide: string;
@@ -492,8 +494,12 @@ export interface ExecutionListFilters {
   createdFrom?: Date;
   createdTo?: Date;
   requiresManualIntervention?: boolean;
-  /** "active" excludes terminal statuses; "closed" keeps only them. */
+  /** "active" excludes terminal statuses; "closed" keeps only them. Combined with `status`, never instead of it. */
   lifecycle?: "active" | "closed";
+  /** A case-insensitive symbol fragment, or an exact execution id or alert id. */
+  q?: string;
+  /** The linked alert's source. An execution whose alert retention removed has no source and never matches. */
+  source?: "TRADINGVIEW" | "NATIVE";
   page?: number;
   pageSize?: number;
 }
@@ -538,7 +544,7 @@ export class ExecutionJournalService {
         orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
         skip: (page - 1) * pageSize,
         take: pageSize,
-        include: { executionProfile: true, protectionState: true },
+        include: { executionProfile: true, protectionState: true, alert: { select: { source: true } } },
       }),
     ]);
 
@@ -546,6 +552,7 @@ export class ExecutionJournalService {
       items: rows.map((row) => ({
         id: row.id,
         alertId: row.alertId,
+        alertSource: row.alert?.source ?? null,
         symbol: row.symbol,
         direction: row.direction,
         positionSide: row.positionSide,
@@ -630,6 +637,19 @@ export class ExecutionJournalService {
       closedWithKnownPnl,
       closedWithUnknownPnl,
     };
+  }
+
+  /**
+   * The profiles that own at least one execution: the journal's account
+   * filter. Name and environment only, exactly like every list item.
+   */
+  async listExecutionProfiles(): Promise<ExecutionProfileSummaryDto[]> {
+    const rows = await this.prisma.executionProfile.findMany({
+      where: { executions: { some: {} } },
+      orderBy: [{ name: "asc" }, { id: "asc" }],
+      select: { id: true, name: true, environment: true },
+    });
+    return rows.map((row) => this.toProfile(row));
   }
 
   // -------------------------------------------------------------------------
@@ -838,33 +858,43 @@ export class ExecutionJournalService {
   // Internals
   // -------------------------------------------------------------------------
 
+  /**
+   * Every filter is one AND term, so filters combine instead of overwriting
+   * each other (a status filter together with lifecycle used to be silently
+   * replaced by the lifecycle).
+   */
   private buildWhere(filters: ExecutionListFilters): Prisma.TradeExecutionWhereInput {
-    const where: Prisma.TradeExecutionWhereInput = {};
+    const and: Prisma.TradeExecutionWhereInput[] = [];
 
-    if (filters.symbol) where.symbol = { equals: filters.symbol.trim().toUpperCase() };
-    if (filters.direction) where.direction = filters.direction;
-    if (filters.status?.length) where.status = { in: filters.status as never };
-    if (filters.executionProfileId) where.executionProfileId = filters.executionProfileId;
-    if (filters.environment) where.executionProfile = { environment: filters.environment };
+    if (filters.symbol) and.push({ symbol: { equals: filters.symbol.trim().toUpperCase() } });
+    // q is letters and digits only (validated by the route), so it can never act as a LIKE pattern.
+    if (filters.q) and.push({ OR: [{ symbol: { contains: filters.q, mode: "insensitive" } }, { id: filters.q }, { alertId: filters.q }] });
+    if (filters.direction) and.push({ direction: filters.direction });
+    if (filters.status?.length) and.push({ status: { in: filters.status as never } });
+    if (filters.executionProfileId) and.push({ executionProfileId: filters.executionProfileId });
+    if (filters.environment) and.push({ executionProfile: { environment: filters.environment } });
+    if (filters.source) and.push({ alert: { source: filters.source } });
     if (filters.requiresManualIntervention !== undefined) {
-      where.requiresManualIntervention = filters.requiresManualIntervention;
+      and.push({ requiresManualIntervention: filters.requiresManualIntervention });
     }
     if (filters.protectionState?.length) {
-      where.protectionState = { state: { in: filters.protectionState as never } };
+      and.push({ protectionState: { state: { in: filters.protectionState as never } } });
     }
     if (filters.createdFrom || filters.createdTo) {
-      where.createdAt = {
-        ...(filters.createdFrom ? { gte: filters.createdFrom } : {}),
-        ...(filters.createdTo ? { lte: filters.createdTo } : {}),
-      };
+      and.push({
+        createdAt: {
+          ...(filters.createdFrom ? { gte: filters.createdFrom } : {}),
+          ...(filters.createdTo ? { lte: filters.createdTo } : {}),
+        },
+      });
     }
     if (filters.lifecycle === "closed") {
-      where.status = { in: CLOSED_STATUSES as never };
+      and.push({ status: { in: CLOSED_STATUSES as never } });
     } else if (filters.lifecycle === "active") {
-      where.status = { notIn: CLOSED_STATUSES as never };
+      and.push({ status: { notIn: CLOSED_STATUSES as never } });
     }
 
-    return where;
+    return and.length === 0 ? {} : { AND: and };
   }
 
   private toProfile(profile: { id: string; name: string; environment: string }): ExecutionProfileSummaryDto {

@@ -6,6 +6,7 @@ import {
   type ExecutionOrder,
   type ExecutionTimelineEntry,
 } from "../api/executions.api";
+import { ExecutionLifecycle } from "../components/executions/ExecutionLifecycle";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
@@ -22,6 +23,7 @@ import {
   ValueCell,
 } from "../features/executions/ExecutionValue";
 import { presentTakeProfitExecution } from "../features/executions/takeProfitExecution";
+import { deriveExecutionLifecycle } from "../features/executions/executionLifecycle";
 import { UNKNOWN_DISPLAY, decimalDifference, displayNetPnl } from "../features/executions/executionFormat";
 import {
   presentAlertDelivery,
@@ -122,6 +124,11 @@ export function ExecutionDetailPage() {
           </p>
         </Card>
       )}
+
+      {/* 0. Lifecycle at a glance: stored records only, unknown never shown as done. */}
+      <Section title="Lifecycle">
+        <ExecutionLifecycle steps={deriveExecutionLifecycle(detail, timeline)} />
+      </Section>
 
       {/* 1. Overview */}
       <Section title="Overview">

@@ -17,6 +17,11 @@ export interface ExecutionProfileSummary {
 export interface ExecutionListItem {
   id: string;
   alertId: string | null;
+  /**
+   * The linked alert's source ("TRADINGVIEW" / "NATIVE"); null when retention
+   * removed the alert. Absent from an older backend: unknown, never assumed.
+   */
+  alertSource?: string | null;
   symbol: string;
   direction: string;
   positionSide: string;
@@ -58,6 +63,11 @@ export interface ExecutionListResponse {
   pageSize: number;
   hasMore: boolean;
   metrics: ExecutionSummaryMetrics;
+  /**
+   * Profiles that own executions (the account filter's options). Absent from an
+   * older backend, which also ignores the search and source filters.
+   */
+  profiles?: ExecutionProfileSummary[];
 }
 
 export interface ExecutionOrder {
@@ -273,6 +283,10 @@ export interface ExecutionListParams {
   createdTo?: string;
   requiresManualIntervention?: boolean;
   lifecycle?: "active" | "closed";
+  /** A symbol fragment, or an exact execution id or alert id (letters and digits only). */
+  q?: string;
+  /** The linked alert's source. */
+  source?: "TRADINGVIEW" | "NATIVE";
   page?: number;
   pageSize?: number;
 }
@@ -294,6 +308,8 @@ export function buildExecutionListQuery(params: ExecutionListParams): string {
 export const executionsApi = {
   list: (params: ExecutionListParams = {}) =>
     apiClient.get<ExecutionListResponse>(`/api/executions${buildExecutionListQuery(params)}`),
+  /** The same read as `list`, for a query string built by buildExecutionListQuery; abortable when superseded. */
+  listPage: (query: string, signal?: AbortSignal) => apiClient.getCancellable<ExecutionListResponse>(`/api/executions${query}`, signal),
   detail: (executionId: string) => apiClient.get<ExecutionDetail>(`/api/executions/${executionId}`),
   timeline: (executionId: string) =>
     apiClient.get<ExecutionTimelineEntry[]>(`/api/executions/${executionId}/timeline`),
