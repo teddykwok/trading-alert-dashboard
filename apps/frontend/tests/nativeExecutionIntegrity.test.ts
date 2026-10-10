@@ -53,13 +53,18 @@ describe("Native execution data integrity on Trading Control", () => {
 
   it("the card shows the line per plan, inside the read-only card, with no new control", () => {
     const card = src("components/operator/NativePlansCard.tsx");
+    // UI Scalability V1: the per-plan line is in the expandable row; the table cell shows the same presenter's badge.
+    const detail = src("components/operator/NativePlanDetail.tsx");
     expect(NATIVE_EXECUTION_INTEGRITY_HEADING).toBe("Execution data integrity");
-    expect(card).toContain("presentNativeExecutionIntegrity(item.executionIntegrity)");
-    expect(card).toContain('data-testid="native-execution-integrity"');
-    expect(card).toContain("{NATIVE_EXECUTION_INTEGRITY_HEADING}:");
+    expect(detail).toContain("presentNativeExecutionIntegrity(item.executionIntegrity)");
+    expect(detail).toContain('data-testid="native-execution-integrity"');
+    expect(detail).toContain("{NATIVE_EXECUTION_INTEGRITY_HEADING}:");
+    expect(src("features/plans/nativePlanTable.ts")).toContain("presentNativeExecutionIntegrity(item.executionIntegrity)");
     expect(card).toContain('<Badge tone="yellow">{NATIVE_PLANNING_ONLY_LABEL}</Badge>');
-    expect(card).toContain('<Badge tone="red">{NATIVE_EXECUTION_DISABLED_LABEL}</Badge>');
-    expect(card).not.toMatch(/<Button|<button|onClick|onSubmit|<form|<select|<input/);
-    expect(card).not.toMatch(/execute|adopt|apply|startAccount|accountControl|operatorApi|LIVE_READY/i);
+    expect(card).toContain("{NATIVE_EXECUTION_DISABLED_LABEL}");
+    for (const file of [card, detail]) {
+      expect(file).not.toMatch(/<Button|<button|onClick|onSubmit|<form|<select|<input/);
+      expect(file).not.toMatch(/execute|adopt|apply|startAccount|accountControl|operatorApi|LIVE_READY/i);
+    }
   });
 });

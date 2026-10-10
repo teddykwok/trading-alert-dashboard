@@ -178,6 +178,34 @@ export {
   selectedPlanSummaryOf,
 } from "./extreme-rr";
 
+export type {
+  NativeIntegrityClass,
+  NativePlanDirection,
+  NativePlanIntegrityFilter,
+  NativePlanIntegrityScan,
+  NativePlanPageDto,
+  NativePlanPageQuery,
+  NativePlanPageQueryKey,
+  NativePlanPageSize,
+  NativePlanPageSummary,
+  NativePlanPagination,
+  NativePlanStatusCounts,
+} from "./native-plan-page";
+export {
+  NATIVE_INTEGRITY_FAIL_CLOSED,
+  NATIVE_PLAN_DIRECTIONS,
+  NATIVE_PLAN_INTEGRITY_FILTERS,
+  NATIVE_PLAN_INTEGRITY_SCAN_LIMIT,
+  NATIVE_PLAN_PAGE_DEFAULT_SIZE,
+  NATIVE_PLAN_PAGE_MAX_SIZE,
+  NATIVE_PLAN_PAGE_QUERY_KEYS,
+  NATIVE_PLAN_PAGE_SIZES,
+  NATIVE_PLAN_SEARCH_MAX_LENGTH,
+  NATIVE_PLAN_SEARCH_PATTERN,
+  nativeIntegrityClassOf,
+  nativeIntegrityMatches,
+} from "./native-plan-page";
+
 export { subtractDecimalStrings, isNegativeDecimalString } from "./decimal-compare";
 
 export type {

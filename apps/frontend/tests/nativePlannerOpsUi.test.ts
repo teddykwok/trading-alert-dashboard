@@ -50,10 +50,12 @@ describe("B1. compact, exact decimals", () => {
     expect(view).toContain("DECIMAL_ROW_LABELS.includes(row.label) ? <DecimalText value={row.value} />");
     expect(view).toContain('<dd className="min-w-0 text-right text-slate-200">');
     expect([...DECIMAL_ROW_LABELS]).toEqual(["Entry", "SL", "TP"]);
-    const card = src("components/operator/NativePlansCard.tsx");
-    expect(card).toContain("Entry <DecimalText value={item.plan.entryPrice} />");
-    expect(card).toContain("min-w-0 space-y-2 overflow-hidden rounded-lg");
-    expect(card).toContain("title={row.detailExact ?? undefined}");
+    // UI Scalability V1: the per-plan view is the expandable row (NativePlanDetail); the table cell uses DecimalText too.
+    const detail = src("components/operator/NativePlanDetail.tsx");
+    expect(detail).toContain("Entry <DecimalText value={item.plan.entryPrice} />");
+    expect(detail).toContain("min-w-0 space-y-2 overflow-hidden rounded-lg");
+    expect(detail).toContain("title={row.detailExact ?? undefined}");
+    expect(src("components/operator/NativePlanTable.tsx")).toContain("<DecimalText value={row.entry} />");
   });
 
   it("the presented rows still carry the EXACT strings (display-only formatting; stored numbers untouched)", () => {
@@ -187,8 +189,10 @@ describe("B4-B6. Trading Control says exactly what is true", () => {
     expect(PLAN_SELECTION_LABEL).toBe("Plan selection (global)");
     expect(PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT).toMatch(/not an account execution preference/);
     expect(PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT).toMatch(/Account A \/ B Native defaults/);
-    expect(card).toContain("{PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT}");
-    expect(card).toContain("item.accountDefaults.map");
+    // UI Scalability V1: shown in each plan's expandable row, beside that plan's account defaults.
+    const detail = src("components/operator/NativePlanDetail.tsx");
+    expect(detail).toContain("{PLAN_SELECTION_IS_NOT_ACCOUNT_DEFAULT}");
+    expect(detail).toContain("item.accountDefaults.map");
     expect(presentNativeAccountPolicy({ account: "A", state: "RESOLVED", lookback: 100, source: "BUILTIN_DEFAULT", reason: null }).label).toBe("Account A Native default");
     expect(presentNativeAccountPolicy({ account: "B", state: "RESOLVED", lookback: 300, source: "BUILTIN_DEFAULT", reason: null }).label).toBe("Account B Native default");
     expect(PLAN_SELECTION_LABEL).not.toMatch(/Account/);
@@ -202,7 +206,7 @@ describe("B4-B6. Trading Control says exactly what is true", () => {
   it("25/26. no Execute, Start Account, adopt or selection control; only read-only API calls", () => {
     expect(card).not.toMatch(/<Button|<button|onClick|onSubmit|<form|<select|<input/);
     expect(card).not.toMatch(/execute|adopt|LIVE_READY|startAccount|accountControl|operatorApi/i);
-    expect([...card.matchAll(/extremeRRApi\s*\.\s*(\w+)/g)].map((m) => m[1])).toEqual(["listNativePlans"]);
+    expect([...card.matchAll(/extremeRRApi\s*\.\s*(\w+)/g)].map((m) => m[1])).toEqual(["listNativePlanPage"]);
     expect([...card.matchAll(/nativePlannerApi\s*\.\s*(\w+)/g)].map((m) => m[1])).toEqual(["status"]);
   });
 

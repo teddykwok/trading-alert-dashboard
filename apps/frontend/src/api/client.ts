@@ -122,6 +122,12 @@ export const operatorApiClient = {
 
 export const apiClient = {
   get: <T>(path: string) => dedupedGet<T>(path),
+  /**
+   * A read the caller can abort — a table page superseded by a newer search or
+   * filter. Deliberately NOT deduped: aborting one caller's request must never
+   * cancel the same request another caller is still waiting for.
+   */
+  getCancellable: <T>(path: string, signal?: AbortSignal) => request<T>(path, { method: "GET", signal }),
   post: <T>(path: string, data?: unknown) =>
     request<T>(path, { method: "POST", body: data ? JSON.stringify(data) : undefined }),
   put: <T>(path: string, data?: unknown) =>

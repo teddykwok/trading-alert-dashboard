@@ -4,6 +4,7 @@ import type {
   ExtremeRRLookback,
   ExtremeRRPlanDto,
   NativePlanListDto,
+  NativePlanPageDto,
 } from "@trading-alert-dashboard/shared";
 
 /**
@@ -30,4 +31,13 @@ export const extremeRRApi = {
 
   /** READ ONLY: recent Native plans as their selected, frozen summaries. Generates nothing. */
   listNativePlans: () => apiClient.get<NativePlanListDto>("/api/extreme-rr/native-plans"),
+
+  /**
+   * READ ONLY: one page of Native plans (search, filters, newest trigger first),
+   * with server-side counts. `query` is a page query string built by
+   * nativePlanQueryString. Generates, selects and writes nothing; abortable so a
+   * superseded page is cancelled.
+   */
+  listNativePlanPage: (query: string, signal?: AbortSignal) =>
+    apiClient.getCancellable<NativePlanPageDto>(`/api/extreme-rr/native-plans${query}`, signal),
 };

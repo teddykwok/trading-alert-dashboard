@@ -307,12 +307,19 @@ describe("14-15. deterministic, Native-only", () => {
       const file = path.join(BACKEND, rel);
       expect(`${rel}:${readFileSync(file, "utf8").includes("native-execution-integrity")}`).toBe(`${rel}:false`);
     }
-    // In the plan read model it is reached only for the Native list, never for a single (TradingView or Native) plan read.
+    // In the plan read model it is reached only for the Native LIST reads (the original list and, since UI
+    // Scalability V1, its paged form), never for a single (TradingView or Native) plan read: exactly two call
+    // sites, one in each list, and both lists read Native alerts only.
     const service = codeOf("src/modules/extreme-rr/extreme-rr.service.ts");
-    expect(service.match(/nativeExecutionIntegrityOf\(/g)?.length).toBe(1);
-    const list = service.slice(service.indexOf("async listNativePlans("), service.indexOf("async updateSelection("));
+    expect(service.match(/nativeExecutionIntegrityOf\(/g)?.length).toBe(2);
+    const list = service.slice(service.indexOf("async listNativePlans("), service.indexOf("async listNativePlanPage("));
     expect(list).toContain("where: { alert: { source: NATIVE_ALERT_SOURCE } }");
-    expect(list).toContain("executionIntegrity: nativeExecutionIntegrityOf(plan.alert, integrityEvidence)");
+    expect(list).toContain("nativeExecutionIntegrityOf(plan.alert, integrityEvidence)");
+    const page = service.slice(service.indexOf("async listNativePlanPage("), service.indexOf("private async nativePlanStatusCounts("));
+    expect(page).toContain("nativeExecutionIntegrityOf(plan.alert, reader)");
+    expect(page).toContain("const filtered = nativePlanFilterWhere(query);");
+    expect(service).toContain("const NATIVE_PLANS_ONLY: Prisma.ExtremeRRPlanWhereInput = { alert: { source: NATIVE_ALERT_SOURCE } };");
+    expect(service).toContain("const and: Prisma.ExtremeRRPlanWhereInput[] = [NATIVE_PLANS_ONLY];");
   });
 
   it("every status the shared contract names is one the evaluator can return, and nothing else", () => {
