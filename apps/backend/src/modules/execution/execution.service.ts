@@ -17,6 +17,8 @@ import {
 } from "@trading-alert-dashboard/shared";
 import { NotFoundError, ValidationError } from "../../utils/errors";
 import { assertExecutableAlertSource } from "../alerts/alert-source";
+import { assertNativeAccountAHandoff, type NativeAccountAHandoff } from "../native-canary/native-account-a-canary";
+import { NATIVE_EXECUTION_MARKER } from "../native-canary/native-execution-fence";
 import {
   assertDecimalString,
   buildClientOrderId,
@@ -78,6 +80,12 @@ export interface CreateExecutionInput {
    * must enable the profile deliberately.
    */
   allowDisabledProfile?: boolean;
+  /**
+   * NATIVE ACCOUNT A CANARY ONLY. The capability issued by the Native Account
+   * A decision, which only exists when Native execution is enabled in code.
+   * Absent for every TradingView caller, whose path is unchanged.
+   */
+  nativeAccountA?: NativeAccountAHandoff;
 }
 
 export interface TransitionInput {
@@ -348,9 +356,25 @@ export class ExecutionService {
       select: { triggeredAt: true, sourceTimeframe: true, source: true },
     });
     if (!alert) throw new NotFoundError(`Alert ${input.alertId} not found.`);
-    // Native execution fence, defense in depth: only a TRADINGVIEW alert can
-    // ever own a TradeExecution, whoever the caller is.
-    assertExecutableAlertSource({ id: input.alertId, source: alert.source }, "execution");
+    const native = input.nativeAccountA !== undefined;
+    if (native) {
+      // Native Account A canary: only an issued hand-off for exactly this
+      // profile, alert, plan, symbol, direction and window, while Native
+      // execution is enabled in code. Today this always throws.
+      assertNativeAccountAHandoff(input.nativeAccountA, {
+        executionProfileId: profile.id,
+        alertId: input.alertId,
+        extremeRRPlanId: input.extremeRRPlanId ?? null,
+        source: alert.source,
+        symbol: plan.symbol,
+        direction: plan.direction,
+        selectedLookback,
+      });
+    } else {
+      // Native execution fence, defense in depth: only a TRADINGVIEW alert can
+      // ever own a TradeExecution, whoever the caller is.
+      assertExecutableAlertSource({ id: input.alertId, source: alert.source }, "execution");
+    }
     if (!(alert.triggeredAt instanceof Date) || Number.isNaN(alert.triggeredAt.getTime())) {
       throw new ValidationError(
         `Alert ${input.alertId} has no usable triggeredAt; refusing to create an execution with unknown signal time.`
@@ -423,6 +447,9 @@ export class ExecutionService {
             symbol: plan.symbol,
             direction: plan.direction,
             selectedLeverage: plan.selectedLeverage,
+            // Written in THIS transaction so the row stays recognisably Native
+            // to the entry lifecycle's fence even after retention nulls alertId.
+            ...(native ? { [NATIVE_EXECUTION_MARKER.key]: NATIVE_EXECUTION_MARKER.value } : {}),
           }),
         },
       });

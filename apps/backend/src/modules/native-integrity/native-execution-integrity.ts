@@ -263,7 +263,7 @@ export function nativeExecutionIntegrityOf(alert: NativeIntegrityAlert, reader: 
 }
 
 // ---------------------------------------------------------------------------
-// FUTURE admission guard (pure; wired into nothing)
+// Admission guard (pure; called only by the Native Account A canary fences)
 // ---------------------------------------------------------------------------
 
 export type NativeExecutionAdmission =
@@ -271,9 +271,11 @@ export type NativeExecutionAdmission =
   | { readonly admitted: false; readonly reason: "NATIVE_EXECUTION_DISABLED" | "NATIVE_INTEGRITY_NOT_ELIGIBLE"; readonly integrity: NativeExecutionIntegrityStatus | null };
 
 /**
- * What a FUTURE Native executor must ask immediately before its FIRST
- * irreversible exchange mutation (canary, signed/private call, margin, order),
- * after every normal admission check. It is not called by anything today.
+ * What a Native executor must ask immediately before its FIRST irreversible
+ * exchange mutation (canary, signed/private call, margin, order), after every
+ * normal admission check. Its only callers are the Native Account A canary
+ * fences (native-canary/), and every one of them passes the hard-coded
+ * NATIVE_EXECUTION_ENABLED, which is false, so nothing is admitted today.
  *
  * Both conditions are required, in this order: the hard execution switch
  * first (false in this code, so nothing is ever admitted), then integrity —

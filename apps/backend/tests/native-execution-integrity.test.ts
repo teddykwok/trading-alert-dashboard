@@ -389,7 +389,7 @@ describe("16-20. the hard Native execution fence stays first; integrity can only
     // the adoption-time decision and the final fence. Neither accepts the
     // switch from a caller, so no call site can pass `true`.
     const callers = productionSources().filter((rel) => rel !== "src/modules/native-integrity/native-execution-integrity.ts" && readFileSync(path.join(BACKEND, rel), "utf8").includes("judgeNativeExecutionAdmission"));
-    expect(callers.sort()).toEqual(["src/modules/native-canary/native-account-a-canary.ts"]);
+    expect(callers.sort()).toEqual(["src/modules/native-canary/native-account-a-canary.ts", "src/modules/native-canary/native-execution-fence.ts"]);
     for (const rel of callers) {
       const calls = [...codeOf(rel).matchAll(/judgeNativeExecutionAdmission\(\{([^}]*)\}\)/g)].map((m) => m[1].trim());
       expect(calls.length, rel).toBeGreaterThan(0);

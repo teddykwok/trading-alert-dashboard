@@ -4,6 +4,12 @@ import type { ExtremeRRPlanDto, ExtremeRRTemplateSnapshot } from "@trading-alert
 import { logger } from "../../config/logger";
 import { EXECUTABLE_ALERT_SOURCE } from "../alerts/alert-source";
 import type { BinanceMarginPlanService } from "../binance/binance-margin-plan.service";
+import {
+  verifyNativeAccountAHandoff,
+  type NativeAccountAHandoff,
+  type NativeAccountAOutcome,
+} from "../native-canary/native-account-a-canary";
+import { nativeAlertFence, nativeFenceRuntimeFromEnv, type NativeFenceRuntime } from "../native-canary/native-execution-fence";
 import { isExactAuthorization } from "./canary-authorization.service";
 import { naturalWindowAdmitsDirection } from "./natural-authorization";
 import type { ExecutionService } from "./execution.service";
@@ -69,6 +75,12 @@ export interface SelectedPlanExecutorDependencies {
    * principle disagree with the account the planner signs as.
    */
   boundProfile: BoundExecutionProfileProjection;
+  /**
+   * Where the Native fence reads a candidate's source-bar evidence. Absent
+   * means this process's own scanner tree. It can only ever add a refusal,
+   * and TradingView plans never consult it.
+   */
+  nativeFence?: NativeFenceRuntime;
 }
 
 /**
@@ -360,6 +372,105 @@ export class SelectedPlanExecutor {
       "Selected Extreme RR plan handled"
     );
 
+    return {
+      handled: true,
+      executionId,
+      created,
+      admitted: admission.admitted,
+      reasonCode: admission.reasonCode ?? null,
+    };
+  }
+
+  /**
+   * NATIVE ACCOUNT A CANARY: the one entry point by which a Native plan could
+   * reach this executor's machinery. Today nothing gets past its fence.
+   *
+   * It accepts only a hand-off issued by the Native Account A decision
+   * (native-canary/native-account-a-canary.ts), which already required Account
+   * A, a NATIVE 1D/1W alert, its READY plan resolved for Account A's planner
+   * window, clean source-bar evidence, a free symbol + side, LIVE_READY, ARMED
+   * and the hard switch. It does not trust that decision: immediately before
+   * the first signed request (the margin planner's account and bracket reads)
+   * it asks the Native fence again.
+   *
+   * Past the fence it adds nothing of its own. It uses the SAME margin planner,
+   * the SAME idempotent creation and the SAME orchestrator admission
+   * `handleSelectedPlan` uses, so Phase 5 still decides authorization, session
+   * budget, capacity and risk under its own lock, and the entry lifecycle asks
+   * the Native fence again immediately before every exposure-increasing call.
+   * There is no authorization pre-check here; SafetyAdmission is authoritative.
+   */
+  async handleNativeAccountACandidate(handoff: NativeAccountAHandoff): Promise<NativeAccountAOutcome> {
+    const executionProfileId = this.deps.boundProfile.executionProfileId;
+
+    const verified = verifyNativeAccountAHandoff(handoff, { executionProfileId });
+    if (!verified.ok) return { handled: false, reasonCode: verified.reasonCode, message: verified.message };
+
+    // --- The Native fence, immediately before the first signed request -----
+    const fence = await nativeAlertFence(this.deps.prisma, handoff.alertId, this.deps.nativeFence ?? nativeFenceRuntimeFromEnv());
+    if (!fence.admitted) return { handled: false, reasonCode: fence.reasonCode, message: fence.message };
+
+    // --- Unreachable while NATIVE_EXECUTION_ENABLED is false ----------------
+    const { stopLoss, takeProfit } = handoff.candidate;
+    if (stopLoss === null || takeProfit === null) {
+      return { handled: false, reasonCode: "PLAN_INCOMPLETE", message: "The hand-off carries no stop loss or take profit." };
+    }
+    const { plan: marginPlan, exchangeFilters } = await this.deps.marginPlanner.planForSymbolWithSnapshot({
+      symbol: handoff.symbol,
+      direction: handoff.direction,
+      entryPrice: handoff.entryPrice,
+      stopLoss,
+      // The plan's own frozen template snapshot is the risk budget, exactly as
+      // for TradingView. The Account A lookback is a planner window, not risk.
+      riskBudgetUsd: handoff.template.riskAmount,
+    });
+    if (marginPlan.status !== "READY" || marginPlan.selectedLeverage === null) {
+      return {
+        handled: false,
+        reasonCode: "MARGIN_PLAN_NOT_READY",
+        message: `The margin plan is ${marginPlan.status}${marginPlan.reason ? `/${marginPlan.reason}` : ""}.`,
+      };
+    }
+
+    let executionId: string;
+    let created = false;
+    try {
+      const execution = await this.deps.executions.createExecutionFromReadyPlan({
+        executionProfileId,
+        alertId: handoff.alertId,
+        extremeRRPlanId: handoff.planId,
+        plan: marginPlan,
+        takeProfit,
+        selectedLookback: handoff.lookback,
+        // Creation re-verifies this capability against the alert, plan,
+        // profile, symbol, direction and window, and marks the row Native.
+        nativeAccountA: handoff,
+        snapshots: {
+          extremeRRCandidate: handoff.candidate,
+          marginPlan,
+          exchangeFilters,
+          riskTemplate: frozenRiskTemplateSnapshot(handoff.template),
+        },
+      });
+      executionId = execution.id;
+      created = true;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        const existing = await this.deps.prisma.tradeExecution.findFirst({
+          where: { alertId: handoff.alertId, executionProfileId: executionProfileId },
+        });
+        if (!existing) throw error;
+        executionId = existing.id;
+      } else {
+        throw error;
+      }
+    }
+
+    const admission = await this.deps.orchestrator.admitAndSubmit({ executionId });
+    logger.info(
+      { executionId, created, admitted: admission.admitted, reasonCode: admission.reasonCode },
+      "Native Account A candidate handled"
+    );
     return {
       handled: true,
       executionId,
