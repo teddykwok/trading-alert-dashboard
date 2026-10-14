@@ -36,6 +36,7 @@ import {
   SelectedPlanAdoptionService,
   startSelectedPlanAdoptionScheduler,
 } from "./selected-plan-adoption.service";
+import { startNativeAccountAAdoptionScheduler } from "../native-canary/native-account-a-adoption";
 
 /**
  * Phase 11E — THE account execution runtime. One process, one account.
@@ -132,6 +133,20 @@ async function startExecutionRuntime(): Promise<void> {
     })
   );
 
+  // NATIVE ACCOUNT A CANARY: DORMANT. Returns null and builds nothing unless
+  // Native execution is enabled in code (NATIVE_EXECUTION_ENABLED, false) AND
+  // this process was launched as exactly Account A. The switch is not
+  // configuration, so today no Native plan is ever discovered or claimed here,
+  // on any account.
+  const nativeAdoptionTimer = await startNativeAccountAAdoptionScheduler({
+    prisma,
+    boundProfile,
+    executor,
+    plans: new ExtremeRRService(prisma),
+    workerId,
+    processEnv: process.env,
+  });
+
   // Phase 9: historical fill ingestion, which is account-specific and
   // therefore belongs to this process. Dormant unless
   // EXECUTION_FILL_RUNTIME_ENABLED=true, and dormant means it builds nothing
@@ -195,6 +210,7 @@ async function startExecutionRuntime(): Promise<void> {
     await attestationRedis.close();
     clearInterval(orchestrationTimer);
     clearInterval(adoptionTimer);
+    if (nativeAdoptionTimer !== null) clearInterval(nativeAdoptionTimer);
     // Before the shared Prisma client goes away: this stops future historical
     // ticks and then waits for one already running, so a claim and its
     // transaction are never torn out mid-flight.

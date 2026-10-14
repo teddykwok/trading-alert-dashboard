@@ -69,6 +69,12 @@ export const ENTRY_REASON_CODES = [
   // has passed. The gates may be wide open: this execution is simply too old to
   // trade, which is a SKIP (deliberately not traded) rather than a cancellation.
   "PREFLIGHT_SKIPPED_SIGNAL_EXPIRED",
+  // The Native final fence refused an execution created from a NATIVE alert,
+  // before any exposure-increasing call (native-canary/native-execution-fence.ts).
+  // Never produced for a TradingView execution.
+  "NATIVE_EXECUTION_DISABLED",
+  "NATIVE_INTEGRITY_NOT_ELIGIBLE",
+  "NATIVE_SOURCE_AMBIGUOUS",
   "ENTRY_SUBMITTED",
   "ENTRY_RECONCILED",
 ] as const;

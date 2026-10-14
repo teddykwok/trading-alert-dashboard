@@ -114,9 +114,12 @@ It requires two things:
 - the execution switch is on;
 - integrity is `ELIGIBLE`.
 
-The switch is checked first, so integrity can only add a refusal. **Nothing
-calls this check today.** The current executor still refuses Native at its
-first line, before canary, signed, margin or order code.
+The switch is checked first, so integrity can only add a refusal. Since
+Milestone 4 its only callers are the Native Account A canary fences
+(`docs/native-account-a-canary.md`), and every call passes the hard-coded
+`NATIVE_EXECUTION_ENABLED`, which is `false`, so nothing is admitted. The
+TradingView executor path still refuses Native at its first line, before canary,
+signed, margin or order code.
 
 ---
 

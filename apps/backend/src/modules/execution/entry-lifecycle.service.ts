@@ -33,6 +33,7 @@ import { resolveTakeProfitModality, takeProfitLineage } from "./protection-lifec
 import { standardTakeProfitMeetsMinNotional } from "./take-profit-notional";
 import type { TerminalTakeProfitFeasibility } from "./entry-lifecycle";
 import { applySessionAccountingForStatus } from "./trading-session.service";
+import { nativeExecutionFence, nativeFenceRuntimeFromEnv, type NativeFenceRuntime } from "../native-canary/native-execution-fence";
 
 /**
  * Phase 6 — LIMIT entry lifecycle orchestration.
@@ -155,6 +156,12 @@ export interface EntryLifecycleOptions {
   ttlSeconds?: number;
   reconcileMaxAttempts?: number;
   reconcileDelayMs?: number;
+  /**
+   * Where the Native final fence reads source-bar evidence. Absent means this
+   * process's own scanner tree. Consulted only for an execution created from
+   * a NATIVE alert; it can only ever add a refusal.
+   */
+  nativeFence?: NativeFenceRuntime;
 }
 
 export interface EntryLifecycleInput {
@@ -186,6 +193,7 @@ export class EntryLifecycleService {
   private readonly ttlSeconds: number;
   private readonly reconcileMaxAttempts: number;
   private readonly reconcileDelayMs: number;
+  private readonly nativeFence: NativeFenceRuntime;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -196,6 +204,7 @@ export class EntryLifecycleService {
     this.ttlSeconds = options.ttlSeconds ?? env.EXECUTION_ENTRY_TTL_SECONDS;
     this.reconcileMaxAttempts = options.reconcileMaxAttempts ?? env.EXECUTION_ENTRY_RECONCILE_MAX_ATTEMPTS;
     this.reconcileDelayMs = options.reconcileDelayMs ?? env.EXECUTION_ENTRY_RECONCILE_DELAY_MS;
+    this.nativeFence = options.nativeFence ?? nativeFenceRuntimeFromEnv();
   }
 
   // ==========================================================================
@@ -213,6 +222,21 @@ export class EntryLifecycleService {
       // Zero mutation calls, no reservation, no status change.
       const execution = await this.loadExecution(input.executionId);
       return this.result(false, gate, "Live entry is disabled; nothing was reserved or submitted.", execution, null);
+    }
+
+    // NATIVE FINAL FENCE (F0): before revalidation's signed reads and before
+    // any reservation. A TradingView execution passes straight through; a
+    // missing execution is left to revalidation to report, exactly as before.
+    const target = await this.prisma.tradeExecution.findUnique({
+      where: { id: input.executionId },
+      select: { id: true, alertId: true },
+    });
+    if (target) {
+      const native = await this.nativeFenceRefusal(target);
+      if (native) {
+        // Zero exchange requests of any kind, no reservation, no status change.
+        return this.result(false, native.reasonCode, native.message, await this.loadExecution(input.executionId), null);
+      }
     }
 
     const revalidated = await this.revalidate(input);
@@ -753,6 +777,28 @@ export class EntryLifecycleService {
   }
 
   /**
+   * THE NATIVE FINAL FENCE, as this service applies it (F0 before
+   * revalidation, F2 before configuration, F3 immediately before each
+   * exposure-increasing call).
+   *
+   * Null for every TradingView execution: the fence does not apply and the
+   * TradingView path is unchanged. For an execution created from a NATIVE
+   * alert it is a FRESH judgment every time (the hard-coded switch, then the
+   * source bar's evidence re-read), never a verdict carried from upstream, and
+   * it refuses unless that judgment admits. Today it never admits.
+   *
+   * Like the live gates, it does not stand in front of risk-REDUCING work:
+   * reconciling or cancelling an order that may exist stays available.
+   */
+  private async nativeFenceRefusal(
+    execution: Pick<TradeExecution, "id" | "alertId">
+  ): Promise<{ reasonCode: EntryReasonCode; message: string } | null> {
+    const verdict = await nativeExecutionFence(this.prisma, execution, this.nativeFence);
+    if (!verdict.applies || verdict.admitted) return null;
+    return { reasonCode: verdict.reasonCode, message: verdict.message };
+  }
+
+  /**
    * Every condition that blocks a NEW entry submission, in ONE place: the two
    * live gates, the mutation client's own block, the profile being disabled,
    * the global kill switch and the profile kill switch.
@@ -1131,6 +1177,19 @@ export class EntryLifecycleService {
       );
     }
 
+    // NATIVE FINAL FENCE (F2): before configuration's reads and writes start.
+    // The reconcile above stays available, exactly as the live gates leave it.
+    const native = await this.nativeFenceRefusal(execution);
+    if (native) {
+      return this.result(
+        false,
+        native.reasonCode,
+        `${native.message} No configuration or submission was attempted; the reserved order can still be reconciled and cancelled.`,
+        execution,
+        order
+      );
+    }
+
     const margin = await this.ensureIsolatedMargin(execution);
     if (margin) return this.result(false, margin.reasonCode, margin.message, execution, order);
 
@@ -1172,6 +1231,10 @@ export class EntryLifecycleService {
     if (exposure) {
       return { reasonCode: "SYMBOL_EXPOSURE_CHANGED", message: "Symbol carries exposure; margin type is not changed." };
     }
+
+    // NATIVE FINAL FENCE (F3): immediately before the exchange call.
+    const native = await this.nativeFenceRefusal(execution);
+    if (native) return native;
 
     let mutationOutcome: MutationOutcome = "CONFIRMED_ACCEPTED";
     try {
@@ -1226,6 +1289,10 @@ export class EntryLifecycleService {
     if (exposure) {
       return { reasonCode: "SYMBOL_EXPOSURE_CHANGED", message: "Symbol carries exposure; leverage is not changed." };
     }
+
+    // NATIVE FINAL FENCE (F3): immediately before the exchange call.
+    const native = await this.nativeFenceRefusal(execution);
+    if (native) return native;
 
     let mutationOutcome: MutationOutcome = "CONFIRMED_ACCEPTED";
     let responseLeverage: number | null = null;
@@ -1282,6 +1349,11 @@ export class EntryLifecycleService {
     order: BinanceOrder,
     evaluatedAt: Date
   ): Promise<EntryLifecycleOutcome> {
+    // NATIVE FINAL FENCE (F3): immediately before the exchange call. Nothing
+    // was sent, so nothing is written: the reservation stays as it was.
+    const native = await this.nativeFenceRefusal(execution);
+    if (native) return this.result(false, native.reasonCode, native.message, execution, order);
+
     let outcome: MutationOutcome = "CONFIRMED_ACCEPTED";
     try {
       await this.mutations.submitLimitEntry(this.mutations.authorizeLiveEntry(), {

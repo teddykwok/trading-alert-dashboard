@@ -384,9 +384,18 @@ describe("16-20. the hard Native execution fence stays first; integrity can only
     expect(judgeNativeExecutionAdmission({ nativeExecutionEnabled: true, integrity: eligible })).toEqual({ admitted: true });
   });
 
-  it("18b. the admission guard is wired into nothing: no production module calls it", () => {
+  it("18b. the admission guard is called ONLY by the Native canary fences, and only ever with the hard-coded switch", () => {
+    // Milestone 4 (Native Account A canary) wired it, deliberately and narrowly:
+    // the adoption-time decision and the final fence. Neither accepts the
+    // switch from a caller, so no call site can pass `true`.
     const callers = productionSources().filter((rel) => rel !== "src/modules/native-integrity/native-execution-integrity.ts" && readFileSync(path.join(BACKEND, rel), "utf8").includes("judgeNativeExecutionAdmission"));
-    expect(callers).toEqual([]);
+    expect(callers.sort()).toEqual(["src/modules/native-canary/native-account-a-canary.ts", "src/modules/native-canary/native-execution-fence.ts"]);
+    for (const rel of callers) {
+      const calls = [...codeOf(rel).matchAll(/judgeNativeExecutionAdmission\(\{([^}]*)\}\)/g)].map((m) => m[1].trim());
+      expect(calls.length, rel).toBeGreaterThan(0);
+      for (const args of calls) expect(args, rel).toMatch(/^nativeExecutionEnabled: NATIVE_EXECUTION_ENABLED, integrity(: |$)/);
+    }
+    expect(codeOf("src/modules/native-canary/native-execution-switch.ts")).toMatch(/export const NATIVE_EXECUTION_ENABLED = false as const;/);
   });
 
   it("19. the evaluator and its loader write nothing: no database, no file write, no lock, no queue", () => {
