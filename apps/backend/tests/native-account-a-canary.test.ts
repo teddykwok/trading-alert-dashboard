@@ -568,17 +568,36 @@ describe("29/30. no Native path reaches a private mutation without the admission
     }
   });
 
-  it("29c. a hand-off is issued in exactly one place, only after the judgment admits", () => {
+  it("29c. a hand-off is issued in exactly one place, only after the full judgment admits", () => {
     const canary = codeOf("src/modules/native-canary/native-account-a-canary.ts");
     expect(canary.match(/issueHandoff\(/g)).toHaveLength(2); // the definition and its one call
-    const decideBody = canary.slice(canary.indexOf("export function decideNativeAccountACandidate("));
-    const judge = decideBody.indexOf("judgeNativeExecutionAdmission({ nativeExecutionEnabled: NATIVE_EXECUTION_ENABLED");
-    const refuse = decideBody.indexOf("if (!admission.admitted) {");
-    const issue = decideBody.indexOf("issueHandoff(evaluated.candidate)");
-    expect(judge).toBeGreaterThan(-1);
-    expect(refuse).toBeGreaterThan(judge);
-    expect(issue).toBeGreaterThan(refuse);
     expect(canary).not.toMatch(/export function issueHandoff/);
+    // The judgment: every stage, then the hard switch, then the Native risk contract. It issues nothing.
+    const judgeBody = canary.slice(canary.indexOf("export function judgeNativeAccountACandidate("), canary.indexOf("export function decideNativeAccountACandidate("));
+    const steps = [
+      "evaluateNativeAccountACandidate(input)",
+      "if (!evaluated.ok) return evaluated.refusal;",
+      "nativeFenceStage(input.integrity)",
+      "if (!fence.ok) {",
+      "nativeRiskStage(input.accountSlot, evaluated.candidate.template.riskAmount)",
+      "if (!risk.ok) return risk.refusal;",
+      "return { admitted: true, candidate: evaluated.candidate };",
+    ].map((needle) => judgeBody.indexOf(needle));
+    expect(steps.every((p) => p > -1)).toBe(true);
+    expect([...steps].sort((a, b) => a - b)).toEqual(steps);
+    expect(judgeBody).not.toContain("issueHandoff(");
+    // The fence stage reads the hard-coded switch itself; no caller supplies it.
+    const fenceStage = canary.slice(canary.indexOf("export function nativeFenceStage("), canary.indexOf("export function nativeRiskStage("));
+    expect(fenceStage).toContain("judgeNativeExecutionAdmission({ nativeExecutionEnabled: NATIVE_EXECUTION_ENABLED, integrity })");
+    expect(fenceStage.indexOf("if (admission.admitted) return PASSED;")).toBeGreaterThan(fenceStage.indexOf("judgeNativeExecutionAdmission("));
+    // The decision issues the one hand-off only after that judgment admits.
+    const decideBody = canary.slice(canary.indexOf("export function decideNativeAccountACandidate("));
+    const judged = decideBody.indexOf("judgeNativeAccountACandidate(input)");
+    const refuse = decideBody.indexOf("if (!judgment.admitted) return judgment;");
+    const issue = decideBody.indexOf("issueHandoff(judgment.candidate)");
+    expect(judged).toBeGreaterThan(-1);
+    expect(refuse).toBeGreaterThan(judged);
+    expect(issue).toBeGreaterThan(refuse);
   });
 
   it("29d. only the entry lifecycle (and the standalone TESTNET verifier, which takes no alert) can reach an exposure-increasing call", () => {
@@ -595,6 +614,8 @@ describe("29/30. no Native path reaches a private mutation without the admission
       "native-account-a-adoption.ts",
       "native-account-a-canary.ts",
       "native-account-slot.ts",
+      // M6: observation only. Its imports and authority are audited in native-m6-dry-admission-structure.test.ts.
+      "native-dry-admission.ts",
       "native-execution-fence.ts",
       "native-execution-switch.ts",
       "native-occupancy.ts",

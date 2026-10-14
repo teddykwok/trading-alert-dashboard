@@ -1075,6 +1075,13 @@ describe("natural authorization: runtime boundary", () => {
     // AVAILABLE. It never claims, prepares, revokes or arms, and the single
     // row it writes is ExecutionSafetyPolicy — asserted immediately below.
     "src/modules/operator/policy-editor.service.ts",
+    // NATIVE DRY ADMISSION (Milestone 6). OBSERVATION ONLY, and the narrowest
+    // entry on this list: it asks the PURE `judgeAdmissionAuthorization` about
+    // a snapshot a caller already read, to report what Phase 5 would say. It
+    // has no Prisma client, so it cannot claim, prepare, revoke or arm, and it
+    // is imported by no production module -- pinned structurally in
+    // native-m6-dry-admission-structure.test.ts.
+    "src/modules/native-canary/native-dry-admission.ts",
   ];
 
   /**

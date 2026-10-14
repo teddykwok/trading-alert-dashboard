@@ -1,9 +1,13 @@
 import { Prisma } from "@prisma/client";
-import type { ExecutionCanaryAuthorization, PrismaClient, SafetyAdmission, TradeExecution } from "@prisma/client";
+import type { PrismaClient, SafetyAdmission, TradeExecution } from "@prisma/client";
 import { claimNaturalWindow, type NaturalClaimFailure } from "./canary-authorization.service";
 import { reserveSessionSlot } from "./trading-session.service";
-import { effectiveNaturalWindowState, isSessionBackedWindow } from "./natural-authorization";
-import { naturalWindowAdmitsDirection, naturalWindowState } from "./natural-authorization";
+import {
+  isSessionBackedWindow,
+  judgeAdmissionAuthorization,
+  type AdmissionAuthorization,
+  type AdmissionAuthorizationFacts,
+} from "./natural-authorization";
 import { connectorEnvironmentMatches } from "../binance/binance-environment";
 import { BinanceError } from "../binance/binance.errors";
 import { profileLockKey } from "./profile-lock";
@@ -92,22 +96,11 @@ export { profileLockKey } from "./profile-lock";
 
 /**
  * Which authorization actually governs THIS execution, decided from persisted
- * state alone.
- *
- * Nothing is carried in from `SelectedPlanExecutor`. The reconciliation tick
- * calls `admitAndSubmit` on recovered PLAN_READY rows with no signal context at
- * all, so anything held in process memory would be absent exactly when a
- * restart made it matter. Every input here is a row: the execution's `alertId`,
- * its profile, and the authorization table.
+ * state alone. The verdict and its precedence live with the natural-window
+ * domain (`judgeAdmissionAuthorization`), where they are pure; this module
+ * loads the rows it judges.
  */
-export type AdmissionAuthorization =
-  /** The profile has no authorization history: pre-existing behaviour, untouched. */
-  | { ok: true; mode: "LEGACY" }
-  /** A durable EXACT_SIGNAL binding already names this alert. */
-  | { ok: true; mode: "EXACT"; authorizationId: string }
-  /** A usable natural window authorizes it; the claim is still to be spent. */
-  | { ok: true; mode: "NATURAL"; window: ExecutionCanaryAuthorization }
-  | { ok: false; reasonCode: SafetyReasonCode; message: string };
+export type { AdmissionAuthorization } from "./natural-authorization";
 
 /**
  * Turns a PASSing decision into a terminal authorization refusal.
@@ -151,31 +144,22 @@ const NATURAL_CLAIM_REASON: Record<NaturalClaimFailure, SafetyReasonCode> = {
  * window that a concurrent admission may be claiming, and the lock is what
  * makes that read stable through to the claim.
  *
- * Precedence, and why:
- *
- *  1. NO authorization rows at all -> LEGACY. A profile that has never been
- *     put under authorization control keeps behaving exactly as it did. This
- *     feature is additive; it does not conscript every profile.
- *
- *  2. A durable EXACT_SIGNAL binding for this alert -> EXACT. The historical
- *     one-shot flow wins outright and spends no natural claim, even when a
- *     natural window happens to be open beside it. The alert was authorized
- *     specifically; that is stronger than being authorized generically.
- *
- *  3. Otherwise the profile IS authorization-controlled and this alert is not
- *     individually authorized, so a natural window must authorize it — or it
- *     is refused. Historical rows still mean "this profile requires
- *     authorization"; they never decay into "anything goes".
+ * It loads exactly the rows the precedence needs, in that precedence (see
+ * `judgeAdmissionAuthorization`), and stops reading as soon as the answer is
+ * known: no rows at all is LEGACY without another query, and an exact binding
+ * wins without reading any window. The verdict itself is the pure judgment.
  */
 export async function resolveAdmissionAuthorization(
   tx: Prisma.TransactionClient,
   execution: Pick<TradeExecution, "alertId" | "executionProfileId" | "positionSide">,
   evaluatedAt: Date
 ): Promise<AdmissionAuthorization> {
+  const judge = (facts: AdmissionAuthorizationFacts) => judgeAdmissionAuthorization(facts, execution.positionSide, evaluatedAt);
+
   const onRecord = await tx.executionCanaryAuthorization.count({
     where: { executionProfileId: execution.executionProfileId },
   });
-  if (onRecord === 0) return { ok: true, mode: "LEGACY" };
+  if (onRecord === 0) return judge({ authorizationCount: 0, exactBindingId: null, newestNaturalWindow: null });
 
   // --- 2. Exact binding wins ------------------------------------------------
   // `alertId` is nullable on TradeExecution (pre-Phase-5 rows). A row without
@@ -191,63 +175,17 @@ export async function resolveAdmissionAuthorization(
       },
       select: { id: true },
     });
-    if (bound) return { ok: true, mode: "EXACT", authorizationId: bound.id };
+    if (bound) return judge({ authorizationCount: onRecord, exactBindingId: bound.id, newestNaturalWindow: null });
   }
 
   // --- 3. A natural window must authorize it --------------------------------
-  // The NEWEST natural row is the only relevant one: preparation exclusivity
-  // means a second window cannot be opened while one is still open, so a newer
-  // row implies every older one was already shut. Reading it regardless of
-  // state (rather than filtering to the usable ones) is what lets the refusal
-  // say REVOKED or EXPIRED instead of a uselessly generic REQUIRED.
+  // The NEWEST natural row, regardless of state, so the refusal can say
+  // REVOKED or EXPIRED rather than a generic REQUIRED.
   const window = await tx.executionCanaryAuthorization.findFirst({
     where: { executionProfileId: execution.executionProfileId, authorizationType: "NATURAL_WINDOW" },
     orderBy: { createdAt: "desc" },
   });
-
-  const refuse = (reasonCode: SafetyReasonCode, message: string): AdmissionAuthorization => ({
-    ok: false,
-    reasonCode,
-    message,
-  });
-
-  if (!window) {
-    return refuse(
-      "NATURAL_AUTHORIZATION_REQUIRED",
-      "This profile requires authorization and no natural window has been prepared."
-    );
-  }
-
-  // `effectiveNaturalWindowState`, not `naturalWindowState`: for a
-  // SESSION-BACKED window the claim counter is not its budget, so EXHAUSTED is
-  // not a state it can be in. The session's trade budget bounds it instead,
-  // and that is checked below where the slot is reserved. For a LEGACY window
-  // the two functions are identical, so nothing about the historical path
-  // changes.
-  switch (effectiveNaturalWindowState(window, evaluatedAt)) {
-    case "INVALID":
-      return refuse("NATURAL_AUTHORIZATION_INVALID", "The natural window contradicts its own declared mode.");
-    case "REVOKED":
-      return refuse("NATURAL_AUTHORIZATION_REVOKED", "The natural window was revoked.");
-    case "EXPIRED":
-      return refuse("NATURAL_AUTHORIZATION_EXPIRED", "The natural window has expired.");
-    case "EXHAUSTED":
-      return refuse(
-        "NATURAL_AUTHORIZATION_EXHAUSTED",
-        `The natural window has spent its whole budget (${window.claimedCount}/${window.maxClaims}).`
-      );
-  }
-
-  // Direction is the only signal property a window judges. It never looks at
-  // the symbol — that is the execution stack's concern, not authorization's.
-  if (!naturalWindowAdmitsDirection(window, execution.positionSide, evaluatedAt)) {
-    return refuse(
-      "NATURAL_AUTHORIZATION_DIRECTION_NOT_ALLOWED",
-      `The window admits ${window.allowedDirections.join("/")}, not ${execution.positionSide}.`
-    );
-  }
-
-  return { ok: true, mode: "NATURAL", window };
+  return judge({ authorizationCount: onRecord, exactBindingId: null, newestNaturalWindow: window });
 }
 
 export class SafetyAdmissionService {

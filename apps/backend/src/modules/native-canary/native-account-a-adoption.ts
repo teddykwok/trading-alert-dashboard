@@ -7,11 +7,12 @@ import { logger } from "../../config/logger";
 import { NATIVE_ALERT_SOURCE } from "../alerts/alert-source";
 import type { BoundExecutionProfileProjection } from "../execution/exchange-runtime-binding";
 import type { SelectedPlanExecutor } from "../execution/selected-plan-executor";
-import { nativeExecutionIntegrityOf } from "../native-integrity/native-execution-integrity";
 import {
   NATIVE_CANARY_SOURCE_TIMEFRAMES,
   decideNativeAccountACandidate,
   nativeAccountAExecutionPolicy,
+  nativeAdoptionDefers,
+  nativeCanaryIntegrityOf,
   type NativeAccountAOutcome,
   type NativeAccountGates,
   type NativeAccountSlot,
@@ -21,7 +22,7 @@ import { nativeAccountSlotOf } from "./native-account-slot";
 import { nativeFenceRuntimeFromEnv, type NativeFenceRuntime } from "./native-execution-fence";
 import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
 import { loadNativeOccupancyRows } from "./native-occupancy";
-import { judgeNativeSignalFreshness, nativeSignalLifetimeSpan, nativeSignalWindowOf } from "./native-signal-freshness";
+import { nativeSignalLifetimeSpan } from "./native-signal-freshness";
 
 /**
  * NATIVE ACCOUNT A ADOPTION: how Account A would decide about a Native plan.
@@ -121,12 +122,7 @@ export class NativeAccountAAdoptionService {
   }
 
   private integrityOf(alert: NativeCanaryAlert): NativeExecutionIntegrityDto | null {
-    if (alert.source !== NATIVE_ALERT_SOURCE) return null;
-    return nativeExecutionIntegrityOf(alert, this.deps.fence.evidence);
-  }
-
-  private isFresh(alert: NativeCanaryAlert, now: Date): boolean {
-    return judgeNativeSignalFreshness(nativeSignalWindowOf(alert), now.getTime()).fresh;
+    return nativeCanaryIntegrityOf(alert, this.deps.fence.evidence);
   }
 
   /** Native plans this profile has not finished evaluating. The profile predicate is in the query. */
@@ -277,7 +273,7 @@ export class NativeAccountAAdoptionService {
       // pass offers it again. Once the signal is no longer fresh it is never
       // deferred: the decision records its terminal FRESHNESS refusal.
       const preview = await this.deps.prisma.alert.findUnique({ where: { id: candidate.alertId }, select: ALERT_SELECT });
-      if (preview !== null && this.integrityOf(preview)?.status === "PENDING_BAR_CLOSE" && this.isFresh(preview, clock())) {
+      if (preview !== null && nativeAdoptionDefers(preview, this.integrityOf(preview), clock().getTime())) {
         summary.deferred += 1;
         continue;
       }

@@ -14,7 +14,12 @@ import {
 import { NATIVE_ALERT_SOURCE, NativeAlertExecutionForbiddenError } from "../alerts/alert-source";
 import { CAPACITY_FREE_STATUSES, TOTAL_ACTIVE_STATUSES } from "../execution/capacity-status";
 import type { TradeExecutionStatusName } from "../execution/execution-status";
-import { judgeNativeExecutionAdmission } from "../native-integrity/native-execution-integrity";
+import {
+  judgeNativeExecutionAdmission,
+  nativeExecutionIntegrityOf,
+  type NativeIntegrityAlert,
+  type NativeScannerEvidenceReader,
+} from "../native-integrity/native-execution-integrity";
 import type { RuntimeMode } from "../operator/account-runtime-transition";
 import type { TradingSystemState } from "../operator/trading-control.service";
 import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
@@ -394,13 +399,30 @@ export function nativeAccountAExecutionPolicy(accountProcessOverride: unknown): 
 
 // ---------------------------------------------------------------------------
 // The stages
+//
+// Each stage is its own pure kernel, so the decision below and the Native dry
+// admission (native-dry-admission.ts) judge a stage with the SAME code. The
+// decision composes them in the documented order; nothing else defines what a
+// stage means.
 // ---------------------------------------------------------------------------
 
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 
-function refusal(stage: NativeCanaryStage, reasonCode: NativeCanaryReasonCode, detail: string, integrity: NativeExecutionIntegrityStatus | null = null): NativeCanaryEvaluation {
+/** One stage's verdict: refused, or passed carrying what later stages need. */
+export type NativeCanaryStageVerdict<T = null> =
+  | { readonly ok: false; readonly refusal: NativeCanaryRefusal }
+  | { readonly ok: true; readonly value: T };
+
+function refusal(
+  stage: NativeCanaryStage,
+  reasonCode: NativeCanaryReasonCode,
+  detail: string,
+  integrity: NativeExecutionIntegrityStatus | null = null
+): { readonly ok: false; readonly refusal: NativeCanaryRefusal } {
   return { ok: false, refusal: { admitted: false, stage, reasonCode, detail, integrity } };
 }
+
+const PASSED: { readonly ok: true; readonly value: null } = Object.freeze({ ok: true, value: null });
 
 const INTEGRITY_REFUSALS: Readonly<Record<string, NativeCanaryReasonCode>> = Object.freeze({
   PENDING_BAR_CLOSE: "INTEGRITY_PENDING_BAR_CLOSE",
@@ -412,30 +434,32 @@ const INTEGRITY_REFUSALS: Readonly<Record<string, NativeCanaryReasonCode>> = Obj
   INELIGIBLE_STALE_GENERATION: "INTEGRITY_INELIGIBLE",
 });
 
-/**
- * Every stage except the final fence, in order. The first refusal wins and
- * names its stage.
- */
-export function evaluateNativeAccountACandidate(input: NativeCanaryInput): NativeCanaryEvaluation {
-  const { alert, plan, accountPlanPolicy: policy } = input;
-
-  // --- ACCOUNT: exactly Account A, from this process's own launch identity --
-  if (input.accountSlot === "UNKNOWN") {
+/** ACCOUNT: exactly Account A, from this process's own launch identity, with Account A's policy. */
+export function nativeAccountStage(accountSlot: NativeAccountSlot, policy: NativeAccountPlanPolicy): NativeCanaryStageVerdict {
+  if (accountSlot === "UNKNOWN") {
     return refusal("ACCOUNT", "AMBIGUOUS_STATE", "This process could not prove which account it is; an unproven account is never Account A.");
   }
-  if (input.accountSlot !== "ACCOUNT_A") {
-    return refusal("ACCOUNT", "ACCOUNT_NOT_A", `This process is ${input.accountSlot}; the Native canary is Account A only.`);
+  if (accountSlot !== "ACCOUNT_A") {
+    return refusal("ACCOUNT", "ACCOUNT_NOT_A", `This process is ${accountSlot}; the Native canary is Account A only.`);
   }
   if (policy.account !== "A") {
     return refusal("ACCOUNT", "AMBIGUOUS_STATE", `The planner-window policy offered belongs to account ${String(policy.account)}, not A.`);
   }
+  return PASSED;
+}
 
-  // --- SOURCE ----------------------------------------------------------------
+/** SOURCE: the alert is exactly NATIVE. */
+export function nativeSourceStage(alert: Pick<NativeCanaryAlert, "source">): NativeCanaryStageVerdict {
   if (alert.source !== NATIVE_ALERT_SOURCE) {
     return refusal("SOURCE", "SOURCE_NOT_NATIVE", `The alert source is ${String(alert.source)}, not NATIVE.`);
   }
+  return PASSED;
+}
 
-  // --- SOURCE_TIMEFRAME: exactly 1D or 1W, and the payload must agree --------
+/** SOURCE_TIMEFRAME: exactly 1D or 1W, and the durable payload must agree. */
+export function nativeSourceTimeframeStage(
+  alert: Pick<NativeCanaryAlert, "sourceTimeframe" | "rawPayload">
+): NativeCanaryStageVerdict<NativeCanarySourceTimeframe> {
   const tf = alert.sourceTimeframe;
   if (typeof tf !== "string" || !(NATIVE_CANARY_SOURCE_TIMEFRAMES as readonly string[]).includes(tf)) {
     return refusal("SOURCE_TIMEFRAME", "SOURCE_TF_NOT_EXECUTABLE", `Source timeframe ${JSON.stringify(tf ?? null)} is not executable; only 1D and 1W are.`);
@@ -444,9 +468,26 @@ export function evaluateNativeAccountACandidate(input: NativeCanaryInput): Nativ
   if (payloadTf !== tf) {
     return refusal("SOURCE_TIMEFRAME", "AMBIGUOUS_STATE", `The alert says ${tf} but its durable payload says ${JSON.stringify(payloadTf ?? null)}.`);
   }
-  const sourceTimeframe = tf as NativeCanarySourceTimeframe;
+  return { ok: true, value: tf as NativeCanarySourceTimeframe };
+}
 
-  // --- PLAN: the alert's own READY plan, resolved for Account A --------------
+/** What the PLAN stage resolves: Account A's candidate, from the plan's own persisted state. */
+export interface NativeCanaryResolvedPlan {
+  readonly planId: string;
+  readonly direction: "LONG" | "SHORT";
+  readonly entryPrice: string;
+  /** Account A's planner LOOKBACK WINDOW in candles. Never a dollar amount. */
+  readonly lookback: ExtremeRRLookback;
+  readonly candidate: ExtremeRRCandidate;
+  readonly template: ExtremeRRTemplateSnapshot;
+}
+
+/** PLAN: the alert's own READY plan, resolved for Account A's code-fixed window. */
+export function nativePlanStage(
+  alert: Pick<NativeCanaryAlert, "id" | "source" | "signal">,
+  plan: NativeCanaryPlan | null,
+  policy: NativeAccountPlanPolicy
+): NativeCanaryStageVerdict<NativeCanaryResolvedPlan> {
   if (plan === null) return refusal("PLAN", "PLAN_NOT_READY", "The alert has no plan.");
   if (plan.alertId !== alert.id) return refusal("PLAN", "PLAN_NOT_FOR_ALERT", `Plan ${plan.id} belongs to alert ${plan.alertId}, not ${alert.id}.`);
   if (plan.alertSource !== alert.source) {
@@ -501,48 +542,144 @@ export function evaluateNativeAccountACandidate(input: NativeCanaryInput): Nativ
   if (typeof plan.entryPrice !== "string" || plan.entryPrice.trim() === "") {
     return refusal("PLAN", "PLAN_INCOMPLETE", "The plan carries no entry price.");
   }
+  return {
+    ok: true,
+    value: { planId: plan.id, direction: plan.direction, entryPrice: plan.entryPrice, lookback, candidate, template: plan.template },
+  };
+}
 
-  // --- FRESHNESS: inside the Native lifetime of its operational 15m bar -------
-  // Judged before integrity, so a bar still forming is never refused merely
-  // because 300 seconds passed, and a signal past its window is refused as
-  // stale, permanently, even if its bar never closed cleanly.
-  const freshness = judgeNativeSignalFreshness(nativeSignalWindowOf(alert), input.nowMs);
+/**
+ * FRESHNESS: inside the Native lifetime of its operational 15m bar, at `nowMs`
+ * (native-signal-freshness.ts). Judged before integrity, so a bar still
+ * forming is never refused merely because 300 seconds passed, and a signal
+ * past its window is refused as stale, permanently, even if its bar never
+ * closed cleanly.
+ */
+export function nativeFreshnessStage(alert: NativeCanaryAlert, nowMs: number): NativeCanaryStageVerdict {
+  const freshness = judgeNativeSignalFreshness(nativeSignalWindowOf(alert), nowMs);
   if (!freshness.fresh) return refusal("FRESHNESS", nativeSignalRefusalCodeOf(freshness), `${freshness.message}.`);
+  return PASSED;
+}
 
-  // --- INTEGRITY: only ELIGIBLE passes --------------------------------------
-  const integrity = input.integrity;
+/** INTEGRITY: only ELIGIBLE passes; the canonical integrity status travels with the refusal. */
+export function nativeIntegrityStage(integrity: NativeExecutionIntegrityDto | null): NativeCanaryStageVerdict {
   if (integrity === null) return refusal("INTEGRITY", "INTEGRITY_UNREADABLE", "No integrity verdict could be produced for the source bar.");
   if (integrity.status !== "ELIGIBLE") {
     const code = INTEGRITY_REFUSALS[integrity.status];
     if (code === undefined) return refusal("INTEGRITY", "INTEGRITY_UNREADABLE", `Unknown integrity status ${JSON.stringify(integrity.status)}.`);
     return refusal("INTEGRITY", code, integrity.reason, integrity.status);
   }
+  return PASSED;
+}
 
-  // --- OCCUPANCY: max one active/pending per symbol + side --------------------
-  const occupancy = judgeSameSymbolSideOccupancy(input.occupancy, { symbol: alert.symbol, positionSide: plan.direction, alertId: alert.id });
+/** OCCUPANCY: max one active/pending execution per symbol + side, from durable local state. */
+export function nativeOccupancyStage(
+  rows: readonly NativeOccupancyRow[] | null,
+  target: { readonly symbol: string; readonly positionSide: "LONG" | "SHORT"; readonly alertId: string }
+): NativeCanaryStageVerdict {
+  const occupancy = judgeSameSymbolSideOccupancy(rows, target);
   if (occupancy.occupied) return refusal("OCCUPANCY", occupancy.reasonCode, occupancy.detail, "ELIGIBLE");
+  return PASSED;
+}
 
-  // --- ACCOUNT_GATES: the existing deterministic Account A gates ---------------
-  const mode = nativeRuntimeModeOf(input.accountGates.environment);
+/** ACCOUNT_GATES: the existing deterministic Account A gates, runtime LIVE_READY and profile ARMED. */
+export function nativeAccountGatesStage(gates: NativeAccountGates): NativeCanaryStageVerdict {
+  const mode = nativeRuntimeModeOf(gates.environment);
   if (mode !== "LIVE_READY") {
     return refusal("ACCOUNT_GATES", "ACCOUNT_NOT_LIVE_READY", `Account A's runtime is ${mode}, not LIVE_READY.`, "ELIGIBLE");
   }
-  const state = nativeTradingStateOf(input.accountGates.profile);
+  const state = nativeTradingStateOf(gates.profile);
   if (state !== "ARMED") return refusal("ACCOUNT_GATES", "ACCOUNT_NOT_ARMED", `Account A's profile is ${state}, not ARMED.`, "ELIGIBLE");
+  return PASSED;
+}
 
+/**
+ * NATIVE_FENCE: judgeNativeExecutionAdmission with the hard-coded switch, read
+ * HERE. Today it refuses every candidate NATIVE_EXECUTION_DISABLED.
+ */
+export function nativeFenceStage(integrity: NativeExecutionIntegrityDto | null): NativeCanaryStageVerdict {
+  const admission = judgeNativeExecutionAdmission({ nativeExecutionEnabled: NATIVE_EXECUTION_ENABLED, integrity });
+  if (admission.admitted) return PASSED;
+  return refusal(
+    "NATIVE_FENCE",
+    admission.reason,
+    admission.reason === "NATIVE_EXECUTION_DISABLED"
+      ? "Native execution is hard-disabled in code (NATIVE_EXECUTION_ENABLED = false)."
+      : `The source bar's integrity is ${String(admission.integrity)}, not ELIGIBLE.`,
+    admission.integrity
+  );
+}
+
+/** RISK: the code-fixed Native risk contract for this process's account admits the budget (native-risk-gate.ts). */
+export function nativeRiskStage(accountSlot: NativeAccountSlot, riskBudgetUsd: unknown): NativeCanaryStageVerdict {
+  const risk = judgeNativeRiskReadiness(accountSlot, riskBudgetUsd);
+  if (!risk.ready) return refusal("RISK", risk.reasonCode, risk.message, "ELIGIBLE");
+  return PASSED;
+}
+
+// ---------------------------------------------------------------------------
+// What the adoption pass asks before (and instead of) deciding
+// ---------------------------------------------------------------------------
+
+/**
+ * The integrity verdict the adoption feeds the decision: the source bar's
+ * scanner evidence judged by the canonical evaluator, for a NATIVE alert only.
+ * Anything else has no Native integrity (null), and its SOURCE stage refuses it.
+ */
+export function nativeCanaryIntegrityOf(alert: NativeIntegrityAlert, evidence: NativeScannerEvidenceReader | null): NativeExecutionIntegrityDto | null {
+  if (alert.source !== NATIVE_ALERT_SOURCE) return null;
+  return nativeExecutionIntegrityOf(alert, evidence);
+}
+
+/**
+ * Whether the adoption pass DEFERS a candidate instead of deciding it: its
+ * source bar is still forming (PENDING_BAR_CLOSE) and its signal is still
+ * fresh. Nothing is written for a deferred candidate, and a later pass offers
+ * it again. A forming bar whose signal is no longer fresh is never deferred:
+ * the decision records its terminal FRESHNESS refusal.
+ */
+export function nativeAdoptionDefers(alert: NativeCanaryAlert, integrity: NativeExecutionIntegrityDto | null, nowMs: number): boolean {
+  return integrity?.status === "PENDING_BAR_CLOSE" && judgeNativeSignalFreshness(nativeSignalWindowOf(alert), nowMs).fresh;
+}
+
+/**
+ * Every stage except the hard fence and the risk contract, in order. The
+ * first refusal wins and names its stage.
+ */
+export function evaluateNativeAccountACandidate(input: NativeCanaryInput): NativeCanaryEvaluation {
+  const { alert, plan, accountPlanPolicy: policy } = input;
+
+  const account = nativeAccountStage(input.accountSlot, policy);
+  if (!account.ok) return account;
+  const source = nativeSourceStage(alert);
+  if (!source.ok) return source;
+  const timeframe = nativeSourceTimeframeStage(alert);
+  if (!timeframe.ok) return timeframe;
+  const resolved = nativePlanStage(alert, plan, policy);
+  if (!resolved.ok) return resolved;
+  const freshness = nativeFreshnessStage(alert, input.nowMs);
+  if (!freshness.ok) return freshness;
+  const integrity = nativeIntegrityStage(input.integrity);
+  if (!integrity.ok) return integrity;
+  const occupancy = nativeOccupancyStage(input.occupancy, { symbol: alert.symbol, positionSide: resolved.value.direction, alertId: alert.id });
+  if (!occupancy.ok) return occupancy;
+  const gates = nativeAccountGatesStage(input.accountGates);
+  if (!gates.ok) return gates;
+
+  const value = resolved.value;
   return {
     ok: true,
     candidate: {
       executionProfileId: input.executionProfileId,
       alertId: alert.id,
-      planId: plan.id,
+      planId: value.planId,
       symbol: alert.symbol,
-      direction: plan.direction,
-      sourceTimeframe,
-      entryPrice: plan.entryPrice,
-      lookback,
-      candidate,
-      template: plan.template,
+      direction: value.direction,
+      sourceTimeframe: timeframe.value,
+      entryPrice: value.entryPrice,
+      lookback: value.lookback,
+      candidate: value.candidate,
+      template: value.template,
     },
   };
 }
@@ -582,7 +719,7 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-/** Module-private: called only by `decideNativeAccountACandidate`, after the fence admits. */
+/** Module-private: called only by `decideNativeAccountACandidate`, after the full judgment admits. */
 function issueHandoff(candidate: NativeAccountACandidate): NativeAccountAHandoff {
   const handoff: NativeAccountAHandoff = deepFreeze({
     kind: "NATIVE_ACCOUNT_A_HANDOFF",
@@ -607,34 +744,48 @@ export type NativeCanaryDecision =
   | NativeCanaryRefusal
   | { readonly admitted: true; readonly handoff: NativeAccountAHandoff };
 
+/** The full judgment WITHOUT issuing anything: what the decision would do, as data. */
+export type NativeCanaryJudgment =
+  | NativeCanaryRefusal
+  | { readonly admitted: true; readonly candidate: NativeAccountACandidate };
+
 /**
- * Every stage, then the hard fence, then the Native risk contract. The fence
- * reads NATIVE_EXECUTION_ENABLED itself and the risk gate reads the code-fixed
- * contract itself; no caller can supply either. With the switch false, a
- * candidate that passes every earlier stage is still refused
- * NATIVE_EXECUTION_DISABLED and no hand-off is ever issued. With the switch
- * true, an UNRESOLVED contract refuses it NATIVE_RISK_UNRESOLVED instead.
+ * Every stage, then the hard fence, then the Native risk contract: the whole
+ * production judgment, and nothing else. The fence reads NATIVE_EXECUTION_ENABLED
+ * itself and the risk gate reads the code-fixed contract itself; no caller can
+ * supply either. With the switch false, a candidate that passes every earlier
+ * stage is refused NATIVE_EXECUTION_DISABLED. With the switch true, an
+ * UNRESOLVED contract refuses it NATIVE_RISK_UNRESOLVED instead.
+ *
+ * It issues NO hand-off, even when it admits: an admitted judgment is a plain
+ * candidate, which neither the executor nor execution creation accepts. That
+ * is what lets the Native dry admission ask the real judgment without ever
+ * holding execution authority.
  */
-export function decideNativeAccountACandidate(input: NativeCanaryInput): NativeCanaryDecision {
+export function judgeNativeAccountACandidate(input: NativeCanaryInput): NativeCanaryJudgment {
   const evaluated = evaluateNativeAccountACandidate(input);
   if (!evaluated.ok) return evaluated.refusal;
-  const admission = judgeNativeExecutionAdmission({ nativeExecutionEnabled: NATIVE_EXECUTION_ENABLED, integrity: input.integrity });
-  if (!admission.admitted) {
-    return {
-      admitted: false,
-      stage: "NATIVE_FENCE",
-      reasonCode: admission.reason,
-      detail:
-        admission.reason === "NATIVE_EXECUTION_DISABLED"
-          ? "Every stage before the hard fence passed; Native execution is hard-disabled in code (NATIVE_EXECUTION_ENABLED = false)."
-          : `The source bar's integrity is ${String(admission.integrity)}, not ELIGIBLE.`,
-      integrity: admission.integrity,
-    };
+  const fence = nativeFenceStage(input.integrity);
+  if (!fence.ok) {
+    // Here every earlier stage has passed, and the refusal says so.
+    return fence.refusal.reasonCode === "NATIVE_EXECUTION_DISABLED"
+      ? { ...fence.refusal, detail: `Every stage before the hard fence passed; ${fence.refusal.detail}` }
+      : fence.refusal;
   }
   // --- RISK: the plan's own risk budget, against Account A's Native contract --
-  const risk = judgeNativeRiskReadiness(input.accountSlot, evaluated.candidate.template.riskAmount);
-  if (!risk.ready) return { admitted: false, stage: "RISK", reasonCode: risk.reasonCode, detail: risk.message, integrity: "ELIGIBLE" };
-  return { admitted: true, handoff: issueHandoff(evaluated.candidate) };
+  const risk = nativeRiskStage(input.accountSlot, evaluated.candidate.template.riskAmount);
+  if (!risk.ok) return risk.refusal;
+  return { admitted: true, candidate: evaluated.candidate };
+}
+
+/**
+ * The judgment, then, only if it admits, the hand-off: the ONLY way to obtain
+ * one. With the switch false no hand-off is ever issued.
+ */
+export function decideNativeAccountACandidate(input: NativeCanaryInput): NativeCanaryDecision {
+  const judgment = judgeNativeAccountACandidate(input);
+  if (!judgment.admitted) return judgment;
+  return { admitted: true, handoff: issueHandoff(judgment.candidate) };
 }
 
 // ---------------------------------------------------------------------------
