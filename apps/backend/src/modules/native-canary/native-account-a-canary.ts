@@ -1,4 +1,6 @@
 import {
+  NATIVE_PLAN_BUILTIN_DEFAULTS,
+  parseNativeAccountPlanPolicy,
   previewNativeAccountPlan,
   type ExtremeRRCandidate,
   type ExtremeRRLookback,
@@ -24,9 +26,11 @@ import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
  *   ACCOUNT           this process is exactly Account A (never B, never a default);
  *   SOURCE            the alert is exactly NATIVE;
  *   SOURCE_TIMEFRAME  exactly 1D or 1W, and the durable payload agrees;
- *   PLAN              the alert's own READY plan, resolved for Account A's
- *                     planner window (A = 100 candles by default: a LOOKBACK
- *                     WINDOW, never a dollar amount), complete and sized;
+ *   PLAN              the alert's own READY plan. Account A's planner window
+ *                     is fixed in code at 100 candles (a LOOKBACK WINDOW, never
+ *                     a dollar amount), no process environment can steer it,
+ *                     and it must equal the window the plan PERSISTS. The
+ *                     candidate must be complete and sized;
  *   INTEGRITY         the source bar's final scanner evidence is ELIGIBLE;
  *   OCCUPANCY         no other Account A execution holds this symbol + side
  *                     (a pending LIMIT counts) and nothing on the symbol is
@@ -87,6 +91,7 @@ export const NATIVE_CANARY_REASON_CODES = [
   "PLAN_NOT_READY",
   "PLAN_INCOMPLETE",
   "ACCOUNT_PLAN_UNRESOLVED",
+  "PLAN_LOOKBACK_MISMATCH",
   // INTEGRITY (the canonical integrity status travels with the refusal)
   "INTEGRITY_PENDING_BAR_CLOSE",
   "INTEGRITY_INELIGIBLE",
@@ -130,7 +135,7 @@ export interface NativeCanaryAlert {
 /** The persisted plan, exactly as the read-only plan service returns it. */
 export type NativeCanaryPlan = Pick<
   ExtremeRRPlanDto,
-  "id" | "alertId" | "alertSource" | "status" | "direction" | "entryPrice" | "candidates" | "template" | "errorReason"
+  "id" | "alertId" | "alertSource" | "status" | "direction" | "entryPrice" | "candidates" | "template" | "errorReason" | "selectedLookback"
 >;
 
 /** One local execution on the candidate's symbol, as durable state holds it. */
@@ -161,7 +166,11 @@ export interface NativeCanaryInput {
   readonly alert: NativeCanaryAlert;
   /** Null when the alert has no plan. */
   readonly plan: NativeCanaryPlan | null;
-  /** Account A's Native planner-window policy (a lookback in candles, never risk). */
+  /**
+   * Account A's Native planner-window policy (a lookback in candles, never
+   * risk). Production builds it with `nativeAccountAExecutionPolicy`; anything
+   * but the code-fixed built-in window is refused.
+   */
   readonly accountPlanPolicy: NativeAccountPlanPolicy;
   /** The source bar's verdict, evaluated freshly by the caller; null when none could be produced. */
   readonly integrity: NativeExecutionIntegrityDto | null;
@@ -319,6 +328,44 @@ export function nativeTradingStateOf(profile: NativeAccountGates["profile"]): Tr
 }
 
 // ---------------------------------------------------------------------------
+// Account A's execution window: fixed in code, never taken from a process
+// ---------------------------------------------------------------------------
+
+/**
+ * The planner-window policy the Account A canary EXECUTES with.
+ *
+ * A READY plan persists candidates for every window and one selected window;
+ * it persists no per-account window. The per-account defaults (A 100, B 300)
+ * are resolved at read time, and the optional NATIVE_PLAN_DEFAULT_LOOKBACK_A
+ * override is a generic-process preview setting. If the Account A worker
+ * resolved its window from ITS OWN environment, a mismatched account-a.env
+ * could silently execute a different window than the plan and the preview
+ * show.
+ *
+ * So execution never takes its window from any environment: it is the
+ * user-approved built-in default, NATIVE_PLAN_BUILTIN_DEFAULTS.A (100
+ * candles). An explicit override in the account process that agrees with it
+ * changes nothing. Any other value is refused (INVALID), so a misconfigured
+ * account-a.env is visible instead of silently ignored or obeyed. The decision
+ * additionally requires the window to equal the plan's own persisted
+ * selection.
+ */
+export function nativeAccountAExecutionPolicy(accountProcessOverride: unknown): NativeAccountPlanPolicy {
+  const builtIn = parseNativeAccountPlanPolicy("A", undefined);
+  if (accountProcessOverride === undefined || accountProcessOverride === null || accountProcessOverride === "") return builtIn;
+  const parsed = parseNativeAccountPlanPolicy("A", accountProcessOverride);
+  if (parsed.state === "RESOLVED" && parsed.lookback === NATIVE_PLAN_BUILTIN_DEFAULTS.A) return builtIn;
+  const shown = typeof accountProcessOverride === "string" ? JSON.stringify(accountProcessOverride.slice(0, 16)) : typeof accountProcessOverride;
+  return {
+    account: "A",
+    state: "INVALID",
+    lookback: null,
+    source: "ENV_OVERRIDE",
+    reason: `This account process sets NATIVE_PLAN_DEFAULT_LOOKBACK_A=${shown}; Native execution takes no window from a process environment (Account A's is fixed at ${NATIVE_PLAN_BUILTIN_DEFAULTS.A} candles).`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The stages
 // ---------------------------------------------------------------------------
 
@@ -384,6 +431,24 @@ export function evaluateNativeAccountACandidate(input: NativeCanaryInput): Nativ
   }
   if (alert.signal !== plan.direction) {
     return refusal("PLAN", "AMBIGUOUS_STATE", `The alert signal ${String(alert.signal)} disagrees with the plan direction ${plan.direction}.`);
+  }
+  // Account A's window is the code-fixed built-in; nothing else may stand in for it.
+  if (policy.state === "INVALID") return refusal("PLAN", "ACCOUNT_PLAN_UNRESOLVED", policy.reason);
+  if (policy.lookback !== NATIVE_PLAN_BUILTIN_DEFAULTS.A || policy.source !== "BUILTIN_DEFAULT") {
+    return refusal(
+      "PLAN",
+      "ACCOUNT_PLAN_UNRESOLVED",
+      `Account A executes only its built-in ${NATIVE_PLAN_BUILTIN_DEFAULTS.A}-candle window; a ${String(policy.lookback)}-candle ${policy.source} policy cannot steer execution.`
+    );
+  }
+  // The plan's PERSISTED window is authoritative for that plan: Account A never
+  // executes a window the plan does not itself select.
+  if (plan.selectedLookback !== policy.lookback) {
+    return refusal(
+      "PLAN",
+      "PLAN_LOOKBACK_MISMATCH",
+      `The plan persists the ${String(plan.selectedLookback)}-candle window, not Account A's ${policy.lookback}-candle window.`
+    );
   }
   const preview = previewNativeAccountPlan(plan, policy);
   if (preview.state === "INVALID_POLICY") {

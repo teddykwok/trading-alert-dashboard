@@ -114,7 +114,9 @@ interface NativeFixture {
 }
 
 /** A NATIVE alert exactly as the emitter writes it, and its READY plan. */
-async function nativePlan(options: { sourceTf?: "1D" | "1W" | "1M"; signal?: "LONG" | "SHORT"; agoMs?: number; status?: "READY" | "PENDING" } = {}): Promise<NativeFixture> {
+async function nativePlan(
+  options: { sourceTf?: "1D" | "1W" | "1M"; signal?: "LONG" | "SHORT"; agoMs?: number; status?: "READY" | "PENDING"; selectedLookback?: 50 | 100 | 200 | 300 } = {}
+): Promise<NativeFixture> {
   sequence += 1;
   const symbol = `CNRY${sequence}USDT`;
   const records = fixtures.cleanRecords({ sourceTf: options.sourceTf ?? "1D", signal: options.signal ?? "LONG", symbol });
@@ -152,7 +154,8 @@ async function nativePlan(options: { sourceTf?: "1D" | "1W" | "1M"; signal?: "LO
       riskAmount: fixtures.TEMPLATE.riskAmount,
       targetAmount: fixtures.TEMPLATE.targetAmount,
       candidates: fixtures.storedCandidates(direction) as object,
-      selectedLookback: 300,
+      // As production persists it (generic EXTREME_RR_LOOKBACK_CANDLES=100).
+      selectedLookback: options.selectedLookback ?? 100,
       generatedAt: triggeredAt,
       // Native plans never carry the TradingView fan-out marker.
       executionFanoutReadyAt: null,
@@ -385,6 +388,18 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const [row] = await adoptionsOf(plan.planId);
     expect(row).toMatchObject({ reasonCode: "INTEGRITY_INELIGIBLE", handled: false });
     expect(row.message).toMatch(/^INTEGRITY: /);
+  });
+
+  maybe()("Q4. the plan's PERSISTED window is authoritative: a plan that persists 300 is refused PLAN_LOOKBACK_MISMATCH for Account A, never executed on another window", async () => {
+    const profileId = await profile("lookback");
+    const plan = await nativePlan({ selectedLookback: 300 });
+    const evidence = evidenceBySymbol([[plan.symbol, fixtures.eligibleEvidence(plan.records, plan.symbol)]]);
+    const executor = executorTrap();
+    await adoption(profileId, executor, evidence).runOnce();
+    const [row] = await adoptionsOf(plan.planId);
+    expect(row).toMatchObject({ status: "COMPLETED", handled: false, reasonCode: "PLAN_LOOKBACK_MISMATCH" });
+    expect(row.message).toMatch(/^PLAN: The plan persists the 300-candle window, not Account A's 100-candle window\.$/);
+    expect(executor.calls()).toBe(0);
   });
 
   maybe()("2/27. an Account B process records ACCOUNT_NOT_A and never reaches its executor or any adapter", async () => {

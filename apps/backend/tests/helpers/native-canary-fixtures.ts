@@ -207,6 +207,9 @@ export function planFor(alert: NativeCanaryAlert, over: Partial<NativeCanaryPlan
     candidates: ([50, 100, 200, 300] as const).map((lookback) => candidateFor(lookback, direction)),
     template: TEMPLATE,
     errorReason: null,
+    // What a plan persists when the generic process plans with
+    // EXTREME_RR_LOOKBACK_CANDLES=100, as production does.
+    selectedLookback: 100,
     ...over,
   };
 }

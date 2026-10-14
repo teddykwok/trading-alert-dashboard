@@ -10,6 +10,7 @@ import {
   decideNativeAccountACandidate,
   evaluateNativeAccountACandidate,
   judgeSameSymbolSideOccupancy,
+  nativeAccountAExecutionPolicy,
   nativeRuntimeModeOf,
   nativeTradingStateOf,
   verifyNativeAccountAHandoff,
@@ -116,7 +117,7 @@ describe("A. Native source and plan", () => {
     }
   });
 
-  it("A1. Account A's plan is the candidate for ITS planner window (100 candles by default): a lookback, never a dollar amount", () => {
+  it("A1. Account A executes the candidate for its code-fixed 100-candle WINDOW (a lookback, never a dollar amount), and only when the plan persists that same window", () => {
     const input = favourableInput();
     const evaluated = evaluateNativeAccountACandidate(input);
     if (!evaluated.ok) throw new Error(evaluated.refusal.detail);
@@ -126,11 +127,31 @@ describe("A. Native source and plan", () => {
     // The risk budget is the plan's frozen template, untouched by the window.
     expect(evaluated.candidate.template).toEqual(TEMPLATE);
     expect(evaluated.candidate.template.riskAmount).toBe("1.50");
-    // A valid override moves the WINDOW, and nothing else.
-    const overridden = evaluateNativeAccountACandidate({ ...input, accountPlanPolicy: parseNativeAccountPlanPolicy("A", "50") });
-    if (!overridden.ok) throw new Error(overridden.refusal.detail);
-    expect([overridden.candidate.lookback, overridden.candidate.candidate.stopLoss]).toEqual([50, candidateFor(50, "LONG").stopLoss]);
-    expect(overridden.candidate.template).toEqual(TEMPLATE);
+    // The plan's PERSISTED window is authoritative: a plan that selects any
+    // other window is refused, never re-read through Account A's own lens.
+    for (const selectedLookback of [50, 200, 300] as const) {
+      expect(refusalOf({ ...input, plan: planFor(input.alert, { selectedLookback }) }), String(selectedLookback)).toMatchObject({
+        stage: "PLAN",
+        reasonCode: "PLAN_LOOKBACK_MISMATCH",
+      });
+    }
+  });
+
+  it("A1b. no process environment can steer Account A's window: an agreeing override changes nothing, any other value is refused", () => {
+    expect(nativeAccountAExecutionPolicy(undefined)).toEqual(ACCOUNT_A_POLICY);
+    expect(nativeAccountAExecutionPolicy("")).toEqual(ACCOUNT_A_POLICY);
+    expect(nativeAccountAExecutionPolicy("100")).toEqual(ACCOUNT_A_POLICY);
+    const input = favourableInput();
+    for (const override of ["50", "200", "300", "100 ", "abc", 100 as never]) {
+      const policy = nativeAccountAExecutionPolicy(override);
+      expect(policy, String(override)).toMatchObject({ account: "A", state: "INVALID", lookback: null });
+      expect(refusalOf({ ...input, accountPlanPolicy: policy }), String(override)).toMatchObject({ stage: "PLAN", reasonCode: "ACCOUNT_PLAN_UNRESOLVED" });
+    }
+    // Defense in depth: a policy built any other way (here: the preview's
+    // env-override reading) cannot steer execution either, even when valid.
+    for (const raw of ["50", "100", "300"]) {
+      expect(refusalOf({ ...input, accountPlanPolicy: parseNativeAccountPlanPolicy("A", raw) }), raw).toMatchObject({ stage: "PLAN", reasonCode: "ACCOUNT_PLAN_UNRESOLVED" });
+    }
   });
 
   it("2. Account B is refused at the first stage (and so are generic and unproven processes, and Account B's own policy)", () => {
@@ -623,6 +644,12 @@ describe("pre-merge audit: (account, symbol, side) is serialized where occupancy
     const native = executor.slice(executor.indexOf("async handleNativeAccountACandidate("));
     expect(native.indexOf("if (error instanceof NativeOccupancyConflictError) {")).toBeGreaterThan(-1);
     expect(native.indexOf("if (error instanceof NativeOccupancyConflictError) {")).toBeLessThan(native.indexOf("this.deps.orchestrator.admitAndSubmit("));
+  });
+
+  it("Q4. the worker's window comes from code, never from the account process's environment, and the adoption no longer reads the preview policy", () => {
+    const adoption = codeOf("src/modules/native-canary/native-account-a-adoption.ts");
+    expect(adoption).not.toMatch(/native-account-plan-policy|configuredNativeAccountPlanPolicies|resolveNativeAccountPlanPolicies/);
+    expect(adoption).toContain("nativeAccountAExecutionPolicy(input.processEnv.NATIVE_PLAN_DEFAULT_LOOKBACK_A)");
   });
 });
 

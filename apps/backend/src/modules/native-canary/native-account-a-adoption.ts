@@ -8,10 +8,10 @@ import { NATIVE_ALERT_SOURCE } from "../alerts/alert-source";
 import type { BoundExecutionProfileProjection } from "../execution/exchange-runtime-binding";
 import type { SelectedPlanExecutor } from "../execution/selected-plan-executor";
 import { nativeExecutionIntegrityOf } from "../native-integrity/native-execution-integrity";
-import { configuredNativeAccountPlanPolicies } from "../native-planning/native-account-plan-policy";
 import {
   NATIVE_CANARY_SOURCE_TIMEFRAMES,
   decideNativeAccountACandidate,
+  nativeAccountAExecutionPolicy,
   type NativeAccountAOutcome,
   type NativeAccountGates,
   type NativeAccountSlot,
@@ -315,8 +315,9 @@ export async function startNativeAccountAAdoptionScheduler(input: NativeAccountA
   if (!NATIVE_EXECUTION_ENABLED) return null;
   const accountSlot = nativeAccountSlotOf(input.processEnv);
   if (accountSlot !== "ACCOUNT_A") return null;
-  const accountPlanPolicy = (await configuredNativeAccountPlanPolicies()).find((policy) => policy.account === "A");
-  if (accountPlanPolicy === undefined) return null;
+  // Fixed in code. The account process's own environment can only make this
+  // refuse (a disagreeing override), never choose a different window.
+  const accountPlanPolicy = nativeAccountAExecutionPolicy(input.processEnv.NATIVE_PLAN_DEFAULT_LOOKBACK_A);
 
   const service = new NativeAccountAAdoptionService({
     prisma: input.prisma,
