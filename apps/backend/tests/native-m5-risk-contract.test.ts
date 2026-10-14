@@ -436,10 +436,21 @@ describe("15 + structural proofs: no Native money in code, and the gate is where
 
   it("no new private path exists before risk resolution: the decision issues a hand-off only after RISK, and the fence admits only after the risk gate", () => {
     const canary = codeOf("src/modules/native-canary/native-account-a-canary.ts");
-    const decide = canary.slice(canary.indexOf("export function decideNativeAccountACandidate("));
-    const order = ["judgeNativeExecutionAdmission({ nativeExecutionEnabled: NATIVE_EXECUTION_ENABLED", "judgeNativeRiskReadiness(input.accountSlot, evaluated.candidate.template.riskAmount)", "if (!risk.ready) return", "issueHandoff(evaluated.candidate)"].map((n) => decide.indexOf(n));
+    // The judgment: the switch, then RISK; only an admitted judgment reaches the hand-off.
+    const judgment = canary.slice(canary.indexOf("export function judgeNativeAccountACandidate("));
+    const order = [
+      "nativeFenceStage(input.integrity)",
+      "nativeRiskStage(input.accountSlot, evaluated.candidate.template.riskAmount)",
+      "if (!risk.ok) return risk.refusal;",
+      "if (!judgment.admitted) return judgment;",
+      "issueHandoff(judgment.candidate)",
+    ].map((n) => judgment.indexOf(n));
     expect(order.every((p) => p > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // And the RISK stage is the risk gate, refusing on anything it does not admit.
+    const riskStage = canary.slice(canary.indexOf("export function nativeRiskStage("), canary.indexOf("export function evaluateNativeAccountACandidate("));
+    expect(riskStage.indexOf("judgeNativeRiskReadiness(accountSlot, riskBudgetUsd)")).toBeGreaterThan(-1);
+    expect(riskStage.indexOf('if (!risk.ready) return refusal("RISK"')).toBeGreaterThan(riskStage.indexOf("judgeNativeRiskReadiness("));
     const fence = codeOf("src/modules/native-canary/native-execution-fence.ts");
     const judge = fence.slice(fence.indexOf("function judgeNativeAlert("), fence.indexOf("export async function nativeAlertFence("));
     const steps = ["judgeNativeExecutionAdmission(", "if (!admission.admitted) {", "judgeNativeRiskReadiness(runtime.accountSlot ?? \"UNKNOWN\", riskBudgetUsd)", "if (!risk.ready) return refuse(", "return { applies: true, admitted: true };"].map((n) => judge.indexOf(n));

@@ -464,8 +464,8 @@ describe("structural proofs: the Native freshness helper is the only one, and Tr
   it("the formula's constants and comparison live in ONE module, and only Native modules call it", () => {
     expect(filesWith("NATIVE_POST_CLOSE_FRESHNESS_MS")).toEqual(["src/modules/native-canary/native-signal-freshness.ts"]);
     expect(filesWith("NATIVE_ABSOLUTE_MAX_SIGNAL_AGE_MS")).toEqual(["src/modules/native-canary/native-signal-freshness.ts"]);
+    // (Since M6 the adoption's deferral asks the canary's `nativeAdoptionDefers`, so it no longer names the helper.)
     expect(filesWith("judgeNativeSignalFreshness(")).toEqual([
-      "src/modules/native-canary/native-account-a-adoption.ts",
       "src/modules/native-canary/native-account-a-canary.ts",
       "src/modules/native-canary/native-execution-fence.ts",
       "src/modules/native-canary/native-signal-freshness.ts",
@@ -490,18 +490,25 @@ describe("structural proofs: the Native freshness helper is the only one, and Tr
     const adoption = codeOf("src/modules/native-canary/native-account-a-adoption.ts");
     expect(adoption).not.toContain("EXECUTION_MAX_ALERT_AGE_SECONDS");
     expect(adoption).toContain("cutoffAt: this.lifetimeWindow(now),");
-    expect(adoption).toMatch(/this\.integrityOf\(preview\)\?\.status === "PENDING_BAR_CLOSE" && this\.isFresh\(preview, clock\(\)\)/);
+    expect(adoption).toContain("if (preview !== null && nativeAdoptionDefers(preview, this.integrityOf(preview), clock().getTime())) {");
 
     const canary = codeOf("src/modules/native-canary/native-account-a-canary.ts");
+    // The deferral: a forming bar waits only while its signal is fresh.
+    const defers = canary.slice(canary.indexOf("export function nativeAdoptionDefers("), canary.indexOf("export function evaluateNativeAccountACandidate("));
+    expect(defers).toContain('return integrity?.status === "PENDING_BAR_CLOSE" && judgeNativeSignalFreshness(nativeSignalWindowOf(alert), nowMs).fresh;');
+    // The decision's FRESHNESS stage sits between PLAN and INTEGRITY, at the caller's instant.
     const evaluate = canary.slice(canary.indexOf("export function evaluateNativeAccountACandidate("), canary.indexOf("export interface NativeAccountAHandoff"));
     const stages = [
-      'if (plan === null) return refusal("PLAN"',
-      "judgeNativeSignalFreshness(nativeSignalWindowOf(alert), input.nowMs)",
-      'if (!freshness.fresh) return refusal("FRESHNESS"',
-      "const integrity = input.integrity;",
+      "nativePlanStage(alert, plan, policy)",
+      "nativeFreshnessStage(alert, input.nowMs)",
+      "if (!freshness.ok) return freshness;",
+      "nativeIntegrityStage(input.integrity)",
     ].map((n) => evaluate.indexOf(n));
     expect(stages.every((p) => p > -1)).toBe(true);
     expect([...stages].sort((a, b) => a - b)).toEqual(stages);
+    const freshnessStage = canary.slice(canary.indexOf("export function nativeFreshnessStage("), canary.indexOf("export function nativeIntegrityStage("));
+    expect(freshnessStage).toContain("judgeNativeSignalFreshness(nativeSignalWindowOf(alert), nowMs)");
+    expect(freshnessStage).toContain('if (!freshness.fresh) return refusal("FRESHNESS", nativeSignalRefusalCodeOf(freshness)');
 
     const executor = codeOf("src/modules/execution/selected-plan-executor.ts");
     const native = executor.slice(executor.indexOf("async handleNativeAccountACandidate("));

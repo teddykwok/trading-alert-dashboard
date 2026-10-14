@@ -58,6 +58,10 @@ const ADMISSION_CODE = codeOf(
 const ENTRY_CODE = codeOf(
   readFileSync(path.join(BACKEND, "src/modules/execution/entry-lifecycle.service.ts"), "utf8")
 );
+/** Where admission's authorization verdict is judged, purely, since Milestone 6. */
+const AUTHORIZATION_CODE = codeOf(
+  readFileSync(path.join(BACKEND, "src/modules/execution/natural-authorization.ts"), "utf8")
+);
 
 const {
   SESSION_BUDGET_PRESETS,
@@ -792,8 +796,17 @@ describe("the session is an ADDITIONAL gate, never a replacement", () => {
     // correct for a legacy window. Admission must ask the session-aware
     // question instead, or the historical cap would refuse the sixth trade of
     // a hundred-trade session.
-    expect(ADMISSION_CODE).toContain("effectiveNaturalWindowState(window, evaluatedAt)");
+    //
+    // Admission loads the rows and asks the pure judgment for the verdict
+    // (`judgeAdmissionAuthorization`, Milestone 6); the judgment is where the
+    // effective state is read. Neither may switch on the raw state.
+    const judgment = AUTHORIZATION_CODE.slice(AUTHORIZATION_CODE.indexOf("export function judgeAdmissionAuthorization("));
+    expect(judgment).toContain("switch (effectiveNaturalWindowState(window, evaluatedAt))");
+    expect(judgment).not.toContain("switch (naturalWindowState(window, evaluatedAt))");
     expect(ADMISSION_CODE).not.toContain("switch (naturalWindowState(window, evaluatedAt))");
+    const resolver = ADMISSION_CODE.slice(ADMISSION_CODE.indexOf("export async function resolveAdmissionAuthorization("), ADMISSION_CODE.indexOf("export class SafetyAdmissionService"));
+    expect(resolver).toContain("judgeAdmissionAuthorization(facts, execution.positionSide, evaluatedAt)");
+    expect(resolver).not.toMatch(/NATURAL_AUTHORIZATION_[A-Z_]+/);
   });
 
   it("the reservation rides in the admission transaction, not beside it", () => {

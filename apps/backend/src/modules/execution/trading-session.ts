@@ -264,6 +264,50 @@ export function sessionAdmissionState(
 const PAUSED_MESSAGE =
   "New trades are paused. The session is intact — resume it to admit again.";
 
+/** The session row fields a reservation is judged on. */
+export type SessionReservationFacts = Pick<
+  TradingSession,
+  "id" | "executionProfileId" | "status" | "expiresAt" | "tradeBudget" | "unlimited" | "openedCount" | "reservedCount"
+>;
+
+/**
+ * Whether a session-backed authorization may reserve a slot right now, from
+ * the facts `reserveSessionSlot` reads before it writes anything: the session
+ * the authorizing window names, and the row loaded for that id.
+ *
+ * Fail closed on the link itself: a window that names no session, or a
+ * session that is missing or belongs to another profile, refuses
+ * SESSION_REQUIRED rather than falling back to unlimited admissions. Otherwise
+ * the verdict is `sessionAdmissionState`. On success the loaded session is
+ * handed back, so the caller reserves against exactly the row judged.
+ */
+export function judgeSessionReservation<S extends SessionReservationFacts>(input: {
+  readonly executionProfileId: string;
+  readonly tradingSessionId: string | null;
+  readonly session: S | null;
+  readonly now: Date;
+}): { admits: true; session: S } | { admits: false; reasonCode: SessionAdmissionRefusal; message: string } {
+  if (input.tradingSessionId === null) {
+    return {
+      admits: false,
+      reasonCode: "SESSION_REQUIRED",
+      message: "This authorization names no trading session, so no new trade may be admitted.",
+    };
+  }
+  // `id` always matches when the row was loaded by that id (as admission
+  // loads it); a supplied snapshot must match too.
+  const session = input.session;
+  if (!session || session.id !== input.tradingSessionId || session.executionProfileId !== input.executionProfileId) {
+    return {
+      admits: false,
+      reasonCode: "SESSION_REQUIRED",
+      message: "The trading session for this authorization could not be read, so nothing is admitted.",
+    };
+  }
+  const state = sessionAdmissionState(session, input.now);
+  return state.admits ? { admits: true, session } : state;
+}
+
 /** Slots still available. Null means unlimited, which is not a number. */
 export function remainingSessionBudget(
   session: Pick<TradingSession, "tradeBudget" | "unlimited" | "openedCount" | "reservedCount">

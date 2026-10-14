@@ -1,5 +1,7 @@
 import type { CanaryDirection, ExecutionCanaryAuthorization } from "@prisma/client";
 
+import type { SafetyReasonCode } from "./safety-engine";
+
 /**
  * Phase 12.2 — the NATURAL_WINDOW domain. PURE: no Prisma client, no fetch, no
  * clock read (callers pass `now`), no environment, no logging.
@@ -16,11 +18,13 @@ import type { CanaryDirection, ExecutionCanaryAuthorization } from "@prisma/clie
  * keeps no second copy of that watchlist, so nothing in this module reads
  * `ExecutionSafetyPolicy.allowedSymbols`, the `Asset` table, or any exchange.
  *
- * ## Nothing here is wired to production
+ * ## Where it is wired
  *
- * Phase 12.2 adds the primitives a future admission integration will call. No
- * production entrypoint calls them yet, and a tokenless TradingView alert is
- * still refused exactly as it was before this module existed.
+ * Phase 12.2 added the primitives; Phase 12.3 admission (`safety-admission
+ * .service.ts`) loads the authorization rows and asks `judgeAdmissionAuthorization`
+ * below. The Native dry admission (Milestone 6) asks the same judgment from a
+ * snapshot, observation only. A tokenless TradingView alert is still refused
+ * exactly as it was before this module existed.
  */
 
 /**
@@ -282,4 +286,115 @@ export function describeNaturalWindow(
     expiresAt: authorization.expiresAt.toISOString(),
     version: authorization.version,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Admission-time authorization, judged from the facts admission loads
+// ---------------------------------------------------------------------------
+
+/**
+ * Which authorization actually governs an admission, decided from persisted
+ * state alone.
+ *
+ * Nothing is carried in from `SelectedPlanExecutor`. The reconciliation tick
+ * calls `admitAndSubmit` on recovered PLAN_READY rows with no signal context at
+ * all, so anything held in process memory would be absent exactly when a
+ * restart made it matter. Every input is a row: the execution's `alertId`, its
+ * profile, and the authorization table.
+ */
+export type AdmissionAuthorization =
+  /** The profile has no authorization history: pre-existing behaviour, untouched. */
+  | { ok: true; mode: "LEGACY" }
+  /** A durable EXACT_SIGNAL binding already names this alert. */
+  | { ok: true; mode: "EXACT"; authorizationId: string }
+  /** A usable natural window authorizes it; the claim is still to be spent. */
+  | { ok: true; mode: "NATURAL"; window: ExecutionCanaryAuthorization }
+  | { ok: false; reasonCode: SafetyReasonCode; message: string };
+
+/**
+ * The persisted facts admission reads, in its precedence order. Phase 5 loads
+ * them inside its locked transaction (`resolveAdmissionAuthorization`); a fact
+ * the precedence never reaches may be left at its empty value.
+ */
+export interface AdmissionAuthorizationFacts {
+  /** How many authorization rows of ANY kind the profile has on record. */
+  readonly authorizationCount: number;
+  /** The id of an unrevoked EXACT_SIGNAL binding naming this alert, or null. */
+  readonly exactBindingId: string | null;
+  /** The profile's NEWEST natural window, whatever its state, or null when it has none. */
+  readonly newestNaturalWindow: ExecutionCanaryAuthorization | null;
+}
+
+/**
+ * The authorization verdict for one admission, PURE. Precedence, and why:
+ *
+ *  1. NO authorization rows at all -> LEGACY. A profile that has never been
+ *     put under authorization control keeps behaving exactly as it did. This
+ *     feature is additive; it does not conscript every profile.
+ *
+ *  2. A durable EXACT_SIGNAL binding for this alert -> EXACT. The historical
+ *     one-shot flow wins outright and spends no natural claim, even when a
+ *     natural window happens to be open beside it. The alert was authorized
+ *     specifically; that is stronger than being authorized generically.
+ *
+ *  3. Otherwise the profile IS authorization-controlled and this alert is not
+ *     individually authorized, so a natural window must authorize it — or it
+ *     is refused. Historical rows still mean "this profile requires
+ *     authorization"; they never decay into "anything goes".
+ */
+export function judgeAdmissionAuthorization(
+  facts: AdmissionAuthorizationFacts,
+  direction: string,
+  evaluatedAt: Date
+): AdmissionAuthorization {
+  if (facts.authorizationCount === 0) return { ok: true, mode: "LEGACY" };
+  if (facts.exactBindingId !== null) return { ok: true, mode: "EXACT", authorizationId: facts.exactBindingId };
+
+  const refuse = (reasonCode: SafetyReasonCode, message: string): AdmissionAuthorization => ({
+    ok: false,
+    reasonCode,
+    message,
+  });
+
+  // The NEWEST natural row is the only relevant one: preparation exclusivity
+  // means a second window cannot be opened while one is still open, so a newer
+  // row implies every older one was already shut. Reading it regardless of
+  // state (rather than filtering to the usable ones) is what lets the refusal
+  // say REVOKED or EXPIRED instead of a uselessly generic REQUIRED.
+  const window = facts.newestNaturalWindow;
+  if (!window) {
+    return refuse(
+      "NATURAL_AUTHORIZATION_REQUIRED",
+      "This profile requires authorization and no natural window has been prepared."
+    );
+  }
+
+  // `effectiveNaturalWindowState`, not `naturalWindowState`: for a
+  // SESSION-BACKED window the claim counter is not its budget, so EXHAUSTED is
+  // not a state it can be in. The session's trade budget bounds it instead,
+  // and that is checked where the slot is reserved. For a LEGACY window the
+  // two functions are identical, so nothing about the historical path changes.
+  switch (effectiveNaturalWindowState(window, evaluatedAt)) {
+    case "INVALID":
+      return refuse("NATURAL_AUTHORIZATION_INVALID", "The natural window contradicts its own declared mode.");
+    case "REVOKED":
+      return refuse("NATURAL_AUTHORIZATION_REVOKED", "The natural window was revoked.");
+    case "EXPIRED":
+      return refuse("NATURAL_AUTHORIZATION_EXPIRED", "The natural window has expired.");
+    case "EXHAUSTED":
+      return refuse(
+        "NATURAL_AUTHORIZATION_EXHAUSTED",
+        `The natural window has spent its whole budget (${window.claimedCount}/${window.maxClaims}).`
+      );
+  }
+
+  // Direction is the only signal property a window judges.
+  if (!naturalWindowAdmitsDirection(window, direction, evaluatedAt)) {
+    return refuse(
+      "NATURAL_AUTHORIZATION_DIRECTION_NOT_ALLOWED",
+      `The window admits ${window.allowedDirections.join("/")}, not ${direction}.`
+    );
+  }
+
+  return { ok: true, mode: "NATURAL", window };
 }

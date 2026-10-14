@@ -4,6 +4,7 @@ import type { PrismaClient, TradingSession } from "@prisma/client";
 import {
   derivedSessionStatus,
   isResumableSession,
+  judgeSessionReservation,
   releasesSessionSlot,
   remainingSessionBudget,
   sessionAdmissionState,
@@ -285,32 +286,24 @@ export async function reserveSessionSlot(
   // A session-backed window always names its session. A null here means the
   // link was lost, and that is refused rather than guessed at — falling back
   // to the profile's newest session would be exactly the silent substitution
-  // this parameter exists to prevent.
-  if (input.tradingSessionId === null) {
-    return {
-      reserved: false,
-      reasonCode: "SESSION_REQUIRED",
-      message: "This authorization names no trading session, so no new trade may be admitted.",
-    };
-  }
-
-  const session = await db.tradingSession.findUnique({ where: { id: input.tradingSessionId } });
-  if (!session || session.executionProfileId !== input.executionProfileId) {
-    // Missing, or belonging to another profile. Fail closed: never fall back
-    // to unlimited admissions because the session could not be found.
-    return {
-      reserved: false,
-      reasonCode: "SESSION_REQUIRED",
-      message: "The trading session for this authorization could not be read, so nothing is admitted.",
-    };
-  }
-
-  // Cheap, honest pre-check: it produces the SPECIFIC refusal reason. The
-  // conditional update below is what actually enforces the budget.
-  const state = sessionAdmissionState(session, input.now);
+  // this parameter exists to prevent. So nothing is read for a null link, and
+  // a session that is missing or belongs to another profile fails closed too:
+  // never fall back to unlimited admissions because it could not be found.
+  //
+  // Cheap, honest pre-check (`judgeSessionReservation`): it produces the
+  // SPECIFIC refusal reason. The conditional update below is what actually
+  // enforces the budget.
+  const loaded = input.tradingSessionId === null ? null : await db.tradingSession.findUnique({ where: { id: input.tradingSessionId } });
+  const state = judgeSessionReservation({
+    executionProfileId: input.executionProfileId,
+    tradingSessionId: input.tradingSessionId,
+    session: loaded,
+    now: input.now,
+  });
   if (!state.admits) {
     return { reserved: false, reasonCode: state.reasonCode, message: state.message };
   }
+  const session = state.session;
 
   // An execution that already holds a slot keeps it. A redelivered admission
   // must not take a second one.
