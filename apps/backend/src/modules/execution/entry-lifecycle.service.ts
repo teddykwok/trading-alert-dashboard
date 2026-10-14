@@ -229,7 +229,7 @@ export class EntryLifecycleService {
     // missing execution is left to revalidation to report, exactly as before.
     const target = await this.prisma.tradeExecution.findUnique({
       where: { id: input.executionId },
-      select: { id: true, alertId: true },
+      select: { id: true, alertId: true, riskBudgetUsd: true },
     });
     if (target) {
       const native = await this.nativeFenceRefusal(target);
@@ -784,14 +784,15 @@ export class EntryLifecycleService {
    * Null for every TradingView execution: the fence does not apply and the
    * TradingView path is unchanged. For an execution created from a NATIVE
    * alert it is a FRESH judgment every time (the hard-coded switch, then the
-   * source bar's evidence re-read), never a verdict carried from upstream, and
-   * it refuses unless that judgment admits. Today it never admits.
+   * source bar's evidence re-read, then the Native risk contract against the
+   * execution's frozen riskBudgetUsd), never a verdict carried from upstream,
+   * and it refuses unless that judgment admits. Today it never admits.
    *
    * Like the live gates, it does not stand in front of risk-REDUCING work:
    * reconciling or cancelling an order that may exist stays available.
    */
   private async nativeFenceRefusal(
-    execution: Pick<TradeExecution, "id" | "alertId">
+    execution: Pick<TradeExecution, "id" | "alertId" | "riskBudgetUsd">
   ): Promise<{ reasonCode: EntryReasonCode; message: string } | null> {
     const verdict = await nativeExecutionFence(this.prisma, execution, this.nativeFence);
     if (!verdict.applies || verdict.admitted) return null;

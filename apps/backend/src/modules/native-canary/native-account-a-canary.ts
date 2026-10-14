@@ -18,6 +18,7 @@ import { judgeNativeExecutionAdmission } from "../native-integrity/native-execut
 import type { RuntimeMode } from "../operator/account-runtime-transition";
 import type { TradingSystemState } from "../operator/trading-control.service";
 import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
+import { judgeNativeRiskReadiness } from "./native-risk-gate";
 
 /**
  * NATIVE ACCOUNT A CANARY: the path a Native plan must traverse before it
@@ -38,7 +39,12 @@ import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
  *   ACCOUNT_GATES     the existing deterministic Account A gates: runtime
  *                     LIVE_READY and profile ARMED;
  *   NATIVE_FENCE      judgeNativeExecutionAdmission with the hard-coded
- *                     switch. Today it refuses every candidate.
+ *                     switch. Today it refuses every candidate;
+ *   RISK              an explicit Native risk contract for Account A admits the
+ *                     plan's risk budget (native-risk-gate.ts). Both contracts
+ *                     are UNRESOLVED in code, so it would refuse every candidate
+ *                     the switch let through. It sits after the switch, which
+ *                     therefore still wins while it is false.
  *
  * Everything here is pure: no database, no file, no network, no clock and no
  * environment. The caller loads the facts; this module only judges them, so
@@ -47,13 +53,16 @@ import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
  *
  * The only way to obtain a NativeAccountAHandoff, the capability the executor
  * and execution creation demand, is `decideNativeAccountACandidate` admitting
- * a candidate, which requires NATIVE_EXECUTION_ENABLED. With the switch false
- * no hand-off can exist, so no Native TradeExecution can be created.
+ * a candidate, which requires NATIVE_EXECUTION_ENABLED and a RESOLVED Native
+ * risk contract for Account A. Neither holds today, so no hand-off can exist
+ * and no Native TradeExecution can be created.
  *
  * What this module does NOT decide: the natural-window claim, the session
- * budget, capacity limits and risk admission belong to the existing Phase 5
- * SafetyAdmission, which a Native execution would pass through unchanged,
- * under its own lock and with its own canonical reason codes.
+ * budget, capacity limits and total risk/margin admission belong to the
+ * existing Phase 5 SafetyAdmission, which a Native execution would pass
+ * through under its own lock and with its own canonical reason codes. The
+ * RISK stage is not that: it is the per-trade Native approval Phase 5 has no
+ * notion of, and it never replaces any Phase 5 limit.
  */
 
 // ---------------------------------------------------------------------------
@@ -76,6 +85,7 @@ export const NATIVE_CANARY_STAGES = [
   "OCCUPANCY",
   "ACCOUNT_GATES",
   "NATIVE_FENCE",
+  "RISK",
 ] as const;
 export type NativeCanaryStage = (typeof NATIVE_CANARY_STAGES)[number];
 
@@ -104,6 +114,10 @@ export const NATIVE_CANARY_REASON_CODES = [
   // NATIVE_FENCE: judgeNativeExecutionAdmission's own canonical reasons
   "NATIVE_EXECUTION_DISABLED",
   "NATIVE_INTEGRITY_NOT_ELIGIBLE",
+  // RISK (native-risk-gate.ts's own refusal codes)
+  "NATIVE_RISK_UNRESOLVED",
+  "NATIVE_RISK_BUDGET_INVALID",
+  "NATIVE_RISK_EXCEEDS_CONTRACT",
   // Any stage: unknown, missing or contradictory state
   "AMBIGUOUS_STATE",
 ] as const;
@@ -574,10 +588,12 @@ export type NativeCanaryDecision =
   | { readonly admitted: true; readonly handoff: NativeAccountAHandoff };
 
 /**
- * Every stage, then the hard fence. The fence reads NATIVE_EXECUTION_ENABLED
- * itself; no caller can supply it. With the switch false, a candidate that
- * passes every stage is still refused NATIVE_EXECUTION_DISABLED and no
- * hand-off is ever issued.
+ * Every stage, then the hard fence, then the Native risk contract. The fence
+ * reads NATIVE_EXECUTION_ENABLED itself and the risk gate reads the code-fixed
+ * contract itself; no caller can supply either. With the switch false, a
+ * candidate that passes every earlier stage is still refused
+ * NATIVE_EXECUTION_DISABLED and no hand-off is ever issued. With the switch
+ * true, an UNRESOLVED contract refuses it NATIVE_RISK_UNRESOLVED instead.
  */
 export function decideNativeAccountACandidate(input: NativeCanaryInput): NativeCanaryDecision {
   const evaluated = evaluateNativeAccountACandidate(input);
@@ -590,11 +606,14 @@ export function decideNativeAccountACandidate(input: NativeCanaryInput): NativeC
       reasonCode: admission.reason,
       detail:
         admission.reason === "NATIVE_EXECUTION_DISABLED"
-          ? "Every stage passed; Native execution is hard-disabled in code (NATIVE_EXECUTION_ENABLED = false)."
+          ? "Every stage before the hard fence passed; Native execution is hard-disabled in code (NATIVE_EXECUTION_ENABLED = false)."
           : `The source bar's integrity is ${String(admission.integrity)}, not ELIGIBLE.`,
       integrity: admission.integrity,
     };
   }
+  // --- RISK: the plan's own risk budget, against Account A's Native contract --
+  const risk = judgeNativeRiskReadiness(input.accountSlot, evaluated.candidate.template.riskAmount);
+  if (!risk.ready) return { admitted: false, stage: "RISK", reasonCode: risk.reasonCode, detail: risk.message, integrity: "ELIGIBLE" };
   return { admitted: true, handoff: issueHandoff(evaluated.candidate) };
 }
 

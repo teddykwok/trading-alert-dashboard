@@ -1,4 +1,4 @@
-import type { Prisma, PrismaClient } from "@prisma/client";
+import type { Prisma, PrismaClient, TradeExecution } from "@prisma/client";
 import type { NativeExecutionIntegrityStatus } from "@trading-alert-dashboard/shared";
 
 import { NATIVE_ALERT_SOURCE } from "../alerts/alert-source";
@@ -8,7 +8,10 @@ import {
   nativeExecutionIntegrityOf,
   type NativeScannerEvidenceReader,
 } from "../native-integrity/native-execution-integrity";
+import type { NativeAccountSlot } from "./native-account-a-canary";
+import { nativeAccountSlotOf } from "./native-account-slot";
 import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
+import { judgeNativeRiskReadiness, type NativeRiskRefusalCode } from "./native-risk-gate";
 
 /**
  * THE NATIVE FINAL FENCE.
@@ -24,12 +27,16 @@ import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
  *     authorization boundary itself.
  *
  * Each ask is a fresh judgment: the hard-coded switch, then the source bar's
- * scanner evidence re-read from disk. Nothing is cached between asks, so a
- * verdict reached upstream is never trusted downstream.
+ * scanner evidence re-read from disk, then the code-fixed Native risk contract
+ * against the risk budget the trade would use (native-risk-gate.ts). Nothing
+ * is cached between asks, so a verdict reached upstream is never trusted
+ * downstream.
  *
  * Today every Native ask is refused NATIVE_EXECUTION_DISABLED, because
- * NATIVE_EXECUTION_ENABLED is false. TradingView executions are recognised and
- * passed through untouched: for them this fence does not apply.
+ * NATIVE_EXECUTION_ENABLED is false; were the switch true, every ask would
+ * still be refused NATIVE_RISK_UNRESOLVED, because no Native risk contract is
+ * resolved. TradingView executions are recognised and passed through
+ * untouched: for them this fence does not apply.
  *
  * Risk-REDUCING calls (the reconcile GET of an already-reserved order, a TTL or
  * operator cancellation, protection of an existing fill) are deliberately not
@@ -44,18 +51,24 @@ import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
  */
 export const NATIVE_EXECUTION_MARKER = Object.freeze({ key: "alertSource", value: NATIVE_ALERT_SOURCE });
 
-/** Where the fence reads the source bar's scanner evidence from. */
+/** Where the fence reads the source bar's scanner evidence from, and which account it judges for. */
 export interface NativeFenceRuntime {
   /** Null = no evidence in this process, so every Native ask is refused. */
   readonly evidence: NativeScannerEvidenceReader | null;
+  /**
+   * Which account THIS process is, for the Native risk contract. Absent means
+   * unproven, which no contract covers, so every Native ask that gets past the
+   * switch is refused NATIVE_RISK_UNRESOLVED.
+   */
+  readonly accountSlot?: NativeAccountSlot;
 }
 
-/** The process's own scanner tree (read only). */
+/** The process's own scanner tree (read only) and its own launch identity. */
 export function nativeFenceRuntimeFromEnv(env: NodeJS.ProcessEnv = process.env): NativeFenceRuntime {
-  return { evidence: fileSystemNativeScannerEvidence(env) };
+  return { evidence: fileSystemNativeScannerEvidence(env), accountSlot: nativeAccountSlotOf(env) };
 }
 
-export type NativeFenceRefusalCode = "NATIVE_EXECUTION_DISABLED" | "NATIVE_INTEGRITY_NOT_ELIGIBLE" | "NATIVE_SOURCE_AMBIGUOUS";
+export type NativeFenceRefusalCode = "NATIVE_EXECUTION_DISABLED" | "NATIVE_INTEGRITY_NOT_ELIGIBLE" | "NATIVE_SOURCE_AMBIGUOUS" | NativeRiskRefusalCode;
 
 export interface NativeFenceRefusal {
   readonly applies: true;
@@ -85,25 +98,35 @@ function refuse(reasonCode: NativeFenceRefusalCode, message: string, integrity: 
 /** The verdict when the fence applies (it always does to a candidate the caller says is Native). */
 export type NativeFenceApplied = Exclude<NativeFenceVerdict, { readonly applies: false }>;
 
-/** The judgment itself, for a NATIVE alert whose durable payload is in hand. */
-function judgeNativeAlert(alert: { source: string; symbol: string; rawPayload: unknown }, runtime: NativeFenceRuntime): NativeFenceApplied {
+/**
+ * The judgment itself, for a NATIVE alert whose durable payload is in hand.
+ * `riskBudgetUsd` is the budget the trade would use: the hand-off's frozen
+ * template amount in the executor, the execution's frozen riskBudgetUsd after
+ * creation.
+ */
+function judgeNativeAlert(alert: { source: string; symbol: string; rawPayload: unknown }, runtime: NativeFenceRuntime, riskBudgetUsd: unknown): NativeFenceApplied {
   // Never throws for a Native alert: anything unreadable comes back UNREADABLE.
   const integrity = nativeExecutionIntegrityOf(alert, runtime.evidence);
   // The switch is read HERE, never passed in by a caller.
   const admission = judgeNativeExecutionAdmission({ nativeExecutionEnabled: NATIVE_EXECUTION_ENABLED, integrity });
-  if (admission.admitted) return { applies: true, admitted: true };
-  if (admission.reason === "NATIVE_EXECUTION_DISABLED") {
+  if (!admission.admitted) {
+    if (admission.reason === "NATIVE_EXECUTION_DISABLED") {
+      return refuse(
+        "NATIVE_EXECUTION_DISABLED",
+        "Native execution is hard-disabled in code (NATIVE_EXECUTION_ENABLED = false); no exchange request was made.",
+        integrity.status
+      );
+    }
     return refuse(
-      "NATIVE_EXECUTION_DISABLED",
-      "Native execution is hard-disabled in code (NATIVE_EXECUTION_ENABLED = false); no exchange request was made.",
+      "NATIVE_INTEGRITY_NOT_ELIGIBLE",
+      `The source bar's final scanner evidence is ${integrity.status}, not ELIGIBLE; no exchange request was made.`,
       integrity.status
     );
   }
-  return refuse(
-    "NATIVE_INTEGRITY_NOT_ELIGIBLE",
-    `The source bar's final scanner evidence is ${integrity.status}, not ELIGIBLE; no exchange request was made.`,
-    integrity.status
-  );
+  // The contract is read from code by the gate, for the account this process proved it is.
+  const risk = judgeNativeRiskReadiness(runtime.accountSlot ?? "UNKNOWN", riskBudgetUsd);
+  if (!risk.ready) return refuse(risk.reasonCode, risk.message, integrity.status);
+  return { applies: true, admitted: true };
 }
 
 /**
@@ -111,12 +134,17 @@ function judgeNativeAlert(alert: { source: string; symbol: string; rawPayload: u
  * exists yet). Always applies: the caller says the alert is Native, and an
  * alert that turns out not to be is refused, never waved through.
  */
-export async function nativeAlertFence(prisma: PrismaClient, alertId: string, runtime: NativeFenceRuntime): Promise<NativeFenceApplied> {
+export async function nativeAlertFence(
+  prisma: PrismaClient,
+  alertId: string,
+  runtime: NativeFenceRuntime,
+  riskBudgetUsd: string
+): Promise<NativeFenceApplied> {
   const alert = await prisma.alert.findUnique({ where: { id: alertId }, select: { source: true, symbol: true, rawPayload: true } });
   if (alert === null || alert.source !== NATIVE_ALERT_SOURCE) {
     return refuse("NATIVE_SOURCE_AMBIGUOUS", "The candidate's alert is missing or is no longer a NATIVE alert; nothing was sent.", null);
   }
-  return judgeNativeAlert(alert, runtime);
+  return judgeNativeAlert(alert, runtime, riskBudgetUsd);
 }
 
 /**
@@ -131,7 +159,7 @@ export async function nativeAlertFence(prisma: PrismaClient, alertId: string, ru
  */
 export async function nativeExecutionFence(
   prisma: PrismaClient,
-  execution: { readonly id: string; readonly alertId: string | null },
+  execution: Pick<TradeExecution, "id" | "alertId" | "riskBudgetUsd">,
   runtime: NativeFenceRuntime
 ): Promise<NativeFenceVerdict> {
   const alertId = execution.alertId;
@@ -165,5 +193,6 @@ export async function nativeExecutionFence(
   if (full === null || full.source !== NATIVE_ALERT_SOURCE) {
     return refuse("NATIVE_SOURCE_AMBIGUOUS", "The Native execution's alert changed while it was being read; nothing was sent.", null);
   }
-  return judgeNativeAlert(full, runtime);
+  // toFixed: the exact decimal, never exponent notation.
+  return judgeNativeAlert(full, runtime, execution.riskBudgetUsd?.toFixed());
 }
