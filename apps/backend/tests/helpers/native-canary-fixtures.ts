@@ -39,6 +39,15 @@ const STATE = "a".repeat(64);
 const CAUSAL = "b".repeat(64);
 /** The source bar every fixture alert is observed on. */
 export const SOURCE_BAR = bar(1);
+/** That operational 15m bar's close. */
+export const SOURCE_BAR_CLOSE = SOURCE_BAR + M15;
+/**
+ * The canonical evaluation instant: one minute after the source bar closed,
+ * inside its 5-minute Native post-close window, when ELIGIBLE evidence for
+ * that bar can exist. Every fixture alert is fresh here.
+ */
+export const FRESH_NOW_MS = SOURCE_BAR_CLOSE + 60_000;
+export const FRESH_NOW = new Date(FRESH_NOW_MS);
 
 export interface FixtureOptions {
   sourceTf?: SourceTimeframe;
@@ -47,6 +56,8 @@ export interface FixtureOptions {
   id?: string;
   /** Which live observation in the records the alert is for (0 = the first). */
   observation?: number;
+  /** The touch's exchange event time (cleanRecords only); default SOURCE_BAR + 61.234s. */
+  eventTimeMs?: number;
 }
 
 const commitOf = (barMs: number, classification: ShadowClassification = "SHADOW_LIVE_ONLY", symbol = CANARY_SYMBOL) =>
@@ -74,7 +85,7 @@ export function cleanRecords(options: FixtureOptions = {}): ShadowRecord[] {
   const symbol = options.symbol ?? CANARY_SYMBOL;
   return [
     commitOf(bar(0), "QUARANTINED_CURRENT_BAR", symbol),
-    observation({ symbol, lineageId: CANARY_LINEAGE, sourceTf: options.sourceTf ?? "1D", signal: options.signal ?? "LONG", barMs: SOURCE_BAR }),
+    observation({ symbol, lineageId: CANARY_LINEAGE, sourceTf: options.sourceTf ?? "1D", signal: options.signal ?? "LONG", barMs: SOURCE_BAR, eventTimeMs: options.eventTimeMs }),
     commitOf(SOURCE_BAR, "SHADOW_LIVE_ONLY", symbol),
   ];
 }
@@ -98,6 +109,7 @@ export function canaryAlert(records: readonly ShadowRecord[], options: FixtureOp
     symbol: draft.symbol,
     signal: draft.signal,
     sourceTimeframe: draft.sourceTimeframe ?? null,
+    triggeredAt: draft.triggeredAt ?? null,
     rawPayload: draft.rawPayload,
     price: draft.price,
   };
@@ -233,7 +245,10 @@ export const LIVE_READY_GATES: NativeAccountGates["environment"] = Object.freeze
 export const SAFE_GATES: NativeAccountGates["environment"] = Object.freeze({ globalKillSwitch: true, liveEntryEnabled: false, protectionReady: false });
 export const ARMED_PROFILE = Object.freeze({ isEnabled: true, killSwitchActive: false });
 
-/** Every fact favourable: the only thing left to refuse is the hard switch. */
+/**
+ * Every fact favourable, evaluated at FRESH_NOW: the only thing left to refuse
+ * is the hard switch (and, behind it, the UNRESOLVED Native risk contract).
+ */
 export function favourableInput(options: FixtureOptions = {}, over: Partial<NativeCanaryInput> = {}): NativeCanaryInput & { alert: NativeCanaryAlert & { id: string } } {
   const records = cleanRecords(options);
   const alert = canaryAlert(records, options);
@@ -246,6 +261,26 @@ export function favourableInput(options: FixtureOptions = {}, over: Partial<Nati
     integrity: integrityDto("ELIGIBLE"),
     occupancy: [],
     accountGates: { environment: LIVE_READY_GATES, profile: ARMED_PROFILE },
+    nowMs: FRESH_NOW_MS,
     ...over,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Native risk contracts, for TEST-ONLY module graphs
+// ---------------------------------------------------------------------------
+
+/** The production contract module, mocked only inside a test module graph. */
+export const RISK_CONTRACT_MODULE = "../src/modules/native-canary/native-risk-contract";
+
+/**
+ * A SYNTHETIC resolved Account A contract. It exists only in tests, it is far
+ * above the fixture template's risk budget on purpose (so it can only ever
+ * cap, never size), and production code can never see it: the production
+ * table stays UNRESOLVED for both accounts.
+ */
+export const SYNTHETIC_RESOLVED_A = Object.freeze({ state: "RESOLVED" as const, account: "A" as const, maxRiskPerTradeUsd: "999999" });
+export const UNRESOLVED_B = Object.freeze({ state: "UNRESOLVED" as const, account: "B" as const, reason: "test: B stays unresolved" });
+
+/** The factory a test graph passes to vi.doMock(RISK_CONTRACT_MODULE, ...). */
+export const resolvedAContracts = () => ({ NATIVE_RISK_CONTRACTS: Object.freeze({ A: SYNTHETIC_RESOLVED_A, B: UNRESOLVED_B }) });

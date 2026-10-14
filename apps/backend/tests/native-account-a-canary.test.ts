@@ -28,7 +28,9 @@ import {
   ACCOUNT_B_POLICY,
   ARMED_PROFILE,
   CANARY_SYMBOL,
+  FRESH_NOW,
   LIVE_READY_GATES,
+  RISK_CONTRACT_MODULE,
   SAFE_GATES,
   SOURCE_BAR,
   TEMPLATE,
@@ -41,6 +43,7 @@ import {
   integrityDto,
   planFor,
   readerOf,
+  resolvedAContracts,
 } from "./helpers/native-canary-fixtures";
 
 /**
@@ -104,7 +107,7 @@ describe("A. Native source and plan", () => {
       admitted: false,
       stage: "NATIVE_FENCE",
       reasonCode: "NATIVE_EXECUTION_DISABLED",
-      detail: "Every stage passed; Native execution is hard-disabled in code (NATIVE_EXECUTION_ENABLED = false).",
+      detail: "Every stage before the hard fence passed; Native execution is hard-disabled in code (NATIVE_EXECUTION_ENABLED = false).",
       integrity: "ELIGIBLE",
     });
   });
@@ -440,7 +443,7 @@ describe("E. the hard fence", () => {
   });
 
   it("the earliest failing stage is the one reported, in the documented order", () => {
-    expect(NATIVE_CANARY_STAGES).toEqual(["ACCOUNT", "SOURCE", "SOURCE_TIMEFRAME", "PLAN", "INTEGRITY", "OCCUPANCY", "ACCOUNT_GATES", "NATIVE_FENCE"]);
+    expect(NATIVE_CANARY_STAGES).toEqual(["ACCOUNT", "SOURCE", "SOURCE_TIMEFRAME", "PLAN", "FRESHNESS", "INTEGRITY", "OCCUPANCY", "ACCOUNT_GATES", "NATIVE_FENCE", "RISK"]);
     const everythingWrong = favourableInput({ sourceTf: "1M" }, {
       accountSlot: "ACCOUNT_B",
       plan: null,
@@ -588,7 +591,17 @@ describe("29/30. no Native path reaches a private mutation without the admission
   it("the Native modules perform no exchange I/O of their own and add no route, UI control or migration", () => {
     const dir = path.join(BACKEND, "src/modules/native-canary");
     const files = readdirSync(dir).sort();
-    expect(files).toEqual(["native-account-a-adoption.ts", "native-account-a-canary.ts", "native-account-slot.ts", "native-execution-fence.ts", "native-execution-switch.ts", "native-occupancy.ts"]);
+    expect(files).toEqual([
+      "native-account-a-adoption.ts",
+      "native-account-a-canary.ts",
+      "native-account-slot.ts",
+      "native-execution-fence.ts",
+      "native-execution-switch.ts",
+      "native-occupancy.ts",
+      "native-risk-contract.ts",
+      "native-risk-gate.ts",
+      "native-signal-freshness.ts",
+    ]);
     for (const file of files) {
       // The only raw SQL is the occupancy module's own advisory lock, checked below.
       const code = codeOf(`src/modules/native-canary/${file}`).replace(/\$executeRaw`SELECT pg_advisory_xact_lock\(\$\{NATIVE_OCCUPANCY_LOCK_NAMESPACE\}::int, /g, "");
@@ -700,12 +713,21 @@ describe("the Native Account A adoption scheduler is dormant", () => {
 describe("mutation sensitivity (the switch is what refuses; the tests above are not vacuous)", () => {
   afterEach(() => {
     vi.doUnmock("../src/modules/native-canary/native-execution-switch");
+    vi.doUnmock(RISK_CONTRACT_MODULE);
     vi.resetModules();
   });
 
-  it("with the switch mutated to true in a TEST module graph, the same favourable input is admitted with a verifiable hand-off; nothing else changes", async () => {
+  it("with the switch mutated to true but the PRODUCTION risk contracts, the favourable input is still refused, at RISK: the switch alone admits nothing", async () => {
     vi.resetModules();
     vi.doMock("../src/modules/native-canary/native-execution-switch", () => ({ NATIVE_EXECUTION_ENABLED: true }));
+    const mutated = await import("../src/modules/native-canary/native-account-a-canary");
+    expect(mutated.decideNativeAccountACandidate(favourableInput())).toMatchObject({ admitted: false, stage: "RISK", reasonCode: "NATIVE_RISK_UNRESOLVED" });
+  });
+
+  it("with the switch mutated to true AND a synthetic RESOLVED Account A contract in a TEST module graph, the same favourable input is admitted with a verifiable hand-off; nothing else changes", async () => {
+    vi.resetModules();
+    vi.doMock("../src/modules/native-canary/native-execution-switch", () => ({ NATIVE_EXECUTION_ENABLED: true }));
+    vi.doMock(RISK_CONTRACT_MODULE, resolvedAContracts);
     const mutated = await import("../src/modules/native-canary/native-account-a-canary");
     const input = favourableInput();
     const decision = mutated.decideNativeAccountACandidate(input);
@@ -720,9 +742,10 @@ describe("mutation sensitivity (the switch is what refuses; the tests above are 
     expect(mutated.decideNativeAccountACandidate({ ...input, integrity: integrityDto("PENDING_BAR_CLOSE") })).toMatchObject({ admitted: false, reasonCode: "INTEGRITY_PENDING_BAR_CLOSE" });
   });
 
-  it("with the switch mutated to true, the executor's Native entry point still asks the fence first, and the first dependency it would reach is the signed margin planner", async () => {
+  it("with the switch mutated to true (and a synthetic RESOLVED Account A contract), the executor's Native entry point still asks the fence first, and the first dependency it would reach is the signed margin planner", async () => {
     vi.resetModules();
     vi.doMock("../src/modules/native-canary/native-execution-switch", () => ({ NATIVE_EXECUTION_ENABLED: true }));
+    vi.doMock(RISK_CONTRACT_MODULE, resolvedAContracts);
     const canary = await import("../src/modules/native-canary/native-account-a-canary");
     const { SelectedPlanExecutor } = await import("../src/modules/execution/selected-plan-executor");
     const records = cleanRecords();
@@ -732,7 +755,7 @@ describe("mutation sensitivity (the switch is what refuses; the tests above are 
     const touched: string[] = [];
     const trap = (name: string) => new Proxy({}, { get: (_t, key) => (touched.push(`${name}.${String(key)}`), () => { throw new Error(`${name} reached`); }) });
     // Ineligible evidence at the executor's fence: refused there, before anything signed.
-    const prisma = { alert: { findUnique: async () => ({ source: "NATIVE", symbol: input.alert.symbol, rawPayload: input.alert.rawPayload }) } };
+    const prisma = { alert: { findUnique: async () => ({ source: "NATIVE", symbol: input.alert.symbol, triggeredAt: input.alert.triggeredAt, rawPayload: input.alert.rawPayload }) } };
     const executor = (reader: ReturnType<typeof readerOf>) =>
       new SelectedPlanExecutor({
         prisma: prisma as never,
@@ -740,13 +763,13 @@ describe("mutation sensitivity (the switch is what refuses; the tests above are 
         executions: trap("executions") as never,
         orchestrator: trap("orchestrator") as never,
         boundProfile: { executionProfileId: "profile-account-a", exchange: "BINANCE", product: "USDM_FUTURES", environment: "TESTNET" } as never,
-        nativeFence: { evidence: reader },
+        nativeFence: { evidence: reader, accountSlot: "ACCOUNT_A" },
       });
-    const pending = await executor(readerOf(evidenceOf(records.slice(0, 2), SOURCE_BAR))).handleNativeAccountACandidate(decision.handoff);
+    const pending = await executor(readerOf(evidenceOf(records.slice(0, 2), SOURCE_BAR))).handleNativeAccountACandidate(decision.handoff, FRESH_NOW);
     expect(pending).toMatchObject({ handled: false, reasonCode: "NATIVE_INTEGRITY_NOT_ELIGIBLE" });
     expect(touched).toEqual([]);
     // Eligible evidence: the fence admits and the very next thing is the signed planner (a trap here).
-    await expect(executor(readerOf(eligibleEvidence(records))).handleNativeAccountACandidate(decision.handoff)).rejects.toThrow("marginPlanner reached");
+    await expect(executor(readerOf(eligibleEvidence(records))).handleNativeAccountACandidate(decision.handoff, FRESH_NOW)).rejects.toThrow("marginPlanner reached");
     expect(touched).toEqual(["marginPlanner.planForSymbolWithSnapshot"]);
   });
 });

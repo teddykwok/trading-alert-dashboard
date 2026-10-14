@@ -73,7 +73,6 @@ const { buildClientOrderId } = await import("../src/modules/execution/execution-
 const fixtures = await import("./helpers/native-canary-fixtures");
 
 const maybe = () => (available ? it : it.skip);
-const ago = (ms: number) => new Date(Date.now() - ms);
 let sequence = 0;
 
 // ---------------------------------------------------------------------------
@@ -105,8 +104,67 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllGlobals());
 
+/** Every production class the composition below is built from. */
+const PRODUCTION_GRAPH = {
+  NativeAccountAAdoptionService,
+  BinanceReadOnlyClient,
+  BinanceReadOnlyService,
+  BinanceUsdMExecutionClient,
+  BinanceMarginPlanService,
+  SelectedPlanExecutor,
+  ExecutionService,
+  SafetyAdmissionService,
+  EntryLifecycleService,
+  ProtectionLifecycleService,
+  CriticalAlertService,
+  ExecutionOrchestrator,
+  ExtremeRRService,
+};
+type ProductionGraph = typeof PRODUCTION_GRAPH;
+
+const SWITCH = "../src/modules/native-canary/native-execution-switch";
+
+/**
+ * M5: the SAME production graph, re-imported with the hard switch mutated to
+ * true (and, optionally, a synthetic resolved Account A risk contract) in a
+ * TEST-ONLY module graph. The production constants are untouched.
+ */
+async function enabledProductionGraph(options: { resolvedA?: boolean } = {}): Promise<ProductionGraph> {
+  vi.resetModules();
+  vi.doMock(SWITCH, () => ({ NATIVE_EXECUTION_ENABLED: true }));
+  if (options.resolvedA) vi.doMock(fixtures.RISK_CONTRACT_MODULE, fixtures.resolvedAContracts);
+  return {
+    NativeAccountAAdoptionService: (await import("../src/modules/native-canary/native-account-a-adoption")).NativeAccountAAdoptionService,
+    BinanceReadOnlyClient: (await import("../src/modules/binance/binance.client")).BinanceReadOnlyClient,
+    BinanceReadOnlyService: (await import("../src/modules/binance/binance-read-only.service")).BinanceReadOnlyService,
+    BinanceUsdMExecutionClient: (await import("../src/modules/binance/binance-execution.client")).BinanceUsdMExecutionClient,
+    BinanceMarginPlanService: (await import("../src/modules/binance/binance-margin-plan.service")).BinanceMarginPlanService,
+    SelectedPlanExecutor: (await import("../src/modules/execution/selected-plan-executor")).SelectedPlanExecutor,
+    ExecutionService: (await import("../src/modules/execution/execution.service")).ExecutionService,
+    SafetyAdmissionService: (await import("../src/modules/execution/safety-admission.service")).SafetyAdmissionService,
+    EntryLifecycleService: (await import("../src/modules/execution/entry-lifecycle.service")).EntryLifecycleService,
+    ProtectionLifecycleService: (await import("../src/modules/execution/protection-lifecycle.service")).ProtectionLifecycleService,
+    CriticalAlertService: (await import("../src/modules/execution/critical-alert.service")).CriticalAlertService,
+    ExecutionOrchestrator: (await import("../src/modules/execution/execution-orchestrator")).ExecutionOrchestrator,
+    ExtremeRRService: (await import("../src/modules/extreme-rr/extreme-rr.service")).ExtremeRRService,
+  };
+}
+
 /** The production runtime, composed exactly as the account worker composes it, on sentinel credentials. */
-function productionRuntime(executionProfileId: string, evidence: ReturnType<typeof fixtures.readerOf>) {
+function productionRuntime(executionProfileId: string, evidence: ReturnType<typeof fixtures.readerOf>, graph: ProductionGraph = PRODUCTION_GRAPH) {
+  const {
+    BinanceReadOnlyClient,
+    BinanceReadOnlyService,
+    BinanceUsdMExecutionClient,
+    BinanceMarginPlanService,
+    SelectedPlanExecutor,
+    ExecutionService,
+    SafetyAdmissionService,
+    EntryLifecycleService,
+    ProtectionLifecycleService,
+    CriticalAlertService,
+    ExecutionOrchestrator,
+  } = graph;
   const readOnlyClient = new BinanceReadOnlyClient({ baseUrl: BASE_URL, apiKey: SENTINEL_KEY, apiSecret: SENTINEL_SECRET, enabled: true });
   const readOnly = new BinanceReadOnlyService(readOnlyClient);
   const transport = vi.fn(async () => {
@@ -122,7 +180,7 @@ function productionRuntime(executionProfileId: string, evidence: ReturnType<type
     transport,
   });
   const boundProfile = testProfileProjection({ executionProfileId });
-  const entry = new EntryLifecycleService(prisma!, readOnly, mutations, { reconcileMaxAttempts: 1, reconcileDelayMs: 1, nativeFence: { evidence } });
+  const entry = new EntryLifecycleService(prisma!, readOnly, mutations, { reconcileMaxAttempts: 1, reconcileDelayMs: 1, nativeFence: { evidence, accountSlot: "ACCOUNT_A" } });
   const orchestrator = new ExecutionOrchestrator({
     prisma: prisma!,
     readOnly,
@@ -137,7 +195,7 @@ function productionRuntime(executionProfileId: string, evidence: ReturnType<type
     executions: new ExecutionService(prisma!),
     orchestrator,
     boundProfile,
-    nativeFence: { evidence },
+    nativeFence: { evidence, accountSlot: "ACCOUNT_A" },
   });
   return { readOnly, mutations, transport, entry, orchestrator, executor, boundProfile };
 }
@@ -165,7 +223,8 @@ async function nativePlan() {
   const symbol = `ISO${sequence}USDT`;
   const records = fixtures.cleanRecords({ symbol });
   const alert = fixtures.canaryAlert(records, { symbol });
-  const triggeredAt = ago(30_000);
+  // The payload's own trigger instant: fresh at fixtures.FRESH_NOW, the clock CASE A runs on.
+  const triggeredAt = alert.triggeredAt!;
   const created = await prisma!.alert.create({
     data: {
       symbol,
@@ -202,7 +261,7 @@ async function nativePlan() {
       executionFanoutReadyAt: null,
     },
   });
-  return { alertId: created.id, planId: plan.id, symbol, records };
+  return { alertId: created.id, planId: plan.id, symbol, records, triggeredAt };
 }
 
 async function cleanup(): Promise<void> {
@@ -247,11 +306,11 @@ describe("Q2. a disabled Native candidate never creates a reason to contact priv
       workerId: "account-a-worker",
       accountSlot: "ACCOUNT_A",
       accountPlanPolicy: fixtures.ACCOUNT_A_POLICY,
-      fence: { evidence },
+      fence: { evidence, accountSlot: "ACCOUNT_A" },
       environmentGates: fixtures.LIVE_READY_GATES,
     });
 
-    expect(await adoption.runOnce()).toMatchObject({ discovered: 1, claimed: 1, completed: 1 });
+    expect(await adoption.runOnce(undefined, fixtures.FRESH_NOW)).toMatchObject({ discovered: 1, claimed: 1, completed: 1 });
     expect(await prisma!.selectedPlanAdoption.findFirstOrThrow({ where: { extremeRRPlanId: plan.planId } })).toMatchObject({ handled: false, reasonCode: "NATIVE_EXECUTION_DISABLED" });
 
     // The executor (holder of the signed planner and the orchestrator) was never entered.
@@ -274,7 +333,7 @@ describe("Q2. a disabled Native candidate never creates a reason to contact priv
     // Handed a forged capability directly, the executor refuses before touching anything.
     entryPoint.mockRestore();
     const forged = Object.freeze({ kind: "NATIVE_ACCOUNT_A_HANDOFF", executionProfileId: profileId, alertId: plan.alertId, planId: plan.planId, symbol: plan.symbol, direction: "LONG", lookback: 100, integrity: "ELIGIBLE" });
-    expect(await runtime.executor.handleNativeAccountACandidate(forged as never)).toMatchObject({ handled: false, reasonCode: "HANDOFF_INVALID" });
+    expect(await runtime.executor.handleNativeAccountACandidate(forged as never, fixtures.FRESH_NOW)).toMatchObject({ handled: false, reasonCode: "HANDOFF_INVALID" });
     expect(vi.mocked(createHmac)).not.toHaveBeenCalled();
     expect(seen).toEqual([]);
     expect(runtime.transport).not.toHaveBeenCalled();
@@ -296,7 +355,7 @@ describe("Q2. a disabled Native candidate never creates a reason to contact priv
         selectedLookback: 100,
         status: "ENTRY_SUBMITTING",
         version: 1,
-        signalTriggeredAt: ago(30_000),
+        signalTriggeredAt: plan.triggeredAt,
         sourceTimeframe: "1D",
         plannedEntryPrice: "0.8123",
         calculatedStopLoss: "0.8043",
@@ -342,5 +401,117 @@ describe("Q2. a disabled Native candidate never creates a reason to contact priv
     expect(runtime.mutations.mutationsDispatched).toBe(0);
     const order = await prisma!.binanceOrder.findFirstOrThrow({ where: { tradeExecutionId: execution.id } });
     expect([order.submittedAt, order.submissionUnknownAt, order.status]).toEqual([null, null, "SUBMITTING"]);
+  });
+});
+
+// ===========================================================================
+// M5: the Native risk contract, past the hard switch, on the same real stack
+// ===========================================================================
+
+describe("M5. past the hard switch (TEST-ONLY graph), an UNRESOLVED Native risk contract keeps the production composition silent", () => {
+  afterEach(() => {
+    vi.doUnmock(SWITCH);
+    vi.doUnmock(fixtures.RISK_CONTRACT_MODULE);
+    vi.resetModules();
+  });
+
+  maybe()("CASE C: a fresh candidate is refused at RISK and a historical Native PREFLIGHT execution at F0: 0 signatures, 0 credential use, 0 requests, 0 mutations", async () => {
+    const graph = await enabledProductionGraph();
+    const profileId = await armedProfile("risk-unresolved");
+    const plan = await nativePlan();
+    const evidence = fixtures.readerOf(fixtures.eligibleEvidence(plan.records, plan.symbol));
+    const runtime = productionRuntime(profileId, evidence, graph);
+    const entryPoint = vi.spyOn(runtime.executor, "handleNativeAccountACandidate");
+    const adoption = new graph.NativeAccountAAdoptionService({
+      prisma: prisma!,
+      boundProfile: runtime.boundProfile,
+      executor: runtime.executor,
+      plans: new graph.ExtremeRRService(prisma!),
+      workerId: "account-a-worker",
+      accountSlot: "ACCOUNT_A",
+      accountPlanPolicy: fixtures.ACCOUNT_A_POLICY,
+      fence: { evidence, accountSlot: "ACCOUNT_A" },
+      environmentGates: fixtures.LIVE_READY_GATES,
+    });
+
+    expect(await adoption.runOnce(undefined, fixtures.FRESH_NOW)).toMatchObject({ discovered: 1, claimed: 1, completed: 1 });
+    expect(await prisma!.selectedPlanAdoption.findFirstOrThrow({ where: { extremeRRPlanId: plan.planId } })).toMatchObject({ handled: false, reasonCode: "NATIVE_RISK_UNRESOLVED" });
+    expect(entryPoint).not.toHaveBeenCalled();
+
+    // A Native PREFLIGHT execution only an enabled AND risk-resolved past could have created, written directly.
+    const execution = await prisma!.tradeExecution.create({
+      data: {
+        executionProfileId: profileId,
+        alertId: plan.alertId,
+        symbol: plan.symbol,
+        direction: "LONG",
+        positionSide: "LONG",
+        selectedLookback: 100,
+        status: "PREFLIGHT",
+        version: 2,
+        signalTriggeredAt: plan.triggeredAt,
+        sourceTimeframe: "1D",
+        plannedEntryPrice: "0.8123",
+        calculatedStopLoss: "0.8043",
+        executableStopLoss: "0.8043",
+        riskBudgetUsd: "1.5",
+        quantityRaw: "187.5",
+        plannedQuantity: "187",
+        quantityStepSize: "1",
+        actualPlannedLoss: "1.496",
+        unusedRiskBudget: "0.004",
+        positionNotional: "151.9",
+        targetIsolatedMargin: "15",
+        maximumIsolatedMargin: "20",
+        selectedLeverage: 10,
+        estimatedInitialMargin: "15.19",
+        liquidationBufferRatio: "2",
+        marginPlanSnapshot: { synthetic: TAG },
+        exchangeFiltersSnapshot: { synthetic: TAG },
+      },
+    });
+    await prisma!.executionEvent.create({
+      data: { tradeExecutionId: execution.id, sequenceNumber: 1, eventType: "EXECUTION_CREATED", toStatus: "PLAN_READY", reasonCode: "PLAN_READY", message: "synthetic", metadata: { alertSource: "NATIVE" } },
+    });
+    const outcome = await runtime.entry.prepareEntrySubmission({ executionId: execution.id, expectedVersion: 2, evaluatedAt: fixtures.FRESH_NOW });
+    expect(outcome).toMatchObject({ ok: false, reasonCode: "NATIVE_RISK_UNRESOLVED", mutationsDispatched: 0, order: null });
+
+    expect(vi.mocked(createHmac)).not.toHaveBeenCalled(); // no signature, the secret never used
+    expect(seen).toEqual([]); // no request of any kind: no key sent, no private read
+    expect(runtime.transport).not.toHaveBeenCalled(); // no mutation
+    expect(runtime.mutations.mutationsDispatched).toBe(0);
+    expect(await prisma!.binanceOrder.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
+    expect(await prisma!.tradeExecution.count({ where: { executionProfileId: profileId } })).toBe(1);
+  });
+
+  maybe()("CASE D (the trap is live): with a SYNTHETIC resolved contract the same fresh candidate does reach the margin planner and the exchange, so the silence above is the risk gate's doing", async () => {
+    const graph = await enabledProductionGraph({ resolvedA: true });
+    const profileId = await armedProfile("risk-resolved-synthetic");
+    const plan = await nativePlan();
+    const evidence = fixtures.readerOf(fixtures.eligibleEvidence(plan.records, plan.symbol));
+    const runtime = productionRuntime(profileId, evidence, graph);
+    const entryPoint = vi.spyOn(runtime.executor, "handleNativeAccountACandidate");
+    const adoption = new graph.NativeAccountAAdoptionService({
+      prisma: prisma!,
+      boundProfile: runtime.boundProfile,
+      executor: runtime.executor,
+      plans: new graph.ExtremeRRService(prisma!),
+      workerId: "account-a-worker",
+      accountSlot: "ACCOUNT_A",
+      accountPlanPolicy: fixtures.ACCOUNT_A_POLICY,
+      fence: { evidence, accountSlot: "ACCOUNT_A" },
+      environmentGates: fixtures.LIVE_READY_GATES,
+    });
+    await adoption.runOnce(undefined, fixtures.FRESH_NOW);
+    expect(entryPoint).toHaveBeenCalledTimes(1);
+    // The planner went to the exchange at once, and the trap recorded it. The stub
+    // answers its first (public) metadata read with an error, so planning stops
+    // there, before its signed reads (CASE B proves a signature IS counted when
+    // one happens). Nothing was ever mutated, and nothing was created.
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((r) => r.method === "GET")).toBe(true);
+    expect(runtime.transport).not.toHaveBeenCalled();
+    expect(runtime.mutations.mutationsDispatched).toBe(0);
+    expect(await prisma!.tradeExecution.count({ where: { executionProfileId: profileId } })).toBe(0);
   });
 });

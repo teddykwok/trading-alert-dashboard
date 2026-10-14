@@ -33,10 +33,15 @@ const maybe = () => (available ? it : it.skip);
 const ago = (ms: number) => new Date(Date.now() - ms);
 let sequence = 0;
 
-/** The production module graph with ONLY the hard switch mutated to true. */
+/**
+ * The production module graph with ONLY the hard switch mutated to true and
+ * the Native risk contracts replaced by a SYNTHETIC resolved Account A one
+ * (M5: an UNRESOLVED contract would refuse every candidate before the race).
+ */
 async function enabledGraph() {
   vi.resetModules();
   vi.doMock(SWITCH, () => ({ NATIVE_EXECUTION_ENABLED: true }));
+  vi.doMock(fixtures.RISK_CONTRACT_MODULE, fixtures.resolvedAContracts);
   return {
     canary: await import("../src/modules/native-canary/native-account-a-canary"),
     adoption: await import("../src/modules/native-canary/native-account-a-adoption"),
@@ -48,6 +53,7 @@ async function enabledGraph() {
 
 afterEach(() => {
   vi.doUnmock(SWITCH);
+  vi.doUnmock(fixtures.RISK_CONTRACT_MODULE);
   vi.resetModules();
 });
 
@@ -67,10 +73,14 @@ async function armedProfile(alias: string): Promise<string> {
 
 const boundProfileOf = (executionProfileId: string) => ({ executionProfileId, exchange: "BINANCE", product: "USDM_FUTURES", environment: "TESTNET" as const });
 
-/** One NATIVE alert row (as the emitter writes it) and its READY plan. */
+/**
+ * One NATIVE alert row (as the emitter writes it) and its READY plan. The
+ * trigger instant is the payload's own, so the alert is fresh at
+ * fixtures.FRESH_NOW, the clock every pass below runs on.
+ */
 async function nativeAlertAndPlan(alert: ReturnType<typeof fixtures.canaryAlert>, direction: "LONG" | "SHORT") {
   sequence += 1;
-  const triggeredAt = ago(30_000);
+  const triggeredAt = alert.triggeredAt!;
   const row = await prisma!.alert.create({
     data: {
       symbol: alert.symbol,
@@ -212,17 +222,17 @@ describe("Q1. two concurrent Native candidates for Account A + BTCUSDT + LONG", 
           executions: new graph.executions.ExecutionService(prisma!),
           orchestrator: orchestrator as never,
           boundProfile: boundProfileOf(profileId),
-          nativeFence: { evidence },
+          nativeFence: { evidence, accountSlot: "ACCOUNT_A" },
         }),
         plans: new graph.plans.ExtremeRRService(prisma!),
         workerId,
         accountSlot: "ACCOUNT_A",
         accountPlanPolicy: fixtures.ACCOUNT_A_POLICY,
-        fence: { evidence },
+        fence: { evidence, accountSlot: "ACCOUNT_A" },
         environmentGates: fixtures.LIVE_READY_GATES,
       });
 
-    await Promise.all([worker("account-a-worker-1").runOnce(), worker("account-a-worker-2").runOnce()]);
+    await Promise.all([worker("account-a-worker-1").runOnce(undefined, fixtures.FRESH_NOW), worker("account-a-worker-2").runOnce(undefined, fixtures.FRESH_NOW)]);
 
     expect(gate.arrivals()).toBe(2);
     expect(marginPlanner.planForSymbolWithSnapshot).toHaveBeenCalledTimes(2);

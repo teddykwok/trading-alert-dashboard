@@ -40,14 +40,21 @@ const { ExecutionService } = await import("../src/modules/execution/execution.se
 const { EntryLifecycleService } = await import("../src/modules/execution/entry-lifecycle.service");
 const { SafetyAdmissionService } = await import("../src/modules/execution/safety-admission.service");
 const { NativeAlertExecutionForbiddenError } = await import("../src/modules/alerts/alert-source");
-const { env } = await import("../src/config/env");
 const fixtures = await import("./helpers/native-canary-fixtures");
 const { bar } = await import("./helpers/native-alert-fixtures");
 
 const maybe = () => (available ? it : it.skip);
 const ago = (ms: number) => new Date(Date.now() - ms);
 const FRESH_MS = 30_000;
-const EXPIRED_MS = (env.EXECUTION_MAX_ALERT_AGE_SECONDS + 600) * 1000;
+/**
+ * M5: every Native pass here runs on the fixture clock. A Native alert's
+ * freshness is anchored to its own operational 15m bar (the fixture's
+ * SOURCE_BAR), so the adoption is evaluated one minute after that bar closed.
+ */
+const NOW = fixtures.FRESH_NOW;
+const beforeNow = (ms: number) => new Date(NOW.getTime() - ms);
+/** Older than the Native absolute cap at NOW: never discovered. */
+const PAST_NATIVE_LIFETIME_MS = 20 * 60_000 + 1;
 
 let sequence = 0;
 
@@ -111,17 +118,22 @@ interface NativeFixture {
   planId: string;
   symbol: string;
   records: ReturnType<typeof fixtures.cleanRecords>;
+  triggeredAt: Date;
 }
 
-/** A NATIVE alert exactly as the emitter writes it, and its READY plan. */
+/**
+ * A NATIVE alert exactly as the emitter writes it, and its READY plan. Its
+ * trigger instant is the payload's own (fresh at NOW); `triggeredAt` overrides
+ * the row and the plan cutoff only, for a plan discovery must never offer.
+ */
 async function nativePlan(
-  options: { sourceTf?: "1D" | "1W" | "1M"; signal?: "LONG" | "SHORT"; agoMs?: number; status?: "READY" | "PENDING"; selectedLookback?: 50 | 100 | 200 | 300 } = {}
+  options: { sourceTf?: "1D" | "1W" | "1M"; signal?: "LONG" | "SHORT"; triggeredAt?: Date; status?: "READY" | "PENDING"; selectedLookback?: 50 | 100 | 200 | 300 } = {}
 ): Promise<NativeFixture> {
   sequence += 1;
   const symbol = `CNRY${sequence}USDT`;
   const records = fixtures.cleanRecords({ sourceTf: options.sourceTf ?? "1D", signal: options.signal ?? "LONG", symbol });
   const alert = fixtures.canaryAlert(records, { symbol });
-  const triggeredAt = ago(options.agoMs ?? FRESH_MS);
+  const triggeredAt = options.triggeredAt ?? alert.triggeredAt!;
   const created = await prisma!.alert.create({
     data: {
       symbol,
@@ -161,7 +173,7 @@ async function nativePlan(
       executionFanoutReadyAt: null,
     },
   });
-  return { alertId: created.id, planId: plan.id, symbol, records };
+  return { alertId: created.id, planId: plan.id, symbol, records, triggeredAt };
 }
 
 /** Scanner evidence per symbol, as the file-system reader would serve it. */
@@ -191,7 +203,7 @@ function adoption(
     workerId: `worker-${sequence}`,
     accountSlot: "ACCOUNT_A",
     accountPlanPolicy: fixtures.ACCOUNT_A_POLICY,
-    fence: { evidence: evidence as never },
+    fence: { evidence: evidence as never, accountSlot: "ACCOUNT_A" },
     environmentGates: fixtures.LIVE_READY_GATES,
     ...over,
   });
@@ -207,6 +219,8 @@ async function executionRow(options: {
   status: "PLAN_READY" | "PREFLIGHT" | "ENTRY_SUBMITTING" | "ENTRY_PENDING" | "CANCELED";
   direction?: "LONG" | "SHORT";
   marker?: boolean;
+  /** The alert's own trigger instant, as creation freezes it; default a fresh TradingView-style one. */
+  signalTriggeredAt?: Date;
 }) {
   const direction = options.direction ?? "LONG";
   const row = await prisma!.tradeExecution.create({
@@ -219,7 +233,7 @@ async function executionRow(options: {
       selectedLookback: 100,
       status: options.status,
       version: 1,
-      signalTriggeredAt: ago(FRESH_MS),
+      signalTriggeredAt: options.signalTriggeredAt ?? ago(FRESH_MS),
       sourceTimeframe: "1D",
       plannedEntryPrice: "0.8123",
       calculatedStopLoss: "0.8043",
@@ -293,12 +307,12 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const evidence = evidenceBySymbol([[plan.symbol, fixtures.eligibleEvidence(plan.records, plan.symbol)]]);
     const executor = executorTrap();
 
-    const summary = await adoption(profileId, executor, evidence).runOnce();
+    const summary = await adoption(profileId, executor, evidence).runOnce(undefined, NOW);
     expect(summary).toMatchObject({ discovered: 1, deferred: 0, claimed: 1, completed: 1 });
 
     const [row] = await adoptionsOf(plan.planId);
     expect(row).toMatchObject({ status: "COMPLETED", handled: false, reasonCode: "NATIVE_EXECUTION_DISABLED", executionId: null, claimedAt: null, claimOwner: null });
-    expect(row.message).toMatch(/^NATIVE_FENCE: Every stage passed/);
+    expect(row.message).toMatch(/^NATIVE_FENCE: Every stage before the hard fence passed/);
     expect(executor.calls()).toBe(0);
     expect(evidence.reads()).toBeGreaterThan(0);
     // Nothing downstream exists: no execution, no order, no admission.
@@ -314,7 +328,7 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
       [s.symbol, fixtures.eligibleEvidence(s.records, s.symbol)],
     ]);
     const executor = executorTrap();
-    expect(await adoption(profileId, executor, evidence).runOnce()).toMatchObject({ discovered: 2, completed: 2 });
+    expect(await adoption(profileId, executor, evidence).runOnce(undefined, NOW)).toMatchObject({ discovered: 2, completed: 2 });
     for (const p of [w, s]) expect((await adoptionsOf(p.planId))[0].reasonCode).toBe("NATIVE_EXECUTION_DISABLED");
     expect(executor.calls()).toBe(0);
   });
@@ -325,9 +339,9 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const evidence = evidenceBySymbol([[plan.symbol, fixtures.eligibleEvidence(plan.records, plan.symbol)]]);
     const executor = executorTrap();
     const service = adoption(profileId, executor, evidence);
-    await service.runOnce();
+    await service.runOnce(undefined, NOW);
     const before = await adoptionsOf(plan.planId);
-    expect(await service.runOnce()).toMatchObject({ discovered: 0, claimed: 0, completed: 0 });
+    expect(await service.runOnce(undefined, NOW)).toMatchObject({ discovered: 0, claimed: 0, completed: 0 });
     expect(await adoptionsOf(plan.planId)).toEqual(before);
     expect(before).toHaveLength(1);
     expect(executor.calls()).toBe(0);
@@ -338,11 +352,11 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const plan = await nativePlan();
     // The crashed worker's claim: PENDING, attempts 1, lease long expired.
     await prisma!.selectedPlanAdoption.create({
-      data: { extremeRRPlanId: plan.planId, executionProfileId: profileId, status: "PENDING", attempts: 1, claimedAt: ago(NATIVE_ADOPTION_CLAIM_LEASE_MS * 2), claimOwner: "crashed-worker" },
+      data: { extremeRRPlanId: plan.planId, executionProfileId: profileId, status: "PENDING", attempts: 1, claimedAt: beforeNow(NATIVE_ADOPTION_CLAIM_LEASE_MS * 2), claimOwner: "crashed-worker" },
     });
     const evidence = evidenceBySymbol([[plan.symbol, fixtures.eligibleEvidence(plan.records, plan.symbol)]]);
     const restarted = adoption(profileId, executorTrap(), evidence, { workerId: "restarted-worker" });
-    expect(await restarted.runOnce()).toMatchObject({ discovered: 1, claimed: 1, completed: 1 });
+    expect(await restarted.runOnce(undefined, NOW)).toMatchObject({ discovered: 1, claimed: 1, completed: 1 });
     const rows = await adoptionsOf(plan.planId);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ status: "COMPLETED", attempts: 2, reasonCode: "NATIVE_EXECUTION_DISABLED" });
@@ -352,7 +366,7 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const profileId = await profile("race");
     const plan = await nativePlan();
     const evidence = evidenceBySymbol([[plan.symbol, fixtures.eligibleEvidence(plan.records, plan.symbol)]]);
-    const [a, b] = await Promise.all([adoption(profileId, executorTrap(), evidence, { workerId: "w-a" }).runOnce(), adoption(profileId, executorTrap(), evidence, { workerId: "w-b" }).runOnce()]);
+    const [a, b] = await Promise.all([adoption(profileId, executorTrap(), evidence, { workerId: "w-a" }).runOnce(undefined, NOW), adoption(profileId, executorTrap(), evidence, { workerId: "w-b" }).runOnce(undefined, NOW)]);
     expect(a.completed + b.completed).toBe(1);
     expect(await adoptionsOf(plan.planId)).toHaveLength(1);
   });
@@ -361,10 +375,10 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const profileId = await profile("lease");
     const plan = await nativePlan();
     await prisma!.selectedPlanAdoption.create({
-      data: { extremeRRPlanId: plan.planId, executionProfileId: profileId, status: "PENDING", attempts: 1, claimedAt: ago(1_000), claimOwner: "busy-worker" },
+      data: { extremeRRPlanId: plan.planId, executionProfileId: profileId, status: "PENDING", attempts: 1, claimedAt: beforeNow(1_000), claimOwner: "busy-worker" },
     });
     const evidence = evidenceBySymbol([[plan.symbol, fixtures.eligibleEvidence(plan.records, plan.symbol)]]);
-    expect(await adoption(profileId, executorTrap(), evidence).runOnce()).toMatchObject({ discovered: 0 });
+    expect(await adoption(profileId, executorTrap(), evidence).runOnce(undefined, NOW)).toMatchObject({ discovered: 0 });
     expect((await adoptionsOf(plan.planId))[0]).toMatchObject({ status: "PENDING", attempts: 1, claimOwner: "busy-worker" });
   });
 
@@ -372,10 +386,10 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const profileId = await profile("deferred");
     const plan = await nativePlan();
     const pending = evidenceBySymbol([[plan.symbol, fixtures.evidenceOf(plan.records.slice(0, 2), fixtures.SOURCE_BAR, plan.symbol)]]);
-    expect(await adoption(profileId, executorTrap(), pending).runOnce()).toMatchObject({ discovered: 1, deferred: 1, claimed: 0 });
+    expect(await adoption(profileId, executorTrap(), pending).runOnce(undefined, NOW)).toMatchObject({ discovered: 1, deferred: 1, claimed: 0 });
     expect(await adoptionsOf(plan.planId)).toHaveLength(0);
     const closed = evidenceBySymbol([[plan.symbol, fixtures.eligibleEvidence(plan.records, plan.symbol)]]);
-    expect(await adoption(profileId, executorTrap(), closed).runOnce()).toMatchObject({ completed: 1 });
+    expect(await adoption(profileId, executorTrap(), closed).runOnce(undefined, NOW)).toMatchObject({ completed: 1 });
     expect((await adoptionsOf(plan.planId))[0].reasonCode).toBe("NATIVE_EXECUTION_DISABLED");
   });
 
@@ -384,7 +398,7 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const plan = await nativePlan();
     const requarantined = fixtures.evidenceOf([...plan.records.slice(0, 2), { ...plan.records[2], classification: "QUARANTINED_CURRENT_BAR" } as never], bar(2), plan.symbol);
     const evidence = evidenceBySymbol([[plan.symbol, requarantined]]);
-    expect(await adoption(profileId, executorTrap(), evidence).runOnce()).toMatchObject({ completed: 1 });
+    expect(await adoption(profileId, executorTrap(), evidence).runOnce(undefined, NOW)).toMatchObject({ completed: 1 });
     const [row] = await adoptionsOf(plan.planId);
     expect(row).toMatchObject({ reasonCode: "INTEGRITY_INELIGIBLE", handled: false });
     expect(row.message).toMatch(/^INTEGRITY: /);
@@ -395,7 +409,7 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const plan = await nativePlan({ selectedLookback: 300 });
     const evidence = evidenceBySymbol([[plan.symbol, fixtures.eligibleEvidence(plan.records, plan.symbol)]]);
     const executor = executorTrap();
-    await adoption(profileId, executor, evidence).runOnce();
+    await adoption(profileId, executor, evidence).runOnce(undefined, NOW);
     const [row] = await adoptionsOf(plan.planId);
     expect(row).toMatchObject({ status: "COMPLETED", handled: false, reasonCode: "PLAN_LOOKBACK_MISMATCH" });
     expect(row.message).toMatch(/^PLAN: The plan persists the 300-candle window, not Account A's 100-candle window\.$/);
@@ -407,7 +421,7 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const plan = await nativePlan();
     const evidence = evidenceBySymbol([[plan.symbol, fixtures.eligibleEvidence(plan.records, plan.symbol)]]);
     const executor = executorTrap();
-    await adoption(profileId, executor, evidence, { accountSlot: "ACCOUNT_B", accountPlanPolicy: fixtures.ACCOUNT_B_POLICY }).runOnce();
+    await adoption(profileId, executor, evidence, { accountSlot: "ACCOUNT_B", accountPlanPolicy: fixtures.ACCOUNT_B_POLICY }).runOnce(undefined, NOW);
     expect((await adoptionsOf(plan.planId))[0]).toMatchObject({ reasonCode: "ACCOUNT_NOT_A", handled: false });
     expect(executor.calls()).toBe(0);
   });
@@ -417,13 +431,13 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const a = await nativePlan();
     await executionRow({ executionProfileId: sameSide, alertId: null, symbol: a.symbol, status: "ENTRY_PENDING", direction: "LONG" });
     const ev = (p: NativeFixture) => evidenceBySymbol([[p.symbol, fixtures.eligibleEvidence(p.records, p.symbol)]]);
-    await adoption(sameSide, executorTrap(), ev(a)).runOnce();
+    await adoption(sameSide, executorTrap(), ev(a)).runOnce(undefined, NOW);
     expect((await adoptionsOf(a.planId))[0].reasonCode).toBe("SAME_SYMBOL_SIDE_OCCUPIED");
 
     const opposite = await profile("opposite");
     const b = await nativePlan();
     await executionRow({ executionProfileId: opposite, alertId: null, symbol: b.symbol, status: "ENTRY_PENDING", direction: "SHORT" });
-    await adoption(opposite, executorTrap(), ev(b)).runOnce();
+    await adoption(opposite, executorTrap(), ev(b)).runOnce(undefined, NOW);
     expect((await adoptionsOf(b.planId))[0].reasonCode).toBe("NATIVE_EXECUTION_DISABLED");
 
     const contradictory = await profile("contradictory");
@@ -432,7 +446,7 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     await prisma!.binanceOrder.create({
       data: { tradeExecutionId: finished.id, role: "ENTRY", generation: 1, clientOrderId: `x-${finished.id}`, side: "BUY", positionSide: "LONG", orderType: "LIMIT", originalQuantity: "1", executedQuantity: "0", status: "NEW" },
     });
-    await adoption(contradictory, executorTrap(), ev(c)).runOnce();
+    await adoption(contradictory, executorTrap(), ev(c)).runOnce(undefined, NOW);
     expect((await adoptionsOf(c.planId))[0].reasonCode).toBe("AMBIGUOUS_STATE");
   });
 
@@ -440,29 +454,31 @@ describe("B. Native Account A adoption: durable intent, one verdict per (plan, p
     const off = await profile("safe-off", "SAFE_OFF");
     const plan = await nativePlan();
     const evidence = evidenceBySymbol([[plan.symbol, fixtures.eligibleEvidence(plan.records, plan.symbol)]]);
-    await adoption(off, executorTrap(), evidence).runOnce();
+    await adoption(off, executorTrap(), evidence).runOnce(undefined, NOW);
     expect((await adoptionsOf(plan.planId))[0].reasonCode).toBe("ACCOUNT_NOT_ARMED");
 
     const armed = await profile("safe-runtime");
     const other = await nativePlan();
     const ev2 = evidenceBySymbol([[other.symbol, fixtures.eligibleEvidence(other.records, other.symbol)]]);
-    await adoption(armed, executorTrap(), ev2, { environmentGates: fixtures.SAFE_GATES }).runOnce();
+    await adoption(armed, executorTrap(), ev2, { environmentGates: fixtures.SAFE_GATES }).runOnce(undefined, NOW);
     expect((await adoptionsOf(other.planId))[0].reasonCode).toBe("ACCOUNT_NOT_LIVE_READY");
   });
 
   maybe()("discovery offers only fresh, READY, NATIVE 1D/1W plans, and never a TradingView plan", async () => {
     const profileId = await profile("discovery");
-    const stale = await nativePlan({ agoMs: EXPIRED_MS });
+    // Triggered before the Native absolute lifetime at NOW (and a plan triggered after NOW): neither is ever offered.
+    const stale = await nativePlan({ triggeredAt: beforeNow(PAST_NATIVE_LIFETIME_MS) });
+    const future = await nativePlan({ triggeredAt: beforeNow(-1) });
     const monthly = await nativePlan({ sourceTf: "1M" });
     const pendingPlan = await nativePlan({ status: "PENDING" });
     sequence += 1;
     const tvAlert = await prisma!.alert.create({
-      data: { symbol: `TV${sequence}USDT`, assetType: "CRYPTO", exchange: "BINANCE", timeframe: "15m", price: 1, signal: "LONG", indicatorName: `${TAG}-tv-${sequence}`, sourceTimeframe: "1D", rawPayload: { note: TAG }, triggeredAt: ago(FRESH_MS) },
+      data: { symbol: `TV${sequence}USDT`, assetType: "CRYPTO", exchange: "BINANCE", timeframe: "15m", price: 1, signal: "LONG", indicatorName: `${TAG}-tv-${sequence}`, sourceTimeframe: "1D", rawPayload: { note: TAG }, triggeredAt: beforeNow(FRESH_MS) },
     });
-    await prisma!.extremeRRPlan.create({ data: { alertId: tvAlert.id, status: "READY", direction: "LONG", entryPrice: "1", cutoffAt: ago(FRESH_MS), timeframe: "15m", executionFanoutReadyAt: ago(FRESH_MS) } });
+    await prisma!.extremeRRPlan.create({ data: { alertId: tvAlert.id, status: "READY", direction: "LONG", entryPrice: "1", cutoffAt: beforeNow(FRESH_MS), timeframe: "15m", executionFanoutReadyAt: beforeNow(FRESH_MS) } });
     const evidence = evidenceBySymbol([]);
-    expect(await adoption(profileId, executorTrap(), evidence).runOnce()).toMatchObject({ discovered: 0, claimed: 0 });
-    for (const p of [stale, monthly, pendingPlan]) expect(await adoptionsOf(p.planId)).toHaveLength(0);
+    expect(await adoption(profileId, executorTrap(), evidence).runOnce(undefined, NOW)).toMatchObject({ discovered: 0, claimed: 0 });
+    for (const p of [stale, future, monthly, pendingPlan]) expect(await adoptionsOf(p.planId)).toHaveLength(0);
     expect(evidence.reads()).toBe(0);
   });
 });
@@ -513,12 +529,20 @@ describe("creation: a NATIVE alert cannot own a TradeExecution while the switch 
 // ===========================================================================
 
 describe("29/30. the entry lifecycle refuses a Native execution before any private call", () => {
-  const evaluatedAt = () => new Date();
+  // The fixture clock: every Native signal here is fresh, so the hard switch is what refuses.
+  const evaluatedAt = () => NOW;
 
   async function nativeExecution(status: "PREFLIGHT" | "ENTRY_SUBMITTING", options: { alert?: boolean } = {}) {
     const profileId = await profile(`entry-${status.toLowerCase()}`);
     const plan = await nativePlan();
-    const execution = await executionRow({ executionProfileId: profileId, alertId: options.alert === false ? null : plan.alertId, symbol: plan.symbol, status, marker: true });
+    const execution = await executionRow({
+      executionProfileId: profileId,
+      alertId: options.alert === false ? null : plan.alertId,
+      symbol: plan.symbol,
+      status,
+      marker: true,
+      signalTriggeredAt: plan.triggeredAt,
+    });
     return { profileId, plan, execution };
   }
 
@@ -588,10 +612,12 @@ describe("29/30. the entry lifecycle refuses a Native execution before any priva
   maybe()("24. Phase 5 still applies to a Native row: a kill-switched profile is refused by SafetyAdmission without any exchange read", async () => {
     const profileId = await profile("phase5", "SAFE_OFF");
     const plan = await nativePlan();
-    const execution = await executionRow({ executionProfileId: profileId, alertId: plan.alertId, symbol: plan.symbol, status: "PLAN_READY", marker: true });
+    const execution = await executionRow({ executionProfileId: profileId, alertId: plan.alertId, symbol: plan.symbol, status: "PLAN_READY", marker: true, signalTriggeredAt: plan.triggeredAt });
     const readOnly = readOnlyTrap();
-    const outcome = await new SafetyAdmissionService(prisma!, readOnly as never).evaluateAndReserveSafetyAdmission({ executionId: execution.id, expectedVersion: 1, evaluatedAt: new Date() });
+    // At NOW the Native signal is fresh, so the kill switch alone is what stops every read.
+    const outcome = await new SafetyAdmissionService(prisma!, readOnly as never).evaluateAndReserveSafetyAdmission({ executionId: execution.id, expectedVersion: 1, evaluatedAt: NOW });
     expect(outcome.decision).not.toBe("PASS");
+    expect(outcome.reasonCode).toBe("PROFILE_KILL_SWITCH_ACTIVE");
     expect(readOnly.calls).toEqual([]);
     expect(await prisma!.binanceOrder.count({ where: { tradeExecutionId: execution.id } })).toBe(0);
   });
