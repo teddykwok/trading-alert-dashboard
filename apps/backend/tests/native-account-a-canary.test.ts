@@ -614,6 +614,8 @@ describe("29/30. no Native path reaches a private mutation without the admission
       "native-account-a-adoption.ts",
       "native-account-a-canary.ts",
       "native-account-slot.ts",
+      // M6: observation only. Its imports and authority are audited in native-m6-dry-admission-structure.test.ts.
+      "native-dry-admission.ts",
       "native-execution-fence.ts",
       "native-execution-switch.ts",
       "native-occupancy.ts",
