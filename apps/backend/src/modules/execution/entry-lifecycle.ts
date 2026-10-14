@@ -75,6 +75,11 @@ export const ENTRY_REASON_CODES = [
   "NATIVE_EXECUTION_DISABLED",
   "NATIVE_INTEGRITY_NOT_ELIGIBLE",
   "NATIVE_SOURCE_AMBIGUOUS",
+  // The same fence's Native risk contract (native-canary/native-risk-gate.ts):
+  // no approved Native risk, an unreadable budget, or a budget above it.
+  "NATIVE_RISK_UNRESOLVED",
+  "NATIVE_RISK_BUDGET_INVALID",
+  "NATIVE_RISK_EXCEEDS_CONTRACT",
   "ENTRY_SUBMITTED",
   "ENTRY_RECONCILED",
 ] as const;

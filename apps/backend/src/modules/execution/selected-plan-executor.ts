@@ -9,8 +9,14 @@ import {
   type NativeAccountAHandoff,
   type NativeAccountAOutcome,
 } from "../native-canary/native-account-a-canary";
-import { nativeAlertFence, nativeFenceRuntimeFromEnv, type NativeFenceRuntime } from "../native-canary/native-execution-fence";
+import {
+  nativeAlertFence,
+  nativeAlertSignalFreshness,
+  nativeFenceRuntimeFromEnv,
+  type NativeFenceRuntime,
+} from "../native-canary/native-execution-fence";
 import { NativeOccupancyConflictError } from "../native-canary/native-occupancy";
+import { nativeSignalRefusalCodeOf } from "../native-canary/native-signal-freshness";
 import { isExactAuthorization } from "./canary-authorization.service";
 import { naturalWindowAdmitsDirection } from "./natural-authorization";
 import type { ExecutionService } from "./execution.service";
@@ -389,10 +395,12 @@ export class SelectedPlanExecutor {
    * It accepts only a hand-off issued by the Native Account A decision
    * (native-canary/native-account-a-canary.ts), which already required Account
    * A, a NATIVE 1D/1W alert, its READY plan resolved for Account A's planner
-   * window, clean source-bar evidence, a free symbol + side, LIVE_READY, ARMED
-   * and the hard switch. It does not trust that decision: immediately before
-   * the first signed request (the margin planner's account and bracket reads)
-   * it asks the Native fence again.
+   * window, a fresh signal, clean source-bar evidence, a free symbol + side,
+   * LIVE_READY, ARMED, the hard switch and a resolved Native risk contract. It
+   * does not trust that decision: immediately before the first signed request
+   * (the margin planner's account and bracket reads) it asks the Native fence
+   * again, against the very risk budget the planner would use, and re-judges
+   * the signal's freshness at `evaluatedAt`.
    *
    * Past the fence it adds nothing of its own. It uses the SAME margin planner,
    * the SAME idempotent creation and the SAME orchestrator admission
@@ -401,15 +409,21 @@ export class SelectedPlanExecutor {
    * the Native fence again immediately before every exposure-increasing call.
    * There is no authorization pre-check here; SafetyAdmission is authoritative.
    */
-  async handleNativeAccountACandidate(handoff: NativeAccountAHandoff): Promise<NativeAccountAOutcome> {
+  async handleNativeAccountACandidate(handoff: NativeAccountAHandoff, evaluatedAt: Date): Promise<NativeAccountAOutcome> {
     const executionProfileId = this.deps.boundProfile.executionProfileId;
 
     const verified = verifyNativeAccountAHandoff(handoff, { executionProfileId });
     if (!verified.ok) return { handled: false, reasonCode: verified.reasonCode, message: verified.message };
 
     // --- The Native fence, immediately before the first signed request -----
-    const fence = await nativeAlertFence(this.deps.prisma, handoff.alertId, this.deps.nativeFence ?? nativeFenceRuntimeFromEnv());
+    // The switch, the source bar's evidence, then the Native risk contract
+    // against the budget the margin planner is about to be given.
+    const fence = await nativeAlertFence(this.deps.prisma, handoff.alertId, this.deps.nativeFence ?? nativeFenceRuntimeFromEnv(), handoff.template.riskAmount);
     if (!fence.admitted) return { handled: false, reasonCode: fence.reasonCode, message: fence.message };
+
+    // --- Native signal freshness, at the same boundary -----------------------
+    const freshness = await nativeAlertSignalFreshness(this.deps.prisma, handoff.alertId, evaluatedAt);
+    if (!freshness.fresh) return { handled: false, reasonCode: nativeSignalRefusalCodeOf(freshness), message: freshness.message };
 
     // --- Unreachable while NATIVE_EXECUTION_ENABLED is false ----------------
     const { stopLoss, takeProfit } = handoff.candidate;
@@ -422,7 +436,9 @@ export class SelectedPlanExecutor {
       entryPrice: handoff.entryPrice,
       stopLoss,
       // The plan's own frozen template snapshot is the risk budget, exactly as
-      // for TradingView. The Account A lookback is a planner window, not risk.
+      // for TradingView; the fence above has just held it against the Native
+      // risk contract (a cap, never a resize). The Account A lookback is a
+      // planner window, not risk.
       riskBudgetUsd: handoff.template.riskAmount,
     });
     if (marginPlan.status !== "READY" || marginPlan.selectedLeverage === null) {

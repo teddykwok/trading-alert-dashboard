@@ -228,7 +228,24 @@ export interface ProposedExecution {
    * the lineage is AMBIGUOUS and no modality may be continued.
    */
   intendedTakeProfitModality: "ALGO" | "STANDARD" | null;
+  /**
+   * NATIVE executions only: the Native signal-freshness verdict
+   * (native-canary/native-signal-freshness.ts), judged by the caller from the
+   * alert's own durable provenance at this same `evaluatedAt`. When present it
+   * REPLACES the maxAlertAgeSeconds rule for this execution; absent (every
+   * TradingView execution) that rule applies exactly as before.
+   */
+  nativeSignalFreshness?: NativeSignalFreshnessVerdict;
 }
+
+/**
+ * The verdict's shape, restated so this pure engine imports nothing: STALE
+ * maps to ALERT_STALE, any other refusal (future-dated or unprovable time) to
+ * SIGNAL_TIME_UNAVAILABLE. Both are terminal.
+ */
+export type NativeSignalFreshnessVerdict =
+  | { readonly fresh: true }
+  | { readonly fresh: false; readonly reason: "STALE" | "TIME_IN_FUTURE" | "EVIDENCE_INVALID"; readonly message: string };
 
 export interface EffectiveSafetyPolicy {
   killSwitchActive: boolean;
@@ -593,7 +610,18 @@ export function evaluateSafetyAdmission(input: SafetyEvaluationInput): SafetyDec
 
   // --- 3. Freshness (original signal time only, never createdAt) ----------
   let signalAgeSeconds: number | null = null;
-  if (!proposed.signalTriggeredAt || Number.isNaN(proposed.signalTriggeredAt.getTime())) {
+  const native = proposed.nativeSignalFreshness;
+  if (native !== undefined) {
+    // NATIVE: the operational-bar rule, already judged at this evaluatedAt.
+    // The age is still reported, from the same frozen signal time.
+    if (proposed.signalTriggeredAt && !Number.isNaN(proposed.signalTriggeredAt.getTime())) {
+      signalAgeSeconds = Math.floor((evaluatedAt.getTime() - proposed.signalTriggeredAt.getTime()) / 1000);
+    }
+    if (native.fresh !== true) {
+      const message = native.message || "Native signal freshness could not be established.";
+      fail(native.reason === "STALE" ? "ALERT_STALE" : "SIGNAL_TIME_UNAVAILABLE", `${message}.`);
+    }
+  } else if (!proposed.signalTriggeredAt || Number.isNaN(proposed.signalTriggeredAt.getTime())) {
     fail("SIGNAL_TIME_UNAVAILABLE", "No trustworthy original signal timestamp; refusing to infer freshness.");
   } else {
     const deltaMs = evaluatedAt.getTime() - proposed.signalTriggeredAt.getTime();

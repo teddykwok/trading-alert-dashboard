@@ -33,7 +33,12 @@ import { resolveTakeProfitModality, takeProfitLineage } from "./protection-lifec
 import { standardTakeProfitMeetsMinNotional } from "./take-profit-notional";
 import type { TerminalTakeProfitFeasibility } from "./entry-lifecycle";
 import { applySessionAccountingForStatus } from "./trading-session.service";
-import { nativeExecutionFence, nativeFenceRuntimeFromEnv, type NativeFenceRuntime } from "../native-canary/native-execution-fence";
+import {
+  nativeExecutionFence,
+  nativeExecutionSignalFreshness,
+  nativeFenceRuntimeFromEnv,
+  type NativeFenceRuntime,
+} from "../native-canary/native-execution-fence";
 
 /**
  * Phase 6 — LIMIT entry lifecycle orchestration.
@@ -229,7 +234,7 @@ export class EntryLifecycleService {
     // missing execution is left to revalidation to report, exactly as before.
     const target = await this.prisma.tradeExecution.findUnique({
       where: { id: input.executionId },
-      select: { id: true, alertId: true },
+      select: { id: true, alertId: true, riskBudgetUsd: true },
     });
     if (target) {
       const native = await this.nativeFenceRefusal(target);
@@ -721,7 +726,7 @@ export class EntryLifecycleService {
       };
     }
 
-    const expiry = this.preflightDeadlinePassed(execution, evaluatedAt);
+    const expiry = await this.preflightDeadlinePassed(execution, evaluatedAt);
     if (expiry) {
       return {
         toStatus: "SKIPPED",
@@ -747,10 +752,20 @@ export class EntryLifecycleService {
    *
    * A missing `signalTriggeredAt` is NOT treated as expiry: it means the age is
    * unknowable, and "unknown" is never proof. Such a row is left alone.
+   *
+   * A NATIVE execution's signal deadline is the Native freshness rule, exactly
+   * as `revalidate` applies it, and only a proven STALE verdict is expiry: its
+   * expiry is fixed by durable provenance, so once passed it stays passed.
+   * Unreadable, inconsistent or future-dated evidence proves nothing, so such
+   * a row is left alone exactly like a missing signalTriggeredAt.
    */
-  private preflightDeadlinePassed(execution: TradeExecution, evaluatedAt: Date): string | null {
+  private async preflightDeadlinePassed(execution: TradeExecution, evaluatedAt: Date): Promise<string | null> {
     if (execution.entryExpiresAt && evaluatedAt.getTime() > execution.entryExpiresAt.getTime()) {
       return `the planned entry deadline passed at ${execution.entryExpiresAt.toISOString()}`;
+    }
+    const native = await nativeExecutionSignalFreshness(this.prisma, execution, evaluatedAt);
+    if (native.applies) {
+      return !native.freshness.fresh && native.freshness.reason === "STALE" ? native.freshness.message : null;
     }
     if (!execution.signalTriggeredAt) return null;
 
@@ -784,14 +799,15 @@ export class EntryLifecycleService {
    * Null for every TradingView execution: the fence does not apply and the
    * TradingView path is unchanged. For an execution created from a NATIVE
    * alert it is a FRESH judgment every time (the hard-coded switch, then the
-   * source bar's evidence re-read), never a verdict carried from upstream, and
-   * it refuses unless that judgment admits. Today it never admits.
+   * source bar's evidence re-read, then the Native risk contract against the
+   * execution's frozen riskBudgetUsd), never a verdict carried from upstream,
+   * and it refuses unless that judgment admits. Today it never admits.
    *
    * Like the live gates, it does not stand in front of risk-REDUCING work:
    * reconciling or cancelling an order that may exist stays available.
    */
   private async nativeFenceRefusal(
-    execution: Pick<TradeExecution, "id" | "alertId">
+    execution: Pick<TradeExecution, "id" | "alertId" | "riskBudgetUsd">
   ): Promise<{ reasonCode: EntryReasonCode; message: string } | null> {
     const verdict = await nativeExecutionFence(this.prisma, execution, this.nativeFence);
     if (!verdict.applies || verdict.admitted) return null;
@@ -946,12 +962,19 @@ export class EntryLifecycleService {
     if (execution.entryExpiresAt && input.evaluatedAt.getTime() > execution.entryExpiresAt.getTime()) {
       return fail("SIGNAL_OR_ENTRY_DEADLINE_EXPIRED", "The planned entry deadline has passed.");
     }
-    if (!execution.signalTriggeredAt) {
+    // A NATIVE signal's freshness is its operational-bar rule, judged from its
+    // own durable provenance (native-canary/native-signal-freshness.ts) before
+    // any signed read below. The age rule after it is TradingView's, unchanged.
+    const native = await nativeExecutionSignalFreshness(this.prisma, execution, input.evaluatedAt);
+    if (native.applies) {
+      if (!native.freshness.fresh) return fail("SIGNAL_OR_ENTRY_DEADLINE_EXPIRED", `${native.freshness.message}.`);
+    } else if (!execution.signalTriggeredAt) {
       return fail("SIGNAL_OR_ENTRY_DEADLINE_EXPIRED", "The original signal time is unknown.");
-    }
-    const ageSeconds = Math.floor((input.evaluatedAt.getTime() - execution.signalTriggeredAt.getTime()) / 1000);
-    if (ageSeconds > env.EXECUTION_MAX_ALERT_AGE_SECONDS) {
-      return fail("SIGNAL_OR_ENTRY_DEADLINE_EXPIRED", `Signal is ${ageSeconds}s old.`);
+    } else {
+      const ageSeconds = Math.floor((input.evaluatedAt.getTime() - execution.signalTriggeredAt.getTime()) / 1000);
+      if (ageSeconds > env.EXECUTION_MAX_ALERT_AGE_SECONDS) {
+        return fail("SIGNAL_OR_ENTRY_DEADLINE_EXPIRED", `Signal is ${ageSeconds}s old.`);
+      }
     }
 
     // Live exchange state.

@@ -10,6 +10,8 @@ import { profileLockKey } from "./profile-lock";
 import { resolveTakeProfitModality, takeProfitLineage } from "./protection-lifecycle";
 import { env } from "../../config/env";
 import type { BinanceReadOnlyService } from "../binance/binance-read-only.service";
+import { nativeExecutionSignalFreshness } from "../native-canary/native-execution-fence";
+import type { NativeSignalFreshness } from "../native-canary/native-signal-freshness";
 import { NotFoundError } from "../../utils/errors";
 import {
   OPEN_POSITION_STATUSES,
@@ -332,17 +334,27 @@ export class SafetyAdmissionService {
       }
     );
 
+    // A NATIVE execution's signal freshness is its operational-bar rule
+    // (native-canary/native-signal-freshness.ts), judged ONCE here from the
+    // alert's own durable provenance at this admission's evaluatedAt, and
+    // handed to the engine. Null for every TradingView execution, which keeps
+    // the engine's unchanged maxAlertAgeSeconds rule.
+    const native = await nativeExecutionSignalFreshness(this.prisma, execution, input.evaluatedAt);
+    const nativeSignalFreshness = native.applies ? native.freshness : null;
+
     // Kill switch short-circuit: no Binance call is made at all when either
     // switch is active. Nothing is cancelled or closed — only this admission
-    // is refused.
+    // is refused. A Native signal that is not fresh short-circuits the same
+    // way, so it never reaches a signed read; the engine refuses it terminally.
     const killSwitched = effective.killSwitchActive;
-    const { binance, symbolState } = killSwitched
+    const nativeNotFresh = nativeSignalFreshness !== null && !nativeSignalFreshness.fresh;
+    const { binance, symbolState } = killSwitched || nativeNotFresh
       ? { binance: UNAVAILABLE_BINANCE, symbolState: UNAVAILABLE_SYMBOL }
       : await this.readBinanceState(execution.symbol);
 
     let lastConflict = false;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      const outcome = await this.attempt(execution.id, input, effective, binance, symbolState, killSwitched);
+      const outcome = await this.attempt(execution.id, input, effective, binance, symbolState, killSwitched, nativeSignalFreshness);
       if (outcome !== "CONFLICT") return outcome;
       lastConflict = true;
     }
@@ -367,7 +379,8 @@ export class SafetyAdmissionService {
     effective: EffectiveSafetyPolicy,
     binance: BinanceCapacitySnapshot,
     symbolState: SymbolStateSnapshot,
-    killSwitched: boolean
+    killSwitched: boolean,
+    nativeSignalFreshness: NativeSignalFreshness | null
   ): Promise<SafetyAdmissionOutcome | "CONFLICT"> {
     return this.prisma.$transaction(async (tx) => {
       const execution = await tx.tradeExecution.findUniqueOrThrow({ where: { id: executionId } });
@@ -423,6 +436,8 @@ export class SafetyAdmissionService {
           plannedQuantity: execution.plannedQuantity.toString(),
           takeProfit: execution.takeProfit?.toString() ?? null,
           intendedTakeProfitModality,
+          // Native only; a TradingView execution carries no such key at all.
+          ...(nativeSignalFreshness === null ? {} : { nativeSignalFreshness }),
         },
         policy: effective,
         local,
