@@ -136,6 +136,8 @@ export type NativeCanaryPlan = Pick<
 /** One local execution on the candidate's symbol, as durable state holds it. */
 export interface NativeOccupancyRow {
   readonly id: string;
+  /** The alert that execution was created from (null once retention nulls it). */
+  readonly alertId: string | null;
   readonly symbol: string;
   readonly status: string;
   readonly direction: string;
@@ -225,13 +227,21 @@ const SIDES = new Set(["LONG", "SHORT"]);
  *  - an occupying status on the SAME side: occupied;
  *  - the opposite side or another symbol: no collision under this rule.
  *
+ * The candidate's OWN execution (same alert) is never its occupant: a retry
+ * after a crash must find its execution, not be refused by it.
+ *
  * "No row" proves only that nothing LOCAL holds the slot. Exchange exposure is
  * still checked later by the existing signed revalidation, which also refuses
  * any other local execution on the symbol, whichever side.
+ *
+ * This judgment is a READ. Taken alone it cannot stop two candidates that read
+ * concurrently; `reserveNativeOccupancy` (native-occupancy.ts) repeats it under
+ * a (profile, symbol, side) lock in the creating transaction, and that repeat
+ * is the authoritative one.
  */
 export function judgeSameSymbolSideOccupancy(
   rows: readonly NativeOccupancyRow[] | null,
-  target: { readonly symbol: string; readonly positionSide: "LONG" | "SHORT" }
+  target: { readonly symbol: string; readonly positionSide: "LONG" | "SHORT"; readonly alertId?: string }
 ): NativeOccupancyVerdict {
   if (rows === null) {
     return { occupied: true, reasonCode: "AMBIGUOUS_STATE", executionId: null, detail: "Local execution state could not be read; an unread state is never treated as free." };
@@ -241,6 +251,7 @@ export function judgeSameSymbolSideOccupancy(
   const occupying: string[] = [];
   for (const row of rows) {
     if (row.symbol.trim().toUpperCase() !== symbol) continue;
+    if (target.alertId !== undefined && row.alertId !== null && row.alertId === target.alertId) continue;
     if (!SIDES.has(row.positionSide)) {
       ambiguous.push({ id: row.id, why: `position side ${row.positionSide} cannot be attributed to one side` });
       continue;
@@ -409,7 +420,7 @@ export function evaluateNativeAccountACandidate(input: NativeCanaryInput): Nativ
   }
 
   // --- OCCUPANCY: max one active/pending per symbol + side --------------------
-  const occupancy = judgeSameSymbolSideOccupancy(input.occupancy, { symbol: alert.symbol, positionSide: plan.direction });
+  const occupancy = judgeSameSymbolSideOccupancy(input.occupancy, { symbol: alert.symbol, positionSide: plan.direction, alertId: alert.id });
   if (occupancy.occupied) return refusal("OCCUPANCY", occupancy.reasonCode, occupancy.detail, "ELIGIBLE");
 
   // --- ACCOUNT_GATES: the existing deterministic Account A gates ---------------

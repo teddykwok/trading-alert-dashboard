@@ -65,6 +65,7 @@ const refusalOf = (input: NativeCanaryInput) => {
 function row(over: Partial<NativeOccupancyRow> = {}): NativeOccupancyRow {
   return {
     id: "exec-1",
+    alertId: "another-alert",
     symbol: CANARY_SYMBOL,
     status: "ENTRY_PENDING",
     direction: "LONG",
@@ -326,6 +327,16 @@ describe("C. same symbol + same side occupancy", () => {
     expect(judgeSameSymbolSideOccupancy([...mixed].reverse(), LONG)).toEqual(judgeSameSymbolSideOccupancy(mixed, LONG));
   });
 
+  it("22b. the candidate's OWN execution (same alert) is never its occupant, so a retry finds it instead of being refused by it", () => {
+    const own = row({ alertId: "alert-x", status: "PLAN_READY" });
+    expect(judgeSameSymbolSideOccupancy([own], { ...LONG, alertId: "alert-x" })).toEqual({ occupied: false });
+    // Anyone else's execution, or one whose alert retention has nulled, still holds the slot.
+    expect(judgeSameSymbolSideOccupancy([own], { ...LONG, alertId: "alert-y" })).toMatchObject({ occupied: true, reasonCode: "SAME_SYMBOL_SIDE_OCCUPIED" });
+    expect(judgeSameSymbolSideOccupancy([row({ alertId: null, status: "PLAN_READY" })], { ...LONG, alertId: "alert-x" })).toMatchObject({ occupied: true });
+    // And an ambiguous own row is skipped only because it is the candidate itself.
+    expect(judgeSameSymbolSideOccupancy([row({ alertId: "alert-x", status: "MANUAL_INTERVENTION" })], { ...LONG, alertId: "alert-x" })).toEqual({ occupied: false });
+  });
+
   it("21b. finished rows whose orders are provably finished are free", () => {
     for (const status of ["ENTRY_EXPIRED", "CLOSED_TP", "CLOSED_SL", "CLOSED_EMERGENCY", "CLOSED_EXTERNAL", "CANCELED", "SKIPPED", "FAILED"]) {
       expect(judgeSameSymbolSideOccupancy([row({ status, entryOrders: [{ status: "FILLED", submissionUnknown: false }, { status: "CANCELED", submissionUnknown: false }] })], LONG), status).toEqual({ occupied: false });
@@ -556,13 +567,62 @@ describe("29/30. no Native path reaches a private mutation without the admission
   it("the Native modules perform no exchange I/O of their own and add no route, UI control or migration", () => {
     const dir = path.join(BACKEND, "src/modules/native-canary");
     const files = readdirSync(dir).sort();
-    expect(files).toEqual(["native-account-a-adoption.ts", "native-account-a-canary.ts", "native-account-slot.ts", "native-execution-fence.ts", "native-execution-switch.ts"]);
+    expect(files).toEqual(["native-account-a-adoption.ts", "native-account-a-canary.ts", "native-account-slot.ts", "native-execution-fence.ts", "native-execution-switch.ts", "native-occupancy.ts"]);
     for (const file of files) {
-      const code = codeOf(`src/modules/native-canary/${file}`);
-      expect({ file, hit: code.match(/binance|fetch\(|fastify|\.post\(|\.get\("\/|createHmac|X-MBX|BINANCE_API|apiSecret|\$executeRaw|writeFile|appendFile/i)?.[0] ?? null }).toEqual({ file, hit: null });
+      // The only raw SQL is the occupancy module's own advisory lock, checked below.
+      const code = codeOf(`src/modules/native-canary/${file}`).replace(/\$executeRaw`SELECT pg_advisory_xact_lock\(\$\{NATIVE_OCCUPANCY_LOCK_NAMESPACE\}::int, /g, "");
+      expect({ file, hit: code.match(/binance|fetch\(|fastify|\.post\(|\.get\("\/|createHmac|X-MBX|BINANCE_API|apiSecret|\$executeRaw|\$queryRaw|writeFile|appendFile/i)?.[0] ?? null }).toEqual({ file, hit: null });
     }
     const app = readFileSync(path.join(BACKEND, "src/app.ts"), "utf8");
     expect(app).not.toContain("native-canary");
+  });
+});
+
+// ===========================================================================
+// Pre-merge audit: the serialization point and the plan-authoritative window
+// ===========================================================================
+
+describe("pre-merge audit: (account, symbol, side) is serialized where occupancy is established", () => {
+  it("Q1. exactly one production module creates a TradeExecution, and its Native branch reserves the slot under the keyed lock INSIDE the creating transaction, before the insert", () => {
+    const creators = productionSources().filter((rel) => /tradeExecution\.(create|createMany|upsert)\(/.test(codeOf(rel)));
+    expect(creators).toEqual(["src/modules/execution/execution.service.ts"]);
+    const execution = codeOf("src/modules/execution/execution.service.ts");
+    const create = execution.slice(execution.indexOf("async createExecutionFromReadyPlan("), execution.indexOf("private resolveSelectedLookback("));
+    const tx = create.indexOf("return this.prisma.$transaction(async (tx) => {");
+    const reserve = create.indexOf("await reserveNativeOccupancy(tx, {");
+    const insert = create.indexOf("await tx.tradeExecution.create({");
+    expect(tx).toBeGreaterThan(-1);
+    expect(reserve).toBeGreaterThan(tx);
+    expect(insert).toBeGreaterThan(reserve);
+    // Guarded by the Native hand-off alone, with nothing else in between.
+    expect(create.slice(tx + "return this.prisma.$transaction(async (tx) => {".length, reserve)).toMatch(/^\s*if \(native\) \{\s*$/);
+  });
+
+  it("Q1. the lock is transaction-scoped, keyed by profile + symbol + side, in a namespace no other lock uses, and the occupancy re-read follows it", () => {
+    const occupancy = codeOf("src/modules/native-canary/native-occupancy.ts");
+    const body = occupancy.slice(occupancy.indexOf("export async function reserveNativeOccupancy("));
+    const lock = body.indexOf("pg_advisory_xact_lock(${NATIVE_OCCUPANCY_LOCK_NAMESPACE}::int, ${nativeOccupancyLockKey(");
+    const read = body.indexOf("await loadNativeOccupancyRows(tx,");
+    const judge = body.indexOf("judgeSameSymbolSideOccupancy(rows,");
+    expect(lock).toBeGreaterThan(-1);
+    expect(read).toBeGreaterThan(lock);
+    expect(judge).toBeGreaterThan(read);
+    const namespaces = productionSources().flatMap((rel) => [...codeOf(rel).matchAll(/const (\w*LOCK_NAMESPACE) = (0x[0-9a-f]+);/gi)].map((m) => m[2].toLowerCase()));
+    expect(namespaces).toContain("0xa7e1");
+    expect(new Set(namespaces).size).toBe(namespaces.length);
+  });
+
+  it("Q1. no alternate Native entry point: only the Native adoption calls the executor's Native method, and only creation reserves the slot", () => {
+    expect(productionSources().filter((rel) => codeOf(rel).includes(".handleNativeAccountACandidate("))).toEqual(["src/modules/native-canary/native-account-a-adoption.ts"]);
+    expect(productionSources().filter((rel) => codeOf(rel).includes("reserveNativeOccupancy(")).sort()).toEqual([
+      "src/modules/execution/execution.service.ts",
+      "src/modules/native-canary/native-occupancy.ts",
+    ]);
+    // The executor turns a lost race into a terminal refusal, before admission.
+    const executor = codeOf("src/modules/execution/selected-plan-executor.ts");
+    const native = executor.slice(executor.indexOf("async handleNativeAccountACandidate("));
+    expect(native.indexOf("if (error instanceof NativeOccupancyConflictError) {")).toBeGreaterThan(-1);
+    expect(native.indexOf("if (error instanceof NativeOccupancyConflictError) {")).toBeLessThan(native.indexOf("this.deps.orchestrator.admitAndSubmit("));
   });
 });
 

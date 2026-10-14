@@ -10,6 +10,7 @@ import {
   type NativeAccountAOutcome,
 } from "../native-canary/native-account-a-canary";
 import { nativeAlertFence, nativeFenceRuntimeFromEnv, type NativeFenceRuntime } from "../native-canary/native-execution-fence";
+import { NativeOccupancyConflictError } from "../native-canary/native-occupancy";
 import { isExactAuthorization } from "./canary-authorization.service";
 import { naturalWindowAdmitsDirection } from "./natural-authorization";
 import type { ExecutionService } from "./execution.service";
@@ -455,6 +456,12 @@ export class SelectedPlanExecutor {
       executionId = execution.id;
       created = true;
     } catch (error) {
+      if (error instanceof NativeOccupancyConflictError) {
+        // Another execution took (or ambiguously holds) this account's symbol
+        // + side between the decision and the insert. The loser fails closed,
+        // the same way every time, and nothing was created for it.
+        return { handled: false, reasonCode: error.reasonCode, message: error.message };
+      }
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
         const existing = await this.deps.prisma.tradeExecution.findFirst({
           where: { alertId: handoff.alertId, executionProfileId: executionProfileId },

@@ -45,10 +45,29 @@ export interface FixtureOptions {
   signal?: "LONG" | "SHORT";
   symbol?: string;
   id?: string;
+  /** Which live observation in the records the alert is for (0 = the first). */
+  observation?: number;
 }
 
 const commitOf = (barMs: number, classification: ShadowClassification = "SHADOW_LIVE_ONLY", symbol = CANARY_SYMBOL) =>
   fixtureCommit(barMs, classification, CANARY_LINEAGE, symbol);
+
+/**
+ * Two genuine alerts for the SAME symbol and side from ONE source bar: a 1D and
+ * a 1W touch. V2 delivers one alert per source-timeframe slot, so both are
+ * delivered, and both become ELIGIBLE at the same commit. This is the shape of
+ * the hardest same-symbol + same-side race.
+ */
+export function sameBarRecords(options: { symbol?: string; signal?: "LONG" | "SHORT" } = {}): ShadowRecord[] {
+  const symbol = options.symbol ?? CANARY_SYMBOL;
+  const signal = options.signal ?? "LONG";
+  return [
+    commitOf(bar(0), "QUARANTINED_CURRENT_BAR", symbol),
+    observation({ symbol, lineageId: CANARY_LINEAGE, sourceTf: "1D", signal, barMs: SOURCE_BAR, candidateSequence: 0, updateSequence: 2 }),
+    observation({ symbol, lineageId: CANARY_LINEAGE, sourceTf: "1W", signal, barMs: SOURCE_BAR, candidateSequence: 1, updateSequence: 3, levelPrice: 0.8101, eventTimeMs: SOURCE_BAR + 95_000, createdBarOpenTimeMs: bar(0) - 7 * 96 * M15 }),
+    commitOf(SOURCE_BAR, "SHADOW_LIVE_ONLY", symbol),
+  ];
+}
 
 /** Readiness bar quarantined, the source bar observed live and committed live: the ELIGIBLE shape. */
 export function cleanRecords(options: FixtureOptions = {}): ShadowRecord[] {
@@ -63,7 +82,9 @@ export function cleanRecords(options: FixtureOptions = {}): ShadowRecord[] {
 /** The Alert row the real V2 pipeline writes for the observation in `records`. */
 export function canaryAlert(records: readonly ShadowRecord[], options: FixtureOptions = {}): NativeCanaryAlert & { id: string; price: number } {
   const symbol = options.symbol ?? CANARY_SYMBOL;
-  const index = records.findIndex((r) => r.kind === "LIVE_IMMEDIATE_OBSERVATION");
+  const observed = records.flatMap((r, i) => (r.kind === "LIVE_IMMEDIATE_OBSERVATION" ? [i] : []));
+  const index = observed[options.observation ?? 0];
+  if (index === undefined) throw new Error("fixture: no such observation");
   const parsed = parseShadowEventLog(logOf(records), { lineageId: CANARY_LINEAGE, marketType: "USDM_PERPETUAL", symbol, chartInterval: "15m" });
   const target = parsed[index];
   const decision = selectNativeDeliveriesV2(parsed, CANARY_PROFILE.delivery).flatMap((s) =>

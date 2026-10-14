@@ -19,6 +19,7 @@ import { NotFoundError, ValidationError } from "../../utils/errors";
 import { assertExecutableAlertSource } from "../alerts/alert-source";
 import { assertNativeAccountAHandoff, type NativeAccountAHandoff } from "../native-canary/native-account-a-canary";
 import { NATIVE_EXECUTION_MARKER } from "../native-canary/native-execution-fence";
+import { reserveNativeOccupancy } from "../native-canary/native-occupancy";
 import {
   assertDecimalString,
   buildClientOrderId,
@@ -390,6 +391,18 @@ export class ExecutionService {
     }
 
     return this.prisma.$transaction(async (tx) => {
+      if (native) {
+        // Native Account A canary: the (account, symbol, side) slot is taken
+        // under its own lock, in THIS transaction, immediately before the
+        // insert. Two different Native candidates for the same slot are
+        // serialized here, and the second re-reads after the first commits.
+        await reserveNativeOccupancy(tx, {
+          executionProfileId: profile.id,
+          symbol: planned.symbol,
+          positionSide: planned.positionSide,
+          alertId: input.alertId,
+        });
+      }
       const created = await tx.tradeExecution.create({
         data: {
           executionProfileId: profile.id,

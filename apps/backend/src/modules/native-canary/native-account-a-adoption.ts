@@ -11,18 +11,16 @@ import { nativeExecutionIntegrityOf } from "../native-integrity/native-execution
 import { configuredNativeAccountPlanPolicies } from "../native-planning/native-account-plan-policy";
 import {
   NATIVE_CANARY_SOURCE_TIMEFRAMES,
-  NATIVE_FINISHED_STATUSES,
-  POSSIBLY_LIVE_ENTRY_ORDER_STATUSES,
   decideNativeAccountACandidate,
   type NativeAccountAOutcome,
   type NativeAccountGates,
   type NativeAccountSlot,
   type NativeCanaryAlert,
-  type NativeOccupancyRow,
 } from "./native-account-a-canary";
 import { nativeAccountSlotOf } from "./native-account-slot";
 import { nativeFenceRuntimeFromEnv, type NativeFenceRuntime } from "./native-execution-fence";
 import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
+import { loadNativeOccupancyRows } from "./native-occupancy";
 
 /**
  * NATIVE ACCOUNT A ADOPTION: how Account A would decide about a Native plan.
@@ -34,8 +32,13 @@ import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
  *    INSERT, so a retry, a restart or a second worker for the same profile can
  *    never produce a second intent;
  *  - the claim is durable BEFORE anything else happens, and a reclaim of an
- *    expired lease re-asserts the `attempts` fencing token it read;
+ *    expired lease re-asserts the `attempts` fencing token it read AND that
+ *    the lease really is expired (see `claim`);
  *  - the verdict is terminal: a refusal is recorded once and never re-run.
+ *
+ * The claim is per PLAN. It does not, and is not meant to, serialize two
+ * different plans for the same account + symbol + side: that is
+ * `reserveNativeOccupancy`, under its own lock, at execution creation.
  *
  * What differs is eligibility. Discovery offers only READY plans of NATIVE
  * 1D/1W alerts that are still inside the signal lifetime, and the verdict
@@ -166,8 +169,17 @@ export class NativeAccountAAdoptionService {
       }
     }
 
+    // A reclaim must re-assert that the lease it is taking really EXPIRED.
+    // Discovery's relation read is a separate query from its WHERE, so it can
+    // return a claim another worker made a moment ago; fencing on `attempts`
+    // alone would then steal a LIVE lease and evaluate the plan twice at once.
     const won = await this.deps.prisma.selectedPlanAdoption.updateMany({
-      where: { id: candidate.adoptionId, status: "PENDING", attempts: candidate.attempts },
+      where: {
+        id: candidate.adoptionId,
+        status: "PENDING",
+        attempts: candidate.attempts,
+        claimedAt: { lt: new Date(now.getTime() - NATIVE_ADOPTION_CLAIM_LEASE_MS) },
+      },
       data: { attempts: { increment: 1 }, claimedAt: now, claimOwner },
     });
     return won.count === 1 ? candidate.adoptionId : null;
@@ -192,51 +204,6 @@ export class NativeAccountAAdoptionService {
     return won.count === 1;
   }
 
-  /**
-   * Local executions of this profile on the symbol that could hold it: every
-   * unfinished one, every one flagged for a human, and every finished one
-   * whose entry order might still be live.
-   */
-  private async occupancyRows(symbol: string): Promise<NativeOccupancyRow[]> {
-    const rows = await this.deps.prisma.tradeExecution.findMany({
-      where: {
-        executionProfileId: this.deps.boundProfile.executionProfileId,
-        symbol: { equals: symbol.trim(), mode: "insensitive" },
-        OR: [
-          { status: { notIn: [...NATIVE_FINISHED_STATUSES] } },
-          { requiresManualIntervention: true },
-          {
-            orders: {
-              some: {
-                role: "ENTRY",
-                OR: [{ status: { in: [...POSSIBLY_LIVE_ENTRY_ORDER_STATUSES] } }, { submissionUnknownAt: { not: null } }],
-              },
-            },
-          },
-        ],
-      },
-      orderBy: { id: "asc" },
-      select: {
-        id: true,
-        symbol: true,
-        status: true,
-        direction: true,
-        positionSide: true,
-        requiresManualIntervention: true,
-        orders: { where: { role: "ENTRY" }, select: { status: true, submissionUnknownAt: true } },
-      },
-    });
-    return rows.map((row) => ({
-      id: row.id,
-      symbol: row.symbol,
-      status: row.status,
-      direction: row.direction,
-      positionSide: row.positionSide,
-      requiresManualIntervention: row.requiresManualIntervention,
-      entryOrders: row.orders.map((order) => ({ status: order.status, submissionUnknown: order.submissionUnknownAt !== null })),
-    }));
-  }
-
   /** Reads every fact, decides, and hands an admitted candidate to the existing executor. */
   private async evaluate(alertId: string): Promise<NativeAccountAOutcome> {
     const executionProfileId = this.deps.boundProfile.executionProfileId;
@@ -245,7 +212,9 @@ export class NativeAccountAAdoptionService {
 
     const plan = await this.deps.plans.getForAlert(alertId);
     const integrity = this.integrityOf(alert);
-    const occupancy = await this.occupancyRows(alert.symbol);
+    // An early, advisory read. The authoritative re-read happens under the
+    // (profile, symbol, side) lock when the execution row is created.
+    const occupancy = await loadNativeOccupancyRows(this.deps.prisma, executionProfileId, alert.symbol);
     const profile = await this.deps.prisma.executionProfile.findUnique({
       where: { id: executionProfileId },
       select: { isEnabled: true, safetyPolicy: { select: { killSwitchActive: true } } },
