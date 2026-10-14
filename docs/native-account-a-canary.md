@@ -14,6 +14,10 @@ refused before any signed or private exchange request.
   the process is exactly Account A.
 - No schema change, no migration, no new route and no UI control.
 
+Milestone 5 added the Native risk contract (both accounts `UNRESOLVED`) and
+bar-close-anchored Native signal freshness to this path. See
+[native-risk-and-freshness.md](native-risk-and-freshness.md).
+
 ---
 
 ## The path
@@ -42,10 +46,12 @@ first refusal wins and names its stage.
 | `SOURCE` | The alert source is exactly `NATIVE`. | `SOURCE_NOT_NATIVE` |
 | `SOURCE_TIMEFRAME` | The source timeframe is exactly `1D` or `1W`, and the payload agrees with the column. | `SOURCE_TF_NOT_EXECUTABLE`, `AMBIGUOUS_STATE` |
 | `PLAN` | It is the alert's own READY plan; Account A's code-fixed 100-candle window equals the window the plan persists; that window has one candidate, with complete history, valid, money-carrying, with a template. | `PLAN_NOT_READY`, `PLAN_INCOMPLETE`, `PLAN_NOT_FOR_ALERT`, `ACCOUNT_PLAN_UNRESOLVED`, `PLAN_LOOKBACK_MISMATCH`, `AMBIGUOUS_STATE` |
+| `FRESHNESS` (M5) | The signal is inside its Native lifetime at the caller's `nowMs`: until 5 minutes after its operational 15m bar closes, and never more than 20 minutes after the touch. | `NATIVE_SIGNAL_STALE`, `NATIVE_SIGNAL_TIME_UNAVAILABLE` |
 | `INTEGRITY` | The source bar's final scanner evidence is `ELIGIBLE`. | `INTEGRITY_PENDING_BAR_CLOSE`, `INTEGRITY_INELIGIBLE`, `INTEGRITY_UNREADABLE` |
 | `OCCUPANCY` | No local execution holds this symbol and side, and nothing on the symbol is ambiguous. | `SAME_SYMBOL_SIDE_OCCUPIED`, `AMBIGUOUS_STATE` |
 | `ACCOUNT_GATES` | The runtime is `LIVE_READY` and the profile is `ARMED`. | `ACCOUNT_NOT_LIVE_READY`, `ACCOUNT_NOT_ARMED` |
 | `NATIVE_FENCE` | `judgeNativeExecutionAdmission`, with the hard-coded switch, admits. | `NATIVE_EXECUTION_DISABLED`, `NATIVE_INTEGRITY_NOT_ELIGIBLE` |
+| `RISK` (M5) | The code-fixed Native risk contract for Account A admits the plan's frozen template budget. Both contracts are `UNRESOLVED`, so this would refuse whatever the switch let through. | `NATIVE_RISK_UNRESOLVED`, `NATIVE_RISK_BUDGET_INVALID`, `NATIVE_RISK_EXCEEDS_CONTRACT` |
 
 `INTEGRITY_INELIGIBLE` refusals carry the canonical integrity status, for
 example `INELIGIBLE_REQUARANTINED`. The runtime-mode and trading-state
@@ -53,9 +59,10 @@ vocabularies are the canonical ones; a test holds them equal to
 `effectiveModeFromWire` and `mapTradingSystemState` on every input.
 
 Some gates are not re-implemented here: the natural-window claim, the session
-budget, capacity limits and risk admission. A Native execution would meet them
-in the existing Phase 5 SafetyAdmission, under its own lock and with its own
-reason codes.
+budget, capacity limits and total risk/margin admission. A Native execution
+would meet them in the existing Phase 5 SafetyAdmission, under its own lock and
+with its own reason codes. The `RISK` stage is not one of them: it is the
+per-trade Native approval Phase 5 has no notion of.
 
 ### The hand-off
 
@@ -65,15 +72,17 @@ entry point and creation demand.
 - It is deep-frozen.
 - It is recognised by identity alone (a module-private `WeakSet`).
 - It is issued in exactly one place: `decideNativeAccountACandidate`, after the
-  fence admits.
+  fence and the Native risk contract admit.
 
-Because the switch is `false`, no hand-off can exist, so no Native
-`TradeExecution` can be created. A structurally perfect forgery is refused.
+Because the switch is `false` (and no risk contract is resolved), no hand-off
+can exist, so no Native `TradeExecution` can be created. A structurally perfect
+forgery is refused.
 
 ## Where the fence is asked
 
 Every ask is a fresh judgment: the hard-coded switch, then the source bar's
-evidence re-read from disk. No verdict is carried forward from upstream.
+evidence re-read from disk, then (since M5) the Native risk contract against
+the budget the trade would use. No verdict is carried forward from upstream.
 
 | Where | Before |
 | --- | --- |
@@ -202,20 +211,17 @@ later pass decides it.
 
 ## Known limits to resolve before any real canary
 
-1. **Signal age versus bar close (product decision, not changed).** Signal age
-   is measured from `Alert.triggeredAt`, the exchange event time of the
-   intrabar touch, frozen as `TradeExecution.signalTriggeredAt`. The limit is
-   300 s: `EXECUTION_MAX_ALERT_AGE_SECONDS`, min-merged with the policy's
-   `maxAlertAgeSeconds` in Phase 5. It is enforced by adoption discovery,
-   Phase 5 (`ALERT_STALE`), entry revalidation and PREFLIGHT release. A bar
-   becomes `ELIGIBLE` only once the scanner commits it, on the stream's closed
-   kline: bar open + 15 min + a few seconds. So only touches in roughly the
-   last 5 minutes of a bar (under about a third) can ever execute. Touches in
-   the first ~10 minutes never can, and candidates that age out while deferred
-   leave no recorded reason. The recommended direction is a Native-only
-   freshness rule anchored on the source bar's close (derived from the alert's
-   immutable `barStart`, so it is deterministic and replay-safe), with a
-   bounded post-close window and an independent absolute cap.
+1. **Signal age versus bar close: resolved in Milestone 5.** Under Milestone
+   4, Native signals used the 300-second rule from `Alert.triggeredAt`, so
+   touches in the first ~10 minutes of a bar aged out before their bar could
+   become `ELIGIBLE`. Native Signal Freshness V1 now anchors a Native signal's
+   lifetime to its own persisted operational bar: until 5 minutes after the
+   bar closes, capped at 20 minutes from the touch. It applies at adoption
+   discovery and deferral, the decision, the executor, Phase 5, entry
+   revalidation and PREFLIGHT release. A bar still forming is deferred only
+   while fresh, and an expired one is refused stale with a recorded reason.
+   TradingView keeps 300 seconds. See
+   [native-risk-and-freshness.md](native-risk-and-freshness.md).
 2. **Per-account windows are not persisted.** Account A executes only when the
    plan persists 100 (today's generic `EXTREME_RR_LOOKBACK_CANDLES`), otherwise
    it refuses. A generic-process `NATIVE_PLAN_DEFAULT_LOOKBACK_A` preview
@@ -243,7 +249,9 @@ later pass decides it.
     fence;
   - a dormant scheduler;
   - mutation sensitivity: with the switch mocked `true` in a test module graph,
-    the same input is admitted.
+    the same input is refused at `RISK` (no contract is resolved), and it is
+    admitted only when a synthetic resolved Account A contract is mocked in
+    too.
 - `apps/backend/tests/native-account-a-canary.integration.test.ts` runs on the
   `_test` database with trap adapters. It covers:
   - durable, idempotent adoption (retry, restart, race, lease, deferral);
@@ -257,11 +265,18 @@ later pass decides it.
   races two Native candidates for one account, symbol and side (two workers,
   and repeated creation pairs). At most one establishes occupancy, and the
   loser fails closed. It also covers the lease-theft guard, keying by side and
-  symbol, and idempotent retry. Each test mutates the switch to `true` in a
-  test-only module graph; nothing can reach an exchange.
+  symbol, and idempotent retry. Each test mutates the switch to `true` (and,
+  since M5, mocks a synthetic resolved Account A risk contract) in a test-only
+  module graph; nothing can reach an exchange.
 - `apps/backend/tests/native-account-a-canary-isolation.integration.test.ts`
   uses the production composition with sentinel credentials, counting HMAC
   signing, requests and mutation transport:
   - a fresh disabled candidate produces zero of each;
   - a historical reserved Native execution makes only its own risk-reducing
-    order lookup.
+    order lookup;
+  - (M5) past the switch, an `UNRESOLVED` contract keeps both silent, and a
+    synthetic resolved contract shows the trap is live.
+
+Since M5 these suites run on the fixture clock (`FRESH_NOW`, one minute after
+the fixture's source bar closed), so every Native fixture alert is fresh by
+the Native freshness rule.
