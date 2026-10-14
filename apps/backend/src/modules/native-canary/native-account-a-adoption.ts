@@ -21,6 +21,7 @@ import { nativeAccountSlotOf } from "./native-account-slot";
 import { nativeFenceRuntimeFromEnv, type NativeFenceRuntime } from "./native-execution-fence";
 import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
 import { loadNativeOccupancyRows } from "./native-occupancy";
+import { judgeNativeSignalFreshness, nativeSignalLifetimeSpan, nativeSignalWindowOf } from "./native-signal-freshness";
 
 /**
  * NATIVE ACCOUNT A ADOPTION: how Account A would decide about a Native plan.
@@ -41,10 +42,16 @@ import { loadNativeOccupancyRows } from "./native-occupancy";
  * `reserveNativeOccupancy`, under its own lock, at execution creation.
  *
  * What differs is eligibility. Discovery offers only READY plans of NATIVE
- * 1D/1W alerts that are still inside the signal lifetime, and the verdict
- * comes from `decideNativeAccountACandidate`, whose last stage is the hard
- * Native fence. Only an admitted decision hands a capability to the EXISTING
- * executor; everything else completes the row with a typed refusal.
+ * 1D/1W alerts whose trigger instant is inside the Native signal lifetime
+ * (native-signal-freshness.ts), and the verdict comes from
+ * `decideNativeAccountACandidate`, whose FRESHNESS stage makes the exact
+ * freshness judgment and whose last stages are the hard Native fence and the
+ * Native risk contract. Only an admitted decision hands a capability to the
+ * EXISTING executor; everything else completes the row with a typed refusal.
+ *
+ * Time: a caller-fixed `now` (tests) is used for every step of a pass;
+ * otherwise each step reads the clock afresh, so no candidate is ever judged
+ * against an instant older than its own evaluation.
  *
  * DORMANT: `startNativeAccountAAdoptionScheduler` starts nothing unless
  * NATIVE_EXECUTION_ENABLED is true AND this process is exactly Account A.
@@ -97,19 +104,29 @@ interface NativeAdoptionCandidate {
   attempts: number;
 }
 
-const ALERT_SELECT = { id: true, source: true, symbol: true, signal: true, sourceTimeframe: true, rawPayload: true } as const;
+const ALERT_SELECT = { id: true, source: true, symbol: true, signal: true, sourceTimeframe: true, triggeredAt: true, rawPayload: true } as const;
 
 export class NativeAccountAAdoptionService {
   constructor(private readonly deps: NativeAccountAAdoptionDependencies) {}
 
-  /** The repository's signal-lifetime rule, measured from the alert's own trigger instant. */
-  private freshnessFloor(now: Date): Date {
-    return new Date(now.getTime() - env.EXECUTION_MAX_ALERT_AGE_SECONDS * 1000);
+  /**
+   * Discovery's window over the plan's cutoff (its alert's trigger instant):
+   * only trigger instants that can still be fresh, i.e. no older than the
+   * Native absolute cap and not in the future. A superset of the fresh ones;
+   * the decision's FRESHNESS stage makes the exact judgment.
+   */
+  private lifetimeWindow(now: Date): { gte: Date; lte: Date } {
+    const span = nativeSignalLifetimeSpan(now.getTime());
+    return { gte: new Date(span.earliestTriggeredAtMs), lte: new Date(span.latestTriggeredAtMs) };
   }
 
   private integrityOf(alert: NativeCanaryAlert): NativeExecutionIntegrityDto | null {
     if (alert.source !== NATIVE_ALERT_SOURCE) return null;
     return nativeExecutionIntegrityOf(alert, this.deps.fence.evidence);
+  }
+
+  private isFresh(alert: NativeCanaryAlert, now: Date): boolean {
+    return judgeNativeSignalFreshness(nativeSignalWindowOf(alert), now.getTime()).fresh;
   }
 
   /** Native plans this profile has not finished evaluating. The profile predicate is in the query. */
@@ -120,7 +137,7 @@ export class NativeAccountAAdoptionService {
     const plans = await this.deps.prisma.extremeRRPlan.findMany({
       where: {
         status: "READY",
-        cutoffAt: { gt: this.freshnessFloor(now) },
+        cutoffAt: this.lifetimeWindow(now),
         alert: { source: NATIVE_ALERT_SOURCE, sourceTimeframe: { in: [...NATIVE_CANARY_SOURCE_TIMEFRAMES] } },
         OR: [
           { selectedPlanAdoptions: { none: { executionProfileId } } },
@@ -204,8 +221,11 @@ export class NativeAccountAAdoptionService {
     return won.count === 1;
   }
 
-  /** Reads every fact, decides, and hands an admitted candidate to the existing executor. */
-  private async evaluate(alertId: string): Promise<NativeAccountAOutcome> {
+  /**
+   * Reads every fact, decides at `evaluatedAt`, and hands an admitted
+   * candidate to the existing executor with a fresh instant from `clock`.
+   */
+  private async evaluate(alertId: string, evaluatedAt: Date, clock: () => Date): Promise<NativeAccountAOutcome> {
     const executionProfileId = this.deps.boundProfile.executionProfileId;
     const alert = await this.deps.prisma.alert.findUnique({ where: { id: alertId }, select: ALERT_SELECT });
     if (alert === null) return { handled: false, reasonCode: "AMBIGUOUS_STATE", message: `Alert ${alertId} no longer exists.` };
@@ -232,33 +252,37 @@ export class NativeAccountAAdoptionService {
         environment: this.deps.environmentGates,
         profile: profile === null ? null : { isEnabled: profile.isEnabled, killSwitchActive: profile.safetyPolicy?.killSwitchActive ?? null },
       },
+      nowMs: evaluatedAt.getTime(),
     });
     if (!decision.admitted) {
       return { handled: false, reasonCode: decision.reasonCode, message: `${decision.stage}: ${decision.detail}` };
     }
     // Only an admitted decision gets here, and only it can carry a hand-off.
-    return this.deps.executor.handleNativeAccountACandidate(decision.handoff);
+    return this.deps.executor.handleNativeAccountACandidate(decision.handoff, clock());
   }
 
   /**
    * One bounded pass: discover, defer a still-forming source bar, claim,
    * evaluate, record. At-least-once discovery with per-profile idempotency.
    */
-  async runOnce(limit: number = NATIVE_ADOPTION_BATCH_SIZE, now: Date = new Date()): Promise<NativeAdoptionPassSummary> {
+  async runOnce(limit: number = NATIVE_ADOPTION_BATCH_SIZE, now?: Date): Promise<NativeAdoptionPassSummary> {
+    const clock = () => now ?? new Date();
     const summary: NativeAdoptionPassSummary = { discovered: 0, deferred: 0, claimed: 0, completed: 0, skipped: 0 };
-    const candidates = await this.discover(now, limit);
+    const candidates = await this.discover(clock(), limit);
     summary.discovered = candidates.length;
 
     for (const candidate of candidates) {
-      // A bar that has not closed yet is not a refusal: it is not decidable
-      // yet. Nothing is written, and a later pass offers it again.
+      // A bar that has not closed yet is not a refusal while its signal is
+      // still fresh: it is not decidable yet. Nothing is written, and a later
+      // pass offers it again. Once the signal is no longer fresh it is never
+      // deferred: the decision records its terminal FRESHNESS refusal.
       const preview = await this.deps.prisma.alert.findUnique({ where: { id: candidate.alertId }, select: ALERT_SELECT });
-      if (preview !== null && this.integrityOf(preview)?.status === "PENDING_BAR_CLOSE") {
+      if (preview !== null && this.integrityOf(preview)?.status === "PENDING_BAR_CLOSE" && this.isFresh(preview, clock())) {
         summary.deferred += 1;
         continue;
       }
 
-      const adoptionId = await this.claim(candidate, now);
+      const adoptionId = await this.claim(candidate, clock());
       if (adoptionId === null) {
         summary.skipped += 1;
         continue;
@@ -266,10 +290,10 @@ export class NativeAccountAAdoptionService {
       summary.claimed += 1;
       const heldAttempts = candidate.attempts + 1;
 
-      const evaluatedAt = new Date();
+      const evaluatedAt = clock();
       let outcome: NativeAccountAOutcome;
       try {
-        outcome = await this.evaluate(candidate.alertId);
+        outcome = await this.evaluate(candidate.alertId, evaluatedAt, clock);
       } catch (error) {
         // The lease recovers this: the row stays PENDING and a later pass retries it.
         logger.error(

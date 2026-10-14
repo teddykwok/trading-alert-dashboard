@@ -19,6 +19,7 @@ import type { RuntimeMode } from "../operator/account-runtime-transition";
 import type { TradingSystemState } from "../operator/trading-control.service";
 import { NATIVE_EXECUTION_ENABLED } from "./native-execution-switch";
 import { judgeNativeRiskReadiness } from "./native-risk-gate";
+import { judgeNativeSignalFreshness, nativeSignalRefusalCodeOf, nativeSignalWindowOf } from "./native-signal-freshness";
 
 /**
  * NATIVE ACCOUNT A CANARY: the path a Native plan must traverse before it
@@ -32,6 +33,9 @@ import { judgeNativeRiskReadiness } from "./native-risk-gate";
  *                     a dollar amount), no process environment can steer it,
  *                     and it must equal the window the plan PERSISTS. The
  *                     candidate must be complete and sized;
+ *   FRESHNESS         the signal is inside its Native lifetime, anchored to
+ *                     the close of its operational 15m bar
+ *                     (native-signal-freshness.ts), at the caller's `nowMs`;
  *   INTEGRITY         the source bar's final scanner evidence is ELIGIBLE;
  *   OCCUPANCY         no other Account A execution holds this symbol + side
  *                     (a pending LIMIT counts) and nothing on the symbol is
@@ -47,9 +51,10 @@ import { judgeNativeRiskReadiness } from "./native-risk-gate";
  *                     therefore still wins while it is false.
  *
  * Everything here is pure: no database, no file, no network, no clock and no
- * environment. The caller loads the facts; this module only judges them, so
- * the same facts always produce the same verdict. Anything unknown, missing
- * or contradictory is refused, never assumed.
+ * environment. The caller loads the facts and supplies the evaluation instant;
+ * this module only judges them, so the same facts always produce the same
+ * verdict. Anything unknown, missing or contradictory is refused, never
+ * assumed.
  *
  * The only way to obtain a NativeAccountAHandoff, the capability the executor
  * and execution creation demand, is `decideNativeAccountACandidate` admitting
@@ -81,6 +86,7 @@ export const NATIVE_CANARY_STAGES = [
   "SOURCE",
   "SOURCE_TIMEFRAME",
   "PLAN",
+  "FRESHNESS",
   "INTEGRITY",
   "OCCUPANCY",
   "ACCOUNT_GATES",
@@ -102,6 +108,9 @@ export const NATIVE_CANARY_REASON_CODES = [
   "PLAN_INCOMPLETE",
   "ACCOUNT_PLAN_UNRESOLVED",
   "PLAN_LOOKBACK_MISMATCH",
+  // FRESHNESS (native-signal-freshness.ts's own refusal codes)
+  "NATIVE_SIGNAL_STALE",
+  "NATIVE_SIGNAL_TIME_UNAVAILABLE",
   // INTEGRITY (the canonical integrity status travels with the refusal)
   "INTEGRITY_PENDING_BAR_CLOSE",
   "INTEGRITY_INELIGIBLE",
@@ -143,6 +152,8 @@ export interface NativeCanaryAlert {
   readonly symbol: string;
   readonly signal: string | null | undefined;
   readonly sourceTimeframe: string | null | undefined;
+  /** Alert.triggeredAt: the exchange event time of the touch. */
+  readonly triggeredAt: Date | null | undefined;
   readonly rawPayload: unknown;
 }
 
@@ -191,6 +202,8 @@ export interface NativeCanaryInput {
   /** Every local execution of this profile on the symbol that is not plainly finished; null when unread. */
   readonly occupancy: readonly NativeOccupancyRow[] | null;
   readonly accountGates: NativeAccountGates;
+  /** The evaluation instant (epoch ms), supplied by the caller: this module never reads a clock. */
+  readonly nowMs: number;
 }
 
 /** What survives every stage before the fence: the resolved Account A candidate. */
@@ -488,6 +501,13 @@ export function evaluateNativeAccountACandidate(input: NativeCanaryInput): Nativ
   if (typeof plan.entryPrice !== "string" || plan.entryPrice.trim() === "") {
     return refusal("PLAN", "PLAN_INCOMPLETE", "The plan carries no entry price.");
   }
+
+  // --- FRESHNESS: inside the Native lifetime of its operational 15m bar -------
+  // Judged before integrity, so a bar still forming is never refused merely
+  // because 300 seconds passed, and a signal past its window is refused as
+  // stale, permanently, even if its bar never closed cleanly.
+  const freshness = judgeNativeSignalFreshness(nativeSignalWindowOf(alert), input.nowMs);
+  if (!freshness.fresh) return refusal("FRESHNESS", nativeSignalRefusalCodeOf(freshness), `${freshness.message}.`);
 
   // --- INTEGRITY: only ELIGIBLE passes --------------------------------------
   const integrity = input.integrity;
