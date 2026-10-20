@@ -469,6 +469,8 @@ describe("structural proofs: the Native freshness helper is the only one, and Tr
       "src/modules/native-canary/native-account-a-canary.ts",
       "src/modules/native-canary/native-execution-fence.ts",
       "src/modules/native-canary/native-signal-freshness.ts",
+      // M6.5: the read-only signal-quality observatory DISPLAYS freshness at delivery with the same helper; it decides nothing.
+      "src/modules/signal-quality/signal-quality-facts.ts",
     ]);
     expect(filesWith("nativeSignalLifetimeSpan(")).toEqual(["src/modules/native-canary/native-account-a-adoption.ts", "src/modules/native-canary/native-signal-freshness.ts"]);
     expect(filesWith("nativeExecutionSignalFreshness(")).toEqual([
@@ -553,6 +555,8 @@ describe("structural proofs: the Native freshness helper is the only one, and Tr
       "src/modules/native-canary/native-account-a-adoption.ts",
       "src/modules/native-canary/native-account-a-canary.ts",
       "src/modules/native-canary/native-execution-fence.ts",
+      // M6.5: observation only (freshness at delivery, displayed); no freshness behaviour changes.
+      "src/modules/signal-quality/signal-quality-facts.ts",
     ]);
   });
 
