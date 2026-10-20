@@ -8,6 +8,8 @@ export const NAV_ITEMS = [
   { to: "/risk-templates", label: "Risk Templates" },
   { to: "/executions", label: "Executions" },
   { to: "/trading-control", label: "Trading Control" },
+  // Monitoring only: observes Native alerts after they trigger; no control on it can trade or arm.
+  { to: "/signal-quality", label: "Signal Quality" },
   { to: "/settings", label: "Settings" },
 ];
 

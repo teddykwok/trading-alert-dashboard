@@ -8,6 +8,7 @@ import { SettingsPage } from "./pages/SettingsPage";
 import { ExecutionsPage } from "./pages/ExecutionsPage";
 import { ExecutionDetailPage } from "./pages/ExecutionDetailPage";
 import { TradingControlPage } from "./pages/TradingControlPage";
+import { SignalQualityPage } from "./pages/SignalQualityPage";
 
 export function App() {
   return (
@@ -21,6 +22,8 @@ export function App() {
         <Route path="/executions" element={<ExecutionsPage />} />
         <Route path="/executions/:executionId" element={<ExecutionDetailPage />} />
         <Route path="/trading-control" element={<TradingControlPage />} />
+        {/* Monitoring only: the Native signal-quality observatory (read-only, no execution authority). */}
+        <Route path="/signal-quality" element={<SignalQualityPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Routes>
     </AppLayout>

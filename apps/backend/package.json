@@ -37,6 +37,7 @@
     "native-alerts:rebaseline-cursors": "tsx src/modules/native-alerts/run-native-emitter-cursor-rebaseline.ts",
     "native-alerts:plan-worker": "tsx src/modules/native-planning/native-plan.worker.ts",
     "native-alerts:audit": "tsx src/modules/native-audit/run-native-alert-audit.ts",
+    "signal-quality:soak-monitor": "tsx src/modules/signal-quality/run-signal-quality-soak-monitor.ts",
     "execution:canary-preflight": "tsx src/modules/execution/run-canary-preflight.ts",
     "execution:ensure-profile": "tsx src/modules/execution/run-ensure-profile.ts",
     "execution:set-policy": "tsx src/modules/execution/run-set-policy-cli.ts",
