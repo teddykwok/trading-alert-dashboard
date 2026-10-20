@@ -32,6 +32,8 @@ describe("trading control page: navigation", () => {
       "Risk Templates",
       "Executions",
       "Trading Control",
+      // M6.5: the read-only Native signal-quality observatory, after Trading Control.
+      "Signal Quality",
       "Settings",
     ]);
   });
@@ -51,7 +53,8 @@ describe("trading control page: navigation", () => {
 
   it("leaves every pre-existing nav entry untouched", () => {
     // A navigation change must not quietly relabel or repoint anything else.
-    expect(NAV_ITEMS.filter((item) => item.label !== "Trading Control")).toEqual([
+    // M6.5 added exactly one entry (Signal Quality); everything else is unchanged.
+    expect(NAV_ITEMS.filter((item) => item.label !== "Trading Control" && item.label !== "Signal Quality")).toEqual([
       { to: "/", label: "Dashboard", end: true },
       { to: "/risk-templates", label: "Risk Templates" },
       { to: "/executions", label: "Executions" },
