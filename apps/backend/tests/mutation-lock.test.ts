@@ -537,6 +537,12 @@ describe("what the authority records", () => {
       // The generic backend's explicit NON-WATCH start / stop.
       "GENERIC_BACKEND_NONWATCH_START",
       "GENERIC_BACKEND_NONWATCH_STOP",
+      // Always-On Monitoring (monitoring roles only): the launcher's start / stop of the supervisor, and the
+      // supervisor's own fenced role start / stop — under the same machine-wide authority as every launcher action.
+      "ALWAYS_ON_START",
+      "ALWAYS_ON_STOP",
+      "ALWAYS_ON_ROLE_START",
+      "ALWAYS_ON_ROLE_STOP",
     ]);
   });
 });

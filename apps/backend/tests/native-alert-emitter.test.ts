@@ -684,7 +684,9 @@ describe("static fences", () => {
           allowed.has(specifier) ||
           ([CLI, MULTI_CLI, REBASELINE_CLI].includes(file) && specifier === "../../config/bootstrap-generic") ||
           // The rebaseline CLI alone holds each lane's scanner lock while it rewrites delivery cursors (no scanner may append).
-          (file === REBASELINE_CLI && specifier === "../native-scanner/scanner-lock");
+          (file === REBASELINE_CLI && specifier === "../native-scanner/scanner-lock") ||
+          // Always-On Monitoring V1: the multi-emitter CLI alone watches the cooperative stop file a supervisor hands it.
+          (file === MULTI_CLI && specifier === "../native-scanner/cooperative-stop");
         expect({ file, specifier, ok }).toEqual({ file, specifier, ok: true });
       }
       // Only the ledger and the CLIs may touch the database client at all.

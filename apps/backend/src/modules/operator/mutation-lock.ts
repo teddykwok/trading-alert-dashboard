@@ -81,6 +81,12 @@ export const MUTATION_ACTIONS = [
   // The generic backend's explicit NON-WATCH start / stop (never part of Start SAFE).
   "GENERIC_BACKEND_NONWATCH_START",
   "GENERIC_BACKEND_NONWATCH_STOP",
+  // Always-On Monitoring (monitoring roles only, never an account role): the launcher's explicit start / stop of
+  // the supervisor, and the supervisor's own fenced role start / stop, so neither can race a launcher action.
+  "ALWAYS_ON_START",
+  "ALWAYS_ON_STOP",
+  "ALWAYS_ON_ROLE_START",
+  "ALWAYS_ON_ROLE_STOP",
 ] as const;
 
 export type MutationAction = (typeof MUTATION_ACTIONS)[number];

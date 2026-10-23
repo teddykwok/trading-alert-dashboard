@@ -75,6 +75,26 @@ still starts the watch backend). The status shows `Generic backend mode:
 RUNNING — NON-WATCH / RUNNING — WATCH / OFF / UNPROVEN / CONFLICT`. See
 [native-preexecution-safety.md](native-preexecution-safety.md).
 
+### Optional: Always-On Monitoring (MONITORING ONLY · NO ACCOUNT EXECUTION)
+
+- **16. Start Always-On Monitoring** starts the Always-On supervisor detached,
+  logging to `logs\always-on-supervisor.log`. The supervisor owns and
+  supervises the monitoring data plane: the non-watch backend, the Native
+  scanner, the Native emitter (COMMIT, follow) and the Native planner.
+- **17. Show Always-On Monitoring Status** shows its status artifact and
+  whether the recorded supervisor is provably still running.
+- **18. Stop Always-On Monitoring** writes a graceful stop request and waits.
+  The supervisor stops only what it owns, through its own fenced stops; the
+  launcher never terminates it.
+
+It never starts an account role. It is not part of Start SAFE, and Start SAFE,
+Stop Runtime, LIVE-READY, 11–15 and the six-role state file are unchanged.
+
+While Always-On owns the backend and the planner, items 11 and 14 (and Start
+SAFE) see them as external and refuse to start a second copy. Always-On, in
+turn, reports a launcher-owned planner or backend as `CONFLICT` and never
+touches it. See [always-on-monitoring.md](always-on-monitoring.md).
+
 ## Start SAFE proves SAFE before it starts anything
 
 Three proofs, in this order.

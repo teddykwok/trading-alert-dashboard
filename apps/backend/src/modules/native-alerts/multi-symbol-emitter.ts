@@ -31,7 +31,14 @@ import { ShadowLogError, ShadowLogTail, type ShadowLogErrorCode } from "./shadow
  *  - One LANE per symbol: its own validator, selector and cursor. Corrupt or
  *    mismatched evidence fails that lane alone; the others continue.
  *  - A BOUNDED queue, drained round-robin across lanes (fair; each lane's own
- *    order is its log order). Overflow is never a silent drop: it fails closed.
+ *    order is its log order). BOUNDED CATCH-UP: new records are admitted only
+ *    as far as the queue has room — each lane with unread records gets a fair
+ *    share of it — then drained, then admitted again, until every lane is at
+ *    the end of its log. A backlog many times the queue capacity therefore
+ *    drains in bounded rounds; `queueDepth <= queueCapacity` always holds, and
+ *    records not yet admitted simply stay in the durable log (nothing is ever
+ *    dropped or skipped to make room). When everything fits, one round admits
+ *    it all and the processing order is exactly the unbounded order.
  *  - CURSORS (COMMIT only) advance only after a record is fully processed, and
  *    after a delivery only once the ledger transaction has committed. A crash
  *    between commit and cursor write replays harmlessly (the ledger is
@@ -321,6 +328,8 @@ export interface MultiEmitterDeps {
   readonly readMembership?: () => string | null;
   /** Dynamic-universe runs: a joined symbol's checkpoint identity (the same rule as the manifest's lanes). */
   readonly checkpointOf?: (symbol: string) => CheckpointIdentity | null;
+  /** Called after every processed record (observation only): a long catch-up can keep its status file fresh. */
+  readonly progress?: () => void;
 }
 
 type FailureClass = "LINEAGE_OR_PROFILE_MISMATCH" | "MALFORMED";
@@ -346,9 +355,14 @@ interface Lane {
   activatedByRunId: string | null;
   /** True once the baseline is established and the first read verified. Only such a lane ever persists a cursor. */
   baselined: boolean;
+  /** Complete records past the tail's position remain in `text`: the catch-up admits them in bounded chunks. */
+  unread: boolean;
   /** The lane's items awaiting processing, in log order. */
   readonly pending: { readonly record: ShadowRecord; readonly endChars: number }[];
 }
+
+/** The end of the last complete line: everything before it is whole records. */
+const completeEnd = (text: string) => text.lastIndexOf("\n") + 1;
 
 const MISMATCH_CODES: readonly ShadowLogErrorCode[] = ["LINEAGE_MISMATCH", "MARKET_MISMATCH", "SYMBOL_MISMATCH", "INTERVAL_MISMATCH"];
 
@@ -378,6 +392,11 @@ export class MultiSymbolNativeEmitter {
   private queueDepth = 0;
   private maxQueueDepth = 0;
   private rotation = 0;
+  /** Where the next admission round starts among the lanes with unread records (fair when room is scarce). */
+  private admissionRotation = 0;
+  /** Admission rounds that admitted at least one record, and how many records the catch-up admitted in all. */
+  private catchUpRounds = 0;
+  private recordsAdmitted = 0;
   private initialized = false;
   private stoppedWithPending = 0;
   readonly tally = emptyTally();
@@ -415,6 +434,7 @@ export class MultiSymbolNativeEmitter {
       activatedAt: null,
       activatedByRunId: null,
       baselined: false,
+      unread: false,
       pending: [],
     };
   }
@@ -431,9 +451,18 @@ export class MultiSymbolNativeEmitter {
     this.deps.report({ type: "LANE_FAILED", symbol: lane.symbol, code, message });
   }
 
+  /**
+   * A refused read fails the lane closed. Anything it still had queued is
+   * dropped unprocessed — exactly as an unbounded read that met the same bad
+   * line delivered nothing of its batch — so nothing at or after a refusal is
+   * ever delivered. Its cursor stays at its last processed record.
+   */
   private refuseLaneRead(lane: Lane, error: unknown): void {
     if (!(error instanceof ShadowLogError)) throw error;
     this.failLane(lane, error.code, error.message, MISMATCH_CODES.includes(error.code) ? "LINEAGE_OR_PROFILE_MISMATCH" : "MALFORMED");
+    this.queueDepth -= lane.pending.length;
+    lane.pending.length = 0;
+    lane.unread = false;
   }
 
   private expectedCursorIdentity(lane: Lane) {
@@ -531,9 +560,11 @@ export class MultiSymbolNativeEmitter {
       lane.activatedByRunId = this.deps.run.runId;
     }
 
+    // Only the records up to the baseline are read here (they never enter the queue). Everything after
+    // it stays unread in the log and is admitted by the bounded catch-up, as the queue has room.
     let entries: { record: ShadowRecord; endChars: number }[];
     try {
-      entries = lane.tail.readWithOffsets(text);
+      entries = lane.tail.readBounded(text, { maxRecords: Number.MAX_SAFE_INTEGER, stopAtChars: lane.baselineChars, judgeTail: true });
     } catch (error) {
       this.refuseLaneRead(lane, error);
       return;
@@ -545,10 +576,6 @@ export class MultiSymbolNativeEmitter {
     lane.processedChars = lane.baselineChars;
     let historical = 0;
     for (const entry of entries) {
-      if (entry.endChars > lane.baselineChars) {
-        this.admit(lane, [entry]);
-        continue;
-      }
       // Before the baseline: rebuild slot state only. Nothing here is ever delivered.
       this.tally.eventsRead += 1;
       lane.selector.consider(entry.record);
@@ -557,6 +584,7 @@ export class MultiSymbolNativeEmitter {
         historical += 1;
       } else this.tally.alreadyProcessedBeforeRestart += 1;
     }
+    lane.unread = lane.tail.consumedLength < completeEnd(text);
     lane.baselined = true;
     if (commit && cursor === null) {
       this.deps.report({ type: "LANE_ACTIVATED", symbol: lane.symbol, activationChars: lane.activationChars, historicalRecords: historical });
@@ -617,7 +645,11 @@ export class MultiSymbolNativeEmitter {
     }
   }
 
-  /** Adds a lane's new records to the bounded queue, or fails closed. */
+  /**
+   * Adds a lane's records to the bounded queue. The catch-up never asks for
+   * more than the room left, so this guard is an invariant, not a flow-control
+   * path: if it ever fired, nothing would be processed and no cursor moved.
+   */
   private admit(lane: Lane, entries: readonly { record: ShadowRecord; endChars: number }[]): void {
     if (this.queueDepth + entries.length > this.deps.queueCapacity) {
       throw new QueueOverflowError(
@@ -626,31 +658,86 @@ export class MultiSymbolNativeEmitter {
     }
     for (const entry of entries) lane.pending.push(entry);
     this.queueDepth += entries.length;
+    this.recordsAdmitted += entries.length;
     this.maxQueueDepth = Math.max(this.maxQueueDepth, this.queueDepth);
   }
 
-  /** One cycle: read every healthy lane (sorted order), then drain fairly. */
+  /**
+   * Admits unread records into the queue's remaining room, never beyond it.
+   * Each lane with unread records gets an equal share of the room per round
+   * (at least one record); a lane that needs less returns the rest to the
+   * others in the next round. Each lane's records are read — and validated —
+   * strictly in log order, from where its last admitted record ended.
+   */
+  private fill(): boolean {
+    let admittedAny = false;
+    let room = this.deps.queueCapacity - this.queueDepth;
+    while (room > 0) {
+      const wanting = this.lanes.filter((l) => l.state === "HEALTHY" && l.baselined && l.unread);
+      if (wanting.length === 0) break;
+      const share = Math.max(1, Math.floor(room / wanting.length));
+      const start = this.admissionRotation % wanting.length;
+      this.admissionRotation += 1;
+      for (let k = 0; k < wanting.length && room > 0; k += 1) {
+        const lane = wanting[(start + k) % wanting.length];
+        let entries: { record: ShadowRecord; endChars: number }[];
+        try {
+          // The lane's latest text, already verified this poll; the partial tail was judged when it was read.
+          entries = lane.tail.readBounded(lane.text, { maxRecords: Math.min(share, room), judgeTail: false });
+        } catch (error) {
+          this.refuseLaneRead(lane, error);
+          continue;
+        }
+        this.admit(lane, entries);
+        room -= entries.length;
+        if (entries.length > 0) admittedAny = true;
+        lane.unread = lane.tail.consumedLength < completeEnd(lane.text);
+      }
+    }
+    if (admittedAny) this.catchUpRounds += 1;
+    return admittedAny;
+  }
+
+  /** One cycle: refresh every healthy lane's log (sorted order), then catch up in bounded rounds. */
   async poll(shouldStop: () => boolean = () => false): Promise<void> {
     if (!this.initialized) throw new Error("initialize first");
     this.absorbMembership();
     for (const lane of this.lanes) {
       if (lane.state === "FAILED") continue;
       const text = this.deps.readLog(lane.symbol);
-      let entries: { record: ShadowRecord; endChars: number }[];
       try {
-        entries = lane.tail.readWithOffsets(text);
+        // Verifies the consumed bytes are unchanged and judges a partial final line, consuming nothing:
+        // the records themselves are admitted by the catch-up below, as the queue has room.
+        lane.tail.readBounded(text, { maxRecords: 0, judgeTail: true });
       } catch (error) {
         this.refuseLaneRead(lane, error);
         continue;
       }
       if (text !== null) lane.text = text;
-      this.admit(lane, entries);
+      lane.unread = lane.tail.consumedLength < completeEnd(lane.text);
     }
     await this.drain(shouldStop);
   }
 
-  /** Round-robin across lanes with pending work, one record per turn; each lane in its log order. */
+  /**
+   * BOUNDED CATCH-UP: admit what fits, drain it fairly, repeat — until every
+   * healthy lane is at the end of its latest log text, or a stop is requested.
+   * A stop leaves unadmitted records in the log and queued ones unprocessed;
+   * both are re-read from the durable cursor on the next start.
+   */
   async drain(shouldStop: () => boolean = () => false): Promise<void> {
+    for (;;) {
+      this.fill();
+      if (this.queueDepth === 0) break;
+      await this.drainQueue(shouldStop);
+      for (const lane of this.lanes) this.persist(lane);
+      if (shouldStop()) break;
+    }
+    for (const lane of this.lanes) this.persist(lane);
+  }
+
+  /** Round-robin across lanes with pending work, one record per turn; each lane in its log order. */
+  private async drainQueue(shouldStop: () => boolean): Promise<void> {
     while (this.queueDepth > 0) {
       if (shouldStop()) break;
       const active = this.lanes.filter((l) => l.pending.length > 0);
@@ -660,11 +747,14 @@ export class MultiSymbolNativeEmitter {
       await this.process(lane, item.record, item.endChars);
       lane.pending.shift();
       this.queueDepth -= 1;
+      this.deps.progress?.();
     }
-    for (const lane of this.lanes) this.persist(lane);
   }
 
-  /** Graceful stop: everything processed is persisted; queued, unprocessed records are dropped and re-read next start. */
+  /**
+   * Graceful stop: everything processed is persisted; queued, unprocessed records are dropped and re-read next
+   * start, and records the catch-up never admitted are still in the log, after the persisted cursor.
+   */
   stop(): void {
     for (const lane of this.lanes) this.persist(lane);
     this.stoppedWithPending = this.queueDepth;
@@ -751,6 +841,12 @@ export class MultiSymbolNativeEmitter {
       maxQueueDepth: this.maxQueueDepth,
       queueCapacity: this.deps.queueCapacity,
       stoppedWithPending: this.stoppedWithPending,
+      /** Bounded catch-up: rounds that admitted records, records admitted in all, and lanes still behind their log's end. */
+      catchUp: {
+        rounds: this.catchUpRounds,
+        recordsAdmitted: this.recordsAdmitted,
+        backlogLanes: this.lanes.filter((l) => l.state === "HEALTHY" && (l.unread || l.pending.length > 0)).length,
+      },
       cursors: {
         kind:
           this.deps.mode === "COMMIT_DASHBOARD_ALERTS"
@@ -769,6 +865,7 @@ export class MultiSymbolNativeEmitter {
           processedChars: l.processedChars,
           productionCursorChars: l.savedChars,
           pending: l.pending.length,
+          unread: l.unread,
         })),
       },
     };

@@ -1,0 +1,363 @@
+import path from "node:path";
+
+import { ALWAYS_ON_DEFAULTS, type AlwaysOnPolicy, type AlwaysOnRole } from "../../src/modules/always-on/always-on-contract";
+import { alwaysOnPaths, emitterCommitStatus, scannerRunManifest, type AlwaysOnPaths } from "../../src/modules/always-on/always-on-paths";
+import type { MonitoringSpawnPlan } from "../../src/modules/always-on/always-on-roles";
+import { AlwaysOnSupervisor, type AlwaysOnAdapters, type AlwaysOnConfig } from "../../src/modules/always-on/always-on-supervisor";
+import type { BuildVerdict } from "../../src/modules/operator/generic-backend-nonwatch-launcher";
+import type { MutationAction, WithAuthorityResult } from "../../src/modules/operator/mutation-lock";
+import { observed, unobserved, type ObservedProcessNode } from "../../src/modules/operator/runtime-launcher";
+import { engineFingerprintOf, resolveScannerProfile } from "../../src/modules/native-scanner/scanner-profile";
+import { makeRunId } from "../../src/modules/native-scanner/supervisor-run-manifest";
+
+/**
+ * A FAKE MACHINE for the Always-On supervisor: an in-memory process table with
+ * real parent links (cmd.exe roots, node.exe runtimes), an in-memory file
+ * system, fake HTTP answers for the local backend, a switchable public
+ * network, and a manual clock. "Autopilot" children publish status the way the
+ * real processes do (the scanner its status.json + manifest, the emitter its
+ * status-commit.json, the backend /health, the planner its readiness), and
+ * honour cooperative stop files — each behaviour switchable per scenario.
+ */
+
+export const REPO = "C:\\repo";
+export const LOCAL = "C:\\local";
+export const SUPERVISOR_PID = 50;
+export const PROFILE = "teddy-7-all-active";
+export const ENGINE = engineFingerprintOf(resolveScannerProfile(PROFILE));
+
+const ENTRY: Readonly<Record<AlwaysOnRole, string>> = {
+  backend: "dist/src/server.js",
+  scanner: "src/modules/native-scanner/run-live-shadow-supervisor.ts",
+  emitter: "src/modules/native-alerts/run-native-multi-emitter.ts",
+  planner: "src/modules/native-planning/native-plan.worker.ts",
+};
+
+/** The supervisor's inherited environment: deliberately FULL of credentials, in mixed case. */
+export const DIRTY_ENV: NodeJS.ProcessEnv = {
+  LOCALAPPDATA: LOCAL,
+  ComSpec: "C:\\Windows\\System32\\cmd.exe",
+  PATH: "C:\\Windows",
+  BINANCE_API_KEY: "never-inherited-key",
+  binance_api_secret: "never-inherited-secret",
+  API_KEY: "never-inherited",
+  Api_Secret: "never-inherited",
+  EXECUTION_PROFILE_ACCOUNT_IDENTIFIER: "account-a-identifier",
+  EXECUTION_PROFILE_ENVIRONMENT: "MAINNET",
+  DATABASE_URL: "postgresql://shell-value",
+  DOTENV_CONFIG_PATH: "C:\\elsewhere\\account-a.env",
+};
+
+export type ScannerBehaviour = "healthy" | "degraded-until-restart" | "crash" | "silent" | "network-dependent" | "degraded";
+
+export interface ScannerShape {
+  selected: number;
+  liveEligible: number;
+  quarantined: number;
+  failed: number;
+  recovering: number;
+  awaitingStream: number;
+  exchangeCandidates: number;
+  stale: boolean;
+  capacityExceeded: boolean;
+}
+
+export const HEALTHY_UNIVERSE: ScannerShape = { selected: 524, liveEligible: 524, quarantined: 0, failed: 0, recovering: 0, awaitingStream: 0, exchangeCandidates: 524, stale: false, capacityExceeded: false };
+export const OUTAGE_UNIVERSE: ScannerShape = { selected: 524, liveEligible: 396, quarantined: 0, failed: 128, recovering: 0, awaitingStream: 0, exchangeCandidates: 524, stale: false, capacityExceeded: false };
+
+interface Child {
+  readonly role: AlwaysOnRole;
+  readonly root: number;
+  readonly runtime: number;
+  readonly plan: MonitoringSpawnPlan;
+  readonly stopFile: string | null;
+  readonly runId: string | null;
+  readonly pinnedRunId: string | null;
+  readonly index: number;
+}
+
+export function plannerStatusBody(over: { state?: string; consumers?: number; failed?: number; pending?: number; lastSweepError?: string | null; readiness?: string } = {}) {
+  return {
+    generatedAt: "x",
+    role: "native-planner",
+    queue: "native-extreme-rr-plan",
+    nativeExecutionEnabled: false,
+    startedBy: "EXPLICIT_COMMAND_OR_LAUNCHER",
+    worker: { state: over.state ?? "RUNNING", reason: "", startedAt: null, lastHeartbeatAt: null, ageSeconds: 1, consumerRunning: true, lastSweep: null, lastSweepError: over.lastSweepError ?? null },
+    connectedConsumers: over.consumers ?? 1,
+    jobs: { waiting: 0, active: 0, delayed: 0, failed: over.failed ?? 2, completed: 40 },
+    pendingNativePlans: over.pending ?? 0,
+    readiness: over.readiness ?? "READY",
+  };
+}
+
+export class FakeMachine {
+  now = Date.UTC(2026, 9, 23, 0, 0, 0);
+  readonly nodes = new Map<number, ObservedProcessNode>();
+  readonly files = new Map<string, string>();
+  readonly spawns: Child[] = [];
+  readonly terminated: number[] = [];
+  readonly fsWrites: string[] = [];
+  readonly mutations: MutationAction[] = [];
+  private nextPid = 1000;
+  network = true;
+  build: BuildVerdict = { ok: true };
+  observable = true;
+  lockBusy = false;
+  honourStops = true;
+  scannerBehaviour: ScannerBehaviour = "healthy";
+  scannerUniverse: ScannerShape = HEALTHY_UNIVERSE;
+  scannerLastMessageAgoMs = 5_000;
+  emitterTracked: number | null = null;
+  emitterFailedLanes = 0;
+  emitterQueue = { depth: 0, capacity: 10_000, max: 0, backlogLanes: 0 };
+  emitterSilent = false;
+  plannerOver: Parameters<typeof plannerStatusBody>[0] = {};
+  plans: Record<string, number> = { PENDING: 0, READY: 12, INVALID: 0, ERROR: 3 };
+  soakStatus = 200;
+  backendAnswers = true;
+  readonly paths: AlwaysOnPaths = alwaysOnPaths({ LOCALAPPDATA: LOCAL });
+  readonly httpCalls: string[] = [];
+  connectivityProbes = 0;
+
+  // ---- process table ----
+  private spawnChild(plan: MonitoringSpawnPlan): number {
+    const root = this.nextPid++;
+    const runtime = this.nextPid++;
+    const arg = (name: string) => {
+      const i = plan.args.indexOf(name);
+      return i >= 0 ? (plan.args[i + 1] as string) : null;
+    };
+    this.nodes.set(root, { pid: root, parentPid: SUPERVISOR_PID, executable: "cmd.exe", startedAtMs: this.now, commandLine: `cmd.exe ${plan.args.join(" ")}` });
+    const index = this.spawns.filter((c) => c.role === plan.role).length;
+    const runId = plan.role === "scanner" ? makeRunId(this.now, (0x10000000 + this.spawns.length).toString(16).slice(-8)) : null;
+    this.nodes.set(runtime, { pid: runtime, parentPid: root, executable: "node.exe", startedAtMs: this.now, commandLine: `node --import loader.mjs ${REPO}\\apps\\backend\\${ENTRY[plan.role].replace(/\//g, "\\")}` });
+    this.spawns.push({ role: plan.role, root, runtime, plan, stopFile: arg("--stop-file"), runId, pinnedRunId: arg("--run-id"), index });
+    return root;
+  }
+
+  /** A process this supervisor did NOT start (a manual scanner, an old soak monitor, …). */
+  addExternal(entrypoint: string): number {
+    const root = this.nextPid++;
+    const runtime = this.nextPid++;
+    this.nodes.set(root, { pid: root, parentPid: 1, executable: "cmd.exe", startedAtMs: this.now, commandLine: `cmd.exe /c pnpm -C C:\\elsewhere ${entrypoint}` });
+    this.nodes.set(runtime, { pid: runtime, parentPid: root, executable: "node.exe", startedAtMs: this.now, commandLine: `node C:\\elsewhere\\apps\\backend\\${entrypoint.replace(/\//g, "\\")}` });
+    return runtime;
+  }
+
+  kill(root: number): void {
+    const doomed = new Set<number>([root]);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const node of this.nodes.values()) {
+        if (!doomed.has(node.pid) && doomed.has(node.parentPid)) {
+          doomed.add(node.pid);
+          grew = true;
+        }
+      }
+    }
+    for (const pid of doomed) this.nodes.delete(pid);
+  }
+
+  alive(child: Child): boolean {
+    return this.nodes.has(child.root);
+  }
+
+  live(role: AlwaysOnRole): Child[] {
+    return this.spawns.filter((c) => c.role === role && this.alive(c));
+  }
+
+  /** The children behave: honour stop files, crash when told to, publish their status. */
+  private autopilot(): void {
+    for (const child of this.spawns) {
+      if (!this.alive(child)) continue;
+      if (this.honourStops && child.stopFile !== null && this.files.has(child.stopFile)) {
+        this.kill(child.root);
+        continue;
+      }
+      if (child.role === "scanner") this.scannerAutopilot(child);
+      if (child.role === "emitter") this.emitterAutopilot(child);
+    }
+  }
+
+  private scannerAutopilot(child: Child): void {
+    const behaviour = this.scannerBehaviour;
+    if (behaviour === "crash") {
+      this.kill(child.root);
+      return;
+    }
+    if (behaviour === "silent") return;
+    const degraded = behaviour === "degraded" || (behaviour === "degraded-until-restart" && child.index === 0) || (behaviour === "network-dependent" && !this.network);
+    this.writeScannerStatus(child, degraded ? OUTAGE_UNIVERSE : this.scannerUniverse, degraded ? 600_000 : this.scannerLastMessageAgoMs);
+    this.files.set(scannerRunManifest(this.paths, child.runId as string), "{}");
+  }
+
+  writeScannerStatus(child: Child, u: ScannerShape, lastMessageAgoMs: number, runState = "RUNNING", writtenAt = this.now): void {
+    this.files.set(
+      this.paths.scannerStatus,
+      JSON.stringify({
+        schema: "teddy.native-scanner.live-shadow-supervisor-status.v3",
+        runId: child.runId,
+        runState,
+        startedAt: new Date(this.now).toISOString(),
+        engineFingerprint: ENGINE,
+        pid: child.runtime,
+        writtenAt: new Date(writtenAt).toISOString(),
+        totals: { selected: u.selected, liveEligible: u.liveEligible, quarantined: u.quarantined, failed: u.failed, recovering: u.recovering, awaitingStream: u.awaitingStream, catchupPending: 0, reconnects: 7, backpressureEvents: 0, restRequests: 600, restHalted: false },
+        universe: { generation: 3, stale: u.stale, exchangeCandidates: u.exchangeCandidates, capacity: { exceeded: u.capacityExceeded } },
+        symbols: [{ symbol: "AAAUSDT", lastValidMessageAt: new Date(this.now - lastMessageAgoMs).toISOString() }],
+      })
+    );
+  }
+
+  private emitterAutopilot(child: Child): void {
+    if (this.emitterSilent || child.pinnedRunId === null) return;
+    this.files.set(
+      emitterCommitStatus(this.paths, child.pinnedRunId),
+      JSON.stringify({
+        schema: "teddy.native-alerts.multi-symbol-emitter-status.v1",
+        pid: child.runtime,
+        runId: child.pinnedRunId,
+        mode: "COMMIT_DASHBOARD_ALERTS",
+        writtenAt: new Date(this.now).toISOString(),
+        symbolsTracked: this.emitterTracked ?? this.scannerUniverse.selected,
+        symbolsHealthy: (this.emitterTracked ?? this.scannerUniverse.selected) - this.emitterFailedLanes,
+        symbolsFailed: this.emitterFailedLanes,
+        queueDepth: this.emitterQueue.depth,
+        queueCapacity: this.emitterQueue.capacity,
+        maxQueueDepth: this.emitterQueue.max,
+        catchUp: { rounds: 1, recordsAdmitted: 10, backlogLanes: this.emitterQueue.backlogLanes },
+        created: 4,
+        ledgerDuplicates: 0,
+        membership: { dynamic: true, recordsAbsorbed: 0, failure: null },
+      })
+    );
+  }
+
+  // ---- adapters ----
+  adapters(over: Partial<AlwaysOnAdapters> = {}, selfPid = SUPERVISOR_PID): AlwaysOnAdapters {
+    const files = this.files;
+    return {
+      now: () => this.now,
+      selfPid,
+      selfStartedAtMs: this.now,
+      env: DIRTY_ENV,
+      paths: this.paths,
+      observeTree: () => {
+        if (!this.observable) return unobserved("COMMAND_FAILED");
+        this.autopilot();
+        return observed([...this.nodes.values()]);
+      },
+      probe: (pid) => {
+        if (!this.observable) return { observed: false };
+        const node = this.nodes.get(pid);
+        return { observed: true, process: node === undefined ? null : { pid: node.pid, commandLine: node.commandLine, startedAtMs: node.startedAtMs } };
+      },
+      spawn: (plan) => this.spawnChild(plan),
+      terminate: (pid) => {
+        this.terminated.push(pid);
+        this.kill(pid);
+        return true;
+      },
+      exitCodeOf: () => null,
+      fs: {
+        readText: (file) => files.get(file) ?? null,
+        writeTextAtomic: (file, text) => {
+          this.fsWrites.push(file);
+          files.set(file, text);
+        },
+        appendLine: (file, line) => files.set(file, (files.get(file) ?? "") + line),
+        exists: (file) => files.has(file),
+        remove: (file) => void files.delete(file),
+        ensureDir: () => undefined,
+        listDir: (dir) => [...files.keys()].filter((k) => path.dirname(k) === dir).map((k) => path.basename(k)),
+      },
+      http: {
+        getJson: async (url) => {
+          this.httpCalls.push(url);
+          const backendUp = this.backendAnswers && (this.live("backend").length > 0 || this.externalBackend);
+          if (!backendUp) return { ok: false, status: null, body: null };
+          if (url.endsWith("/health")) return { ok: true, status: 200, body: { status: "ok" } };
+          if (url.endsWith("/api/native-planner/status")) {
+            const plannerUp = this.live("planner").length > 0;
+            return { ok: true, status: 200, body: plannerUp ? plannerStatusBody(this.plannerOver) : plannerStatusBody({ state: "OFF", consumers: 0, readiness: "DOWN" }) };
+          }
+          if (url.endsWith("/api/signal-quality/soak-health")) {
+            return this.soakStatus === 200 ? { ok: true, status: 200, body: { plans: this.plans } } : { ok: false, status: this.soakStatus, body: null };
+          }
+          return { ok: false, status: 404, body: null };
+        },
+      },
+      publicConnectivity: async () => {
+        this.connectivityProbes += 1;
+        return this.network;
+      },
+      buildVerdict: () => this.build,
+      genericEnvKeyNames: () => ({ ok: true, keys: ["DATABASE_URL", "REDIS_URL", "BINANCE_FUTURES_REST_BASE_URL"] }),
+      mutation: async <T>(action: MutationAction, run: () => Promise<T>): Promise<WithAuthorityResult<T>> => {
+        if (this.lockBusy) return { ran: false, outcome: "BUSY", reasons: ["another launcher holds mutation authority"] };
+        this.mutations.push(action);
+        return { ran: true, result: await run() };
+      },
+      log: () => undefined,
+      ...over,
+    };
+  }
+
+  externalBackend = false;
+
+  incidents(): { kind: string; role: string | null; reasonCode: string | null; detail: string | null; generation: number }[] {
+    return (this.files.get(this.paths.incidents) ?? "")
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => JSON.parse(line) as { kind: string; role: string | null; reasonCode: string | null; detail: string | null; generation: number });
+  }
+
+  kinds(): string[] {
+    return this.incidents().map((i) => i.kind);
+  }
+}
+
+export function testConfig(over: Partial<AlwaysOnConfig> = {}, policy: Partial<AlwaysOnPolicy> = {}): AlwaysOnConfig {
+  return {
+    repoRoot: REPO,
+    profileName: PROFILE,
+    engineFingerprint: ENGINE,
+    roles: ["backend", "scanner", "emitter", "planner"],
+    backendUrl: "http://127.0.0.1:4000",
+    emitterQueueCapacity: 10_000,
+    emitterActivateAtEof: false,
+    scannerExtraArgs: [],
+    policy: { ...ALWAYS_ON_DEFAULTS, ...policy },
+    commandIdentity: "monitoring:always-on run (test)",
+    instancePort: 4019,
+    ...over,
+  };
+}
+
+export async function startSupervisor(m: FakeMachine, config: AlwaysOnConfig = testConfig(), adapters: Partial<AlwaysOnAdapters> = {}, selfPid = SUPERVISOR_PID) {
+  const supervisor = new AlwaysOnSupervisor(config, m.adapters(adapters, selfPid));
+  const started = await supervisor.start({ strippedCredentialNames: [] });
+  return { supervisor, started };
+}
+
+/** Ticks `count` times, advancing the clock by `stepMs` after each. */
+export async function run(m: FakeMachine, supervisor: AlwaysOnSupervisor, count: number, stepMs = 15_000) {
+  const outcomes: string[] = [];
+  for (let i = 0; i < count; i += 1) {
+    outcomes.push(await supervisor.tick());
+    m.now += stepMs;
+  }
+  return outcomes;
+}
+
+/** Ticks until the predicate holds (bounded), advancing the clock by `stepMs` after each tick. */
+export async function until(m: FakeMachine, supervisor: AlwaysOnSupervisor, predicate: () => boolean, max = 400, stepMs = 15_000) {
+  for (let i = 0; i < max; i += 1) {
+    if (predicate()) return i;
+    await supervisor.tick();
+    m.now += stepMs;
+  }
+  throw new Error("condition not reached");
+}

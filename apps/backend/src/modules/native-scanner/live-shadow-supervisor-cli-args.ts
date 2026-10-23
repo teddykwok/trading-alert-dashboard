@@ -52,7 +52,9 @@ const TUNING = [
   "--duration-minutes",
 ] as const;
 const FLAGS = ["--all-active", "--json-status"] as const;
-const VALUES: readonly string[] = [...LINEAGE_CONFIG_OPTIONS, ...SELECTION, ...TUNING, "--profile"];
+/** Operational only: how the process is asked to stop. Never part of the engine, the universe or a lineage. */
+const OPERATIONAL = ["--stop-file"] as const;
+const VALUES: readonly string[] = [...LINEAGE_CONFIG_OPTIONS, ...SELECTION, ...TUNING, ...OPERATIONAL, "--profile"];
 
 export const SUPERVISOR_DEFAULTS = Object.freeze({
   symbolsPerConnection: 50,
@@ -106,6 +108,7 @@ export const SUPERVISOR_CLI_USAGE = [
   `    [--max-total-requests ${SUPERVISOR_DEFAULTS.maxTotalRequests}] [--request-spacing-ms ${FAST_RECOVERY_DEFAULTS.minSpacingMs}] [--status-every-s ${SUPERVISOR_DEFAULTS.statusEverySeconds}]`,
   `    [--recovery-policy fast|legacy] [--max-in-flight ${FAST_RECOVERY_DEFAULTS.maxInFlight}] [--max-weight-per-minute ${FAST_RECOVERY_DEFAULTS.maxWeightPerMinute}]   (fast is the default)`,
   "    [--duration-minutes N] [--json-status]",
+  "    [--stop-file <absolute path outside the repository, ending .stop>]   (cooperative stop: stops as on Ctrl+C when the file appears)",
   `  scanner:live-shadow-supervisor --profile <${Object.keys(SCANNER_PROFILES).join("|")}> [--symbols A,B,...] [operational tuning flags]`,
   "    (a profile fixes the engine and the universe; lineage and universe flags are refused with it)",
 ].join("\n");
@@ -132,6 +135,12 @@ export interface SupervisorCliOptions {
   readonly statusEverySeconds: number;
   readonly durationMinutes: number | null;
   readonly jsonStatus: boolean;
+  /**
+   * COOPERATIVE STOP (operational, optional): when this file appears the
+   * supervisor runs its own graceful stop, exactly as on Ctrl+C. Validated
+   * (absolute, outside the repository) by the entrypoint; null = no watcher.
+   */
+  readonly stopFile: string | null;
 }
 
 const usage = (message: string): never => {
@@ -238,5 +247,6 @@ export function parseSupervisorCliArgs(argv: readonly string[]): SupervisorCliOp
     statusEverySeconds: bounded(values.get("--status-every-s"), "--status-every-s", 5, 3_600, SUPERVISOR_DEFAULTS.statusEverySeconds),
     durationMinutes: values.has("--duration-minutes") ? bounded(values.get("--duration-minutes"), "--duration-minutes", 1, 100_000, 0) : null,
     jsonStatus: flags.has("--json-status"),
+    stopFile: values.get("--stop-file") ?? null,
   };
 }

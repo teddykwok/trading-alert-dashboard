@@ -37,9 +37,21 @@ Delivering that backlog would flood the dashboard and planning with stale
 Alerts.
 
 **Never brute-force a stale backlog by raising `--queue-capacity`.** The
-10,000 default is a guard, and it worked. The emitter's defaults and overflow
-behaviour are unchanged. Nothing rebaselines automatically: not on overflow,
-not on start-up.
+10,000 default is a guard, and it worked. Nothing rebaselines automatically:
+not on overflow, not on start-up.
+
+> **Since Always-On Monitoring V1 the queue no longer overflows.** A backlog
+> larger than the queue drains in bounded rounds
+> ([always-on-monitoring.md](always-on-monitoring.md) §4). The default
+> capacity is unchanged, but the overflow no longer stops a stale backlog as a
+> side effect. A backlog like the one above, days of live records the emitter
+> never consumed, would now be delivered late if the emitter were simply
+> started.
+>
+> So the decision is explicit. After a long emitter downtime, first run the DRY
+> emitter. If its would-create backlog is stale, rebaseline with this tool
+> (operator decision) before starting COMMIT or Always-On. Nothing
+> rebaselines automatically.
 
 ## What it does, exactly
 

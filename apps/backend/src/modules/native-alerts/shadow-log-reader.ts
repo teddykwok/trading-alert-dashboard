@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, type Hash } from "node:crypto";
 import { SOURCE_TIMEFRAMES } from "@trading-alert-dashboard/shared";
 
 import {
@@ -284,6 +284,29 @@ export class ShadowLogValidator {
 
 const sha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
 
+/** One validated record and the character position just past its newline. */
+export interface ShadowLogEntry {
+  readonly record: ShadowRecord;
+  readonly endChars: number;
+}
+
+/**
+ * A BOUNDED read: the multi-symbol emitter's catch-up admits a large backlog in
+ * chunks that fit its queue, instead of reading every new line at once.
+ */
+export interface BoundedReadOptions {
+  /** At most this many complete records are validated, returned and consumed (0: verify only). */
+  readonly maxRecords: number;
+  /** Only records ending at or before this character position are returned (and consumed). */
+  readonly stopAtChars?: number;
+  /**
+   * Judge a trailing partial line on this read. Exactly once per freshly loaded
+   * text — the chunk reads that follow over the SAME text pass false, so a
+   * partial line is still judged once per poll, as an unbounded read judges it.
+   */
+  readonly judgeTail: boolean;
+}
+
 /**
  * Reads an append-only log incrementally. Each `read(text)` is handed the
  * WHOLE current file; bytes already consumed must be byte-identical (a
@@ -293,10 +316,17 @@ const sha256 = (text: string) => createHash("sha256").update(text, "utf8").diges
  * A trailing partial line is either refused at once (`pendingTailPolls` 0: a
  * one-shot read) or tolerated for that many consecutive reads while the writer
  * finishes it, then refused.
+ *
+ * `readBounded` reads the same log in chunks: it consumes only the records it
+ * returns, so whatever it leaves is read — and validated, in order — by the next
+ * call. Every rule below applies unchanged to every chunk.
  */
 export class ShadowLogTail {
   private consumedChars = 0;
-  private consumedSha256 = sha256("");
+  /** A running SHA-256 of exactly the consumed characters: a chunk never re-hashes the whole log. */
+  private readonly consumedHash: Hash = createHash("sha256");
+  /** The last text whose consumed prefix was verified; reading on through the SAME text needs no second proof. */
+  private verifiedText: string | null = null;
   private lines = 0;
   private pendingTail: { text: string; polls: number } | null = null;
   readonly validator: ShadowLogValidator;
@@ -327,36 +357,63 @@ export class ShadowLogTail {
    * its newline. A cursor that stores such an offset always sits on a line
    * boundary, after a record that was completely processed.
    */
-  readWithOffsets(text: string | null): { readonly record: ShadowRecord; readonly endChars: number }[] {
+  readWithOffsets(text: string | null): ShadowLogEntry[] {
+    return this.consume(text, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, true);
+  }
+
+  /**
+   * At most `maxRecords` of the newly completed records (ending at or before
+   * `stopAtChars`), validated in log order. Records it does not return are not
+   * consumed: the next call, over the same or a longer text, returns them.
+   */
+  readBounded(text: string | null, options: BoundedReadOptions): ShadowLogEntry[] {
+    if (!Number.isSafeInteger(options.maxRecords) || options.maxRecords < 0) throw new Error("maxRecords must be a non-negative safe integer");
+    const stopAtChars = options.stopAtChars ?? Number.POSITIVE_INFINITY;
+    if (stopAtChars !== Number.POSITIVE_INFINITY && (!Number.isSafeInteger(stopAtChars) || stopAtChars < 0)) throw new Error("stopAtChars must be a non-negative safe integer");
+    return this.consume(text, options.maxRecords, stopAtChars, options.judgeTail);
+  }
+
+  private consume(text: string | null, maxRecords: number, stopAtChars: number, judgeTail: boolean): ShadowLogEntry[] {
     if (text === null) {
       if (this.consumedChars > 0) fail("LOG_REWRITTEN", "the event log disappeared after it was read");
       return [];
     }
-    if (text.length < this.consumedChars || sha256(text.slice(0, this.consumedChars)) !== this.consumedSha256) {
-      fail("LOG_REWRITTEN", "bytes of the event log that were already read have changed: it is append-only");
+    if (text !== this.verifiedText) {
+      if (text.length < this.consumedChars || sha256(text.slice(0, this.consumedChars)) !== this.consumedHash.copy().digest("hex")) {
+        fail("LOG_REWRITTEN", "bytes of the event log that were already read have changed: it is append-only");
+      }
+      this.verifiedText = text;
     }
     const end = text.lastIndexOf("\n") + 1;
-    const tail = text.slice(Math.max(end, this.consumedChars));
-    if (tail !== "") {
-      const polls = this.pendingTail?.text === tail ? this.pendingTail.polls + 1 : 1;
-      if (polls > this.pendingTailPolls) fail("TORN_LINE", "the event log ends in a torn line");
-      this.pendingTail = { text: tail, polls };
-    } else {
-      this.pendingTail = null;
+    if (judgeTail) {
+      const tail = text.slice(Math.max(end, this.consumedChars));
+      if (tail !== "") {
+        const polls = this.pendingTail?.text === tail ? this.pendingTail.polls + 1 : 1;
+        if (polls > this.pendingTailPolls) fail("TORN_LINE", "the event log ends in a torn line");
+        this.pendingTail = { text: tail, polls };
+      } else {
+        this.pendingTail = null;
+      }
     }
     if (end <= this.consumedChars) return [];
 
-    const fresh = text.slice(this.consumedChars, end - 1).split("\n");
-    const records: { record: ShadowRecord; endChars: number }[] = [];
+    // Line by line, in order. Nothing is consumed until every returned line has
+    // validated: a refusal leaves the position where it was, as it always did.
+    const records: ShadowLogEntry[] = [];
     let position = this.consumedChars;
-    for (const line of fresh) {
+    while (position < end && records.length < maxRecords) {
+      const lineEnd = text.indexOf("\n", position) + 1;
+      if (lineEnd > stopAtChars) break;
+      const line = text.slice(position, lineEnd - 1);
       this.lines += 1;
       if (line === "") fail("TORN_LINE", `line ${this.lines} is empty`);
-      position += line.length + 1;
-      records.push({ record: this.validator.acceptLine(line, this.lines), endChars: position });
+      records.push({ record: this.validator.acceptLine(line, this.lines), endChars: lineEnd });
+      position = lineEnd;
     }
-    this.consumedChars = end;
-    this.consumedSha256 = sha256(text.slice(0, end));
+    if (position > this.consumedChars) {
+      this.consumedHash.update(text.slice(this.consumedChars, position), "utf8");
+      this.consumedChars = position;
+    }
     return records;
   }
 }

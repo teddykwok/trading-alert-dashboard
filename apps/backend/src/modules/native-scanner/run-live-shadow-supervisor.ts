@@ -10,6 +10,7 @@ import path from "node:path";
 import { env } from "../../config/env";
 import { EXCHANGE_INFO_PATH, ScannerDataError, assertPublicFuturesBaseUrl, buildPublicFuturesUrl } from "./binance-public-futures";
 import { CandidateRankHaltError, GovernedPublicTransport } from "./candidate-rank-runner";
+import { CooperativeStopUsageError, validateStopFilePath, watchCooperativeStop } from "./cooperative-stop";
 import { KlineCacheStore } from "./kline-cache";
 import { BinanceServerClock, PublicRequestController, REQUEST_POLICY_LIMITS, type PublicHttpTransport } from "./kline-fetcher";
 import type { OpenPublicStream } from "./live-shadow-runner";
@@ -122,6 +123,17 @@ async function main(): Promise<void> {
     console.error(`REFUSED: ${error.message}\n\n${SUPERVISOR_CLI_USAGE}`);
     process.exitCode = 2;
     return;
+  }
+  let stopFile: string | null = null;
+  if (options.stopFile !== null) {
+    try {
+      stopFile = validateStopFilePath(options.stopFile, REPO_ROOT);
+    } catch (error) {
+      if (!(error instanceof CooperativeStopUsageError)) throw error;
+      console.error(`REFUSED: ${error.message}\n\n${SUPERVISOR_CLI_USAGE}`);
+      process.exitCode = 2;
+      return;
+    }
   }
 
   console.log("NATIVE LIVE SHADOW SUPERVISOR");
@@ -294,6 +306,18 @@ async function main(): Promise<void> {
     process.exit(0);
   };
   process.on("SIGINT", () => stop("operator stop"));
+  // Cooperative stop (operational, optional): the same graceful stop as Ctrl+C, asked for by a supervisor that
+  // cannot deliver Ctrl+C to a detached process on Windows. Watched from before start-up recovery onwards.
+  if (stopFile !== null) {
+    console.log(`cooperative stop: ${stopFile} (stops exactly as on Ctrl+C when it appears)`);
+    watchCooperativeStop({
+      file: stopFile,
+      onStop: () => stop("cooperative stop request"),
+      exists: existsSync,
+      every: (fn, ms) => setInterval(fn, ms),
+      cancel: (handle) => clearInterval(handle as NodeJS.Timeout),
+    });
+  }
 
   // A start-up that throws never reaches status.json: keep its recovery summary in this run's directory (once), then fail as before.
   await startRecordingFailure(

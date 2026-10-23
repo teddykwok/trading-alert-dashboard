@@ -314,6 +314,15 @@ Get-NetTCPConnection -State Listen -LocalPort 4001,4002 -ErrorAction SilentlyCon
 
 ### B. Start (monitoring-only)
 
+> **Preferred since Always-On Monitoring V1:** start the whole monitoring stack
+> with launcher **16** (or `Always-On Monitoring.cmd`), and steps 1–5 below are
+> done and supervised for you. That covers the scanner, the emitter pinned to
+> its run, the planner and the non-watch backend, with network-outage recovery
+> and bounded emitter catch-up. See
+> [always-on-monitoring.md](always-on-monitoring.md). The manual steps remain
+> valid when Always-On is not running. Never run both: Always-On reports manual
+> roles as CONFLICT and never touches them.
+
 1. **Scanner** (own terminal; Ctrl+C to stop):
 
    ```powershell
@@ -337,8 +346,10 @@ Get-NetTCPConnection -State Listen -LocalPort 4001,4002 -ErrorAction SilentlyCon
 
    If it reports a large stale backlog (would-create from days ago), **stop
    here**. Follow [native-emitter-cursor-rebaseline.md](native-emitter-cursor-rebaseline.md),
-   which is an operator decision. Never raise `--queue-capacity` to force a
-   backlog through.
+   which is an operator decision. Since Always-On Monitoring V1 the emitter
+   drains a backlog larger than its queue in bounded rounds instead of
+   overflowing. A stale backlog is therefore no longer stopped by the queue:
+   this dry-run check is what stops it.
 
 3. **Emitter: COMMIT** (own terminal; Ctrl+C to stop):
 

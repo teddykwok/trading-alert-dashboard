@@ -31,10 +31,16 @@ export interface MultiEmitterCliRequest {
   readonly durationMinutes: number | null;
   readonly queueCapacity: number;
   readonly statusEverySeconds: number;
+  /**
+   * COOPERATIVE STOP (operational, optional): when this file appears the emitter
+   * stops exactly as on Ctrl+C. Validated (absolute, outside the repository) by
+   * the entrypoint; absent means no watcher at all.
+   */
+  readonly stopFile: string | null;
 }
 
 const REQUIRED = ["--profile", "--run-id", "--expect-engine-fingerprint"] as const;
-const OPTIONAL_VALUES = ["--poll-ms", "--duration-minutes", "--queue-capacity", "--status-every-s"] as const;
+const OPTIONAL_VALUES = ["--poll-ms", "--duration-minutes", "--queue-capacity", "--status-every-s", "--stop-file"] as const;
 const FLAGS = ["--follow", "--commit-dashboard-alerts", "--activate-at-eof", "--dry-run-from-start"] as const;
 
 export const MULTI_EMITTER_DEFAULTS = Object.freeze({ pollMs: 2_000, queueCapacity: 10_000, statusEverySeconds: 30 });
@@ -45,6 +51,7 @@ export const MULTI_EMITTER_CLI_USAGE = [
   `    [--follow [--poll-ms ${MULTI_EMITTER_DEFAULTS.pollMs}]] [--duration-minutes N] [--queue-capacity ${MULTI_EMITTER_DEFAULTS.queueCapacity}] [--status-every-s ${MULTI_EMITTER_DEFAULTS.statusEverySeconds}]`,
   "    [--dry-run-from-start]                        (dry run only: evaluate each whole log; writes nothing)",
   "    [--commit-dashboard-alerts [--activate-at-eof]] (persistent delivery; first activation starts at current EOF)",
+  "    [--stop-file <absolute path outside the repository, ending .stop>] (cooperative stop: stops as on Ctrl+C when the file appears)",
   "Without --commit-dashboard-alerts it is a DRY RUN: it reads the shadow logs and writes no database row and no cursor.",
 ].join("\n");
 
@@ -101,5 +108,6 @@ export function parseMultiEmitterCliArgs(argv: readonly string[]): MultiEmitterC
     durationMinutes: values.has("--duration-minutes") ? bounded(values.get("--duration-minutes"), "--duration-minutes", 1, 100_000, 0) : null,
     queueCapacity: bounded(values.get("--queue-capacity"), "--queue-capacity", MULTI_EMITTER_QUEUE_LIMITS.min, MULTI_EMITTER_QUEUE_LIMITS.max, MULTI_EMITTER_DEFAULTS.queueCapacity),
     statusEverySeconds: bounded(values.get("--status-every-s"), "--status-every-s", 5, 3_600, MULTI_EMITTER_DEFAULTS.statusEverySeconds),
+    stopFile: values.get("--stop-file") ?? null,
   };
 }

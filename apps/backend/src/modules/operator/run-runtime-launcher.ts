@@ -136,6 +136,9 @@ import {
 } from "./generic-analysis-supervision";
 import { createNativePlannerLauncher, type NativePlannerLauncher } from "./native-planner-launcher";
 import { createNonWatchBackendLauncher, type NonWatchBackendLauncher } from "./generic-backend-nonwatch-launcher";
+import { createAlwaysOnLauncher, type AlwaysOnLauncher } from "./always-on-launcher";
+import { readAlwaysOnText, spawnAlwaysOnSupervisor, writeAlwaysOnRequest } from "../always-on/always-on-launch";
+import { alwaysOnPaths } from "../always-on/always-on-paths";
 
 /**
  * Phase 11I — the local Windows runtime launcher for the DUAL-ACCOUNT topology.
@@ -2325,6 +2328,32 @@ function nonWatchBackend(): NonWatchBackendLauncher {
   return nonWatchBackendLauncher;
 }
 
+// ---------------------------------------------------------------------------
+// Always-On Monitoring — its own module; it starts no account role and owns nothing here
+// ---------------------------------------------------------------------------
+
+/**
+ * Menu 16-18 (always-on-launcher.ts). The supervisor is started by the
+ * always-on module's own durable-log spawner (always-on-launch.ts), so this
+ * CLI keeps its ONE spawn call site; the supervisor records its own identity,
+ * and stopping it is a request it carries out itself.
+ */
+let alwaysOnLauncher: AlwaysOnLauncher | null = null;
+function alwaysOn(): AlwaysOnLauncher {
+  alwaysOnLauncher ??= createAlwaysOnLauncher({
+    repoRoot: REPO_ROOT,
+    probeProcesses,
+    readText: readAlwaysOnText,
+    writeTextAtomic: writeAlwaysOnRequest,
+    startSupervisor: (env) => spawnAlwaysOnSupervisor(alwaysOnPaths(process.env), REPO_ROOT, env),
+    lockAdapters,
+    log: (line) => console.log(line),
+    sleep,
+    now: () => Date.now(),
+  });
+  return alwaysOnLauncher;
+}
+
 async function main(): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const ask = (question: string): Promise<string> =>
@@ -2351,6 +2380,7 @@ async function main(): Promise<void> {
       for (const line of renderTopology(status, disowned, effectiveGates)) console.log(line);
       console.log(nativePlanner().statusLine(status));
       for (const line of await nonWatchBackend().statusLines(status)) console.log(line);
+      console.log(alwaysOn().statusLine());
 
       console.log("");
       console.log("1. Show Status");
@@ -2368,6 +2398,9 @@ async function main(): Promise<void> {
       console.log("13. Stop Native Planner");
       console.log("14. Start Generic Backend — Non-Watch (built server, no auto-restart, not Start SAFE)");
       console.log("15. Stop Generic Backend — Non-Watch (launcher-owned only)");
+      console.log("16. Start Always-On Monitoring (MONITORING ONLY · NO ACCOUNT EXECUTION · NATIVE EXECUTION HARD-DISABLED)");
+      console.log("17. Show Always-On Monitoring Status");
+      console.log("18. Stop Always-On Monitoring (graceful; the supervisor stops only what it owns)");
       console.log("");
 
       const choice = (await ask("Choose: ")).trim();
@@ -2387,6 +2420,9 @@ async function main(): Promise<void> {
         else if (choice === "13") await nativePlanner().stop();
         else if (choice === "14") await nonWatchBackend().start(status);
         else if (choice === "15") await nonWatchBackend().stop(status);
+        else if (choice === "16") await alwaysOn().start(ask);
+        else if (choice === "17") alwaysOn().showStatus();
+        else if (choice === "18") await alwaysOn().stop();
         else console.log("Unrecognised choice. Nothing was changed.");
       } catch (error) {
         // Any action that needs to see the machine refuses when it cannot.

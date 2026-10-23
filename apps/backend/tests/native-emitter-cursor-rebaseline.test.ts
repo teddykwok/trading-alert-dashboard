@@ -497,7 +497,9 @@ describe("no delivery evaluation and the durable transaction", () => {
 // ===========================================================================
 
 describe("the normal emitter after a rebaseline", () => {
-  it("queue default stays 10000 and overflow still fails closed", async () => {
+  // Always-On Monitoring V1: the queue default and bound are unchanged, but a backlog larger than the queue no
+  // longer fails closed at start — it is admitted in bounded rounds (native-emitter-bounded-catch-up.test.ts).
+  it("queue default stays 10000, and a backlog larger than the queue drains in bounded rounds without overflow", async () => {
     expect(MULTI_EMITTER_DEFAULTS.queueCapacity).toBe(10_000);
     const w = world();
     const run = bindPinnedRun({ manifest: JSON.parse(w.source.manifestText as string), expect: w.request, checkpointOf: w.source.checkpointOf });
@@ -505,7 +507,15 @@ describe("the normal emitter after a rebaseline", () => {
       mode: "DRY_RUN", run, readLog: (s) => w.logs[s] ?? null, cursors: { load: () => null }, cursorWriter: null, ledger: null, baseline: "DRY_RUN_FROM_START", activateAtEof: false,
       queueCapacity: 10, pendingTailPolls: 0, nowIso: () => "t", report: () => undefined,
     });
-    await expect(emitter.initialize()).rejects.toBeInstanceOf(QueueOverflowError);
+    await emitter.initialize();
+    await emitter.drain();
+    const total = run.lanes.reduce((n, lane) => n + (w.logs[lane.symbol] ?? "").split("\n").filter((line) => line !== "").length, 0);
+    const s = emitter.status();
+    expect(total).toBeGreaterThan(10);
+    expect(s.maxQueueDepth).toBeLessThanOrEqual(10);
+    expect(s.eventsRead).toBe(total);
+    expect(s.queueDepth).toBe(0);
+    expect(QueueOverflowError.name).toBe("QueueOverflowError");
   });
 
   it("a rebaselined lane delivers NONE of its old backlog, and a record appended later IS deliverable", async () => {

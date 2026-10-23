@@ -454,16 +454,25 @@ describe("restart-safe cursors and first activation", () => {
     expect(rest.emitter.status().ledgerDuplicates).toBe(0);
   });
 
-  it("24. the queue is bounded: overflow fails closed with no ledger call and no cursor movement", async () => {
+  // Always-On Monitoring V1 changed this contract deliberately: a finite backlog larger than the queue used to
+  // fail closed with EMITTER_QUEUE_OVERFLOW before anything drained (a real 14,088-record catch-up did). The
+  // queue stays bounded; the backlog is now admitted in bounded rounds. Full matrix: native-emitter-bounded-catch-up.test.ts.
+  it("24. the queue is bounded: a backlog larger than the queue drains in bounded rounds, never above capacity", async () => {
     const { cursors, ledger, start } = activatedState({});
     await runMultiSymbolEmitter(start.emitter, { follow: false, pollMs: 1, sleep: async () => undefined, shouldStop: () => false });
-    const before = JSON.stringify([...cursors.saved]);
     const records: ShadowRecord[] = [com("AAAUSDT", bar(0), "QUARANTINED_CURRENT_BAR")];
     for (let i = 1; i <= 12; i += 1) records.push(com("AAAUSDT", bar(i)));
-    const big = emitterFor({ logs: { AAAUSDT: logOf(records) }, mode: "COMMIT_DASHBOARD_ALERTS", ledger, cursors, queueCapacity: 10 });
-    await expect(runMultiSymbolEmitter(big.emitter, { follow: false, pollMs: 1, sleep: async () => undefined, shouldStop: () => false })).rejects.toBeInstanceOf(QueueOverflowError);
+    const logs = { AAAUSDT: logOf(records) };
+    const big = emitterFor({ logs, mode: "COMMIT_DASHBOARD_ALERTS", ledger, cursors, queueCapacity: 10 });
+    await runMultiSymbolEmitter(big.emitter, { follow: false, pollMs: 1, sleep: async () => undefined, shouldStop: () => false });
+    const s = big.emitter.status();
+    expect(s.maxQueueDepth).toBeLessThanOrEqual(10);
+    expect(s.catchUp.rounds).toBeGreaterThanOrEqual(2);
+    expect(s.queueDepth).toBe(0);
+    // Bar-close commits are never delivered: the whole backlog is read once and no ledger call is made.
     expect(ledger.calls).toBe(0);
-    expect(JSON.stringify([...cursors.saved])).toBe(before);
+    expect((cursors.saved.get("AAAUSDT") as EmitterCursor).consumedChars).toBe(logs.AAAUSDT.length);
+    expect(QueueOverflowError.name).toBe("QueueOverflowError");
   });
 
   it("follow mode: appended records are picked up, the queue depth is visible, and the maximum is tracked", async () => {

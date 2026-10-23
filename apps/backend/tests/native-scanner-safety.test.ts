@@ -39,6 +39,8 @@ describe("the native scanner data layer", () => {
       "compat-replay-cli-args.ts",
       "compat-replay-runner.ts",
       "compat-replay.ts",
+      // Always-On Monitoring V1: the pure stop-file watcher the supervisor and emitter CLIs use (timers injected).
+      "cooperative-stop.ts",
       "exchange-symbol.ts",
       "historical-replay-runner.ts",
       "historical-replay.ts",
