@@ -17,7 +17,7 @@ import type { OpenPublicStream } from "./live-shadow-runner";
 import { LiveShadowSupervisor, NATIVE_RECOVERY_POLICY_VERSION, SupervisorConfigError, TargetNotReachedError, type MembershipChange, type SupervisorStatus } from "./live-shadow-supervisor";
 import { FAST_RECOVERY_DEFAULTS, SUPERVISOR_CLI_USAGE, SupervisorCliUsageError, parseSupervisorCliArgs } from "./live-shadow-supervisor-cli-args";
 import { ScannerPathError, assertOutsideRepository, scannerKlineCacheDir, scannerRootDir } from "./scanner-paths";
-import { acquireLiveShadowLock } from "./scanner-lock";
+import { acquireLiveShadowLock, windowsProcessCreatedAtMs } from "./scanner-lock";
 import { RUN_MEMBERSHIP_JOURNAL_FILE, membershipLine } from "./run-membership";
 import {
   DEFAULT_UNIVERSE_REFRESH_MS,
@@ -73,6 +73,16 @@ const openPublicStream: OpenPublicStream = (url, handlers) => {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const iso = (ms: number) => new Date(ms).toISOString();
+
+/** One CIM query per holder pid within 30 s: a crash leaves every symbol's lock naming the same pid. */
+const createdAtCache = new Map<number, { atMs: number; value: number | null }>();
+function processCreatedAtMs(pid: number): number | null {
+  const hit = createdAtCache.get(pid);
+  if (hit !== undefined && Date.now() - hit.atMs < 30_000) return hit.value;
+  const value = windowsProcessCreatedAtMs(pid);
+  createdAtCache.set(pid, { atMs: Date.now(), value });
+  return value;
+}
 
 function isProcessAlive(pid: number): boolean {
   try {
@@ -248,7 +258,7 @@ async function main(): Promise<void> {
       governor,
       fetchDeps,
       cache: new KlineCacheStore(assertOutsideRepository(scannerKlineCacheDir(process.env), REPO_ROOT)),
-      acquireLock: (dir) => acquireLiveShadowLock(dir, { pid: process.pid, owner: "scanner:live-shadow-supervisor", startedAt: iso(started), isProcessAlive }),
+      acquireLock: (dir) => acquireLiveShadowLock(dir, { pid: process.pid, owner: "scanner:live-shadow-supervisor", startedAt: iso(started), isProcessAlive, processCreatedAtMs }),
       nowMs: () => Date.now(),
       nowIso: () => iso(Date.now()),
       schedule: (fn) => setImmediate(fn),

@@ -21,7 +21,7 @@ import { LiveShadowEventStore } from "./live-shadow-store";
 import { REPLAY_PAGE_LIMIT, REPLAY_SETTLE_MS } from "./replay-cli-args";
 import { ScannerLineageError, deriveHtfContextStartMs } from "./scanner-lineage";
 import { ScannerPathError, assertOutsideRepository, scannerKlineCacheDir, scannerRootDir } from "./scanner-paths";
-import { ScannerLockError, acquireLiveShadowLock } from "./scanner-lock";
+import { ScannerLockError, acquireLiveShadowLock, windowsProcessCreatedAtMs } from "./scanner-lock";
 
 /**
  * LIVE SHADOW scanner for ONE symbol on Binance USD-M public 15m klines.
@@ -143,7 +143,7 @@ async function main(): Promise<void> {
   }
 
   // One live-shadow writer per symbol directory: refuses if the supervisor (or another scanner) owns it.
-  const lock = acquireLiveShadowLock(liveDir, { pid: process.pid, owner: "scanner:live-shadow", startedAt: iso(Date.now()), isProcessAlive });
+  const lock = acquireLiveShadowLock(liveDir, { pid: process.pid, owner: "scanner:live-shadow", startedAt: iso(Date.now()), isProcessAlive, processCreatedAtMs: windowsProcessCreatedAtMs });
   process.on("exit", () => lock.release());
   const checkpoints = new LiveCheckpointStore(liveDir);
   const plan = prepareLiveShadowState(klines, request, trustedEndMs, checkpoints.load());
