@@ -136,6 +136,14 @@ describe("the Always-On supervisor's reach", () => {
     expect([...MUTATION_ACTIONS]).toEqual(expect.arrayContaining(["ALWAYS_ON_START", "ALWAYS_ON_STOP", "ALWAYS_ON_ROLE_START", "ALWAYS_ON_ROLE_STOP"]));
   });
 
+  it("the real file system retries transient Windows sharing failures on every ownership open, replace, strict read and removal", () => {
+    const code = codeOf(`${AO}/always-on-machine.ts`);
+    expect(code).toContain('const fd = retryTransientFs(() => openSync(temporary, "w"));');
+    expect(code).toContain("retryTransientFs(() => renameSync(temporary, file));");
+    expect(code).toContain('return retryTransientFs(() => readFileSync(file, "utf8"));');
+    expect(code).toContain("retryTransientFs(() => unlinkSync(file));");
+  });
+
   it("the CLI never records a supervisor identity it could not read (an unverifiable identity could never be stopped or seen)", () => {
     const code = codeOf(ENTRY);
     expect(code).toMatch(/const selfStart = selfStartedAtMs\(\);\s*if \(selfStart === null\) \{\s*say\("REFUSED: [^"]*"\);\s*await lock\.held\.release\(\);\s*return 1;\s*\}/);
