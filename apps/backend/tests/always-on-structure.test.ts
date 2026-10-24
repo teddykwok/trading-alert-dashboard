@@ -136,6 +136,12 @@ describe("the Always-On supervisor's reach", () => {
     expect([...MUTATION_ACTIONS]).toEqual(expect.arrayContaining(["ALWAYS_ON_START", "ALWAYS_ON_STOP", "ALWAYS_ON_ROLE_START", "ALWAYS_ON_ROLE_STOP"]));
   });
 
+  it("the CLI never records a supervisor identity it could not read (an unverifiable identity could never be stopped or seen)", () => {
+    const code = codeOf(ENTRY);
+    expect(code).toMatch(/const selfStart = selfStartedAtMs\(\);\s*if \(selfStart === null\) \{\s*say\("REFUSED: [^"]*"\);\s*await lock\.held\.release\(\);\s*return 1;\s*\}/);
+    expect(code).toContain("selfStartedAtMs: selfStart,");
+  });
+
   it("the supervisor deletes nothing but its own request files and stop files: no cursor, namespace, checkpoint or log", () => {
     const code = codeOf(SUPERVISOR);
     // Two helpers are the only direct removers (both tolerate a held file)...

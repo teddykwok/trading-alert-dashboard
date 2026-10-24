@@ -8,7 +8,7 @@ import { buildProcessProbeQuery, parseEnvFileStrict } from "../operator/dual-acc
 import { assessNonWatchBuild, type BuildVerdict } from "../operator/generic-backend-nonwatch-launcher";
 import { listenerAuthority, withMutationLock, type ListenerHandle, type MutationAction, type WithAuthorityResult } from "../operator/mutation-lock";
 import { classifySpawnResult, parseProcessRows, parseProcessTreeRows, type Observation, type ObservedProcessNode } from "../operator/runtime-launcher";
-import type { ProbeOutcome } from "../operator/worker-supervision";
+import { OWNERSHIP_PROOF_ATTEMPTS, type ProbeOutcome } from "../operator/worker-supervision";
 import type { AlwaysOnRole } from "./always-on-contract";
 import { listenerInstanceLock, type InstanceLock } from "./always-on-ownership";
 import { alwaysOnRoleLog, type AlwaysOnPaths } from "./always-on-paths";
@@ -302,8 +302,18 @@ export function realMutation(log: (line: string) => void): <T>(action: MutationA
   return (action, run) => withMutationLock(action, { authority: listenerAuthority(openLoopbackListener), log: (line) => log(`  ${line}`) }, run);
 }
 
-/** This process's own OS creation time (the PID-reuse fence in its ownership record), or now. */
-export function selfStartedAtMs(): number {
-  const probed = probeProcess(process.pid);
-  return (probed.observed ? probed.process?.startedAtMs : undefined) ?? Date.now();
+/**
+ * This process's own OS creation time — the PID-reuse fence in its ownership
+ * record — probed as often as the fenced start probes a fresh child. Null when
+ * it still cannot be read: "now" would be seconds late, and no later
+ * verification (±1 s of the real time) could ever match it, so `stop`, `status`
+ * and the launcher would never see this supervisor again.
+ */
+export function selfStartedAtMs(probe: (pid: number) => ProbeOutcome = probeProcess, pid: number = process.pid): number | null {
+  for (let attempt = 0; attempt < OWNERSHIP_PROOF_ATTEMPTS; attempt += 1) {
+    const probed = probe(pid);
+    const startedAtMs = probed.observed ? probed.process?.startedAtMs : undefined;
+    if (startedAtMs !== undefined) return startedAtMs;
+  }
+  return null;
 }

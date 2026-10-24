@@ -4,8 +4,9 @@ import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { spawnAlwaysOnSupervisor } from "../src/modules/always-on/always-on-launch";
-import { createSpawner, observeProcessRows, realFileSystem, retryTransientFs } from "../src/modules/always-on/always-on-machine";
+import { createSpawner, observeProcessRows, realFileSystem, retryTransientFs, selfStartedAtMs } from "../src/modules/always-on/always-on-machine";
 import { alwaysOnPaths } from "../src/modules/always-on/always-on-paths";
+import { OWNERSHIP_PROOF_ATTEMPTS, type ProbeOutcome } from "../src/modules/operator/worker-supervision";
 import { fsError } from "./helpers/always-on-fake-machine";
 
 /**
@@ -128,6 +129,26 @@ describe("a spawn that fails at run time is a refused start, never an uncaught e
     });
     expect(pid).toBeNull();
     expect(caught).toEqual([]);
+  });
+});
+
+describe("the supervisor's own identity is its OS creation time, or it does not start", () => {
+  const row = (startedAtMs: number) => ({ observed: true as const, process: { pid: 77, commandLine: "node run-always-on-monitoring.ts", startedAtMs } });
+  const unobserved = { observed: false as const };
+
+  it("a transient probe failure is retried (as the fenced start retries a fresh child's) before giving up", () => {
+    const answers: ProbeOutcome[] = [unobserved, { observed: true, process: null }, row(1_700_000_000_000)];
+    expect(selfStartedAtMs(() => answers.shift() ?? unobserved, 77)).toBe(1_700_000_000_000);
+  });
+
+  it("an unreadable creation time is null — never 'now', which no later verification (±1 s of the real one) could ever match", () => {
+    let probes = 0;
+    const always = () => {
+      probes += 1;
+      return unobserved;
+    };
+    expect(selfStartedAtMs(always, 77)).toBeNull();
+    expect(probes).toBe(OWNERSHIP_PROOF_ATTEMPTS);
   });
 });
 

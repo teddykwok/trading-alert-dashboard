@@ -192,6 +192,13 @@ async function run(paths: AlwaysOnPaths, request: AlwaysOnRunRequest): Promise<n
     say(`REFUSED: ${lock.reason}. Nothing was started or stopped.`);
     return 1;
   }
+  // Recorded as this supervisor's identity: without its real OS creation time, stop / status / the launcher could never verify it.
+  const selfStart = selfStartedAtMs();
+  if (selfStart === null) {
+    say("REFUSED: this process's own OS creation time could not be read (process observation failed), so its ownership record could never be verified. Nothing was started or stopped; try again.");
+    await lock.held.release();
+    return 1;
+  }
   const spawner = createSpawner(paths, say);
   const supervisor = new AlwaysOnSupervisor(
     {
@@ -210,7 +217,7 @@ async function run(paths: AlwaysOnPaths, request: AlwaysOnRunRequest): Promise<n
     {
       now: () => Date.now(),
       selfPid: process.pid,
-      selfStartedAtMs: selfStartedAtMs(),
+      selfStartedAtMs: selfStart,
       env: process.env,
       paths,
       observeTree: observeProcessTree,
