@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { realFileSystem, retryTransientFs } from "../src/modules/always-on/always-on-machine";
+import { observeProcessRows, realFileSystem, retryTransientFs } from "../src/modules/always-on/always-on-machine";
 import { fsError } from "./helpers/always-on-fake-machine";
 
 /**
@@ -62,6 +62,34 @@ describe("transient Windows sharing failures are retried, bounded", () => {
     // Bounded: at most ~1.8 s of waiting in all.
     expect(sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(1_800);
   });
+});
+
+describe("process-tree observation survives any command line on the machine", () => {
+  // A process object exactly as the CIM query yields one, through the REAL row format and the REAL parser.
+  const processObject = (commandLine: string) =>
+    `[pscustomobject]@{ ProcessId = 4242; ParentProcessId = 7; Name = 'node.exe'; CreationDate = [datetime]::UtcNow; CommandLine = (${commandLine}) }`;
+
+  it.runIf(process.platform === "win32")(
+    "a CR/LF inside one unrelated command line (node -e with a multi-line script) stays inside its own row — it no longer makes the whole table UNPARSEABLE",
+    () => {
+      const observed = observeProcessRows(processObject("'node -e a' + [char]13 + [char]10 + 'b' + [char]10 + 'c|d'"));
+      expect(observed).toMatchObject({ ok: true });
+      if (!observed.ok) return;
+      expect(observed.value).toHaveLength(1);
+      expect(observed.value[0]).toMatchObject({ pid: 4242, parentPid: 7, executable: "node.exe" });
+      expect(observed.value[0].commandLine).toBe("node -e a  b c d");
+    },
+    60_000
+  );
+
+  it.runIf(process.platform === "win32")(
+    "an ordinary command line is observed unchanged",
+    () => {
+      const observed = observeProcessRows(processObject("'cmd.exe /d /s /c pnpm -C C:\\repo --filter backend run'"));
+      expect(observed.ok && observed.value[0].commandLine).toBe("cmd.exe /d /s /c pnpm -C C:\\repo --filter backend run");
+    },
+    60_000
+  );
 });
 
 describe("the real file system adapter", () => {

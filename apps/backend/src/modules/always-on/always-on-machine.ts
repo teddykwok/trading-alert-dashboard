@@ -40,14 +40,26 @@ function powershell(script: string): Observation<string> {
   return classifySpawnResult(result);
 }
 
-export function observeProcessTree(): Observation<ObservedProcessNode[]> {
-  const out = powershell(
-    "Get-CimInstance Win32_Process -Filter \"Name='node.exe' OR Name='cmd.exe'\" | " +
-      "ForEach-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.ProcessId, $_.ParentProcessId, $_.Name, " +
-      "([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds(), ($_.CommandLine -replace '\\|',' ') }"
-  );
+/**
+ * One output line per process: pid|parent pid|name|creation ms|command line.
+ * '|' AND line breaks in a command line become spaces: Windows allows CR/LF
+ * in any process's command line (node -e "<multi-line script>"), and one row
+ * split across lines would make the all-or-nothing parser refuse the whole
+ * table — stalling every start, stop and recovery while that process lives.
+ */
+export const PROCESS_ROW_FORMAT =
+  "ForEach-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.ProcessId, $_.ParentProcessId, $_.Name, " +
+  "([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds(), ($_.CommandLine -replace '[|\\r\\n]',' ') }";
+
+/** Formats a PowerShell pipeline of process objects into rows and parses them (all or nothing). */
+export function observeProcessRows(source: string): Observation<ObservedProcessNode[]> {
+  const out = powershell(`${source} | ${PROCESS_ROW_FORMAT}`);
   if (!out.ok) return out;
   return parseProcessTreeRows(out.value);
+}
+
+export function observeProcessTree(): Observation<ObservedProcessNode[]> {
+  return observeProcessRows("Get-CimInstance Win32_Process -Filter \"Name='node.exe' OR Name='cmd.exe'\"");
 }
 
 export function probeProcess(pid: number): ProbeOutcome {
