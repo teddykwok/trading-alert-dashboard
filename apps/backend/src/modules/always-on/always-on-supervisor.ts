@@ -195,6 +195,11 @@ interface RoleRuntime {
   unhealthySinceMs: number | null;
   healthySinceMs: number | null;
   warmingSinceMs: number | null;
+  /**
+   * The last tick the current child's status was judged its OWN (null: none yet since it started or was adopted).
+   * Once it has reported, a status that is missing or unreadable is degraded evidence — never a failed start-up.
+   */
+  lastOwnStatusAtMs: number | null;
   restarts: number;
   lastExit: { atMs: number; code: number | null } | null;
   startedAtMs: number | null;
@@ -229,6 +234,7 @@ const fresh = (): RoleRuntime => ({
   unhealthySinceMs: null,
   healthySinceMs: null,
   warmingSinceMs: null,
+  lastOwnStatusAtMs: null,
   restarts: 0,
   lastExit: null,
   startedAtMs: null,
@@ -825,6 +831,7 @@ export class AlwaysOnSupervisor {
       rt.unhealthySinceMs = null;
       rt.healthySinceMs = null;
       rt.warmingSinceMs = null;
+      rt.lastOwnStatusAtMs = null;
       this.setRole(role, "STARTING", restart ? "RESTARTED" : "STARTED", `started (root pid ${result.pid}); waiting for its first evidence of health`);
       this.record({
         kind: "ROLE_STARTED",
@@ -1265,7 +1272,10 @@ export class AlwaysOnSupervisor {
       await this.advanceStop(role, now);
       return;
     }
-    if (scanner.verdict === "AWAITING_STATUS") {
+    if (scanner.ours) rt.lastOwnStatusAtMs = now;
+    // Before its first status: a start-up, with its own deadline. After it: a status that is missing or unreadable
+    // (one failed read is enough for that) is judged below like a stale one — grace first, never acted on at once.
+    if (scanner.verdict === "AWAITING_STATUS" && rt.lastOwnStatusAtMs === null) {
       if (rt.startedAtMs !== null && now - rt.startedAtMs > p.scannerStartupTimeoutMs) {
         this.requestRecovery("SCANNER_STARTUP_TIMEOUT", `the scanner wrote no status of its own within ${Math.round(p.scannerStartupTimeoutMs / 60_000)} min`, now);
         await this.advanceRecovery(scanner, now);
@@ -1289,7 +1299,7 @@ export class AlwaysOnSupervisor {
       await this.advanceRecovery(scanner, now);
       return;
     }
-    let issues = scanner.issues.map((i) => i.code as string);
+    let issues = scanner.verdict === "AWAITING_STATUS" ? ["STATUS_MISSING"] : scanner.issues.map((i) => i.code as string);
     if (scanner.verdict === "WARMING") {
       rt.warmingSinceMs ??= now;
       if (now - rt.warmingSinceMs >= p.quarantinePersistentMs) issues = ["QUARANTINE_PERSISTENT"];
@@ -1362,6 +1372,18 @@ export class AlwaysOnSupervisor {
         return;
       }
       const health = emitter;
+      if (health.ours) rt.lastOwnStatusAtMs = now;
+      if (health.verdict === "AWAITING_STATUS" && rt.lastOwnStatusAtMs !== null) {
+        // It has reported since it started: a missing or unreadable status is judged like a stale one — hung only
+        // once the hung window has passed since its last own status (or the resume), never on one failed read.
+        if (now - Math.max(rt.lastOwnStatusAtMs, this.resumedAtMs ?? 0) > p.emitterHungMs) {
+          await this.requestStop(role, "RESTART", "STATUS_HUNG", now);
+          this.setRole(role, "RECOVERING", "STATUS_HUNG", "its status has been missing or unreadable beyond the hung window: restarting it");
+          return;
+        }
+        this.setRole(role, "DEGRADED", "STATUS_MISSING", "its status file is missing or unreadable");
+        return;
+      }
       if (health.verdict === "AWAITING_STATUS") {
         if (rt.startedAtMs !== null && now - rt.startedAtMs > p.emitterStartupTimeoutMs) {
           await this.requestStop(role, "RESTART", "NO_STATUS_AFTER_START", now);

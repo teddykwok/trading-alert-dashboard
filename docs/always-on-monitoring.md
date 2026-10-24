@@ -70,6 +70,13 @@ Quarantine of the current bar is normal after a start or reconnect. It reads
 WARMING, and becomes degraded only after 35 minutes. Reconnect and
 backpressure counters are reported but never trigger a restart on their own.
 
+**A status that disappears or cannot be read.** Before a role's first status
+of its own, a missing status means it is still starting up, with its own
+deadline: 45 minutes for the scanner, 10 for the emitter. After that it is
+degraded evidence (`STATUS_MISSING`), judged like a stale status. The scanner
+gets the grace period, the emitter its hung window. A single failed read is
+never acted on at once.
+
 **Emitter.** Health is judged from its own status for its pinned run (its own
 pid):
 

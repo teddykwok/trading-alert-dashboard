@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { ALWAYS_ON_DEFAULTS, ALWAYS_ON_REQUEST_SCHEMA } from "../src/modules/always-on/always-on-contract";
 import { parseOwnership } from "../src/modules/always-on/always-on-ownership";
+import { emitterCommitStatus } from "../src/modules/always-on/always-on-paths";
 import { ENGINE as PROFILE_ENGINE, FakeMachine, run, startSupervisor, testConfig, until } from "./helpers/always-on-fake-machine";
 
 /**
@@ -390,6 +391,56 @@ describe("an emitter re-validating a large backlog at start-up is alive, not sil
     await until(m, supervisor, () => m.incidents().some((i) => i.kind === "ROLE_STOP_REQUESTED" && i.role === "emitter"), 100);
     expect(m.incidents().find((i) => i.kind === "ROLE_STOP_REQUESTED" && i.role === "emitter")?.reasonCode).toBe("NO_STATUS_AFTER_START");
     expect(m.now - startedAt).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.emitterStartupTimeoutMs);
+  });
+});
+
+describe("a role that has reported and then has no readable status is degraded evidence — not a failed start-up", () => {
+  it("one unreadable scanner status, long after its start-up window, triggers no recovery", async () => {
+    const { m, supervisor } = await healthyStack();
+    await run(m, supervisor, 200); // 50 minutes: past the 45-minute start-up window
+    m.failRead = (file) => file === m.paths.scannerStatus;
+    await run(m, supervisor, 1);
+    m.failRead = null;
+    await run(m, supervisor, 3);
+    expect(m.kinds()).not.toContain("SCANNER_RECOVERY_REQUESTED");
+    expect(supervisor.status().state).toBe("RUNNING");
+    expect(m.spawns.filter((c) => c.role === "scanner")).toHaveLength(1);
+  });
+
+  it("a scanner status that STAYS unreadable is degraded first and recovered only after the grace period", async () => {
+    const { m, supervisor } = await healthyStack();
+    await run(m, supervisor, 200);
+    m.failRead = (file) => file === m.paths.scannerStatus;
+    const since = m.now;
+    await until(m, supervisor, () => m.kinds().includes("SCANNER_RECOVERY_REQUESTED"), 40);
+    expect(m.incidents().find((i) => i.kind === "SCANNER_DEGRADED")?.reasonCode).toBe("STATUS_MISSING");
+    expect(m.incidents().find((i) => i.kind === "SCANNER_RECOVERY_REQUESTED")?.reasonCode).toBe("SCANNER_DEGRADED_BEYOND_GRACE");
+    expect(m.now - since).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.degradedGraceMs);
+  });
+
+  it("one unreadable emitter status, long after its start, does not restart it", async () => {
+    const { m, supervisor } = await healthyStack();
+    await run(m, supervisor, 50); // 12.5 minutes: past the 10-minute first-status window
+    const statusFile = emitterCommitStatus(m.paths, m.live("emitter")[0].pinnedRunId as string);
+    m.failRead = (file) => file === statusFile;
+    await run(m, supervisor, 1);
+    expect(supervisor.status().roles.emitter).toMatchObject({ state: "DEGRADED", reasonCode: "STATUS_MISSING" });
+    m.failRead = null;
+    await run(m, supervisor, 2);
+    expect(m.incidents().filter((i) => i.kind === "ROLE_STOP_REQUESTED" && i.role === "emitter")).toEqual([]);
+    expect(supervisor.status().roles.emitter.state).toBe("RUNNING");
+    expect(m.spawns.filter((c) => c.role === "emitter")).toHaveLength(1);
+  });
+
+  it("an emitter status that STAYS unreadable is restarted once the hung window has passed since its last own status", async () => {
+    const { m, supervisor } = await healthyStack();
+    await run(m, supervisor, 50);
+    const statusFile = emitterCommitStatus(m.paths, m.live("emitter")[0].pinnedRunId as string);
+    m.failRead = (file) => file === statusFile;
+    const since = m.now;
+    await until(m, supervisor, () => m.incidents().some((i) => i.kind === "ROLE_STOP_REQUESTED" && i.role === "emitter"), 100);
+    expect(m.incidents().find((i) => i.kind === "ROLE_STOP_REQUESTED" && i.role === "emitter")?.reasonCode).toBe("STATUS_HUNG");
+    expect(m.now - since).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.emitterHungMs - 15_000);
   });
 });
 
