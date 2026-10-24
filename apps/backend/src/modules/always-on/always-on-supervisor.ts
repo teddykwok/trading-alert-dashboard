@@ -114,7 +114,10 @@ export interface AlwaysOnConfig {
 }
 
 export interface AlwaysOnFileSystem {
+  /** Evidence (status files, manifests): null when absent OR unreadable. */
   readText(file: string): string | null;
+  /** The ownership record: null ONLY when the file does not exist; any other failure throws (unknown is never absent). */
+  readTextStrict(file: string): string | null;
   writeTextAtomic(file: string, text: string): void;
   appendLine(file: string, line: string): void;
   exists(file: string): boolean;
@@ -155,6 +158,16 @@ export interface AlwaysOnAdapters {
 
 type StopPurpose = "RESTART" | "SUPERSEDED" | "RECOVERY" | "SHUTDOWN";
 
+/** The generation fence as read from disk. UNKNOWN (the file could not be read) pauses mutations; it never fences. */
+type FenceState = "CURRENT" | "SUPERSEDED" | "UNKNOWN";
+
+/** An error's code for the journal (an fs code such as EPERM, or the error's name) — never its message. */
+function errorCode(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code)) return code;
+  return error instanceof Error && /^[A-Za-z0-9_]{1,64}$/.test(error.name) ? error.name : "UNKNOWN_ERROR";
+}
+
 interface StopRequest {
   readonly purpose: StopPurpose;
   readonly cooperative: boolean;
@@ -173,6 +186,12 @@ interface RoleRuntime {
   latched: boolean;
   /** The first start of a role in a generation is free; every later start is a recovery attempt. */
   everStarted: boolean;
+  /**
+   * The last child was stopped by the supervisor for ANOTHER role's sake (a
+   * scanner recovery) or because its pinned run was superseded: it did not
+   * fail, so its next start spends no attempt and waits for no backoff.
+   */
+  freeRestart: boolean;
   unhealthySinceMs: number | null;
   healthySinceMs: number | null;
   warmingSinceMs: number | null;
@@ -206,6 +225,7 @@ const fresh = (): RoleRuntime => ({
   nextAttemptAtMs: 0,
   latched: false,
   everStarted: false,
+  freeRestart: false,
   unhealthySinceMs: null,
   healthySinceMs: null,
   warmingSinceMs: null,
@@ -242,11 +262,18 @@ export class AlwaysOnSupervisor {
   };
   private dataStore: "AVAILABLE" | "UNAVAILABLE" | "UNKNOWN" = "UNKNOWN";
   private lastTickAtMs: number | null = null;
+  /** When supervision last resumed after a clock gap (sleep / hibernate): no status older than this proves a hang. */
+  private resumedAtMs: number | null = null;
   private lastEndToEndHealthyAtMs: number | null = null;
   private lastRecovery: AlwaysOnStatusDto["lastRecovery"] = null;
   private readonly counters = { ticks: 0, scannerRecoveries: 0, restarts: { backend: 0, scanner: 0, emitter: 0, planner: 0 } as Record<AlwaysOnRole, number> };
   private largeBacklog = false;
   private observationFailing = false;
+  /** ownership.json does not match memory yet (a write failed): retried every tick; no role starts meanwhile. */
+  private ownershipDirty = false;
+  private ownershipWriteFailing = false;
+  private ownershipReadFailing = false;
+  private tickFailing = false;
   private readonly reportedExternal = new Set<string>();
   private latest: {
     census: MonitoringCensus | null;
@@ -281,12 +308,19 @@ export class AlwaysOnSupervisor {
     this.a.fs.ensureDir(this.a.paths.dir);
     this.a.fs.ensureDir(this.a.paths.requestsDir);
     this.a.fs.ensureDir(this.a.paths.stopDir);
-    const previous = parseOwnership(this.a.fs.readText(this.a.paths.ownership));
+    let previousText: string | null;
+    try {
+      previousText = this.a.fs.readTextStrict(this.a.paths.ownership);
+    } catch (error) {
+      // A file that exists but cannot be read is not "nothing owned": taking generation 1 would orphan its children.
+      return { ok: false, reason: `the ownership file could not be read (${errorCode(error)}); refusing to take ownership blind — nothing was adopted, started or stopped` };
+    }
+    const previous = parseOwnership(previousText);
     if (previous.kind === "UNREADABLE") {
       return { ok: false, reason: `the ownership file is unreadable (${previous.reason}); refusing to take ownership blind — inspect ${this.a.paths.ownership}` };
     }
     const previousChildren = previous.kind === "VALID" ? previous.file.children : [];
-    const decisions = decideAdoption(previousChildren, this.a.probe, this.config.repoRoot);
+    const decisions = decideAdoption(previousChildren, this.a.probe, this.config.repoRoot, previous.kind === "VALID" ? previous.file.repoRoot : this.config.repoRoot);
     if (decisions === null) return { ok: false, reason: "the previous generation's children could not be observed; nothing was adopted, started or stopped" };
 
     this.generation = nextGeneration(previous);
@@ -300,7 +334,9 @@ export class AlwaysOnSupervisor {
         adopted.push(decision.child);
       }
     }
-    this.writeOwnership();
+    if (!this.writeOwnership()) {
+      return { ok: false, reason: `the ownership file could not be written (${this.a.paths.ownership}); nothing was adopted, started or stopped` };
+    }
     this.record({
       kind: "SUPERVISOR_STARTED",
       reasonCode: previous.kind === "VALID" ? "NEXT_GENERATION" : "FIRST_GENERATION",
@@ -322,7 +358,7 @@ export class AlwaysOnSupervisor {
     // Stop files nobody adopted can never be honoured by anyone: tidy them (a child only ever watches its own path).
     const keep = new Set(adopted.map((c) => c.stopFile).filter((f): f is string => f !== null).map((f) => path.basename(f)));
     for (const name of this.a.fs.listDir(this.a.paths.stopDir)) {
-      if (name.endsWith(".stop") && !keep.has(name)) this.a.fs.remove(path.join(this.a.paths.stopDir, name));
+      if (name.endsWith(".stop") && !keep.has(name)) this.removeQuietly(path.join(this.a.paths.stopDir, name));
     }
     this.lastTickAtMs = now;
     this.writeStatus();
@@ -333,7 +369,31 @@ export class AlwaysOnSupervisor {
   // One pass: observe, judge, act
   // ---------------------------------------------------------------------------
 
+  /**
+   * One supervision pass. Never rejects: an unexpected error is journaled (once
+   * per streak) and the next pass runs as usual — a supervisor that died here
+   * would leave every child running with nobody watching it.
+   */
   async tick(): Promise<AlwaysOnTickOutcome> {
+    try {
+      const outcome = await this.tickOnce();
+      this.tickFailing = false;
+      return outcome;
+    } catch (error) {
+      if (!this.tickFailing) {
+        this.tickFailing = true;
+        this.record({ kind: "SUPERVISOR_TICK_FAILED", reasonCode: errorCode(error), detail: "an unexpected error interrupted one supervision pass; supervision continues with the next one" });
+      }
+      if (this.fenced) return "FENCED";
+      this.state = this.shutdown ? "STOPPING" : "DEGRADED";
+      this.reasonCode = "SUPERVISION_ERROR";
+      this.reason = `an unexpected error interrupted the last supervision pass (${errorCode(error)}); supervision continues`;
+      this.writeStatus();
+      return "CONTINUE";
+    }
+  }
+
+  private async tickOnce(): Promise<AlwaysOnTickOutcome> {
     if (this.fenced) return "FENCED";
     if (this.detached || this.shutdown?.done) return "STOPPED";
     const now = this.a.now();
@@ -345,9 +405,15 @@ export class AlwaysOnSupervisor {
       for (const role of ALWAYS_ON_ROLES) {
         this.rt[role].unhealthySinceMs = null;
         this.rt[role].warmingSinceMs = null;
+        // Time asleep is not healthy time either: forgiveness needs an observed streak.
+        this.rt[role].healthySinceMs = null;
         if (this.rt[role].startedAtMs !== null) this.rt[role].startedAtMs = now;
       }
-      if (this.recovery?.awaitingSinceMs != null) this.recovery.awaitingSinceMs = now;
+      if (this.recovery !== null) {
+        if (this.recovery.awaitingSinceMs !== null) this.recovery.awaitingSinceMs = now;
+        this.recovery.degradedSinceMs = null;
+      }
+      this.resumedAtMs = now;
       this.network = { reachable: null, lastProbeAtMs: null, unavailableSinceMs: null, restoredAtMs: null };
     }
     this.lastTickAtMs = now;
@@ -364,7 +430,18 @@ export class AlwaysOnSupervisor {
       return "CONTINUE";
     }
     this.observationFailing = false;
-    if (!this.fenceHolds()) return this.becomeFenced();
+    const fence = this.fenceState();
+    if (fence === "SUPERSEDED") return this.becomeFenced();
+    if (fence === "UNKNOWN") {
+      this.state = this.shutdown ? "STOPPING" : "DEGRADED";
+      this.reasonCode = "OWNERSHIP_UNREADABLE";
+      this.reason = "ownership.json could not be read; nothing is started, stopped or recorded until it can (this generation is not given up)";
+      this.writeStatus();
+      return "CONTINUE";
+    }
+    // A record that could not be made durable earlier is retried before anything else changes.
+    this.flushOwnership();
+    if (this.fenced) return "FENCED";
 
     this.reconcileChildren(tree.value, now);
     if (this.fenced) return "FENCED";
@@ -465,8 +542,27 @@ export class AlwaysOnSupervisor {
   // Fencing and ownership records
   // ---------------------------------------------------------------------------
 
-  private fenceHolds(): boolean {
-    return generationIsCurrent(parseOwnership(this.a.fs.readText(this.a.paths.ownership)), this.generation);
+  /**
+   * The generation on disk. A file that cannot be READ is UNKNOWN — a reader,
+   * an indexer or antivirus can hold it for a moment — and only pauses
+   * mutations; anything readable that is not this generation fences it.
+   */
+  private fenceState(): FenceState {
+    let text: string | null;
+    try {
+      text = this.a.fs.readTextStrict(this.a.paths.ownership);
+    } catch (error) {
+      if (!this.ownershipReadFailing) {
+        this.ownershipReadFailing = true;
+        this.record({ kind: "OWNERSHIP_READ_FAILED", reasonCode: errorCode(error), detail: "ownership.json could not be read: nothing is started, stopped or recorded until it can; the generation is not given up" });
+      }
+      return "UNKNOWN";
+    }
+    if (this.ownershipReadFailing) {
+      this.ownershipReadFailing = false;
+      this.record({ kind: "OWNERSHIP_READ_RESTORED", reasonCode: "OWNERSHIP_READABLE", detail: "ownership.json can be read again" });
+    }
+    return generationIsCurrent(parseOwnership(text), this.generation) ? "CURRENT" : "SUPERSEDED";
   }
 
   private becomeFenced(): AlwaysOnTickOutcome {
@@ -489,8 +585,13 @@ export class AlwaysOnSupervisor {
     return roots;
   }
 
-  /** The ONLY writer of ownership.json (atomic replace). Callers have passed the generation fence. */
-  private writeOwnership(): void {
+  /**
+   * The ONLY writer of ownership.json (atomic replace). Callers have passed the
+   * generation fence. Never throws: a write that fails right after a spawn must
+   * not end the supervisor and strand the child. The record stays in memory,
+   * is retried every tick, and no role is started until it is durable.
+   */
+  private writeOwnership(): boolean {
     const file: OwnershipFile = {
       schema: ALWAYS_ON_OWNERSHIP_SCHEMA,
       generation: this.generation,
@@ -502,17 +603,51 @@ export class AlwaysOnSupervisor {
       children: ALWAYS_ON_ROLES.map((role) => this.children[role]).filter((c): c is ChildRecord => c !== null),
       writtenAt: new Date(this.a.now()).toISOString(),
     };
-    this.a.fs.writeTextAtomic(this.a.paths.ownership, serializeOwnership(file));
+    try {
+      this.a.fs.writeTextAtomic(this.a.paths.ownership, serializeOwnership(file));
+    } catch (error) {
+      this.ownershipDirty = true;
+      if (!this.ownershipWriteFailing) {
+        this.ownershipWriteFailing = true;
+        this.record({
+          kind: "OWNERSHIP_WRITE_FAILED",
+          reasonCode: errorCode(error),
+          detail: "ownership.json could not be written: every owned child stays recorded in memory, the write is retried every tick, and no role is started until the record is durable",
+        });
+      }
+      return false;
+    }
+    this.ownershipDirty = false;
+    if (this.ownershipWriteFailing) {
+      this.ownershipWriteFailing = false;
+      this.record({ kind: "OWNERSHIP_WRITE_RESTORED", reasonCode: "OWNERSHIP_DURABLE", detail: "ownership.json is written again: every owned child is durably recorded" });
+    }
+    return true;
   }
 
-  /** Records a change of children after re-checking the fence; a fenced supervisor writes nothing. */
+  /**
+   * Records a change of children after re-checking the fence; a fenced
+   * supervisor writes nothing. False only when fenced. While the fence cannot
+   * be read the change is kept in memory and written once it can.
+   */
   private persistChildren(): boolean {
-    if (!this.fenceHolds()) {
+    const fence = this.fenceState();
+    if (fence === "SUPERSEDED") {
       this.becomeFenced();
       return false;
     }
+    if (fence === "UNKNOWN") {
+      this.ownershipDirty = true;
+      return true;
+    }
     this.writeOwnership();
     return true;
+  }
+
+  /** Retries a record that could not be made durable. True when ownership.json matches memory. */
+  private flushOwnership(): boolean {
+    if (!this.ownershipDirty) return true;
+    return this.persistChildren() && !this.ownershipDirty;
   }
 
   /**
@@ -521,15 +656,17 @@ export class AlwaysOnSupervisor {
    * fence is re-proven UNDER that lock.
    */
   private async mutate<T>(action: MutationAction, run: () => T): Promise<{ ran: true; result: T } | { ran: false; reason: string }> {
-    const held = await this.a.mutation(action, async () => {
-      if (!this.fenceHolds()) return { fenced: true as const };
-      return { fenced: false as const, value: run() };
+    const held = await this.a.mutation(action, async (): Promise<{ fence: "CURRENT"; value: T } | { fence: "SUPERSEDED" | "UNKNOWN" }> => {
+      const fence = this.fenceState();
+      if (fence !== "CURRENT") return { fence };
+      return { fence, value: run() };
     });
     if (!held.ran) return { ran: false, reason: held.reasons.join("; ") || held.outcome };
-    if (held.result.fenced) {
+    if (held.result.fence === "SUPERSEDED") {
       this.becomeFenced();
       return { ran: false, reason: "FENCED_BY_NEWER_GENERATION" };
     }
+    if (held.result.fence === "UNKNOWN") return { ran: false, reason: "OWNERSHIP_UNREADABLE" };
     return { ran: true, result: held.result.value };
   }
 
@@ -549,6 +686,7 @@ export class AlwaysOnSupervisor {
       this.removeStopFile(child);
       if (rt.stopping !== null) {
         this.record({ kind: "ROLE_STOPPED", role, reasonCode: rt.stopping.reasonCode, detail: `${ALWAYS_ON_ROLE_LABELS[role]} stopped (${rt.stopping.purpose.toLowerCase()})`, facts: { pid: child.pid, exitCode: rt.lastExit.code } });
+        this.noteStopCompleted(role, rt.stopping);
         rt.stopping = null;
         continue;
       }
@@ -559,16 +697,25 @@ export class AlwaysOnSupervisor {
         detail: `${ALWAYS_ON_ROLE_LABELS[role]} root pid ${child.pid} ended unexpectedly${rt.lastExit.code === null ? "" : ` (exit ${rt.lastExit.code})`}; see its always-on log`,
         facts: { pid: child.pid, exitCode: rt.lastExit.code },
       });
-      if (role === "scanner" && this.recovery === null && this.shutdown === null) {
+      // Only a supervised scanner is recovered: an adopted child of a role excluded by --roles just leaves the record.
+      if (role === "scanner" && this.recovery === null && this.shutdown === null && this.config.roles.includes("scanner")) {
         this.requestRecovery("SCANNER_EXITED", "the owned scanner exited", now);
       }
     }
   }
 
+  /** A stop the supervisor asked for because of ANOTHER role (a scanner recovery) or a superseded run is not this role's failure. */
+  private noteStopCompleted(role: AlwaysOnRole, stopping: StopRequest): void {
+    if (stopping.purpose === "SUPERSEDED" || (stopping.purpose === "RECOVERY" && role !== "scanner")) this.rt[role].freeRestart = true;
+  }
+
   private removeStopFile(child: ChildRecord): void {
-    if (child.stopFile === null) return;
+    if (child.stopFile !== null) this.removeQuietly(child.stopFile);
+  }
+
+  private removeQuietly(file: string): void {
     try {
-      this.a.fs.remove(child.stopFile);
+      this.a.fs.remove(file);
     } catch {
       // A stale stop file names a child that no longer exists; harmless.
     }
@@ -580,7 +727,7 @@ export class AlwaysOnSupervisor {
 
   private gateOpen(role: AlwaysOnRole, now: number): boolean {
     const rt = this.rt[role];
-    return !rt.everStarted || now >= rt.nextAttemptAtMs;
+    return !rt.everStarted || rt.freeRestart || now >= rt.nextAttemptAtMs;
   }
 
   private spendAttempt(role: AlwaysOnRole, now: number): void {
@@ -612,7 +759,14 @@ export class AlwaysOnSupervisor {
 
   private async startRole(role: AlwaysOnRole, now: number, plan: (stopFile: string | null) => MonitoringSpawnPlan, meta: { readonly pinnedRunId: string | null; readonly engineFingerprint: string | null; readonly cooperative: boolean }): Promise<"STARTED" | "REFUSED" | "FAILED"> {
     const rt = this.rt[role];
-    const counted = rt.everStarted;
+    // Never a second child while an earlier one is recorded only in memory: a crash now would orphan both.
+    if (!this.flushOwnership()) {
+      if (!this.fenced) this.setRole(role, rt.state === "OFF" ? "BLOCKED" : rt.state, "OWNERSHIP_NOT_DURABLE", "ownership.json cannot be written yet; nothing is started until every owned child is durably recorded");
+      return "REFUSED";
+    }
+    const restart = rt.everStarted;
+    // A restart after a stop the supervisor made for another role's sake is not a recovery attempt.
+    const counted = restart && !rt.freeRestart;
     if (counted && rt.attempts >= this.config.policy.maxRecoveryAttempts) {
       this.latch(role, "RECOVERY_ATTEMPTS_EXHAUSTED", now);
       return "REFUSED";
@@ -653,26 +807,29 @@ export class AlwaysOnSupervisor {
       })
     );
     if (!outcome.ran) {
-      if (!this.fenced) this.setRole(role, rt.state === "OFF" ? "BLOCKED" : rt.state, "MUTATION_AUTHORITY_BUSY", `the start waits for the launcher's mutation lock (${outcome.reason})`);
+      if (this.fenced) return "REFUSED";
+      if (outcome.reason === "OWNERSHIP_UNREADABLE") this.setRole(role, rt.state === "OFF" ? "BLOCKED" : rt.state, "OWNERSHIP_UNREADABLE", "the start waits until ownership.json can be read under the mutation lock");
+      else this.setRole(role, rt.state === "OFF" ? "BLOCKED" : rt.state, "MUTATION_AUTHORITY_BUSY", `the start waits for the launcher's mutation lock (${outcome.reason})`);
       return "REFUSED";
     }
     const result = outcome.result;
     if (result.started) {
-      if (counted) {
-        this.spendAttempt(role, now);
+      if (counted) this.spendAttempt(role, now);
+      if (restart) {
         rt.restarts += 1;
         this.counters.restarts[role] += 1;
       }
       rt.everStarted = true;
+      rt.freeRestart = false;
       rt.startedAtMs = now;
       rt.unhealthySinceMs = null;
       rt.healthySinceMs = null;
       rt.warmingSinceMs = null;
-      this.setRole(role, "STARTING", counted ? "RESTARTED" : "STARTED", `started (root pid ${result.pid}); waiting for its first evidence of health`);
+      this.setRole(role, "STARTING", restart ? "RESTARTED" : "STARTED", `started (root pid ${result.pid}); waiting for its first evidence of health`);
       this.record({
         kind: "ROLE_STARTED",
         role,
-        reasonCode: counted ? "RESTART" : "INITIAL_START",
+        reasonCode: !restart ? "INITIAL_START" : counted ? "RESTART" : "RESTART_NOT_A_FAILURE",
         detail: `${ALWAYS_ON_ROLE_LABELS[role]} started: ${built.commandIdentity}`,
         facts: { pid: result.pid, attempt: counted ? rt.attempts : 0, pinnedRunId: meta.pinnedRunId },
       });
@@ -688,6 +845,7 @@ export class AlwaysOnSupervisor {
     }
     // A spawn that failed, or one whose identity cannot be proven, is a spent attempt (never a hot loop).
     rt.everStarted = true;
+    rt.freeRestart = false;
     this.spendAttempt(role, now);
     this.record({ kind: "ROLE_START_FAILED", role, reasonCode: result.outcome, detail: `${ALWAYS_ON_ROLE_LABELS[role]} did not start (${result.reason})`, facts: { attempt: rt.attempts } });
     this.setRole(role, "BACKOFF", result.outcome, `the start failed (${result.reason}); the next attempt waits for its backoff`);
@@ -705,14 +863,24 @@ export class AlwaysOnSupervisor {
     if (child === null || rt.stopping !== null) return;
     if (child.stopFile !== null) {
       const stopFile = child.stopFile;
-      const wrote = await this.mutate("ALWAYS_ON_ROLE_STOP", () => {
-        this.a.fs.ensureDir(path.dirname(stopFile));
-        this.a.fs.writeTextAtomic(
-          stopFile,
-          `${JSON.stringify({ schema: ALWAYS_ON_REQUEST_SCHEMA, kind: "COOPERATIVE_STOP", role, generation: this.generation, reasonCode, requestedAt: new Date(now).toISOString() })}\n`
-        );
+      const wrote = await this.mutate("ALWAYS_ON_ROLE_STOP", (): string | null => {
+        try {
+          this.a.fs.ensureDir(path.dirname(stopFile));
+          this.a.fs.writeTextAtomic(
+            stopFile,
+            `${JSON.stringify({ schema: ALWAYS_ON_REQUEST_SCHEMA, kind: "COOPERATIVE_STOP", role, generation: this.generation, reasonCode, requestedAt: new Date(now).toISOString() })}\n`
+          );
+          return null;
+        } catch (error) {
+          return errorCode(error);
+        }
       });
       if (!wrote.ran) return;
+      if (wrote.result !== null) {
+        // Not requested yet: the next tick asks again.
+        this.a.log(`  ${role}: its cooperative stop file could not be written (${wrote.result}); retried on the next tick`);
+        return;
+      }
       rt.stopping = { purpose, cooperative: true, requestedAtMs: now, deadlineMs: now + this.stopWaitMs(role), reasonCode, forcedAttempted: false };
       this.record({ kind: "ROLE_STOP_REQUESTED", role, reasonCode, detail: `${ALWAYS_ON_ROLE_LABELS[role]}: cooperative stop requested (${purpose.toLowerCase()}); forced only if it has not exited in ${Math.round(this.stopWaitMs(role) / 1000)}s`, facts: { pid: child.pid } });
       return;
@@ -753,6 +921,7 @@ export class AlwaysOnSupervisor {
       this.removeStopFile(child);
       rt.lastExit = { atMs: now, code: this.a.exitCodeOf?.(child.pid) ?? null };
       rt.startedAtMs = null;
+      this.noteStopCompleted(role, stopping);
       rt.stopping = null;
       if (result.stopped) {
         this.record({
@@ -813,6 +982,11 @@ export class AlwaysOnSupervisor {
     n.reachable = ok;
     n.lastProbeAtMs = now;
     return ok;
+  }
+
+  /** Our scanner reports a run whose engine is not the profile's: no emitter may ever be pinned to it. */
+  private runOfAnotherEngine(scanner: ScannerHealth): boolean {
+    return scanner.ours && scanner.runId !== null && scanner.engineFingerprint !== this.config.engineFingerprint;
   }
 
   /** Our scanner's run, once its own status names it: the only run an emitter may be pinned to. */
@@ -1016,6 +1190,11 @@ export class AlwaysOnSupervisor {
       rec.phase = "STARTING_SCANNER";
       return;
     }
+    if (this.runOfAnotherEngine(scanner)) {
+      // The fresh run is the code on disk: another run of the same code cannot help (restart Always-On after a code change).
+      this.latch(role, "ENGINE_FINGERPRINT_MISMATCH", now);
+      return;
+    }
     const healthy = scanner.ours && (scanner.verdict === "HEALTHY" || scanner.verdict === "WARMING");
     if (healthy && this.scannerRun !== null && this.scannerRun.bindable) {
       this.record({
@@ -1034,6 +1213,12 @@ export class AlwaysOnSupervisor {
     if (scanner.ours && scanner.verdict === "DEGRADED") {
       rec.degradedSinceMs ??= now;
       if (now - rec.degradedSinceMs >= this.config.policy.degradedGraceMs && (await this.networkReachable(now))) {
+        const restoredAtMs = this.network.restoredAtMs;
+        if (restoredAtMs !== null && now - restoredAtMs < this.config.policy.postNetworkGraceMs) {
+          // As on the normal path: connectivity just returned, so the fresh run gets time to reconnect first.
+          this.setRole(role, "RECOVERING", "NETWORK_RESTORED_SCANNER_HEALING", `recovery: the network returned ${Math.round((now - restoredAtMs) / 1000)}s ago; the fresh run gets ${Math.round(this.config.policy.postNetworkGraceMs / 1000)}s to heal itself`);
+          return;
+        }
         this.record({ kind: "SCANNER_RECOVERY_FAILED", role, reasonCode: "FRESH_RUN_DEGRADED", detail: `the fresh run stayed degraded (${scanner.issues.map((i) => i.code).join(", ")}); trying another run after its backoff` });
         rec.phase = "STOPPING_SCANNER";
         return;
@@ -1091,6 +1276,16 @@ export class AlwaysOnSupervisor {
     }
     if (scanner.verdict === "STOPPED") {
       this.requestRecovery("SCANNER_RUN_STOPPED", "the owned scanner reported its run STOPPED", now);
+      await this.advanceRecovery(scanner, now);
+      return;
+    }
+    if (this.runOfAnotherEngine(scanner)) {
+      // No emitter can ever be pinned to it (e.g. adopted after a code change): replace it once, emitter first.
+      if (rt.latched) {
+        this.setRole(role, "LATCHED", "ENGINE_FINGERPRINT_MISMATCH", `run ${scanner.runId} reports engine ${scanner.engineFingerprint ?? "(none)"}, not this profile's ${this.config.engineFingerprint}: restart Always-On after a code change, then clear the latch`);
+        return;
+      }
+      this.requestRecovery("ENGINE_FINGERPRINT_MISMATCH", `the owned scanner's run ${scanner.runId} is not the profile's engine`, now);
       await this.advanceRecovery(scanner, now);
       return;
     }
@@ -1176,9 +1371,17 @@ export class AlwaysOnSupervisor {
         this.setRole(role, "STARTING", "AWAITING_FIRST_STATUS", `pinned to run ${child.pinnedRunId}; waiting for its first status`);
         return;
       }
+      if (health.verdict === "INITIALIZING") {
+        // Alive (fresh status of its own), not yet healthy: re-validating every lane up to its cursor grows with
+        // the run's logs, so no fixed first-status deadline applies — a status that stops refreshing is STALE.
+        const init = health.initialization;
+        this.setRole(role, "STARTING", "INITIALIZING", `pinned to run ${child.pinnedRunId}; re-validating its lanes before delivering (${init?.lanesBaselined ?? "?"}/${init?.lanesTotal ?? "?"})`);
+        return;
+      }
       if (health.verdict === "STALE") {
         const writtenMs = health.writtenAt === null ? 0 : Date.parse(health.writtenAt);
-        if (now - writtenMs > p.emitterHungMs) {
+        // After a sleep the emitter gets a whole hung window to write again: its pre-sleep status proves no hang.
+        if (now - Math.max(writtenMs, this.resumedAtMs ?? 0) > p.emitterHungMs) {
           await this.requestStop(role, "RESTART", "STATUS_HUNG", now);
           this.setRole(role, "RECOVERING", "STATUS_HUNG", `alive but its status is ${health.ageSeconds ?? "?"}s old: restarting it`);
           return;
@@ -1359,21 +1562,22 @@ export class AlwaysOnSupervisor {
     this.state = "STOPPED";
     this.reasonCode = shutdown.reasonCode;
     this.reason = "every owned role was stopped; nothing is owned";
-    if (this.fenceHolds()) this.writeOwnership();
+    if (this.fenceState() === "CURRENT") this.writeOwnership();
     this.record({ kind: "SUPERVISOR_STOPPED", reasonCode: shutdown.reasonCode, detail: `graceful stop finished in ${Math.round((now - shutdown.requestedAtMs) / 1000)}s` });
   }
 
   private consumeRequests(now: number): void {
     const stopText = this.a.fs.readText(this.a.paths.stopRequest);
     if (stopText !== null) {
-      this.a.fs.remove(this.a.paths.stopRequest);
+      const removed = this.removeRequest(this.a.paths.stopRequest);
       const target = requestGeneration(stopText);
+      // Honoured even when its file could not be removed: a shutdown is requested once (idempotent).
       if (target === null || target === this.generation) this.requestShutdown("OPERATOR_STOP_REQUEST");
-      else this.a.log(`a stop request for generation ${target} was ignored (this is generation ${this.generation})`);
+      else if (removed) this.a.log(`a stop request for generation ${target} was ignored (this is generation ${this.generation})`);
     }
     const clearText = this.a.fs.readText(this.a.paths.clearLatchRequest);
-    if (clearText !== null) {
-      this.a.fs.remove(this.a.paths.clearLatchRequest);
+    // Applied once, and only after its file is gone: re-applying it every tick would defeat latching.
+    if (clearText !== null && this.removeRequest(this.a.paths.clearLatchRequest)) {
       const roleNamed = requestRole(clearText);
       for (const role of ALWAYS_ON_ROLES) {
         const rt = this.rt[role];
@@ -1386,6 +1590,16 @@ export class AlwaysOnSupervisor {
           this.record({ kind: "LATCH_CLEARED", role, reasonCode: "OPERATOR_REQUEST", detail: `${ALWAYS_ON_ROLE_LABELS[role]}: attempts reset${wasLatched ? " and latch cleared" : ""}` });
         }
       }
+    }
+  }
+
+  private removeRequest(file: string): boolean {
+    try {
+      this.a.fs.remove(file);
+      return true;
+    } catch (error) {
+      this.a.log(`request file not removed (${errorCode(error)}); retried on the next tick`);
+      return false;
     }
   }
 
@@ -1546,7 +1760,7 @@ export class AlwaysOnSupervisor {
 
   private writeStatus(): void {
     // The status artifact belongs to the generation on disk: a stale supervisor never overwrites a newer one's.
-    if (this.fenced || !this.fenceHolds()) return;
+    if (this.fenced || this.fenceState() === "SUPERSEDED") return;
     try {
       this.a.fs.writeTextAtomic(this.a.paths.status, `${JSON.stringify(this.status(), null, 2)}\n`);
     } catch (error) {

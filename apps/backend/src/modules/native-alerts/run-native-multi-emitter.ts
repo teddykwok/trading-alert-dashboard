@@ -207,6 +207,8 @@ async function main(): Promise<number> {
       lastStatus = Date.now();
       writeStatus();
     },
+    // A full turn of the event loop: the cooperative-stop watcher (a timer) and Ctrl+C are seen mid-catch-up.
+    yieldToEventLoop: () => new Promise<void>((resolve) => setImmediate(resolve)),
   });
   emitter = instance;
 

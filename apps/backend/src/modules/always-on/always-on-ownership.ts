@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import { classifyBindFailure, type AuthorityRefusal, type ListenerHandle } from "../operator/mutation-lock";
 import { verifyOwnership } from "../operator/runtime-launcher";
 import type { ProbeOutcome } from "../operator/worker-supervision";
@@ -157,15 +159,28 @@ export function generationIsCurrent(onDisk: OwnershipRead, generation: number): 
 
 export type AdoptionDecision =
   | { readonly child: ChildRecord; readonly decision: "ADOPT" }
-  | { readonly child: ChildRecord; readonly decision: "DROP"; readonly reason: "GONE" | "PID_REUSED" | "NOT_THIS_REPO" };
+  | { readonly child: ChildRecord; readonly decision: "DROP"; readonly reason: "GONE" | "PID_REUSED" | "NOT_THIS_REPO" | "OTHER_REPOSITORY" };
+
+/** One repository however it is spelled (case, separators, a trailing separator). */
+export function sameRepository(a: string, b: string): boolean {
+  const normal = (p: string) => path.resolve(p).replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+  return normal(a) === normal(b);
+}
 
 /**
  * What a new generation does with the previous generation's children:
  * provably ours (alive, same creation time, this repository) is adopted;
  * anything else is dropped from the record — and NOT terminated. Null when a
  * probe could not be made: unknown is never gone, so nothing is decided.
+ *
+ * Every checkout (the main one and each worktree) shares one ownership file
+ * under %LOCALAPPDATA%, and the command-line check is a containment test — so
+ * `C:\…\trading-alert-dashboard` would accept a child of
+ * `C:\…\trading-alert-dashboard-wt\…`. A record written by ANOTHER
+ * repository's supervisor (`recordedRepoRoot`) is therefore never adopted.
  */
-export function decideAdoption(children: readonly ChildRecord[], probe: (pid: number) => ProbeOutcome, repoRoot: string): AdoptionDecision[] | null {
+export function decideAdoption(children: readonly ChildRecord[], probe: (pid: number) => ProbeOutcome, repoRoot: string, recordedRepoRoot: string = repoRoot): AdoptionDecision[] | null {
+  if (!sameRepository(recordedRepoRoot, repoRoot)) return children.map((child) => ({ child, decision: "DROP", reason: "OTHER_REPOSITORY" }));
   const decisions: AdoptionDecision[] = [];
   for (const child of children) {
     const probed = probe(child.pid);

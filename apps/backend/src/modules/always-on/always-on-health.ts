@@ -231,6 +231,8 @@ export type EmitterVerdict =
   | "HEALTHY"
   /** Healthy and working through a backlog (bounded catch-up): not a failure. */
   | "CATCHING_UP"
+  /** Ours and writing fresh status, still re-validating its lanes up to their cursors: alive, not yet healthy. */
+  | "INITIALIZING"
   | "DEGRADED"
   /** Ours, but its status is too old to prove it is still working. */
   | "STALE"
@@ -263,6 +265,8 @@ export interface EmitterHealth {
    */
   readonly laneNote: "MATCHES_SCANNER_SELECTION" | "HISTORICAL_LANES_BEYOND_CURRENT_SELECTION" | "FEWER_LANES_THAN_SELECTION" | "UNKNOWN";
   readonly largeBacklog: boolean;
+  /** Start-up progress while the emitter is still initializing; null once complete (or from an emitter that predates it). */
+  readonly initialization: { readonly lanesBaselined: number | null; readonly lanesTotal: number | null } | null;
 }
 
 export function judgeEmitterHealth(input: {
@@ -293,6 +297,7 @@ export function judgeEmitterHealth(input: {
     ledgerDuplicates: null,
     laneNote: "UNKNOWN",
     largeBacklog: false,
+    initialization: null,
   };
   const parsed = parseObject(input.statusText);
   if (parsed === null || typeof parsed.schema !== "string") return empty;
@@ -301,6 +306,7 @@ export function judgeEmitterHealth(input: {
   const writtenAtMs = instantOf(parsed.writtenAt, input.nowMs);
   const catchUp = isRecord(parsed.catchUp) ? parsed.catchUp : {};
   const membership = isRecord(parsed.membership) ? parsed.membership : {};
+  const init = isRecord(parsed.initialization) && parsed.initialization.complete === false ? parsed.initialization : null;
   const lanesTracked = num(parsed.symbolsTracked);
   const queueDepth = num(parsed.queueDepth);
   const queueCapacity = num(parsed.queueCapacity);
@@ -333,8 +339,10 @@ export function judgeEmitterHealth(input: {
     ledgerDuplicates: num(parsed.ledgerDuplicates),
     laneNote,
     largeBacklog,
+    initialization: init === null ? null : { lanesBaselined: num(init.lanesBaselined), lanesTotal: num(init.lanesTotal) },
   };
   if (writtenAtMs === null || input.nowMs - writtenAtMs > input.policy.emitterStatusFreshMs) return { ...health, verdict: "STALE" };
+  if (init !== null) return { ...health, verdict: "INITIALIZING" };
   const issues: { code: EmitterIssueCode; detail: string }[] = [];
   if (parsed.mode !== "COMMIT_DASHBOARD_ALERTS") issues.push({ code: "WRONG_MODE", detail: `the emitter runs in ${String(parsed.mode)}, not COMMIT` });
   if ((health.lanesFailed ?? 0) > 0) issues.push({ code: "LANES_FAILED", detail: `${health.lanesFailed} lane(s) failed closed (a restart does not repair evidence; see the emitter log)` });

@@ -382,8 +382,10 @@ export class ShadowLogTail {
       if (text.length < this.consumedChars || sha256(text.slice(0, this.consumedChars)) !== this.consumedHash.copy().digest("hex")) {
         fail("LOG_REWRITTEN", "bytes of the event log that were already read have changed: it is append-only");
       }
-      this.verifiedText = text;
     }
+    // Always the text just handed in, even when it equals the last one: holding the earlier (equal) copy would
+    // keep every unchanged log in memory twice — the caller keeps the new one.
+    this.verifiedText = text;
     const end = text.lastIndexOf("\n") + 1;
     if (judgeTail) {
       const tail = text.slice(Math.max(end, this.consumedChars));

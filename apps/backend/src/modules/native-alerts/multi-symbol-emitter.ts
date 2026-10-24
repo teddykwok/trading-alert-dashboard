@@ -328,9 +328,21 @@ export interface MultiEmitterDeps {
   readonly readMembership?: () => string | null;
   /** Dynamic-universe runs: a joined symbol's checkpoint identity (the same rule as the manifest's lanes). */
   readonly checkpointOf?: (symbol: string) => CheckpointIdentity | null;
-  /** Called after every processed record (observation only): a long catch-up can keep its status file fresh. */
+  /**
+   * Called after every lane loaded and baselined during initialization, and after every processed record
+   * (observation only): a long start-up or catch-up can keep its status file fresh.
+   */
   readonly progress?: () => void;
+  /**
+   * Lets the event loop run (a timer, a signal) during long synchronous work: between lanes while
+   * initializing and every MULTI_EMITTER_YIELD_EVERY processed records. Skipped records and DRY_RUN never
+   * await I/O, so without it a cooperative stop or Ctrl+C is not seen until the whole backlog is done.
+   */
+  readonly yieldToEventLoop?: () => Promise<void>;
 }
+
+/** Processed records between two yields to the event loop. */
+export const MULTI_EMITTER_YIELD_EVERY = 256;
 
 type FailureClass = "LINEAGE_OR_PROFILE_MISMATCH" | "MALFORMED";
 
@@ -398,6 +410,9 @@ export class MultiSymbolNativeEmitter {
   private catchUpRounds = 0;
   private recordsAdmitted = 0;
   private initialized = false;
+  /** Start-up evidence: re-validating every lane up to its cursor can take long on a large run. */
+  private readonly initialization = { complete: false, lanesBaselined: 0, lanesTotal: 0 };
+  private sinceYield = 0;
   private stoppedWithPending = 0;
   readonly tally = emptyTally();
 
@@ -507,11 +522,14 @@ export class MultiSymbolNativeEmitter {
     if (this.initialized) throw new Error("already initialized");
     this.initialized = true;
     const commit = this.deps.mode === "COMMIT_DASHBOARD_ALERTS";
+    this.initialization.lanesTotal = this.lanes.filter((l) => l.state !== "FAILED").length;
 
     // Pass 1: decide every baseline; refuse before any write.
     const plans: { lane: Lane; cursor: EmitterCursor | null; text: string }[] = [];
     for (const lane of this.lanes) {
       if (lane.state === "FAILED") continue;
+      // Yields only: nothing (not even a status file) is written before every refusal check has passed.
+      await this.yieldNow();
       const cursor = this.deps.cursors.load(lane.symbol);
       if (cursor !== null) {
         const why = cursorMismatch(cursor, this.expectedCursorIdentity(lane));
@@ -529,9 +547,22 @@ export class MultiSymbolNativeEmitter {
     }
 
     // Pass 2: baselines (and, for COMMIT, durable first activation at EOF).
-    for (const { lane, cursor, text } of plans) this.baselineLane(lane, cursor, text);
+    this.initialization.lanesTotal = plans.length;
+    this.deps.progress?.();
+    for (const { lane, cursor, text } of plans) {
+      this.baselineLane(lane, cursor, text);
+      this.initialization.lanesBaselined += 1;
+      this.deps.progress?.();
+      await this.yieldNow();
+    }
     // Symbols the run onboarded after its manifest (a restart picks up every earlier join).
     this.absorbMembership();
+    this.initialization.complete = true;
+  }
+
+  private async yieldNow(): Promise<void> {
+    this.sinceYield = 0;
+    await this.deps.yieldToEventLoop?.();
   }
 
   /** Establishes one lane's baseline from its production cursor, or activates it at its current EOF. */
@@ -730,9 +761,10 @@ export class MultiSymbolNativeEmitter {
       this.fill();
       if (this.queueDepth === 0) break;
       await this.drainQueue(shouldStop);
-      for (const lane of this.lanes) this.persist(lane);
       if (shouldStop()) break;
     }
+    // Once per drain, not per round: every write hashes the lane's whole consumed prefix and fsyncs. Deliveries
+    // persist as they commit; skipped records re-read after a crash are only re-skipped (stop() persists too).
     for (const lane of this.lanes) this.persist(lane);
   }
 
@@ -748,6 +780,9 @@ export class MultiSymbolNativeEmitter {
       lane.pending.shift();
       this.queueDepth -= 1;
       this.deps.progress?.();
+      // Between records only: each record is processed (ledger, then cursor) as a whole before a stop can be seen.
+      this.sinceYield += 1;
+      if (this.sinceYield >= MULTI_EMITTER_YIELD_EVERY) await this.yieldNow();
     }
   }
 
@@ -841,6 +876,8 @@ export class MultiSymbolNativeEmitter {
       maxQueueDepth: this.maxQueueDepth,
       queueCapacity: this.deps.queueCapacity,
       stoppedWithPending: this.stoppedWithPending,
+      /** Start-up: lanes re-validated up to their cursors so far (a supervisor reads an incomplete one as alive, not healthy). */
+      initialization: { ...this.initialization },
       /** Bounded catch-up: rounds that admitted records, records admitted in all, and lanes still behind their log's end. */
       catchUp: {
         rounds: this.catchUpRounds,

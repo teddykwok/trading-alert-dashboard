@@ -131,16 +131,23 @@ describe("the Always-On supervisor's reach", () => {
     const code = codeOf(SUPERVISOR);
     expect((code.match(/this\.mutate\("ALWAYS_ON_ROLE_START"/g) ?? []).length).toBe(1);
     expect((code.match(/this\.mutate\("ALWAYS_ON_ROLE_STOP"/g) ?? []).length).toBe(2);
-    expect(code).toMatch(/const held = await this\.a\.mutation\(action, async \(\) => \{\s*if \(!this\.fenceHolds\(\)\) return \{ fenced: true as const \};/);
+    // The fence is read again UNDER the lock and anything but CURRENT (superseded, or unreadable) runs nothing.
+    expect(code).toMatch(/const held = await this\.a\.mutation\(action, async \(\)[^\n]* => \{\s*const fence = this\.fenceState\(\);\s*if \(fence !== "CURRENT"\) return \{ fence \};\s*return \{ fence, value: run\(\) \};/);
     expect([...MUTATION_ACTIONS]).toEqual(expect.arrayContaining(["ALWAYS_ON_START", "ALWAYS_ON_STOP", "ALWAYS_ON_ROLE_START", "ALWAYS_ON_ROLE_STOP"]));
   });
 
   it("the supervisor deletes nothing but its own request files and stop files: no cursor, namespace, checkpoint or log", () => {
     const code = codeOf(SUPERVISOR);
+    // Two helpers are the only direct removers (both tolerate a held file)...
     const removes = code.split("\n").filter((line) => /\.remove\(/.test(line));
-    expect(removes.length).toBeGreaterThan(0);
-    for (const line of removes) {
-      expect({ line: line.trim(), allowed: /paths\.stopRequest|paths\.clearLatchRequest|paths\.stopDir|child\.stopFile/.test(line) }).toEqual({ line: line.trim(), allowed: true });
+    expect(removes.map((line) => line.trim())).toEqual(["this.a.fs.remove(file);", "this.a.fs.remove(file);"]);
+    expect(code).toMatch(/private removeQuietly\(file: string\): void \{\s*try \{\s*this\.a\.fs\.remove\(file\);/);
+    expect(code).toMatch(/private removeRequest\(file: string\): boolean \{\s*try \{\s*this\.a\.fs\.remove\(file\);/);
+    // ...and every call of them names a request file or a child's own stop file.
+    const calls = code.split("\n").filter((line) => /this\.(removeQuietly|removeRequest|removeStopFile)\(/.test(line));
+    expect(calls.length).toBeGreaterThan(0);
+    for (const line of calls) {
+      expect({ line: line.trim(), allowed: /paths\.stopRequest|paths\.clearLatchRequest|paths\.stopDir|child\.stopFile|removeStopFile\(child\)|removeStopFile\(\{ stopFile \} as ChildRecord\)/.test(line) }).toEqual({ line: line.trim(), allowed: true });
     }
     for (const file of AO_FILES) {
       const code = codeOf(file);

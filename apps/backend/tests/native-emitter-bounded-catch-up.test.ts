@@ -138,6 +138,8 @@ function rig(input: {
   cursors?: AuditCursors;
   activateAtEof?: boolean;
   baseline?: "PRODUCTION_CURSOR" | "DRY_RUN_FROM_START";
+  yieldToEventLoop?: () => Promise<void>;
+  onProgress?: (emitter: MultiSymbolNativeEmitter) => void;
 }): Rig {
   const events: MultiEmitterEvent[] = [];
   const depths: number[] = [];
@@ -160,7 +162,11 @@ function rig(input: {
     pendingTailPolls: 0,
     nowIso: () => "2026-10-23T00:00:00.000Z",
     report: (event) => events.push(event),
-    progress: sample,
+    progress: () => {
+      sample();
+      if (emitter !== null) input.onProgress?.(emitter);
+    },
+    ...(input.yieldToEventLoop === undefined ? {} : { yieldToEventLoop: input.yieldToEventLoop }),
   };
   emitter = new MultiSymbolNativeEmitter(deps);
   return { emitter, events, depths };
@@ -376,20 +382,28 @@ describe("4. a ledger failure never advances a cursor past the failed record; th
     const w = await activatedWorld(symbols, 6, 10);
     w.ledger.failOnCall = w.ledger.calls + 9;
     let failedKey: string | null = null;
+    let failedDeliveryKey: string | null = null;
     const r = rig({ symbols, logs: w.logs, capacity: 10, mode: "COMMIT_DASHBOARD_ALERTS", ledger: w.ledger, cursors: w.cursors });
     const original = w.ledger.deliverV2.bind(w.ledger);
     w.ledger.deliverV2 = async (decision, context) => {
-      if (w.ledger.calls + 1 === w.ledger.failOnCall) failedKey = `${decision.winner.symbol}:${decision.winner.eventId}`;
+      if (w.ledger.calls + 1 === w.ledger.failOnCall) {
+        failedKey = `${decision.winner.symbol}:${decision.winner.eventId}`;
+        failedDeliveryKey = decision.deliveryKey;
+      }
       return original(decision, context);
     };
     await expect(once(r.emitter)).rejects.toThrow(/database failure/);
     const [failedSymbol, failedEvent] = (failedKey as unknown as string).split(":");
     const failedLineEnd = w.logs[failedSymbol].indexOf(failedEvent);
     expect(w.cursors.saved.get(failedSymbol)!.consumedChars).toBeLessThan(failedLineEnd);
-    expect(w.ledger.rows.has(failedKey!)).toBe(false);
+    // The ledger is keyed by DELIVERY KEY: the failed delivery is not in it, and nothing of it reached the audit trail.
+    expect(failedDeliveryKey).not.toBeNull();
+    expect(w.ledger.rows.has(failedDeliveryKey as unknown as string)).toBe(false);
+    expect(w.trail).not.toContain(`ledger:${failedKey}`);
     w.ledger.failOnCall = null;
     const again = rig({ symbols, logs: w.logs, capacity: 10, mode: "COMMIT_DASHBOARD_ALERTS", ledger: w.ledger, cursors: w.cursors });
     await once(again.emitter);
+    expect(w.ledger.rows.has(failedDeliveryKey as unknown as string)).toBe(true);
     expect(w.ledger.rows.size).toBe(2 * 6 * 3);
     for (const sym of symbols) expect(w.cursors.saved.get(sym)!.consumedChars).toBe(w.logs[sym].length);
   });
@@ -403,19 +417,22 @@ describe("5. a graceful stop with queued (and unadmitted) work persists only pro
   it("stops mid-catch-up: cursors are at processed records only, the restart finishes, no Alert is lost or duplicated", async () => {
     const symbols = ["AAAUSDT", "BBBUSDT", "CCCUSDT"];
     const w = await activatedWorld(symbols, 8, 10);
-    let processedCount = 0;
     const r = rig({ symbols, logs: w.logs, capacity: 10, mode: "COMMIT_DASHBOARD_ALERTS", ledger: w.ledger, cursors: w.cursors });
-    const stopAt = 20;
-    await once(r.emitter, () => {
-      processedCount = processed(r.events).length;
-      return processedCount >= stopAt;
-    });
+    // NOT a multiple of the 10-record round: the stop lands mid-round, with records still QUEUED (and more unadmitted).
+    const stopAt = 15;
+    await once(r.emitter, () => processed(r.events).length >= stopAt);
     const stopped = r.emitter.status();
-    expect(stopped.stoppedWithPending + stopped.catchUp.backlogLanes).toBeGreaterThan(0);
+    expect(stopped.stoppedWithPending).toBeGreaterThan(0);
+    expect(stopped.catchUp.backlogLanes).toBeGreaterThan(0);
     for (const sym of symbols) {
+      // Each cursor sits exactly at the end of its lane's LAST PROCESSED record — never past a queued one.
+      const last = [...r.events].reverse().find((e) => (e.type === "SKIPPED" || e.type === "DECISION") && e.symbol === sym);
+      if (last === undefined || (last.type !== "SKIPPED" && last.type !== "DECISION")) throw new Error(`nothing was processed for ${sym}`);
+      const eventId = last.type === "SKIPPED" ? last.eventId : last.decision.winner.eventId;
+      const lineEnd = w.logs[sym].indexOf("\n", w.logs[sym].indexOf(eventId)) + 1;
       const cursor = w.cursors.saved.get(sym)!;
+      expect({ sym, consumedChars: cursor.consumedChars }).toEqual({ sym, consumedChars: lineEnd });
       expect(cursor.consumedChars).toBeLessThan(w.logs[sym].length);
-      expect(w.logs[sym].slice(0, cursor.consumedChars).endsWith("\n")).toBe(true);
     }
     const createdBefore = w.ledger.rows.size;
     expect(createdBefore).toBeGreaterThan(0);
@@ -471,5 +488,84 @@ describe("a refused line fails its lane closed; nothing of the failing batch is 
     expect(cursors.saved.get("AAAUSDT")!.consumedChars).toBe(logs.AAAUSDT.length);
     expect(s.queueDepth).toBe(0);
     expect(s.maxQueueDepth).toBeLessThanOrEqual(12);
+  });
+});
+
+// ===========================================================================
+// Review regressions: cost, responsiveness and start-up evidence of a catch-up
+// ===========================================================================
+
+/** `count` bar-close commits from bar 1: every one is processed and SKIPPED (never delivered). */
+const commitsOnly = (symbol: string, count: number) => logOf(Array.from({ length: count }, (_, i) => commit(bar(1 + i), "SHADOW_LIVE_ONLY", lineageOf(symbol), symbol)));
+
+describe("a multi-round catch-up persists each cursor once per drain, not once per lane per round", () => {
+  it("COMMIT, three lanes of skipped records over many rounds: one cursor write per lane, at the end (each write hashes the lane's whole prefix and fsyncs)", async () => {
+    const symbols = ["AAAUSDT", "BBBUSDT", "CCCUSDT"];
+    const trail: string[] = [];
+    const ledger = new AuditLedger(trail);
+    const cursors = new AuditCursors(trail);
+    const logs: Record<string, string> = Object.fromEntries(symbols.map((s) => [s, activationLog(s)]));
+    await once(rig({ symbols, logs, capacity: 10, mode: "COMMIT_DASHBOARD_ALERTS", ledger, cursors, activateAtEof: true }).emitter);
+    const savesAfterActivation = cursors.saves;
+    for (const s of symbols) logs[s] += commitsOnly(s, 40);
+    const r = rig({ symbols, logs, capacity: 10, mode: "COMMIT_DASHBOARD_ALERTS", ledger, cursors });
+    await once(r.emitter);
+    const s = r.emitter.status();
+    expect(s.eventsSkipped).toBe(120);
+    expect(s.catchUp.rounds).toBeGreaterThanOrEqual(12);
+    expect(cursors.saves - savesAfterActivation).toBe(symbols.length);
+    for (const sym of symbols) expect(cursors.saved.get(sym)!.consumedChars).toBe(logs[sym].length);
+  });
+});
+
+describe("a long catch-up yields to the event loop, so a cooperative stop or Ctrl+C is seen mid-catch-up", () => {
+  it("records that never await I/O (skips, DRY_RUN) still let a timer fire: the stop lands long before the backlog is done", async () => {
+    const symbol = "AAAUSDT";
+    const logs = { [symbol]: commitsOnly(symbol, 3_000) };
+    let stop = false;
+    let armed = false;
+    const r = rig({
+      symbols: [symbol],
+      logs,
+      capacity: 1_000,
+      yieldToEventLoop: () => new Promise<void>((resolve) => setImmediate(resolve)),
+      // Once the catch-up is under way, a stop arrives the way the cooperative-stop watcher delivers it: from a timer.
+      onProgress: (emitter) => {
+        if (armed || emitter.status().eventsRead === 0) return;
+        armed = true;
+        setTimeout(() => {
+          stop = true;
+        }, 0);
+      },
+    });
+    await once(r.emitter, () => stop);
+    const read = r.emitter.status().eventsRead;
+    expect(read).toBeGreaterThan(0);
+    expect(read).toBeLessThan(3_000);
+  });
+});
+
+describe("initialization writes evidence of life: an emitter re-validating a large backlog is never taken for a silent one", () => {
+  it("initialize() reports progress lane by lane (status.initialization), yields between lanes, and completes", async () => {
+    const symbols = ["AAAUSDT", "BBBUSDT", "CCCUSDT"];
+    const logs = Object.fromEntries(symbols.map((s) => [s, logOf(backlog(s, 1, 3))]));
+    const seen: { complete: boolean; lanesBaselined: number; lanesTotal: number }[] = [];
+    let yields = 0;
+    const r = rig({
+      symbols,
+      logs,
+      capacity: 10,
+      onProgress: (emitter) => seen.push({ ...emitter.status().initialization }),
+      yieldToEventLoop: async () => {
+        yields += 1;
+      },
+    });
+    await r.emitter.initialize();
+    const during = seen.filter((s) => !s.complete);
+    expect(during.length).toBeGreaterThanOrEqual(symbols.length);
+    expect(during.map((s) => s.lanesBaselined).at(-1)).toBe(symbols.length);
+    expect(during.every((s) => s.lanesTotal === symbols.length)).toBe(true);
+    expect(yields).toBeGreaterThanOrEqual(symbols.length);
+    expect(r.emitter.status().initialization).toEqual({ complete: true, lanesBaselined: 3, lanesTotal: 3 });
   });
 });

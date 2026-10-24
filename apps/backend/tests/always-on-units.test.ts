@@ -7,7 +7,7 @@ import { ALWAYS_ON_DEFAULTS, ALWAYS_ON_INSTANCE_PORT, ALWAYS_ON_OWNERSHIP_SCHEMA
 import { judgeEmitterHealth, judgePlannerHealth, judgeScannerHealth, nextPlannerBaseline } from "../src/modules/always-on/always-on-health";
 import { IncidentJournal, redactIncidentText } from "../src/modules/always-on/always-on-journal";
 import { alwaysOnSupervisorArgs } from "../src/modules/always-on/always-on-launch";
-import { decideAdoption, generationIsCurrent, listenerInstanceLock, nextGeneration, parseOwnership, type ChildRecord } from "../src/modules/always-on/always-on-ownership";
+import { decideAdoption, generationIsCurrent, listenerInstanceLock, nextGeneration, parseOwnership, sameRepository, type ChildRecord } from "../src/modules/always-on/always-on-ownership";
 import { alwaysOnPaths, childStopFile } from "../src/modules/always-on/always-on-paths";
 import {
   MonitoringPlanError,
@@ -137,6 +137,15 @@ describe("emitter health", () => {
     expect(judge(status(), 522, [889]).verdict).toBe("AWAITING_STATUS");
     expect(judge(status({ runId: "R0" })).verdict).toBe("AWAITING_STATUS");
   });
+
+  it("an emitter still re-validating its lanes is INITIALIZING (alive, not yet healthy) — and STALE like any other once it stops writing", () => {
+    const initializing = { initialization: { complete: false, lanesBaselined: 200, lanesTotal: 524 } };
+    expect(judge(status(initializing))).toMatchObject({ verdict: "INITIALIZING", ours: true, initialization: { lanesBaselined: 200, lanesTotal: 524 } });
+    expect(judge(status({ ...initializing, writtenAt: new Date(NOW - 6 * 60_000).toISOString() })).verdict).toBe("STALE");
+    expect(judge(status({ initialization: { complete: true, lanesBaselined: 524, lanesTotal: 524 } })).verdict).toBe("HEALTHY");
+    // An emitter that predates the field is judged exactly as before.
+    expect(judge(status())).toMatchObject({ verdict: "HEALTHY", initialization: null });
+  });
 });
 
 describe("planner health and its baseline", () => {
@@ -197,6 +206,19 @@ describe("ownership records and the instance authority", () => {
     expect(decideAdoption([child], probe({ commandLine: "cmd /c pnpm -C C:\\repo", startedAtMs: 9_000 }), "C:\\repo")?.[0]).toMatchObject({ decision: "DROP", reason: "PID_REUSED" });
     expect(decideAdoption([child], probe({ commandLine: "cmd /c pnpm -C C:\\other", startedAtMs: 5_000 }), "C:\\repo")?.[0]).toMatchObject({ decision: "DROP", reason: "NOT_THIS_REPO" });
     expect(decideAdoption([child], () => ({ observed: false }), "C:\\repo")).toBeNull();
+  });
+
+  it("adoption: a record written by ANOTHER repository's supervisor is dropped whole, unprobed — even when the command-line containment check would pass", () => {
+    const worktreeChild = { ...child, commandIdentity: "cmd /c pnpm -C C:\\repo-wt\\x" };
+    const probe = () => ({ observed: true as const, process: { pid: 1200, commandLine: "cmd /c pnpm -C C:\\repo-wt\\x --filter backend", startedAtMs: 5_000 } });
+    // The containment check alone accepts it ("c:\repo" is inside "c:\repo-wt\x")...
+    expect(decideAdoption([worktreeChild], probe, "C:\\repo")?.[0].decision).toBe("ADOPT");
+    // ...so the recorded repository decides first.
+    expect(decideAdoption([worktreeChild], probe, "C:\\repo", "C:\\repo-wt\\x")).toEqual([{ child: worktreeChild, decision: "DROP", reason: "OTHER_REPOSITORY" }]);
+    expect(decideAdoption([worktreeChild], () => ({ observed: false }), "C:\\repo", "C:\\repo-wt\\x")?.[0]).toMatchObject({ reason: "OTHER_REPOSITORY" });
+    expect(sameRepository("C:\\repo", "c:\\REPO\\")).toBe(true);
+    expect(sameRepository("C:\\repo", "C:/repo")).toBe(true);
+    expect(sameRepository("C:\\repo", "C:\\repo-wt\\x")).toBe(false);
   });
 
   it("the instance authority is exclusive on a real loopback port, and released on close", async () => {

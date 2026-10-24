@@ -108,10 +108,14 @@ export class FakeMachine {
   scannerBehaviour: ScannerBehaviour = "healthy";
   scannerUniverse: ScannerShape = HEALTHY_UNIVERSE;
   scannerLastMessageAgoMs = 5_000;
+  /** The engine fingerprint each scanner run (by its spawn index) reports. */
+  scannerEngine: (index: number) => string = () => ENGINE;
   emitterTracked: number | null = null;
   emitterFailedLanes = 0;
   emitterQueue = { depth: 0, capacity: 10_000, max: 0, backlogLanes: 0 };
   emitterSilent = false;
+  /** Until this instant the emitter is still re-validating its lanes (initialize()): fresh status, initialization incomplete. */
+  emitterInitializingUntilMs: number | null = null;
   plannerOver: Parameters<typeof plannerStatusBody>[0] = {};
   plans: Record<string, number> = { PENDING: 0, READY: 12, INVALID: 0, ERROR: 3 };
   soakStatus = 200;
@@ -119,6 +123,10 @@ export class FakeMachine {
   readonly paths: AlwaysOnPaths = alwaysOnPaths({ LOCALAPPDATA: LOCAL });
   readonly httpCalls: string[] = [];
   connectivityProbes = 0;
+  /** File-system faults, as Windows produces them (a reader, an editor, an indexer or antivirus holding the file). */
+  failWrite: ((file: string) => boolean) | null = null;
+  failRead: ((file: string) => boolean) | null = null;
+  failRemove: ((file: string) => boolean) | null = null;
 
   // ---- process table ----
   private spawnChild(plan: MonitoringSpawnPlan): number {
@@ -201,7 +209,7 @@ export class FakeMachine {
         runId: child.runId,
         runState,
         startedAt: new Date(this.now).toISOString(),
-        engineFingerprint: ENGINE,
+        engineFingerprint: this.scannerEngine(child.index),
         pid: child.runtime,
         writtenAt: new Date(writtenAt).toISOString(),
         totals: { selected: u.selected, liveEligible: u.liveEligible, quarantined: u.quarantined, failed: u.failed, recovering: u.recovering, awaitingStream: u.awaitingStream, catchupPending: 0, reconnects: 7, backpressureEvents: 0, restRequests: 600, restHalted: false },
@@ -213,6 +221,8 @@ export class FakeMachine {
 
   private emitterAutopilot(child: Child): void {
     if (this.emitterSilent || child.pinnedRunId === null) return;
+    const tracked = this.emitterTracked ?? this.scannerUniverse.selected;
+    const initializing = this.emitterInitializingUntilMs !== null && this.now < this.emitterInitializingUntilMs;
     this.files.set(
       emitterCommitStatus(this.paths, child.pinnedRunId),
       JSON.stringify({
@@ -221,8 +231,8 @@ export class FakeMachine {
         runId: child.pinnedRunId,
         mode: "COMMIT_DASHBOARD_ALERTS",
         writtenAt: new Date(this.now).toISOString(),
-        symbolsTracked: this.emitterTracked ?? this.scannerUniverse.selected,
-        symbolsHealthy: (this.emitterTracked ?? this.scannerUniverse.selected) - this.emitterFailedLanes,
+        symbolsTracked: tracked,
+        symbolsHealthy: tracked - this.emitterFailedLanes,
         symbolsFailed: this.emitterFailedLanes,
         queueDepth: this.emitterQueue.depth,
         queueCapacity: this.emitterQueue.capacity,
@@ -231,6 +241,7 @@ export class FakeMachine {
         created: 4,
         ledgerDuplicates: 0,
         membership: { dynamic: true, recordsAbsorbed: 0, failure: null },
+        initialization: initializing ? { complete: false, lanesBaselined: Math.floor(tracked / 3), lanesTotal: tracked } : { complete: true, lanesBaselined: tracked, lanesTotal: tracked },
       })
     );
   }
@@ -262,14 +273,23 @@ export class FakeMachine {
       },
       exitCodeOf: () => null,
       fs: {
-        readText: (file) => files.get(file) ?? null,
+        // The lenient evidence read: a file that cannot be read is null, exactly like the real adapter.
+        readText: (file) => (this.failRead?.(file) ? null : (files.get(file) ?? null)),
+        readTextStrict: (file) => {
+          if (this.failRead?.(file)) throw fsError("EBUSY", "read", file);
+          return files.get(file) ?? null;
+        },
         writeTextAtomic: (file, text) => {
+          if (this.failWrite?.(file)) throw fsError("EPERM", "rename", file);
           this.fsWrites.push(file);
           files.set(file, text);
         },
         appendLine: (file, line) => files.set(file, (files.get(file) ?? "") + line),
         exists: (file) => files.has(file),
-        remove: (file) => void files.delete(file),
+        remove: (file) => {
+          if (this.failRemove?.(file)) throw fsError("EPERM", "unlink", file);
+          files.delete(file);
+        },
         ensureDir: () => undefined,
         listDir: (dir) => [...files.keys()].filter((k) => path.dirname(k) === dir).map((k) => path.basename(k)),
       },
@@ -317,6 +337,15 @@ export class FakeMachine {
   kinds(): string[] {
     return this.incidents().map((i) => i.kind);
   }
+}
+
+/** An error shaped like Node's own fs errors on Windows. */
+export function fsError(code: string, syscall: string, file: string): NodeJS.ErrnoException {
+  const error: NodeJS.ErrnoException = new Error(`${code}: operation not permitted, ${syscall} '${file}'`);
+  error.code = code;
+  error.syscall = syscall;
+  error.path = file;
+  return error;
 }
 
 export function testConfig(over: Partial<AlwaysOnConfig> = {}, policy: Partial<AlwaysOnPolicy> = {}): AlwaysOnConfig {

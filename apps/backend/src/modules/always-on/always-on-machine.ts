@@ -112,6 +112,33 @@ export function createSpawner(paths: AlwaysOnPaths, log: (line: string) => void)
   };
 }
 
+/** The codes Windows returns while another process briefly holds a file (a reader, an editor, an indexer, antivirus). */
+const TRANSIENT_FS_CODES: ReadonlySet<string> = new Set(["EPERM", "EBUSY", "EACCES"]);
+
+const sleepSync = (ms: number): void => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+};
+
+/**
+ * Runs one synchronous file operation, retrying ONLY a transient sharing
+ * failure, on a short bounded backoff (at most ~1.8 s in all) — the graceful-fs
+ * approach, synchronous because every caller is. Any other error, or the last
+ * transient one, is thrown.
+ */
+export function retryTransientFs<T>(operation: () => T, options: { readonly attempts?: number; readonly sleep?: (ms: number) => void } = {}): T {
+  const attempts = options.attempts ?? 8;
+  const sleep = options.sleep ?? sleepSync;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return operation();
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (attempt >= attempts || code === undefined || !TRANSIENT_FS_CODES.has(code)) throw error;
+      sleep(Math.min(25 * 2 ** (attempt - 1), 500));
+    }
+  }
+}
+
 export const realFileSystem: AlwaysOnFileSystem = {
   readText(file) {
     try {
@@ -120,17 +147,27 @@ export const realFileSystem: AlwaysOnFileSystem = {
       return null;
     }
   },
+  readTextStrict(file) {
+    try {
+      return retryTransientFs(() => readFileSync(file, "utf8"));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return null;
+      throw error;
+    }
+  },
   writeTextAtomic(file, text) {
     mkdirSync(path.dirname(file), { recursive: true });
     const temporary = `${file}.tmp`;
-    const fd = openSync(temporary, "w");
+    const fd = retryTransientFs(() => openSync(temporary, "w"));
     try {
       writeSync(fd, text);
       fsyncSync(fd);
     } finally {
       closeSync(fd);
     }
-    renameSync(temporary, file);
+    // MoveFileEx cannot replace a file another process holds open: retried, bounded, then thrown.
+    retryTransientFs(() => renameSync(temporary, file));
   },
   appendLine(file, line) {
     mkdirSync(path.dirname(file), { recursive: true });
@@ -145,7 +182,7 @@ export const realFileSystem: AlwaysOnFileSystem = {
   exists: (file) => existsSync(file),
   remove(file) {
     try {
-      unlinkSync(file);
+      retryTransientFs(() => unlinkSync(file));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
