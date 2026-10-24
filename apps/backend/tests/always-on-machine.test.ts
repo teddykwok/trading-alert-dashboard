@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { observeProcessRows, realFileSystem, retryTransientFs } from "../src/modules/always-on/always-on-machine";
+import { spawnAlwaysOnSupervisor } from "../src/modules/always-on/always-on-launch";
+import { createSpawner, observeProcessRows, realFileSystem, retryTransientFs } from "../src/modules/always-on/always-on-machine";
+import { alwaysOnPaths } from "../src/modules/always-on/always-on-paths";
 import { fsError } from "./helpers/always-on-fake-machine";
 
 /**
@@ -90,6 +92,43 @@ describe("process-tree observation survives any command line on the machine", ()
     },
     60_000
   );
+});
+
+describe("a spawn that fails at run time is a refused start, never an uncaught exception", () => {
+  // libuv reports ENOENT / EACCES / EMFILE … through the child's 'error' event on the NEXT tick.
+  const missing = path.join(dir, "no-such-dir", "no-such-program.exe");
+
+  async function uncaughtDuring(action: () => void): Promise<unknown[]> {
+    const caught: unknown[] = [];
+    const listener = (error: unknown) => void caught.push(error);
+    process.on("uncaughtException", listener);
+    try {
+      action();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      process.off("uncaughtException", listener);
+    }
+    return caught;
+  }
+
+  it("the role spawner returns null (SPAWN_FAILED, backoff) and handles the late 'error' event", async () => {
+    const spawner = createSpawner(alwaysOnPaths({ LOCALAPPDATA: dir }), () => undefined);
+    let pid: number | null | undefined;
+    const caught = await uncaughtDuring(() => {
+      pid = spawner.spawn({ role: "planner", command: missing, args: [], cwd: dir, env: {}, commandIdentity: "a program that does not exist" });
+    });
+    expect(pid).toBeNull();
+    expect(caught).toEqual([]);
+  });
+
+  it("the launcher's supervisor spawner returns null ('could not be started') and handles the late 'error' event", async () => {
+    let pid: number | null | undefined;
+    const caught = await uncaughtDuring(() => {
+      pid = spawnAlwaysOnSupervisor(alwaysOnPaths({ LOCALAPPDATA: dir }), dir, { ComSpec: missing });
+    });
+    expect(pid).toBeNull();
+    expect(caught).toEqual([]);
+  });
 });
 
 describe("the real file system adapter", () => {

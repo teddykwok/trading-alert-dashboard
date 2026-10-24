@@ -64,6 +64,9 @@ export function spawnAlwaysOnSupervisor(paths: AlwaysOnPaths, repoRoot: string, 
   }
   try {
     const child = spawn(env.ComSpec ?? "cmd.exe", args, { cwd: repoRoot, env, detached: true, windowsHide: true, stdio: ["ignore", fd, fd] });
+    // A run-time spawn failure has no pid and reports through 'error' on the next tick: handled here, so it is
+    // "could not be started" — never an uncaught exception that ends the runtime launcher.
+    child.on("error", () => undefined);
     if (child.pid === undefined) return null;
     child.unref();
     return child.pid;

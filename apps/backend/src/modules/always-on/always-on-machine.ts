@@ -104,10 +104,14 @@ export function createSpawner(paths: AlwaysOnPaths, log: (line: string) => void)
       }
       try {
         const child = spawn(plan.command, [...plan.args], { cwd: plan.cwd, env: plan.env, detached: true, windowsHide: true, stdio: ["ignore", fd, fd] });
+        // A spawn that fails at run time (ENOENT, EACCES, EMFILE …) has no pid and reports through 'error' on the
+        // NEXT tick: listened for before anything else, or that event is an uncaught exception ending this process.
+        child.on("error", () => {
+          if (child.pid !== undefined) exitCodes.set(child.pid, null);
+        });
         if (child.pid === undefined) return null;
         const pid = child.pid;
         child.on("exit", (code) => exitCodes.set(pid, code));
-        child.on("error", () => exitCodes.set(pid, null));
         child.unref();
         return pid;
       } catch {
