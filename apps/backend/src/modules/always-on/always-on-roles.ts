@@ -8,20 +8,18 @@ import { STRIPPED_CREDENTIAL_KEYS, type AlwaysOnRole } from "./always-on-contrac
 /**
  * HOW the Always-On supervisor starts each role, and how it RECOGNISES one.
  *
- * Every command is repo-controlled: the same entrypoints and package scripts
- * the operator runs by hand and the runtime launcher already runs, through the
- * same `cmd /d /s /c` wrapper (so the owned root's command line carries this
- * repository's path, which is what later proves ownership). Nothing an
- * operator types reaches a command except the profile name, the scanner run id
- * and the engine fingerprint, each validated before it is used.
+ * Every command is repo-controlled: the same entrypoints the operator's
+ * package scripts run (`tsx <entry>`, or the built backend), started as node
+ * itself with the repository's own tsx CLI, so the owned root's command line
+ * carries this repository's path, which is what later proves ownership.
+ * Nothing an operator types reaches a command except the profile name, the
+ * scanner run id and the engine fingerprint, each validated before it is used.
  *
  * Every child is started with the GENERIC environment file authoritative and
  * with every account / credential variable removed — case-insensitively,
  * because Windows environment names are — so no monitoring process can hold a
  * Binance key, an account identifier or any API secret.
  */
-
-const BACKEND_FILTER = "@trading-alert-dashboard/backend";
 
 /** The entrypoints that do monitoring work, wherever they run (any checkout counts: they share LocalAppData state). */
 export const MONITORING_ENTRYPOINTS = Object.freeze({
@@ -101,7 +99,7 @@ export interface MonitoringSpawnPlan {
   readonly commandIdentity: string;
 }
 
-/** Characters that `cmd /s /c` or pnpm could split or interpret: such a path is refused, never quoted around. */
+/** Characters a shell could split or interpret: such a path is refused, never quoted around (defence in depth). */
 const UNSAFE_ARGUMENT = /[\s"&|<>^%!]/;
 
 export class MonitoringPlanError extends Error {
@@ -113,7 +111,7 @@ export class MonitoringPlanError extends Error {
 
 function assertPlainArgument(value: string, what: string): string {
   if (value === "" || UNSAFE_ARGUMENT.test(value)) {
-    throw new MonitoringPlanError(`${what} contains a space or a shell character, which the cmd/pnpm wrapper could re-split; refusing (${what} must be a plain path)`);
+    throw new MonitoringPlanError(`${what} contains a space or a shell character; refusing (${what} must be a plain path)`);
   }
   return value;
 }
@@ -122,14 +120,26 @@ const RUN_ID = /^\d{8}T\d{6}Z-[0-9a-f]{8}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const PROFILE_NAME = /^[a-z0-9][a-z0-9-]*$/;
 
-function pnpmPlan(role: AlwaysOnRole, repoRoot: string, env: NodeJS.ProcessEnv, genericKeyNames: readonly string[], script: string, scriptArgs: readonly string[]): MonitoringSpawnPlan {
+/** The node executable every role is started with (the supervisor's own). */
+export const MONITORING_NODE = process.execPath;
+
+/** The repository's own tsx CLI: exactly what each role's package script (`tsx <entry>`) runs. */
+export const tsxCliOf = (repoRoot: string) => path.join(assertPlainArgument(repoRoot, "the repository path"), "apps", "backend", "node_modules", "tsx", "dist", "cli.mjs");
+
+/**
+ * A role started as NODE itself — never through cmd.exe. A DETACHED cmd.exe has no console, so every console
+ * program it starts (pnpm, tsx, node) gets a new, hidden one and writes there: on the real machine
+ * (2026-10-24) every role's log stayed empty. Node started detached writes to the log handle it is given,
+ * and tsx hands that handle to the runtime it starts.
+ */
+function tsxPlan(role: AlwaysOnRole, repoRoot: string, env: NodeJS.ProcessEnv, genericKeyNames: readonly string[], script: string, entry: string, scriptArgs: readonly string[]): MonitoringSpawnPlan {
   return {
     role,
-    command: env.ComSpec ?? "cmd.exe",
-    args: ["/d", "/s", "/c", "pnpm", "-C", assertPlainArgument(repoRoot, "the repository path"), "--filter", BACKEND_FILTER, script, ...scriptArgs],
-    cwd: repoRoot,
+    command: MONITORING_NODE,
+    args: [tsxCliOf(repoRoot), entry, ...scriptArgs],
+    cwd: path.join(repoRoot, "apps", "backend"),
     env: monitoringChildEnv(env, genericKeyNames),
-    commandIdentity: `pnpm --filter ${BACKEND_FILTER} ${script}${scriptArgs.length > 0 ? ` ${scriptArgs.join(" ")}` : ""}`,
+    commandIdentity: `${script}: tsx ${entry}${scriptArgs.length > 0 ? ` ${scriptArgs.join(" ")}` : ""}`,
   };
 }
 
@@ -138,8 +148,8 @@ export function backendSpawnPlan(repoRoot: string, env: NodeJS.ProcessEnv, gener
   const server = path.join(assertPlainArgument(repoRoot, "the repository path"), "apps", "backend", "dist", "src", "server.js");
   return {
     role: "backend",
-    command: env.ComSpec ?? "cmd.exe",
-    args: ["/d", "/s", "/c", "node", server],
+    command: MONITORING_NODE,
+    args: [server],
     cwd: path.join(repoRoot, "apps", "backend"),
     env: monitoringChildEnv(env, genericKeyNames),
     commandIdentity: "node apps/backend/dist/src/server.js",
@@ -157,7 +167,7 @@ export interface ScannerPlanInput {
 export function scannerSpawnPlan(repoRoot: string, env: NodeJS.ProcessEnv, genericKeyNames: readonly string[], input: ScannerPlanInput): MonitoringSpawnPlan {
   if (!PROFILE_NAME.test(input.profileName)) throw new MonitoringPlanError("the scanner profile name is not a plain profile identifier");
   for (const arg of input.extraArgs) assertPlainArgument(arg, "a scanner tuning argument");
-  return pnpmPlan("scanner", repoRoot, env, genericKeyNames, "scanner:live-shadow-supervisor", [
+  return tsxPlan("scanner", repoRoot, env, genericKeyNames, "scanner:live-shadow-supervisor", MONITORING_ENTRYPOINTS.scanner, [
     "--profile",
     input.profileName,
     "--stop-file",
@@ -181,7 +191,7 @@ export function emitterSpawnPlan(repoRoot: string, env: NodeJS.ProcessEnv, gener
   if (!RUN_ID.test(input.runId)) throw new MonitoringPlanError("the pinned scanner run id is not a supervisor run id");
   if (!SHA256.test(input.engineFingerprint)) throw new MonitoringPlanError("the expected engine fingerprint is not a SHA-256 hex digest");
   if (!Number.isSafeInteger(input.queueCapacity) || input.queueCapacity < 10 || input.queueCapacity > 100_000) throw new MonitoringPlanError("the emitter queue capacity is out of bounds");
-  return pnpmPlan("emitter", repoRoot, env, genericKeyNames, "native-alerts:multi-emitter", [
+  return tsxPlan("emitter", repoRoot, env, genericKeyNames, "native-alerts:multi-emitter", MONITORING_ENTRYPOINTS.emitter, [
     "--profile",
     input.profileName,
     "--run-id",
@@ -200,7 +210,7 @@ export function emitterSpawnPlan(repoRoot: string, env: NodeJS.ProcessEnv, gener
 
 /** The planning-only Native planner worker, exactly as the launcher's optional planner role runs it. */
 export function plannerSpawnPlan(repoRoot: string, env: NodeJS.ProcessEnv, genericKeyNames: readonly string[]): MonitoringSpawnPlan {
-  return pnpmPlan("planner", repoRoot, env, genericKeyNames, "native-alerts:plan-worker", []);
+  return tsxPlan("planner", repoRoot, env, genericKeyNames, "native-alerts:plan-worker", MONITORING_ENTRYPOINTS.planner, []);
 }
 
 // ---------------------------------------------------------------------------

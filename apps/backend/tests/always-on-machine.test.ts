@@ -1,11 +1,12 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { spawnAlwaysOnSupervisor } from "../src/modules/always-on/always-on-launch";
 import { createSpawner, observeProcessRows, realFileSystem, retryTransientFs, selfStartedAtMs } from "../src/modules/always-on/always-on-machine";
-import { alwaysOnPaths } from "../src/modules/always-on/always-on-paths";
+import { alwaysOnPaths, alwaysOnRoleLog } from "../src/modules/always-on/always-on-paths";
+import { plannerSpawnPlan } from "../src/modules/always-on/always-on-roles";
 import { OWNERSHIP_PROOF_ATTEMPTS, type ProbeOutcome } from "../src/modules/operator/worker-supervision";
 import { fsError } from "./helpers/always-on-fake-machine";
 
@@ -125,7 +126,7 @@ describe("a spawn that fails at run time is a refused start, never an uncaught e
   it("the launcher's supervisor spawner returns null ('could not be started') and handles the late 'error' event", async () => {
     let pid: number | null | undefined;
     const caught = await uncaughtDuring(() => {
-      pid = spawnAlwaysOnSupervisor(alwaysOnPaths({ LOCALAPPDATA: dir }), dir, { ComSpec: missing });
+      pid = spawnAlwaysOnSupervisor(alwaysOnPaths({ LOCALAPPDATA: dir }), dir, {}, missing);
     });
     expect(pid).toBeNull();
     expect(caught).toEqual([]);
@@ -174,4 +175,30 @@ describe("the real file system adapter", () => {
     realFileSystem.remove(file);
     expect(realFileSystem.readTextStrict(file)).toBeNull();
   });
+});
+
+describe("every role's output reaches its durable log", () => {
+  // The worktree this test runs in: its own tsx CLI, exactly as a role plan names it.
+  const repoRoot = path.resolve(__dirname, "..", "..", "..");
+
+  it.runIf(process.platform === "win32")(
+    "a role started detached as the plan says writes stdout AND stderr into its log (it was empty on the real machine: a detached cmd.exe gave its children a hidden console)",
+    async () => {
+      const fixture = path.join(dir, "role-output.ts");
+      writeFileSync(fixture, ['console.log("role stdout line");', 'console.error("role stderr line");', ""].join("\n"));
+      const plan = plannerSpawnPlan(repoRoot, process.env, []);
+      const paths = alwaysOnPaths({ LOCALAPPDATA: path.join(dir, "role-log") });
+      // The real plan's command and tsx CLI; only the entry is a harmless fixture (no role is ever started here).
+      const pid = createSpawner(paths, () => undefined).spawn({ ...plan, args: [plan.args[0] as string, fixture], env: process.env });
+      expect(pid).not.toBeNull();
+      let text = "";
+      for (let i = 0; i < 100 && !(text.includes("role stdout line") && text.includes("role stderr line")); i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        text = readFileSync(alwaysOnRoleLog(paths, "planner"), "utf8");
+      }
+      expect(text).toContain("role stdout line");
+      expect(text).toContain("role stderr line");
+    },
+    30_000
+  );
 });

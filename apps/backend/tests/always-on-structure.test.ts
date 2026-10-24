@@ -251,3 +251,11 @@ describe("what did NOT change", () => {
     expect(emitter).toContain('process.once("SIGINT", () => (stopping = true));');
   });
 });
+
+describe("role output is never lost", () => {
+  it("no role and no launcher-started supervisor runs through cmd.exe (a detached cmd.exe gives its children a hidden console, and their output never reaches the log)", () => {
+    for (const file of [`${AO}/always-on-roles.ts`, `${AO}/always-on-launch.ts`]) {
+      expect({ file, hit: codeOf(file).match(/ComSpec|cmd\.exe|"\/d", "\/s", "\/c"/)?.[0] ?? null }).toEqual({ file, hit: null });
+    }
+  });
+});

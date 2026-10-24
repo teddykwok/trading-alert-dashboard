@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -10,6 +11,7 @@ import { alwaysOnSupervisorArgs } from "../src/modules/always-on/always-on-launc
 import { decideAdoption, generationIsCurrent, listenerInstanceLock, nextGeneration, parseOwnership, sameRepository, supervisorLiveness, type ChildRecord } from "../src/modules/always-on/always-on-ownership";
 import { alwaysOnPaths, childStopFile } from "../src/modules/always-on/always-on-paths";
 import {
+  MONITORING_ENTRYPOINTS,
   MonitoringPlanError,
   backendSpawnPlan,
   classifyMonitoringRuntime,
@@ -333,17 +335,25 @@ describe("spawn plans, the child environment and the census", () => {
     expect(DIRTY_ENV.BINANCE_API_KEY).toBe("never-inherited-key"); // the parent environment is never modified
   });
 
-  it("each plan is the repo's own command through cmd /d /s /c, carrying the repository path", () => {
-    expect(backendSpawnPlan("C:\\repo", DIRTY_ENV, keys).args).toEqual(["/d", "/s", "/c", "node", "C:\\repo\\apps\\backend\\dist\\src\\server.js"]);
-    expect(scannerSpawnPlan("C:\\repo", DIRTY_ENV, keys, { profileName: "teddy-7-all-active", stopFile: stop, extraArgs: ["--max-total-requests", "12000"] }).args).toEqual([
-      "/d", "/s", "/c", "pnpm", "-C", "C:\\repo", "--filter", "@trading-alert-dashboard/backend", "scanner:live-shadow-supervisor", "--profile", "teddy-7-all-active", "--stop-file", stop, "--max-total-requests", "12000",
-    ]);
-    expect(plannerSpawnPlan("C:\\repo", DIRTY_ENV, keys).args.slice(-1)).toEqual(["native-alerts:plan-worker"]);
+  it("each plan is the repo's own entry started as node itself (never through cmd.exe), carrying the repository path", () => {
+    const tsx = "C:\\repo\\apps\\backend\\node_modules\\tsx\\dist\\cli.mjs";
+    expect(backendSpawnPlan("C:\\repo", DIRTY_ENV, keys)).toMatchObject({ command: process.execPath, args: ["C:\\repo\\apps\\backend\\dist\\src\\server.js"], cwd: "C:\\repo\\apps\\backend" });
+    const scanner = scannerSpawnPlan("C:\\repo", DIRTY_ENV, keys, { profileName: "teddy-7-all-active", stopFile: stop, extraArgs: ["--max-total-requests", "12000"] });
+    expect(scanner).toMatchObject({ command: process.execPath, cwd: "C:\\repo\\apps\\backend" });
+    expect(scanner.args).toEqual([tsx, "src/modules/native-scanner/run-live-shadow-supervisor.ts", "--profile", "teddy-7-all-active", "--stop-file", stop, "--max-total-requests", "12000"]);
+    expect(plannerSpawnPlan("C:\\repo", DIRTY_ENV, keys).args).toEqual([tsx, "src/modules/native-planning/native-plan.worker.ts"]);
     const emitter = emitterSpawnPlan("C:\\repo", DIRTY_ENV, keys, { profileName: "teddy-7-all-active", runId: "20261023T110000Z-0a0b0c0d", engineFingerprint: ENGINE, queueCapacity: 10_000, activateAtEof: false, stopFile: stop });
-    expect(emitter.args).toEqual(expect.arrayContaining(["native-alerts:multi-emitter", "--commit-dashboard-alerts", "--follow", "--run-id", "20261023T110000Z-0a0b0c0d"]));
+    expect(emitter.args).toEqual(expect.arrayContaining([tsx, "src/modules/native-alerts/run-native-multi-emitter.ts", "--commit-dashboard-alerts", "--follow", "--run-id", "20261023T110000Z-0a0b0c0d"]));
+    // The entries are exactly what the operator's package scripts run (`tsx <entry>`): plans and scripts cannot drift apart.
+    const scripts = (JSON.parse(readFileSync(path.join(__dirname, "..", "package.json"), "utf8")) as { scripts: Record<string, string> }).scripts;
+    expect([scripts["scanner:live-shadow-supervisor"], scripts["native-alerts:multi-emitter"], scripts["native-alerts:plan-worker"]]).toEqual([
+      `tsx ${MONITORING_ENTRYPOINTS.scanner}`,
+      `tsx ${MONITORING_ENTRYPOINTS.emitter}`,
+      `tsx ${MONITORING_ENTRYPOINTS.planner}`,
+    ]);
     // Every plan parses with the real CLI parsers (no unknown argument can reach a child).
-    expect(() => parseSupervisorCliArgs(scannerSpawnPlan("C:\\repo", DIRTY_ENV, keys, { profileName: "teddy-7-all-active", stopFile: stop, extraArgs: [] }).args.slice(9))).not.toThrow();
-    expect(parseMultiEmitterCliArgs(emitter.args.slice(9))).toMatchObject({ mode: "COMMIT_DASHBOARD_ALERTS", follow: true, stopFile: stop, queueCapacity: 10_000, activateAtEof: false });
+    expect(() => parseSupervisorCliArgs(scannerSpawnPlan("C:\\repo", DIRTY_ENV, keys, { profileName: "teddy-7-all-active", stopFile: stop, extraArgs: [] }).args.slice(2))).not.toThrow();
+    expect(parseMultiEmitterCliArgs(emitter.args.slice(2))).toMatchObject({ mode: "COMMIT_DASHBOARD_ALERTS", follow: true, stopFile: stop, queueCapacity: 10_000, activateAtEof: false });
   });
 
   it("refuses arguments cmd or pnpm could re-split, and malformed pins", () => {
@@ -484,7 +494,7 @@ describe("the runtime launcher's Always-On controls", () => {
     expect(base(new Map(), false).statusLine()).toBe("Always-On Monitoring (monitoring only): OFF");
     expect(base(new Map([[paths.ownership, ownership]]), true).statusLine()).toMatch(/RUNNING — generation 7/);
     expect(credentialNamesPresent(alwaysOnLaunchEnv(DIRTY_ENV))).toEqual([]);
-    expect(alwaysOnSupervisorArgs("C:\\repo")).toEqual(["/d", "/s", "/c", "pnpm", "-C", "C:\\repo", "--filter", "@trading-alert-dashboard/backend", "monitoring:always-on", "run"]);
+    expect(alwaysOnSupervisorArgs("C:\\repo")).toEqual(["C:\\repo\\apps\\backend\\node_modules\\tsx\\dist\\cli.mjs", "src/modules/always-on/run-always-on-monitoring.ts", "run"]);
     expect(() => alwaysOnSupervisorArgs("C:\\my repo")).toThrow();
   });
 });

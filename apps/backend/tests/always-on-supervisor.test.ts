@@ -126,9 +126,9 @@ describe("start-up and steady state", () => {
     const scripts = m.spawns.map((c) => c.plan.commandIdentity);
     expect(scripts).toEqual([
       "node apps/backend/dist/src/server.js",
-      expect.stringMatching(/^pnpm --filter @trading-alert-dashboard\/backend scanner:live-shadow-supervisor --profile teddy-7-all-active --stop-file /),
-      expect.stringMatching(/^pnpm --filter @trading-alert-dashboard\/backend native-alerts:multi-emitter --profile teddy-7-all-active --run-id /),
-      "pnpm --filter @trading-alert-dashboard/backend native-alerts:plan-worker",
+      expect.stringMatching(/^scanner:live-shadow-supervisor: tsx src\/modules\/native-scanner\/run-live-shadow-supervisor\.ts --profile teddy-7-all-active --stop-file /),
+      expect.stringMatching(/^native-alerts:multi-emitter: tsx src\/modules\/native-alerts\/run-native-multi-emitter\.ts --profile teddy-7-all-active --run-id /),
+      "native-alerts:plan-worker: tsx src/modules/native-planning/native-plan.worker.ts",
     ]);
     for (const child of m.spawns) expect(child.plan.args.join(" ")).not.toMatch(/execution|account-control|arm|live-ready|binance:|set-policy|canary/i);
     expect(supervisor.status()).toMatchObject({ authority: "NONE", nativeExecutionEnabled: false, accountExecution: "NONE", notice: ["MONITORING ONLY", "NO ACCOUNT EXECUTION", "NATIVE EXECUTION HARD-DISABLED"] });

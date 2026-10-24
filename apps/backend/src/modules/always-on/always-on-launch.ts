@@ -20,10 +20,14 @@ const PLAIN_REPO = /^[A-Za-z]:\\[^\s"&|<>^%!]*$/;
 
 export const alwaysOnSupervisorLog = (paths: AlwaysOnPaths) => path.join(paths.logsDir, "always-on-supervisor.log");
 
-/** The supervisor's command: `cmd /d /s /c pnpm -C <repo> --filter … monitoring:always-on run` (repo-controlled). */
+/**
+ * The supervisor's arguments to node: the repository's own tsx CLI running `monitoring:always-on run`'s entry
+ * (repo-controlled), from apps/backend. Node itself, never cmd.exe: a detached cmd.exe has no console, and the
+ * console programs it starts would write to a new hidden one instead of the supervisor's log.
+ */
 export function alwaysOnSupervisorArgs(repoRoot: string): string[] {
   if (!PLAIN_REPO.test(repoRoot)) throw new Error("the repository path must be a plain absolute path (no spaces or shell characters) to start Always-On unattended");
-  return ["/d", "/s", "/c", "pnpm", "-C", repoRoot, "--filter", "@trading-alert-dashboard/backend", "monitoring:always-on", "run"];
+  return [path.join(repoRoot, "apps", "backend", "node_modules", "tsx", "dist", "cli.mjs"), "src/modules/always-on/run-always-on-monitoring.ts", "run"];
 }
 
 /** Reads an Always-On file (status, ownership), or null. */
@@ -47,7 +51,7 @@ export function writeAlwaysOnRequest(file: string, text: string): void {
 }
 
 /** Starts the supervisor with durable output, or not at all. Returns the root pid. */
-export function spawnAlwaysOnSupervisor(paths: AlwaysOnPaths, repoRoot: string, env: NodeJS.ProcessEnv): number | null {
+export function spawnAlwaysOnSupervisor(paths: AlwaysOnPaths, repoRoot: string, env: NodeJS.ProcessEnv, nodePath: string = process.execPath): number | null {
   const args = alwaysOnSupervisorArgs(repoRoot);
   let fd: number;
   try {
@@ -63,7 +67,7 @@ export function spawnAlwaysOnSupervisor(paths: AlwaysOnPaths, repoRoot: string, 
     return null;
   }
   try {
-    const child = spawn(env.ComSpec ?? "cmd.exe", args, { cwd: repoRoot, env, detached: true, windowsHide: true, stdio: ["ignore", fd, fd] });
+    const child = spawn(nodePath, args, { cwd: path.join(repoRoot, "apps", "backend"), env, detached: true, windowsHide: true, stdio: ["ignore", fd, fd] });
     // A run-time spawn failure has no pid and reports through 'error' on the next tick: handled here, so it is
     // "could not be started" — never an uncaught exception that ends the runtime launcher.
     child.on("error", () => undefined);
