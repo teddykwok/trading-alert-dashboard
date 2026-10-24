@@ -136,6 +136,19 @@ describe("the Always-On supervisor's reach", () => {
     expect([...MUTATION_ACTIONS]).toEqual(expect.arrayContaining(["ALWAYS_ON_START", "ALWAYS_ON_STOP", "ALWAYS_ON_ROLE_START", "ALWAYS_ON_ROLE_STOP"]));
   });
 
+  it("the launcher's Always-On module writes exactly two things: one request file (temporary + rename) and the supervisor's log (append, rotated)", () => {
+    // Launcher pin 22 counts only run-runtime-launcher.ts itself; each imported launcher module pins its own writes.
+    const code = codeOf(`${AO}/always-on-launch.ts`);
+    expect((code.match(/writeFileSync\(/g) ?? []).length).toBe(1);
+    expect(code).toContain('writeFileSync(temporary, text, "utf8");');
+    expect((code.match(/renameSync\(/g) ?? []).length).toBe(2);
+    expect(code).toContain("renameSync(temporary, file);");
+    expect(code).toContain("renameSync(file, `${file}.1`);");
+    expect((code.match(/openSync\(/g) ?? []).length).toBe(1);
+    expect(code).toContain('fd = openSync(file, "a");');
+    expect(code).not.toMatch(/appendFileSync|unlinkSync|rmSync|copyFileSync|createWriteStream|writeSync\(/);
+  });
+
   it("the real file system retries transient Windows sharing failures on every ownership open, replace, strict read and removal", () => {
     const code = codeOf(`${AO}/always-on-machine.ts`);
     expect(code).toContain('const fd = retryTransientFs(() => openSync(temporary, "w"));');
