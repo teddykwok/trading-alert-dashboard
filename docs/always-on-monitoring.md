@@ -105,7 +105,8 @@ spending attempts.
    the network.
    - **Unreachable:** nothing is restarted, no attempt is spent, and the state
      reads `NETWORK_UNAVAILABLE`.
-   - **Reachable again:** the scanner gets 120 seconds to heal itself.
+   - **Reachable again:** the scanner gets 120 seconds to heal itself. So does
+     the fresh run of a recovery that is still starting up.
 3. Still degraded after that, a single fenced **recovery** runs:
    - stop the owned emitter, cooperatively (it persists its processed cursors);
    - stop the owned scanner, cooperatively (its status and checkpoints persist);
@@ -117,6 +118,13 @@ spending attempts.
 A scanner that exits takes the same path. An emitter is never left pinned to a
 replaced run, and it never hops runs internally.
 
+So does a scanner whose run is **not the profile's engine**, for example a run
+adopted after a code change: its emitter is stopped first, then a fresh run
+starts. If the fresh run is again not the profile's engine, the scanner
+latches at once with `ENGINE_FINGERPRINT_MISMATCH`. The code on disk is not
+the engine this supervisor was started with, so another run cannot help.
+Restart Always-On, then clear the latch.
+
 A cooperative stop asks the child to stop by creating its unique
 `--stop-file`. The child runs exactly the graceful stop that Ctrl+C runs. If
 the child has not exited after 90 seconds (emitter) or 180 seconds (scanner),
@@ -127,14 +135,18 @@ During recovery no cursor is rebaselined, and no cursor, namespace,
 checkpoint or log is deleted.
 
 **Backoff and latching.** Every restart after a role's first start in a
-generation is an attempt.
+generation is an attempt, except a restart after a stop the supervisor made
+for another reason. An emitter stopped for a scanner recovery, or because its
+pinned run was superseded, did not fail: it restarts at once and spends no
+attempt.
 
 - Attempts are spaced 30 seconds, then 1, 2, 5, 10 and 15 minutes apart.
 - After 6 attempts the role **LATCHES**: no more automatic restarts until
   `monitoring:always-on clear-latch`.
-- 30 minutes of continuous health forgives the attempts.
+- 30 minutes of continuous, observed health forgives the attempts.
 - A sleep or hibernate (a tick more than 4 polls late) restarts every grace
-  period instead of acting on pre-sleep timers.
+  period, the emitter's hung window and the forgiveness streak. Nothing is
+  judged on pre-sleep timers or on a status written before the sleep.
 
 **Supervisor states:** `STARTING`, `RUNNING` (normal), `DEGRADED`,
 `RECOVERING`, `BACKOFF`, `LATCHED` (failed/latching), `STOPPING`, `STOPPED`.
@@ -182,6 +194,19 @@ During a long catch-up the emitter refreshes its status file every
 `--status-every-s`, so it is never mistaken for a hung process. Its status has
 `catchUp: { rounds, recordsAdmitted, backlogLanes }`.
 
+- It yields to the event loop every 256 processed records. A cooperative stop
+  or Ctrl+C is therefore seen promptly, even while it only skips records.
+- Cursors are written after each delivery, once at the end of each drain, and
+  on stop. They are not written once per lane per round: each write hashes the
+  lane's consumed prefix and fsyncs.
+
+**Start-up.** Before it delivers anything, the emitter re-validates every lane
+up to its cursor, which takes longer as the run's logs grow. From the first
+lane on, its status has `initialization: { complete, lanesBaselined,
+lanesTotal }`. The supervisor reads a fresh, incomplete one as
+`STARTING (INITIALIZING)` and applies no first-status deadline to it. A status
+that stops refreshing is still `STALE`, and hung after 10 minutes.
+
 > **The queue bound is no longer a staleness guard.** The overflow used to stop
 > a stale multi-day backlog as a side effect
 > ([native-emitter-cursor-rebaseline.md](native-emitter-cursor-rebaseline.md)).
@@ -205,6 +230,19 @@ During a long catch-up the emitter refreshes its status file every
   **under the launcher's mutation lock** (`127.0.0.1:4009`) and refuses unless
   the generation on disk is still its own. A stale supervisor can never control
   a newer generation's children.
+  - A file that cannot be **read**, for example while an editor, an indexer or
+    antivirus holds it, is UNKNOWN. Mutations pause until it can be read, and
+    the generation is not given up (`OWNERSHIP_READ_FAILED`).
+  - Only a readable file naming another generation, or a removed or broken
+    file, fences the supervisor.
+- **Durability.** `ownership.json` is replaced atomically, with bounded retries
+  for Windows sharing errors (EPERM, EBUSY, EACCES).
+  - If it still cannot be written right after a spawn, the child stays
+    recorded in memory and the write is retried every tick
+    (`OWNERSHIP_WRITE_FAILED`, then `OWNERSHIP_WRITE_RESTORED`). No other role
+    starts until the record is durable.
+  - `run` refuses to start if it cannot read or write the file, or cannot read
+    its own OS creation time.
 - **Children.** Each child is recorded by its owned root: pid, OS creation
   time, and the repository path on its command line. A process is terminated
   only through the reviewed fenced stop, which re-proves all three.
@@ -212,6 +250,13 @@ During a long catch-up the emitter refreshes its status file every
   that are still provably its own. A recycled pid or a gone root is dropped
   from the record and never killed. A supervisor restart therefore does not
   restart a healthy scanner.
+  - A record written by **another checkout's** supervisor is never adopted.
+    The main checkout and every worktree share `%LOCALAPPDATA%`. Such children
+    are dropped from the record (`OTHER_REPOSITORY`), reported as `CONFLICT`,
+    and never stopped.
+- **A supervision pass never ends the supervisor.** An unexpected error is
+  journaled once (`SUPERVISOR_TICK_FAILED`) and the state reads
+  `DEGRADED (SUPERVISION_ERROR)`. The next pass then runs as usual.
 - **Conflicts.** A manual or launcher-owned scanner, emitter, planner or
   backend is reported as `CONFLICT` and never killed; nothing is started beside
   it. Old `signal-quality:soak-monitor` processes are reported as external.
@@ -251,8 +296,9 @@ Journal kinds include `SCANNER_DEGRADED`, `NETWORK_UNAVAILABLE`,
 `SCANNER_RECOVERY_FAILED`, `EMITTER_STOPPED_RUN_SUPERSEDED`,
 `EMITTER_STARTED_ON_RUN`, `LARGE_BACKLOG_DETECTED`, `BACKLOG_DRAINED`,
 `PLANNER_FAILURE_DELTA_INCREASED`, `BACKOFF_ENTERED`, `ROLE_LATCHED`,
-`SUPERVISOR_LATCHED`, `SUPERVISOR_RETURNED_HEALTHY`, `ROLE_CONFLICT` and
-`EXTERNAL_MONITORING_PROCESS`.
+`SUPERVISOR_LATCHED`, `SUPERVISOR_RETURNED_HEALTHY`, `ROLE_CONFLICT`,
+`EXTERNAL_MONITORING_PROCESS`, `OWNERSHIP_READ_FAILED`,
+`OWNERSHIP_WRITE_FAILED` and `SUPERVISOR_TICK_FAILED`.
 
 ## 7. Commands
 
@@ -267,6 +313,13 @@ pnpm --filter @trading-alert-dashboard/backend monitoring:always-on startup-task
 ```
 
 pnpm 11 passes arguments straight through. Do not insert a bare `--`.
+
+If the recorded supervisor cannot be observed (a process probe failed, or
+`ownership.json` cannot be read):
+
+- `status` says `UNKNOWN` (`supervisorRunning: null` with `--json`);
+- `stop` and `clear-latch` request nothing and exit 1;
+- a `stop` waits until the supervisor has provably exited.
 
 `--emitter-activate-at-eof` is an explicit operator decision. Without it, a
 lane that has never had a production cursor refuses COMMIT, for example a
@@ -386,6 +439,16 @@ Observatory soak ([native-signal-quality-observatory.md](native-signal-quality-o
   path. Raise it with `--scanner-max-total-requests` if that happens too often.
 - **The launcher-started supervisor has no console.** Use 17/18 or the CLI; for
   a console, use `Always-On Monitoring.cmd`.
+- **Ownership writes are retried, not transactional.** If the supervisor dies
+  after a spawn and before `ownership.json` could be written, that child is
+  unrecorded. The next generation reports it as `CONFLICT` and never kills it.
+- **The launcher's Always-On status line reads `ownership.json` leniently.** A
+  transient read failure shows OFF for that refresh; the CLI reports
+  `UNKNOWN`.
+- **The runtime launcher's own process-tree queries** (pre-existing, outside
+  Always-On) still replace only `|` in command lines. While any node.exe or
+  cmd.exe has a line break in its command line, those launcher views report
+  `UNPARSEABLE`. The Always-On adapter already removes CR and LF.
 - **Unrelated, unchanged:** the TradingView adoption lease-theft finding and
   ENTRY_SUBMITTING recovery.
 
@@ -398,6 +461,17 @@ Observatory soak ([native-signal-quality-observatory.md](native-signal-quality-o
   delivery ledger on the `_test` database.
 - `tests/always-on-supervisor.test.ts`: the supervisor end to end on a fake
   machine (matrix items 7 to 18 and more).
+- `tests/always-on-supervisor-resilience.test.ts`: regressions from the
+  adversarial review, among them: a held or unreadable `ownership.json`; an
+  unexpected error in a pass; adoption across checkouts; restart accounting;
+  sleep timers; wrong-engine runs; post-network grace for a fresh run;
+  excluded roles; and emitter start-up.
+- `tests/always-on-machine.test.ts`: the real adapters without starting
+  anything long-lived. It covers file-system retries and strict reads, line
+  breaks in process command lines, run-time spawn failures, and the
+  supervisor's own identity.
+- `tests/native-shadow-log-memory.test.ts`: an unchanged log is held once,
+  not twice.
 - `tests/always-on-units.test.ts`: the pure judges, plans, census, ownership,
   instance lock, journal, startup task, CLI and launcher controls.
 - `tests/always-on-structure.test.ts`: the AST closure has no database, env,
