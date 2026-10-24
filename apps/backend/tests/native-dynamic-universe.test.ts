@@ -670,6 +670,46 @@ describe("11-20. periodic refresh, discovery, onboarding", () => {
     h.supervisor.stop();
   });
 
+  it("a start-up longer than the refresh interval (FAST_RECOVERY replay): the first refresh is due at once, and the universe is never 'stale' before any refresh could run", async () => {
+    // Always-On acceptance run 2: a 435 s start-up, UNIVERSE_STALE 600 s after the run began, refreshes=0, lastAttemptAt=null.
+    const h = harness(["AAAUSDT", "BBBUSDT"]);
+    const gate = deferred();
+    h.gates.set("BBBUSDT", gate.promise);
+    const starting = h.supervisor.start();
+    h.advance(435_000);
+    gate.release();
+    await starting;
+    expect(h.universeControl.calls).toBe(0);
+    await Promise.all(h.supervisor.tick());
+    // The run's universe was read before the start-up began: one interval has long passed, so it is refreshed now.
+    expect(h.universeControl.calls).toBe(1);
+    expect(h.supervisor.status().universe).toMatchObject({ lastResult: "OK", refreshes: 1, stale: false });
+    h.advance(170_000); // 605 s after the run began
+    await h.settle();
+    expect(h.supervisor.status().universe!.stale).toBe(false);
+    h.supervisor.stop();
+  });
+
+  it("after a long start-up a refresh that keeps FAILING still goes stale — two intervals after refreshing could begin", async () => {
+    const h = harness(["AAAUSDT", "BBBUSDT"]);
+    const gate = deferred();
+    h.gates.set("BBBUSDT", gate.promise);
+    const starting = h.supervisor.start();
+    h.advance(435_000);
+    gate.release();
+    await starting;
+    h.universeControl.fail = 10;
+    await h.settle();
+    expect(h.supervisor.status().universe).toMatchObject({ lastResult: "FAILED", consecutiveFailures: 1, stale: false });
+    h.advance(300_000);
+    await h.settle();
+    expect(h.supervisor.status().universe!.stale).toBe(false);
+    h.advance(300_001);
+    await h.settle();
+    expect(h.supervisor.status().universe).toMatchObject({ lastResult: "FAILED", stale: true });
+    h.supervisor.stop();
+  });
+
   it("16. a failed refresh keeps the last-known-good universe: nothing evicted, failure reported, stale after two intervals", async () => {
     const h = await startedHarness(["AAAUSDT", "BBBUSDT"]);
     h.universeControl.fail = 3;

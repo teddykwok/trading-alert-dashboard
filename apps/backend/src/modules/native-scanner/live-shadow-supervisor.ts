@@ -450,6 +450,8 @@ export class LiveShadowSupervisor {
     capacityRequired: null as number | null,
     notAdmitted: [] as string[],
   };
+  /** When the start-up finished and periodic refreshes could begin (null until then). */
+  private refreshingSinceMs: number | null = null;
   readonly startedAt: string;
   /** Every accepted symbol's lineage must belong to this engine. */
   readonly engineFingerprint: string;
@@ -538,7 +540,13 @@ export class LiveShadowSupervisor {
     this.assign(accepted);
     for (const connection of this.connections) this.connect(connection);
     this.started = true;
-    if (this.dynamic) this.universeState.nextAtMs = this.deps.nowMs() + (this.config.dynamicUniverse as DynamicUniverseConfig).refreshIntervalMs;
+    if (this.dynamic) {
+      // The run's universe was read before construction (startedAt), and a FAST_RECOVERY start-up can take longer than
+      // one interval: the first refresh is due one interval after that read — at once, if the start-up took longer.
+      const now = this.deps.nowMs();
+      this.refreshingSinceMs = now;
+      this.universeState.nextAtMs = Math.max(now, Date.parse(this.startedAt) + (this.config.dynamicUniverse as DynamicUniverseConfig).refreshIntervalMs);
+    }
   }
 
   private summarizeStartup(startedAtMs: number, before: GovernorMetrics, clockBefore: number, completed: boolean, peakReportedUsedWeight: number | null): StartupRecoverySummary {
@@ -1664,7 +1672,9 @@ export class LiveShadowSupervisor {
     const interval = (this.config.dynamicUniverse as DynamicUniverseConfig | null | undefined)?.refreshIntervalMs ?? null;
     const iso = (ms: number | null) => (ms === null ? null : new Date(ms).toISOString());
     const capacity = this.config.symbolsPerConnection * this.config.maxConnections;
-    const lastGood = st.lastSuccessAtMs ?? (this.started ? Date.parse(this.startedAt) : null);
+    // Refreshes run only once the run has started: with none successful yet, staleness counts from when they could
+    // first run — never across the start-up itself, when no refresh is possible by design.
+    const lastGood = st.lastSuccessAtMs ?? (this.started ? (this.refreshingSinceMs ?? Date.parse(this.startedAt)) : null);
     return {
       lifecycle: "DYNAMIC_UNIVERSE_V1" as const,
       refreshIntervalMs: interval,
