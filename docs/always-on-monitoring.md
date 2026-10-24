@@ -61,14 +61,34 @@ these hold:
 
 - `RUNNING`, with a status no older than 3 minutes;
 - `universe.stale = false` and `capacity.exceeded = false`;
-- `failed`, `recovering`, `awaitingStream` and `catchupPending` are all 0;
-- `liveEligible + quarantined = selected`;
+- `failed`, `recovering` and `catchupPending` are all 0, and no symbol awaits
+  its stream on a connection that delivers nothing;
+- membership is consistent: every placed symbol is in exactly one known state
+  (live, quarantined, awaiting its stream, recovering, pending), and their
+  number matches `selected`;
 - the newest market message is under 3 minutes old;
 - the REST budget is not halted (418/429).
 
-Quarantine of the current bar is normal after a start or reconnect. It reads
-WARMING, and becomes degraded only after 35 minutes. Reconnect and
-backpressure counters are reported but never trigger a restart on their own.
+These are WARMING, not degraded: normal after a start or a reconnect:
+- symbols quarantined for the current bar;
+- quiet symbols awaiting their first update on a connection that **is**
+  delivering messages.
+
+The scanner itself detaches a symbol that stays silent on a healthy connection
+for `staleSymbolMs` (30 minutes) and recovers it. So the supervisor does not
+race it: WARMING becomes degraded only after 35 minutes, as
+`QUARANTINE_PERSISTENT` or `AWAITING_STREAM_PERSISTENT`. A symbol on a silent,
+closed or never-opened connection is a stream failure (`AWAITING_STREAM`) at
+once. A status without per-symbol detail, from an older scanner, is read
+strictly. Reconnect and backpressure counters are reported but never trigger
+a restart on their own.
+
+**Universe staleness.** The run's first universe refresh is due one interval
+(5 minutes) after the universe the run started with was read. After a
+FAST_RECOVERY start-up longer than that, it is due immediately. With no
+refresh successful yet, staleness counts from the end of start-up. Until the
+2026-10-24 acceptance it counted from the run's start, so a 7-minute start-up
+read as `UNIVERSE_STALE` before the first refresh was even due.
 
 **A status that disappears or cannot be read.** Before a role's first status
 of its own, a missing status means it is still starting up, with its own
@@ -426,10 +446,21 @@ Observatory soak ([native-signal-quality-observatory.md](native-signal-quality-o
 
 ## 10. Known limitations and follow-ups
 
-- **Not yet validated against the real machine.** The behaviour is proven with
-  a fake process table, file system and clock, and the emitter catch-up also
-  against the real Postgres ledger. The acceptance procedure above has not been
-  run.
+- **The first real-machine acceptance (2026-10-24) failed, and was fixed by
+  `fix/always-on-scanner-stability`.** The causes:
+  - stale symbol locks of a killed manual scanner, falsely held by a reused
+    pid;
+  - a first universe refresh scheduled after a long start-up while staleness
+    counted from the run's start;
+  - one quiet symbol awaiting its first stream update, read as two failures;
+  - empty role logs, because a detached `cmd.exe` gives children a hidden
+    console.
+
+  The acceptance must be repeated.
+- **Stop a manual scanner gracefully before starting Always-On** (Ctrl+C, so
+  its run writes STOPPED and releases its symbol locks). A killed scanner's
+  locks are reclaimed once its pid is gone, or proven to belong to a younger
+  process.
 - **No staleness policy for long-downtime backlogs** (section 4). Deciding one,
   for example requiring a rebaseline decision past a backlog age, is an
   operator follow-up.
