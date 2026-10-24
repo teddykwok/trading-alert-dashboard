@@ -656,7 +656,7 @@ export class AlwaysOnSupervisor {
    * fence is re-proven UNDER that lock.
    */
   private async mutate<T>(action: MutationAction, run: () => T): Promise<{ ran: true; result: T } | { ran: false; reason: string }> {
-    const held = await this.a.mutation(action, async (): Promise<{ fence: "CURRENT"; value: T } | { fence: "SUPERSEDED" | "UNKNOWN" }> => {
+    const held = await this.a.mutation(action, async (): Promise<{ fence: "CURRENT"; value: T } | { fence: "SUPERSEDED" } | { fence: "UNKNOWN" }> => {
       const fence = this.fenceState();
       if (fence !== "CURRENT") return { fence };
       return { fence, value: run() };
