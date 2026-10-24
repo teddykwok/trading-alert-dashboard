@@ -191,6 +191,33 @@ export function decideAdoption(children: readonly ChildRecord[], probe: (pid: nu
   return decisions;
 }
 
+export type SupervisorLiveness =
+  | { readonly kind: "RUNNING"; readonly generation: number; readonly pid: number }
+  | { readonly kind: "NOT_RUNNING" }
+  | { readonly kind: "UNKNOWN"; readonly reason: string };
+
+/**
+ * Whether the recorded supervisor is provably alive (pid + OS creation time +
+ * this repository), for stop / status / clear-latch. A file that could not be
+ * read, or a probe that could not be made, is UNKNOWN — never "not running":
+ * a stop must not report "exited" because one PowerShell probe failed.
+ */
+export function supervisorLiveness(readOwnershipText: () => string | null, probe: (pid: number) => ProbeOutcome): SupervisorLiveness {
+  let text: string | null;
+  try {
+    text = readOwnershipText();
+  } catch {
+    return { kind: "UNKNOWN", reason: "the ownership file could not be read" };
+  }
+  const read = parseOwnership(text);
+  if (read.kind === "UNREADABLE") return { kind: "UNKNOWN", reason: read.reason };
+  if (read.kind === "ABSENT" || read.file.supervisor === null) return { kind: "NOT_RUNNING" };
+  const supervisor = read.file.supervisor;
+  const probed = probe(supervisor.pid);
+  if (!probed.observed) return { kind: "UNKNOWN", reason: "the recorded supervisor process could not be observed" };
+  return verifyOwnership(supervisor, probed.process, read.file.repoRoot).owned ? { kind: "RUNNING", generation: read.file.generation, pid: supervisor.pid } : { kind: "NOT_RUNNING" };
+}
+
 // ---------------------------------------------------------------------------
 // The single-instance authority
 // ---------------------------------------------------------------------------

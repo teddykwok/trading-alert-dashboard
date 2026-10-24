@@ -7,7 +7,7 @@ import { ALWAYS_ON_DEFAULTS, ALWAYS_ON_INSTANCE_PORT, ALWAYS_ON_OWNERSHIP_SCHEMA
 import { judgeEmitterHealth, judgePlannerHealth, judgeScannerHealth, nextPlannerBaseline } from "../src/modules/always-on/always-on-health";
 import { IncidentJournal, redactIncidentText } from "../src/modules/always-on/always-on-journal";
 import { alwaysOnSupervisorArgs } from "../src/modules/always-on/always-on-launch";
-import { decideAdoption, generationIsCurrent, listenerInstanceLock, nextGeneration, parseOwnership, sameRepository, type ChildRecord } from "../src/modules/always-on/always-on-ownership";
+import { decideAdoption, generationIsCurrent, listenerInstanceLock, nextGeneration, parseOwnership, sameRepository, supervisorLiveness, type ChildRecord } from "../src/modules/always-on/always-on-ownership";
 import { alwaysOnPaths, childStopFile } from "../src/modules/always-on/always-on-paths";
 import {
   MonitoringPlanError,
@@ -219,6 +219,26 @@ describe("ownership records and the instance authority", () => {
     expect(sameRepository("C:\\repo", "c:\\REPO\\")).toBe(true);
     expect(sameRepository("C:\\repo", "C:/repo")).toBe(true);
     expect(sameRepository("C:\\repo", "C:\\repo-wt\\x")).toBe(false);
+  });
+
+  it("supervisor liveness for stop / status / clear-latch: a probe or read that FAILED is UNKNOWN, never 'not running'", () => {
+    const supervisor = { pid: 60, startedAtMs: 1_000, startedAt: "x", commandIdentity: "x", instancePort: 4019 };
+    const recorded = file({ generation: 7, supervisor });
+    const alive = () => ({ observed: true as const, process: { pid: 60, startedAtMs: 1_200, commandLine: "node C:\\repo\\apps\\backend\\src\\modules\\always-on\\run-always-on-monitoring.ts" } });
+    const failedProbe = () => ({ observed: false as const });
+    const failedRead = (): string | null => {
+      throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" });
+    };
+    expect(supervisorLiveness(() => recorded, alive)).toEqual({ kind: "RUNNING", generation: 7, pid: 60 });
+    // The finding: one failed PowerShell/CIM probe ended `stop`'s wait with "The supervisor has exited." (exit 0).
+    expect(supervisorLiveness(() => recorded, failedProbe)).toMatchObject({ kind: "UNKNOWN" });
+    expect(supervisorLiveness(failedRead, alive)).toMatchObject({ kind: "UNKNOWN" });
+    expect(supervisorLiveness(() => "{not json", alive)).toMatchObject({ kind: "UNKNOWN" });
+    // Proven absences stay NOT_RUNNING.
+    expect(supervisorLiveness(() => null, alive)).toEqual({ kind: "NOT_RUNNING" });
+    expect(supervisorLiveness(() => file({ supervisor: null }), alive)).toEqual({ kind: "NOT_RUNNING" });
+    expect(supervisorLiveness(() => recorded, () => ({ observed: true as const, process: null }))).toEqual({ kind: "NOT_RUNNING" });
+    expect(supervisorLiveness(() => recorded, () => ({ observed: true as const, process: { ...alive().process, startedAtMs: 9_000 } }))).toEqual({ kind: "NOT_RUNNING" });
   });
 
   it("the instance authority is exclusive on a real loopback port, and released on close", async () => {

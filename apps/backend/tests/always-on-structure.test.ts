@@ -142,6 +142,15 @@ describe("the Always-On supervisor's reach", () => {
     expect(code).toContain("selfStartedAtMs: selfStart,");
   });
 
+  it("the CLI's stop / status / clear-latch read the supervisor as RUNNING, NOT_RUNNING or UNKNOWN — only a PROVEN exit ends a stop's wait", () => {
+    const code = codeOf(ENTRY);
+    expect(code).toContain("supervisorLiveness(() => realFileSystem.readTextStrict(paths.ownership), probeProcess)");
+    expect(code).toMatch(/if \(still\.kind === "NOT_RUNNING"\) \{\s*say\("The supervisor has exited\."\);\s*return 0;\s*\}/);
+    expect((code.match(/The supervisor has exited\./g) ?? []).length).toBe(1);
+    // Neither a stop nor a clear-latch is written for a supervisor that could not be observed.
+    expect((code.match(/if \(live\.kind === "UNKNOWN"\) \{\s*say\(`The recorded supervisor could not be observed \(\$\{live\.reason\}\); nothing was requested\. Try again\.`\);\s*return 1;\s*\}/g) ?? []).length).toBe(2);
+  });
+
   it("the supervisor deletes nothing but its own request files and stop files: no cursor, namespace, checkpoint or log", () => {
     const code = codeOf(SUPERVISOR);
     // Two helpers are the only direct removers (both tolerate a held file)...

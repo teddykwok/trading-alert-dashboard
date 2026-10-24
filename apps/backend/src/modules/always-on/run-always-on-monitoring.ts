@@ -1,7 +1,6 @@
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 
-import { verifyOwnership } from "../operator/runtime-launcher";
 import { ALWAYS_ON_DEFAULTS, ALWAYS_ON_INSTANCE_PORT, ALWAYS_ON_NOTICE, ALWAYS_ON_REQUEST_SCHEMA, type AlwaysOnRole } from "./always-on-contract";
 import { ALWAYS_ON_CLI_USAGE, AlwaysOnCliUsageError, parseAlwaysOnCliArgs, type AlwaysOnRunRequest } from "./always-on-cli-args";
 import {
@@ -19,7 +18,7 @@ import {
   selfStartedAtMs,
   terminateTree,
 } from "./always-on-machine";
-import { parseOwnership, type OwnershipFile } from "./always-on-ownership";
+import { supervisorLiveness, type SupervisorLiveness } from "./always-on-ownership";
 import { AlwaysOnPathError, alwaysOnPaths, type AlwaysOnPaths } from "./always-on-paths";
 import { credentialNamesPresent } from "./always-on-roles";
 import { renderAlwaysOnStatus, type AlwaysOnStatusDto } from "./always-on-status";
@@ -58,19 +57,8 @@ function banner(title: string): void {
   say("==============================================================");
 }
 
-function readOwnership(paths: AlwaysOnPaths): OwnershipFile | null {
-  const read = parseOwnership(realFileSystem.readText(paths.ownership));
-  return read.kind === "VALID" ? read.file : null;
-}
-
-/** The recorded supervisor, if it is provably still running (pid + OS creation time + this repository). */
-function liveSupervisor(paths: AlwaysOnPaths): { readonly generation: number; readonly pid: number } | null {
-  const file = readOwnership(paths);
-  if (file === null || file.supervisor === null) return null;
-  const probed = probeProcess(file.supervisor.pid);
-  if (!probed.observed) return null;
-  return verifyOwnership(file.supervisor, probed.process, file.repoRoot).owned ? { generation: file.generation, pid: file.supervisor.pid } : null;
-}
+/** The recorded supervisor: provably RUNNING, provably NOT_RUNNING, or UNKNOWN (unreadable file, failed probe). */
+const liveSupervisor = (paths: AlwaysOnPaths): SupervisorLiveness => supervisorLiveness(() => realFileSystem.readTextStrict(paths.ownership), probeProcess);
 
 function readStatus(paths: AlwaysOnPaths): AlwaysOnStatusDto | null {
   const text = realFileSystem.readText(paths.status);
@@ -86,11 +74,18 @@ function printStatus(paths: AlwaysOnPaths, json: boolean): number {
   const status = readStatus(paths);
   const live = liveSupervisor(paths);
   if (json) {
-    say(JSON.stringify({ supervisorRunning: live !== null, status }, null, 2));
+    // null: it could not be observed this time (never reported as not running).
+    say(JSON.stringify({ supervisorRunning: live.kind === "UNKNOWN" ? null : live.kind === "RUNNING", status }, null, 2));
     return 0;
   }
   banner("ALWAYS-ON MONITORING — STATUS (read-only)");
-  say(live === null ? "Supervisor: NOT RUNNING (no live supervisor is recorded)" : `Supervisor: RUNNING (pid ${live.pid}, generation ${live.generation})`);
+  say(
+    live.kind === "RUNNING"
+      ? `Supervisor: RUNNING (pid ${live.pid}, generation ${live.generation})`
+      : live.kind === "NOT_RUNNING"
+        ? "Supervisor: NOT RUNNING (no live supervisor is recorded)"
+        : `Supervisor: UNKNOWN (${live.reason}; ask again)`
+  );
   if (status === null) {
     say("No status artifact yet.");
     return 0;
@@ -106,7 +101,11 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 async function requestStop(paths: AlwaysOnPaths, waitSeconds: number): Promise<number> {
   banner("ALWAYS-ON MONITORING — STOP");
   const live = liveSupervisor(paths);
-  if (live === null) {
+  if (live.kind === "UNKNOWN") {
+    say(`The recorded supervisor could not be observed (${live.reason}); nothing was requested. Try again.`);
+    return 1;
+  }
+  if (live.kind === "NOT_RUNNING") {
     say("No running Always-On supervisor is recorded; nothing was requested.");
     return 0;
   }
@@ -121,10 +120,13 @@ async function requestStop(paths: AlwaysOnPaths, waitSeconds: number): Promise<n
     const line = status === null ? "no status" : `${status.state} (${status.reasonCode})`;
     if (line !== last) say(`  ${stamp()}  ${line}`);
     last = line;
-    if (liveSupervisor(paths) === null) {
+    const still = liveSupervisor(paths);
+    // Only a PROVEN exit ends the wait: a probe or read that failed this once says nothing.
+    if (still.kind === "NOT_RUNNING") {
       say("The supervisor has exited.");
       return 0;
     }
+    if (still.kind === "UNKNOWN") say(`  ${stamp()}  the supervisor could not be observed this time (${still.reason}); still waiting`);
   }
   say(`Still running after ${waitSeconds}s; the stop continues in the supervisor (check: monitoring:always-on status).`);
   return 1;
@@ -133,7 +135,11 @@ async function requestStop(paths: AlwaysOnPaths, waitSeconds: number): Promise<n
 function requestClearLatch(paths: AlwaysOnPaths, role: AlwaysOnRole | null): number {
   banner("ALWAYS-ON MONITORING — CLEAR LATCH");
   const live = liveSupervisor(paths);
-  if (live === null) {
+  if (live.kind === "UNKNOWN") {
+    say(`The recorded supervisor could not be observed (${live.reason}); nothing was requested. Try again.`);
+    return 1;
+  }
+  if (live.kind === "NOT_RUNNING") {
     say("No running Always-On supervisor is recorded; nothing was requested (a fresh start begins with no latch).");
     return 0;
   }
