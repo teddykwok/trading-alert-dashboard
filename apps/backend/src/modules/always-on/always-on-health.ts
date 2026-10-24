@@ -96,6 +96,11 @@ export interface ScannerHealth {
     readonly failed: number | null;
     readonly recovering: number | null;
     readonly awaitingStream: number | null;
+    /**
+     * Of those, the ones awaiting their first update on a connection that IS delivering: quiet symbols, owned
+     * by the scanner's own per-symbol stale timeout. Null when the status carries no per-symbol detail.
+     */
+    readonly awaitingStreamQuiet: number | null;
     readonly catchupPending: number | null;
   };
   readonly lastMarketDataAt: string | null;
@@ -116,6 +121,7 @@ const NO_UNIVERSE: ScannerHealth["universe"] = {
   failed: null,
   recovering: null,
   awaitingStream: null,
+  awaitingStreamQuiet: null,
   catchupPending: null,
 };
 
@@ -175,6 +181,7 @@ export function judgeScannerHealth(input: {
     failed: num(totals.failed),
     recovering: num(totals.recovering),
     awaitingStream: num(totals.awaitingStream),
+    awaitingStreamQuiet: null,
     catchupPending: num(totals.catchupPending),
   };
   const base = {
@@ -201,26 +208,75 @@ export function judgeScannerHealth(input: {
   if (universe.stale === true) issues.push({ code: "UNIVERSE_STALE", detail: "the exchange universe has not refreshed for two intervals" });
   if (universe.capacityExceeded === true) issues.push({ code: "CAPACITY_EXCEEDED", detail: "the active universe exceeds the connection capacity" });
   const positive = (value: number | null) => value !== null && value > 0;
+  const detail = readinessDetail(parsed, input.nowMs, input.policy.marketDataFreshMs);
   if (positive(universe.failed)) issues.push({ code: "SYMBOLS_FAILED", detail: `${universe.failed} symbol(s) failed` });
   if (positive(universe.recovering)) issues.push({ code: "SYMBOLS_RECOVERING", detail: `${universe.recovering} symbol(s) recovering` });
-  if (positive(universe.awaitingStream)) issues.push({ code: "AWAITING_STREAM", detail: `${universe.awaitingStream} symbol(s) awaiting their stream` });
+  if (detail === null) {
+    // An older status with no per-symbol detail: no way to tell a quiet symbol from a dead stream — strict.
+    if (positive(universe.awaitingStream)) issues.push({ code: "AWAITING_STREAM", detail: `${universe.awaitingStream} symbol(s) awaiting their stream` });
+  } else if (detail.awaitingSilent > 0) {
+    // A symbol whose connection delivers nothing at all has no stream: that is a failure, whatever its bar.
+    issues.push({ code: "AWAITING_STREAM", detail: `${detail.awaitingSilent} symbol(s) awaiting their stream on a connection that delivers nothing` });
+  }
   if (positive(universe.catchupPending)) issues.push({ code: "CATCHUP_PENDING", detail: `${universe.catchupPending} symbol(s) waiting for catch-up` });
   const selected = universe.selected;
   if (selected === null || selected === 0) {
     issues.push({ code: "NO_SYMBOLS_SELECTED", detail: "the run has no selected symbols" });
-  } else if ((universe.liveEligible ?? 0) + (universe.quarantined ?? 0) !== selected) {
-    issues.push({
-      code: "MEMBERSHIP_INCONSISTENT",
-      detail: `selected ${selected} ≠ live ${universe.liveEligible ?? "?"} + quarantined ${universe.quarantined ?? "?"}`,
-    });
+  } else {
+    // Membership is the scanner's whole partition of its placed symbols; each state above is reported once, by its own code.
+    const why =
+      detail !== null
+        ? detail.placed !== selected
+          ? `selected ${selected} ≠ ${detail.placed} placed symbol(s) listed`
+          : detail.unexplained.length > 0
+            ? `${detail.unexplained.length} placed symbol(s) in no known state (${[...new Set(detail.unexplained)].slice(0, 5).join(", ")})`
+            : null
+        : (universe.liveEligible ?? 0) + (universe.quarantined ?? 0) > selected ||
+            (universe.liveEligible ?? 0) + (universe.quarantined ?? 0) + (universe.awaitingStream ?? 0) + (universe.recovering ?? 0) + (universe.catchupPending ?? 0) < selected
+          ? `selected ${selected} ≠ live ${universe.liveEligible ?? "?"} + quarantined ${universe.quarantined ?? "?"} + awaiting ${universe.awaitingStream ?? "?"} + recovering ${universe.recovering ?? "?"} + pending ${universe.catchupPending ?? "?"}`
+          : null;
+    if (why !== null) issues.push({ code: "MEMBERSHIP_INCONSISTENT", detail: why });
   }
   if (selected !== null && selected > 0 && (lastMarketMs === null || input.nowMs - lastMarketMs > input.policy.marketDataFreshMs)) {
     issues.push({ code: "MARKET_DATA_STALE", detail: lastMarketMs === null ? "no market data has been received" : `newest market data is ${Math.round((input.nowMs - lastMarketMs) / 1000)}s old` });
   }
   if (base.restHalted === true) issues.push({ code: "REST_HALTED", detail: "Binance rate-limited the scanner (418/429): its REST is halted for the run" });
 
-  const verdict: ScannerVerdict = issues.length > 0 ? "DEGRADED" : (universe.quarantined ?? 0) > 0 ? "WARMING" : "HEALTHY";
-  return { ...base, verdict, issues };
+  // WARMING: normal after a start or reconnect (current-bar quarantine, quiet symbols awaiting their first update on a
+  // delivering connection). The supervisor bounds how long it may last; the scanner's own per-symbol stale timeout acts first.
+  const warming = (universe.quarantined ?? 0) > 0 || (detail?.awaitingQuiet ?? 0) > 0;
+  const verdict: ScannerVerdict = issues.length > 0 ? "DEGRADED" : warming ? "WARMING" : "HEALTHY";
+  return { ...base, universe: { ...universe, awaitingStreamQuiet: detail === null ? null : detail.awaitingQuiet }, verdict, issues };
+}
+
+/** The placed symbols' readiness states a status may list; each is reported by its own code. */
+const KNOWN_PLACED_STATES: ReadonlySet<string> = new Set(["LIVE_ELIGIBLE", "QUARANTINED_CURRENT_BAR", "AWAITING_STREAM", "NOT_READY", "RECOVERING", "PENDING"]);
+
+/**
+ * The scanner's per-symbol and per-connection detail (it lists every symbol with its connection and readiness,
+ * and every connection with its lifecycle and last message). Null when the status carries none.
+ */
+function readinessDetail(parsed: Record<string, unknown>, nowMs: number, freshMs: number): { placed: number; awaitingQuiet: number; awaitingSilent: number; unexplained: string[] } | null {
+  if (!Array.isArray(parsed.symbols) || !Array.isArray(parsed.connections)) return null;
+  const delivering = new Map<number, boolean>();
+  for (const c of parsed.connections as unknown[]) {
+    if (!isRecord(c) || num(c.index) === null) return null;
+    const last = instantOf(c.lastMessageAt, nowMs);
+    delivering.set(num(c.index) as number, c.lifecycle === "OPEN" && last !== null && nowMs - last <= freshMs);
+  }
+  const result = { placed: 0, awaitingQuiet: 0, awaitingSilent: 0, unexplained: [] as string[] };
+  for (const s of parsed.symbols as unknown[]) {
+    if (!isRecord(s) || num(s.connection) === null || typeof s.readiness !== "string") return null;
+    const connection = num(s.connection) as number;
+    if (connection < 0) continue;
+    result.placed += 1;
+    if (!KNOWN_PLACED_STATES.has(s.readiness)) result.unexplained.push(s.readiness);
+    else if (s.readiness === "AWAITING_STREAM" || s.readiness === "NOT_READY") {
+      if (delivering.get(connection) === true) result.awaitingQuiet += 1;
+      else result.awaitingSilent += 1;
+    }
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

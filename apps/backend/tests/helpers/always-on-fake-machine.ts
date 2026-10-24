@@ -108,6 +108,8 @@ export class FakeMachine {
   scannerBehaviour: ScannerBehaviour = "healthy";
   scannerUniverse: ScannerShape = HEALTHY_UNIVERSE;
   scannerLastMessageAgoMs = 5_000;
+  /** Null: the compact status. Otherwise the full per-symbol / per-connection detail the real scanner writes. */
+  scannerDetail: { silentAwaiting: boolean } | null = null;
   /** The engine fingerprint each scanner run (by its spawn index) reports. */
   scannerEngine: (index: number) => string = () => ENGINE;
   emitterTracked: number | null = null;
@@ -189,6 +191,32 @@ export class FakeMachine {
     }
   }
 
+  /**
+   * The scanner's per-symbol and per-connection detail, as the real scanner writes it: connection 0 is OPEN and
+   * delivering; awaiting symbols sit on it ("quiet") unless `silentAwaiting` puts them on connection 1, which has
+   * never delivered anything.
+   */
+  private detailOf(u: ScannerShape, lastMessageAgoMs: number) {
+    const detail = this.scannerDetail as { silentAwaiting: boolean };
+    const lastValidMessageAt = new Date(this.now - lastMessageAgoMs).toISOString();
+    const symbols: { symbol: string; connection: number; status: string; readiness: string; lastValidMessageAt: string | null }[] = [];
+    const add = (n: number, readiness: string, connection: number, status = "ATTACHED") => {
+      for (let i = 0; i < n; i += 1) symbols.push({ symbol: `${readiness.slice(0, 3)}${symbols.length}USDT`, connection, status, readiness, lastValidMessageAt: readiness === "AWAITING_STREAM" ? null : lastValidMessageAt });
+    };
+    add(u.liveEligible, "LIVE_ELIGIBLE", 0);
+    add(u.quarantined, "QUARANTINED_CURRENT_BAR", 0);
+    add(u.awaitingStream, "AWAITING_STREAM", detail.silentAwaiting ? 1 : 0);
+    add(u.recovering, "RECOVERING", 0, "RECOVERING");
+    add(u.failed, "FAILED", -1, "FAILED");
+    return {
+      symbols,
+      connections: [
+        { index: 0, lifecycle: "OPEN", lastMessageAt: lastValidMessageAt },
+        { index: 1, lifecycle: "CONNECTING", lastMessageAt: null },
+      ],
+    };
+  }
+
   private scannerAutopilot(child: Child): void {
     const behaviour = this.scannerBehaviour;
     if (behaviour === "crash") {
@@ -214,7 +242,7 @@ export class FakeMachine {
         writtenAt: new Date(writtenAt).toISOString(),
         totals: { selected: u.selected, liveEligible: u.liveEligible, quarantined: u.quarantined, failed: u.failed, recovering: u.recovering, awaitingStream: u.awaitingStream, catchupPending: 0, reconnects: 7, backpressureEvents: 0, restRequests: 600, restHalted: false },
         universe: { generation: 3, stale: u.stale, exchangeCandidates: u.exchangeCandidates, capacity: { exceeded: u.capacityExceeded } },
-        symbols: [{ symbol: "AAAUSDT", lastValidMessageAt: new Date(this.now - lastMessageAgoMs).toISOString() }],
+        ...(this.scannerDetail === null ? { symbols: [{ symbol: "AAAUSDT", lastValidMessageAt: new Date(this.now - lastMessageAgoMs).toISOString() }] } : this.detailOf(u, lastMessageAgoMs)),
       })
     );
   }

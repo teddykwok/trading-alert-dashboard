@@ -96,6 +96,64 @@ describe("scanner health", () => {
   });
 });
 
+describe("scanner health with the scanner's per-symbol and per-connection detail", () => {
+  const judge = (text: string) => judgeScannerHealth({ statusText: text, nowMs: NOW, ownedRuntimePids: [777], policy: POLICY });
+  const at = (agoMs: number) => new Date(NOW - agoMs).toISOString();
+  /** A status as the real scanner writes it: every placed symbol with its connection and readiness, every connection. */
+  function detailed(spec: { readonly readiness: readonly { readonly readiness: string; readonly status?: string; readonly connection?: number }[]; readonly connections: readonly { readonly lifecycle: string; readonly lastMessageAgoMs: number | null }[]; readonly selected?: number }) {
+    const symbols = spec.readiness.map((r, i) => ({ symbol: `S${i}USDT`, connection: r.connection ?? 0, status: r.status ?? "ATTACHED", readiness: r.readiness, lastValidMessageAt: at(2_000) }));
+    const count = (pred: (s: (typeof symbols)[number]) => boolean) => symbols.filter(pred).length;
+    return scannerStatus(
+      {
+        symbols,
+        connections: spec.connections.map((c, index) => ({ index, lifecycle: c.lifecycle, assigned: count((s) => s.connection === index), lastMessageAt: c.lastMessageAgoMs === null ? null : at(c.lastMessageAgoMs) })),
+      },
+      {
+        selected: spec.selected ?? count((s) => s.connection >= 0),
+        liveEligible: count((s) => s.readiness === "LIVE_ELIGIBLE"),
+        quarantined: count((s) => s.readiness === "QUARANTINED_CURRENT_BAR"),
+        awaitingStream: count((s) => s.readiness === "AWAITING_STREAM" || s.readiness === "NOT_READY"),
+        recovering: count((s) => s.status === "RECOVERING"),
+      }
+    );
+  }
+  const many = (n: number, readiness: string, connection = 0) => Array.from({ length: n }, () => ({ readiness, connection }));
+
+  it("acceptance run 3, 16:19:15: 521 quarantined + ONE quiet symbol awaiting its first update on a delivering connection is WARMING — not AWAITING_STREAM, not MEMBERSHIP_INCONSISTENT", () => {
+    const health = judge(detailed({ readiness: [...many(521, "QUARANTINED_CURRENT_BAR"), { readiness: "AWAITING_STREAM" }], connections: [{ lifecycle: "OPEN", lastMessageAgoMs: 1_000 }] }));
+    expect(health).toMatchObject({ verdict: "WARMING", issues: [] });
+    expect(health.universe).toMatchObject({ selected: 522, quarantined: 521, awaitingStream: 1, awaitingStreamQuiet: 1 });
+  });
+
+  it("symbols awaiting their stream on a connection that delivers NOTHING (silent, never opened, closed) are a stream failure — DEGRADED at once, counted once", () => {
+    for (const connection of [
+      { lifecycle: "OPEN", lastMessageAgoMs: 10 * 60_000 },
+      { lifecycle: "OPEN", lastMessageAgoMs: null },
+      { lifecycle: "CONNECTING", lastMessageAgoMs: null },
+      { lifecycle: "CLOSED", lastMessageAgoMs: 5_000 },
+    ]) {
+      const health = judge(detailed({ readiness: [...many(40, "LIVE_ELIGIBLE", 0), ...many(10, "AWAITING_STREAM", 1)], connections: [{ lifecycle: "OPEN", lastMessageAgoMs: 1_000 }, connection] }));
+      expect({ connection, codes: health.issues.map((i) => i.code) }).toEqual({ connection, codes: ["AWAITING_STREAM"] });
+      expect(health.verdict).toBe("DEGRADED");
+    }
+  });
+
+  it("membership is the scanner's full partition: a placed symbol in no known state, or a selection that does not match the symbols, is MEMBERSHIP_INCONSISTENT", () => {
+    const connections = [{ lifecycle: "OPEN", lastMessageAgoMs: 1_000 }];
+    expect(judge(detailed({ readiness: [...many(20, "LIVE_ELIGIBLE"), { readiness: "RECOVERY_REQUIRED" }], connections })).issues.map((i) => i.code)).toEqual(["MEMBERSHIP_INCONSISTENT"]);
+    expect(judge(detailed({ readiness: many(20, "LIVE_ELIGIBLE"), connections, selected: 25 })).issues.map((i) => i.code)).toEqual(["MEMBERSHIP_INCONSISTENT"]);
+    // Recovering symbols are their own issue — never also an inconsistency.
+    expect(judge(detailed({ readiness: [...many(20, "LIVE_ELIGIBLE"), { readiness: "RECOVERING", status: "RECOVERING" }], connections })).issues.map((i) => i.code)).toEqual(["SYMBOLS_RECOVERING"]);
+    expect(judge(detailed({ readiness: many(20, "LIVE_ELIGIBLE"), connections })).verdict).toBe("HEALTHY");
+  });
+
+  it("a status without that detail (an older scanner) keeps the strict reading: an awaiting symbol is an issue — reported once, not twice", () => {
+    const health = judge(scannerStatus({}, { awaitingStream: 1, liveEligible: 521 }));
+    expect(health.issues.map((i) => i.code)).toEqual(["AWAITING_STREAM"]);
+    expect(health.universe.awaitingStreamQuiet).toBeNull();
+  });
+});
+
 describe("emitter health", () => {
   const status = (over: Record<string, unknown> = {}) =>
     JSON.stringify({

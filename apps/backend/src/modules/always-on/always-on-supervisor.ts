@@ -1300,14 +1300,25 @@ export class AlwaysOnSupervisor {
       return;
     }
     let issues = scanner.verdict === "AWAITING_STATUS" ? ["STATUS_MISSING"] : scanner.issues.map((i) => i.code as string);
+    const quiet = scanner.universe.awaitingStreamQuiet ?? 0;
     if (scanner.verdict === "WARMING") {
+      // Bounded: longer than the scanner's own per-symbol stale timeout, so a quiet symbol it failed to detach is caught too.
       rt.warmingSinceMs ??= now;
-      if (now - rt.warmingSinceMs >= p.quarantinePersistentMs) issues = ["QUARANTINE_PERSISTENT"];
+      if (now - rt.warmingSinceMs >= p.quarantinePersistentMs) {
+        issues = [...((scanner.universe.quarantined ?? 0) > 0 ? ["QUARANTINE_PERSISTENT"] : []), ...(quiet > 0 ? ["AWAITING_STREAM_PERSISTENT"] : [])];
+      }
     } else rt.warmingSinceMs = null;
     if (issues.length === 0) {
       rt.unhealthySinceMs = null;
       this.network.restoredAtMs = null;
-      this.markHealthy(role, now, scanner.verdict === "WARMING" ? "WARMING" : "HEALTHY", scanner.verdict === "WARMING" ? `coherent and fresh; ${scanner.universe.quarantined} symbol(s) quarantined for the current bar` : "coherent, fresh, every selected symbol live");
+      this.markHealthy(
+        role,
+        now,
+        scanner.verdict === "WARMING" ? "WARMING" : "HEALTHY",
+        scanner.verdict === "WARMING"
+          ? `coherent and fresh; ${scanner.universe.quarantined} symbol(s) quarantined for the current bar${quiet > 0 ? `, ${quiet} quiet symbol(s) awaiting their first update on a delivering connection` : ""}`
+          : "coherent, fresh, every selected symbol live"
+      );
       return;
     }
     // DEGRADED: grace, then the network gate, then one fenced recovery.
