@@ -12,6 +12,7 @@ import { listenerAuthority, withMutationLock, type ListenerHandle, type Mutation
 import { classifySpawnResult, parseProcessRows, parseProcessTreeRows, type Observation, type ObservedProcessNode } from "../operator/runtime-launcher";
 import { OWNERSHIP_PROOF_ATTEMPTS, type ProbeOutcome } from "../operator/worker-supervision";
 import type { AlwaysOnRole, PublicStreamProbeOutcome } from "./always-on-contract";
+import { judgeDirectoryAcl, type DrillDirectoryCheck } from "./always-on-drill";
 import { listenerInstanceLock, type InstanceLock } from "./always-on-ownership";
 import { alwaysOnRoleLog, type AlwaysOnPaths } from "./always-on-paths";
 import { genericEnvFilePath, type MonitoringSpawnPlan } from "./always-on-roles";
@@ -337,6 +338,26 @@ export function publicStreamReachable(options: { readonly timeoutMs?: number; re
     }
     for (const [type, listener] of listeners) socket.addEventListener(type, listener);
   });
+}
+
+/**
+ * The REAL Windows access rules of the directories an operator drill relies on (Get-Acl, inherited rules included,
+ * identities as SIDs) and this account's SID, judged by judgeDirectoryAcl: private only when nobody but this account,
+ * SYSTEM and Administrators can write them. A query that fails, or a path that cannot be quoted, is NOT private.
+ */
+export function verifyPrivateDirectories(dirs: readonly string[]): DrillDirectoryCheck {
+  if (dirs.length === 0 || dirs.some((d) => /[\r\n]/.test(d))) return { private: false, reason: "the directory list cannot be passed to the ACL query" };
+  const quoted = dirs.map((d) => `'${d.replace(/'/g, "''")}'`).join(",");
+  const out = powershell(
+    "$ErrorActionPreference = 'Stop'; " +
+      "'SID|' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; " +
+      `foreach ($d in @(${quoted})) { foreach ($r in (Get-Acl -LiteralPath $d).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) { ` +
+      "'{0}|{1}|{2}|{3}' -f $d, $r.IdentityReference.Value, $r.AccessControlType, [int]$r.FileSystemRights } }"
+  );
+  if (!out.ok) return { private: false, reason: `the access rules could not be read (${out.reason})` };
+  const lines = out.value.split(/\r?\n/);
+  const owner = (lines.find((line) => line.startsWith("SID|")) ?? "").slice(4).trim();
+  return judgeDirectoryAcl(lines.filter((line) => !line.startsWith("SID|")).join("\n"), dirs, owner);
 }
 
 export function genericEnvKeyNames(env: NodeJS.ProcessEnv): { readonly ok: true; readonly keys: string[] } | { readonly ok: false; readonly reason: string } {

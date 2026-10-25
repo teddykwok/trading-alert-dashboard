@@ -543,6 +543,8 @@ describe("what the authority records", () => {
       "ALWAYS_ON_STOP",
       "ALWAYS_ON_ROLE_START",
       "ALWAYS_ON_ROLE_STOP",
+      // The supervisor activating an operator-authorized drill for its own scanner run, fenced the same way.
+      "ALWAYS_ON_DRILL_START",
     ]);
   });
 });

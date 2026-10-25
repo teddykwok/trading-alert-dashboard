@@ -87,6 +87,8 @@ export const MUTATION_ACTIONS = [
   "ALWAYS_ON_STOP",
   "ALWAYS_ON_ROLE_START",
   "ALWAYS_ON_ROLE_STOP",
+  // The Always-On supervisor writing an operator-authorized drill file for its own scanner run (fenced like a role start).
+  "ALWAYS_ON_DRILL_START",
 ] as const;
 
 export type MutationAction = (typeof MUTATION_ACTIONS)[number];

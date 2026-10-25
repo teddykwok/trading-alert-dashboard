@@ -4,6 +4,7 @@ import type { BuildVerdict } from "../operator/generic-backend-nonwatch-launcher
 import type { MutationAction, WithAuthorityResult } from "../operator/mutation-lock";
 import { verifyOwnership, type Observation, type ObservedProcessNode } from "../operator/runtime-launcher";
 import { executeFencedStart, executeFencedStop, type ProbeOutcome } from "../operator/worker-supervision";
+import { drillFileOf, publicTransportDrillText, type PublicTransportDrill } from "../native-scanner/public-transport-drill";
 import {
   ALWAYS_ON_NOTICE,
   ALWAYS_ON_OWNERSHIP_SCHEMA,
@@ -28,6 +29,17 @@ import {
   type PlannerHealth,
   type ScannerHealth,
 } from "./always-on-health";
+import {
+  ALWAYS_ON_DRILL_FAULTS,
+  commandLineInRepository,
+  controllerIsDrillCli,
+  judgeDrillStart,
+  parseDrillStartRequest,
+  type DrillController,
+  type DrillControllerCheck,
+  type DrillDirectoryCheck,
+  type DrillProbeFaults,
+} from "./always-on-drill";
 import { IncidentJournal, type IncidentEvent } from "./always-on-journal";
 import { decideAdoption, generationIsCurrent, nextGeneration, parseOwnership, serializeOwnership, type ChildRecord, type OwnershipFile } from "./always-on-ownership";
 import { childStopFile, emitterCommitStatus, scannerRunManifest, type AlwaysOnPaths } from "./always-on-paths";
@@ -41,7 +53,7 @@ import {
   type MonitoringCensus,
   type MonitoringSpawnPlan,
 } from "./always-on-roles";
-import type { AlwaysOnRoleView, AlwaysOnStatusDto } from "./always-on-status";
+import type { AlwaysOnDrillView, AlwaysOnRoleView, AlwaysOnStatusDto } from "./always-on-status";
 
 /**
  * THE ALWAYS-ON MONITORING SUPERVISOR.
@@ -155,6 +167,11 @@ export interface AlwaysOnAdapters {
    * Never a credential. Asked only when the scanner's own status points at its streams (streamOutageConfirmed).
    */
   readonly publicStreamConnectivity: () => Promise<PublicStreamProbeOutcome>;
+  /**
+   * The Windows ACL of the directories an operator drill relies on: private when nobody but this account, SYSTEM and
+   * Administrators can write them. Asked only for a drill request; a throw is "not private".
+   */
+  readonly verifyPrivateDirectories: (dirs: readonly string[]) => DrillDirectoryCheck;
   readonly buildVerdict: () => BuildVerdict;
   /** The KEY NAMES the generic env file declares (never a value), or why it could not be read. */
   readonly genericEnvKeyNames: () => { readonly ok: true; readonly keys: string[] } | { readonly ok: false; readonly reason: string };
@@ -180,6 +197,25 @@ const freshStreamPath = (): StreamPathState => ({ unavailableSinceMs: null, last
 
 /** The only scanner issues a public stream outage explains. Any other issue keeps the normal recovery path. */
 const STREAM_EXPLAINED_ISSUES: ReadonlySet<string> = new Set(["AWAITING_STREAM", "MARKET_DATA_STALE", "SYMBOLS_RECOVERING"]);
+
+/**
+ * An operator drill this generation activated (always-on-drill.ts): bound to ONE owned scanner child (its pid and
+ * spawn sequence) and that child's run, with the faults it hands this supervisor's own probes while it lasts. Kept
+ * after it ends, so its restore can be confirmed and reported, until the next accepted drill replaces it.
+ */
+interface ActiveDrill {
+  readonly drill: PublicTransportDrill;
+  readonly file: string;
+  readonly childPid: number;
+  readonly childSequence: number;
+  readonly probes: DrillProbeFaults;
+  readonly controller: DrillController;
+  endedAtMs: number | null;
+  endReason: string | null;
+  fileRemoved: boolean | null;
+  activation: AlwaysOnDrillView["activation"];
+  restore: AlwaysOnDrillView["restore"];
+}
 
 /** An error's code for the journal (an fs code such as EPERM, or the error's name) — never its message. */
 function errorCode(error: unknown): string {
@@ -287,6 +323,10 @@ export class AlwaysOnSupervisor {
     restoredAtMs: null,
   };
   private stream: StreamPathState = freshStreamPath();
+  /** The operator drill of this generation, if one was ever accepted (null: none — production behaviour). */
+  private drill: ActiveDrill | null = null;
+  /** Every drill request id this generation has judged: an authorization is used once. */
+  private readonly drillRequestIds = new Set<string>();
   private dataStore: "AVAILABLE" | "UNAVAILABLE" | "UNKNOWN" = "UNKNOWN";
   private lastTickAtMs: number | null = null;
   /** When supervision last resumed after a clock gap (sleep / hibernate): no status older than this proves a hang. */
@@ -478,6 +518,7 @@ export class AlwaysOnSupervisor {
     this.reportExternal(census);
 
     if (this.shutdown) {
+      await this.consumeDrillStart(null, now);
       await this.advanceShutdown(now);
       this.writeStatus();
       return this.shutdown.done ? "STOPPED" : this.fenced ? "FENCED" : "CONTINUE";
@@ -527,6 +568,9 @@ export class AlwaysOnSupervisor {
     await this.superviseEmitter(emitter, scanner, census, now);
     if (this.fenced) return "FENCED";
     await this.supervisePlanner(planner, backendOk, census, now);
+    if (this.fenced) return "FENCED";
+    // An operator drill request is judged on this pass's evidence, after every decision it could interfere with.
+    await this.consumeDrillStart(scanner, now);
     if (this.fenced) return "FENCED";
 
     this.computeOverallState(now);
@@ -1769,6 +1813,161 @@ export class AlwaysOnSupervisor {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // The operator network drill (always-on-drill.ts)
+  // ---------------------------------------------------------------------------
+
+  /** A drill is active from its acceptance until it ends (and never past its expiry or its scanner child). */
+  private drillIsActive(now: number): boolean {
+    const d = this.drill;
+    return d !== null && d.endedAtMs === null && now < d.drill.expiresAtMs && this.children.scanner?.pid === d.childPid && this.children.scanner.sequence === d.childSequence;
+  }
+
+  /** The controller a request names: a live node process of THIS repository running `drill start`, its creation time matching. */
+  private verifyDrillController(controller: DrillController): DrillControllerCheck {
+    const probed = this.a.probe(controller.pid);
+    if (!probed.observed) return "UNOBSERVABLE";
+    const found = probed.process;
+    if (found === null || Math.abs(found.startedAtMs - controller.startedAtMs) > 1_000) return "NOT_VERIFIED";
+    return controllerIsDrillCli(found.commandLine) && commandLineInRepository(found.commandLine, this.config.repoRoot) ? "VERIFIED" : "NOT_VERIFIED";
+  }
+
+  private drillDirectoriesPrivate(): DrillDirectoryCheck {
+    try {
+      return this.a.verifyPrivateDirectories([this.a.paths.dir, this.a.paths.requestsDir, this.a.paths.stopDir]);
+    } catch (error) {
+      return { private: false, reason: `the access rules could not be read (${errorCode(error)})` };
+    }
+  }
+
+  private rejectDrill(reasonCode: string, detail: string, requestId: string | null, facts: Record<string, string | number | null> = {}): void {
+    this.record({ kind: "DRILL_REJECTED", role: "scanner", reasonCode, detail: `drill request refused: ${detail}; nothing was drilled`, facts: { requestId, ...facts } });
+  }
+
+  /**
+   * Consumes an operator drill request (once, and only after its file is gone) and judges it. Accepted, the drill file
+   * is written beside the owned scanner's own stop file — under the launcher's mutation lock, the generation fence
+   * re-checked under it — naming that scanner's run and the drill's window; the scanner applies it on its own.
+   */
+  private async consumeDrillStart(scanner: ScannerHealth | null, now: number): Promise<void> {
+    const text = this.a.fs.readText(this.a.paths.drillRequest);
+    if (text === null || !this.removeRequest(this.a.paths.drillRequest)) return;
+    const parsed = parseDrillStartRequest(text);
+    if (!parsed.ok) {
+      this.rejectDrill(parsed.reason, "the request could not be read as a valid drill request", parsed.requestId);
+      return;
+    }
+    const request = parsed.request;
+    const child = this.children.scanner;
+    const run = this.scannerRun;
+    const ownedRunId = child !== null && scanner !== null && scanner.ours && run !== null && run.runId === scanner.runId ? run.runId : null;
+    const verdict = judgeDrillStart(request, {
+      nowMs: now,
+      generation: this.generation,
+      scanner: {
+        owned: child !== null && child.stopFile !== null && this.config.roles.includes("scanner"),
+        runId: ownedRunId,
+        healthy: this.rt.scanner.state === "RUNNING" && scanner !== null && (scanner.verdict === "HEALTHY" || scanner.verdict === "WARMING"),
+      },
+      recoveryActive: this.recovery !== null,
+      shuttingDown: this.shutdown !== null,
+      drillActive: this.drillIsActive(now),
+      seenRequestIds: this.drillRequestIds,
+      controller: this.verifyDrillController(request.controller),
+      directories: this.drillDirectoriesPrivate(),
+    });
+    this.drillRequestIds.add(request.requestId);
+    const facts = { generation: request.generation, runId: request.runId, fault: request.fault, durationSeconds: request.durationSeconds, controllerPid: request.controller.pid, controllerUser: request.controller.user };
+    if (!verdict.accept) {
+      this.rejectDrill(verdict.reasonCode, verdict.detail, request.requestId, facts);
+      return;
+    }
+    const owned = child as ChildRecord;
+    const spec = ALWAYS_ON_DRILL_FAULTS[request.fault];
+    const drill: PublicTransportDrill = {
+      drillId: request.requestId,
+      fault: request.fault,
+      runId: request.runId,
+      generation: this.generation,
+      startedAtMs: now,
+      expiresAtMs: now + request.durationSeconds * 1_000,
+      faults: spec.scanner,
+    };
+    const file = drillFileOf(owned.stopFile as string);
+    const wrote = await this.mutate("ALWAYS_ON_DRILL_START", (): string | null => {
+      try {
+        this.a.fs.writeTextAtomic(file, publicTransportDrillText(drill));
+        return null;
+      } catch (error) {
+        return errorCode(error);
+      }
+    });
+    if (!wrote.ran) {
+      if (this.fenced) return;
+      this.rejectDrill(
+        wrote.reason === "OWNERSHIP_UNREADABLE" ? "OWNERSHIP_UNREADABLE" : "MUTATION_AUTHORITY_BUSY",
+        `the drill file is written only under the launcher's mutation lock with the generation fence re-checked (${wrote.reason})`,
+        request.requestId,
+        facts
+      );
+      return;
+    }
+    if (wrote.result !== null) {
+      this.removeQuietly(file);
+      this.rejectDrill("DRILL_FILE_WRITE_FAILED", `the drill file could not be written (${wrote.result})`, request.requestId, facts);
+      return;
+    }
+    this.drill = {
+      drill,
+      file,
+      childPid: owned.pid,
+      childSequence: owned.sequence,
+      probes: spec.probes,
+      controller: request.controller,
+      endedAtMs: null,
+      endReason: null,
+      fileRemoved: null,
+      activation: "PENDING",
+      restore: "NOT_ENDED",
+    };
+    this.record({
+      kind: "DRILL_STARTED",
+      role: "scanner",
+      reasonCode: request.fault,
+      detail: `operator drill ${request.fault} on run ${request.runId} (${spec.summary}) until ${new Date(drill.expiresAtMs).toISOString()}; restored automatically at the latest then`,
+      facts: {
+        requestId: request.requestId,
+        drillId: drill.drillId,
+        ...facts,
+        generation: this.generation,
+        startedAt: new Date(drill.startedAtMs).toISOString(),
+        expiresAt: new Date(drill.expiresAtMs).toISOString(),
+        file: path.basename(file),
+      },
+    });
+  }
+
+  /** The status view of the drill (null: none was ever accepted by this generation). */
+  private drillView(): AlwaysOnDrillView | null {
+    const d = this.drill;
+    if (d === null) return null;
+    return {
+      drillId: d.drill.drillId,
+      fault: d.drill.fault,
+      generation: d.drill.generation,
+      runId: d.drill.runId,
+      state: d.endedAtMs === null ? "ACTIVE" : "ENDED",
+      startedAt: new Date(d.drill.startedAtMs).toISOString(),
+      expiresAt: new Date(d.drill.expiresAtMs).toISOString(),
+      endedAt: d.endedAtMs === null ? null : new Date(d.endedAtMs).toISOString(),
+      endReason: d.endReason,
+      fileRemoved: d.fileRemoved,
+      activation: d.activation,
+      restore: d.restore,
+      controller: { pid: d.controller.pid, user: d.controller.user },
+    };
+  }
+
   private removeRequest(file: string): boolean {
     try {
       this.a.fs.remove(file);
@@ -1936,6 +2135,11 @@ export class AlwaysOnSupervisor {
       external: { soakMonitorPids: this.latest.census?.soakMonitors ?? [], otherSupervisorPids: this.latest.census?.otherSupervisors ?? [] },
       counters: { ticks: this.counters.ticks, scannerRecoveries: this.counters.scannerRecoveries, restarts: { ...this.counters.restarts } },
       recentIncidents: this.journal.latest(10),
+      // Present only once this generation accepted a drill: a status without one is exactly the one written before drills existed.
+      ...((): { drill?: AlwaysOnDrillView } => {
+        const view = this.drillView();
+        return view === null ? {} : { drill: view };
+      })(),
     };
   }
 

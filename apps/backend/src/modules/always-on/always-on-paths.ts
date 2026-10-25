@@ -13,8 +13,9 @@ import type { AlwaysOnRole } from "./always-on-contract";
  *     ownership.json   the owning supervisor generation and its children (atomic replace)
  *     status.json      teddy.native-monitoring.always-on-status.v1 (atomic replace, every tick)
  *     incidents.jsonl  append-only transitions journal (fsync per line)
- *     requests\        operator requests (stop, clear-latch) the running supervisor consumes
- *     stop\            one cooperative stop file per spawned scanner/emitter child
+ *     requests\        operator requests (stop, clear-latch, drill, drill-restore) the running supervisor consumes
+ *     stop\            one cooperative stop file per spawned scanner/emitter child, and the owned scanner's
+ *                     drill file beside its stop file while an operator drill is active (always-on-drill.ts)
  *   %LOCALAPPDATA%\trading-alert-dashboard\logs\always-on-<role>.log   each child's stdout+stderr
  *
  * No path here is derived from anything an operator types except the profile
@@ -29,6 +30,10 @@ export interface AlwaysOnPaths {
   readonly requestsDir: string;
   readonly stopRequest: string;
   readonly clearLatchRequest: string;
+  /** An operator's drill request (`monitoring:always-on drill start`), consumed once by the running supervisor. */
+  readonly drillRequest: string;
+  /** An operator's drill restore request: honoured by any running generation (it can only end a fault). */
+  readonly drillRestoreRequest: string;
   readonly stopDir: string;
   readonly logsDir: string;
   readonly scannerRoot: string;
@@ -58,6 +63,8 @@ export function alwaysOnPaths(env: NodeJS.ProcessEnv): AlwaysOnPaths {
     requestsDir,
     stopRequest: path.join(requestsDir, "stop.json"),
     clearLatchRequest: path.join(requestsDir, "clear-latch.json"),
+    drillRequest: path.join(requestsDir, "drill.json"),
+    drillRestoreRequest: path.join(requestsDir, "drill-restore.json"),
     stopDir: path.join(dir, "stop"),
     logsDir: path.join(root, "logs"),
     scannerRoot,

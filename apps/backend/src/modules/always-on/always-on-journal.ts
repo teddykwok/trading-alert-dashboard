@@ -66,6 +66,16 @@ export const INCIDENT_KINDS = Object.freeze([
   "DATA_STORE_UNAVAILABLE",
   "DATA_STORE_RESTORED",
   "EXTERNAL_MONITORING_PROCESS",
+  // The operator network drill (always-on-drill.ts): every request, start, end and confirmation.
+  "DRILL_REJECTED",
+  "DRILL_STARTED",
+  "DRILL_ACTIVATION_CONFIRMED",
+  "DRILL_ACTIVATION_UNCONFIRMED",
+  "DRILL_RESTORE_REQUESTED",
+  "DRILL_ENDED",
+  "DRILL_RESTORE_CONFIRMED",
+  "DRILL_RESTORE_UNCONFIRMED",
+  "DRILL_STALE_REMOVED",
 ] as const);
 export type IncidentKind = (typeof INCIDENT_KINDS)[number];
 

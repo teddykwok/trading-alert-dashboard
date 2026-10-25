@@ -46,6 +46,30 @@ export interface AlwaysOnRoleView {
   readonly externalPids: readonly number[];
 }
 
+/**
+ * The operator network drill of the writing generation (always-on-drill.ts). Absent from an artifact that never had
+ * one, including every artifact written before drills existed: readers show nothing, never an invented drill.
+ */
+export interface AlwaysOnDrillView {
+  readonly drillId: string;
+  readonly fault: string;
+  readonly generation: number;
+  readonly runId: string;
+  readonly state: "ACTIVE" | "ENDED";
+  readonly startedAt: string;
+  /** The restoration deadline: the scanner ends the drill on its own at the latest then. */
+  readonly expiresAt: string;
+  readonly endedAt: string | null;
+  readonly endReason: string | null;
+  /** Whether the drill file is gone (null: not ended yet). */
+  readonly fileRemoved: boolean | null;
+  /** The scanner's own status shows it applied the drill — or did not within the status freshness window. */
+  readonly activation: "PENDING" | "CONFIRMED" | "UNCONFIRMED";
+  /** The scanner's own status (or its exit) shows the drill is over — never claimed without that evidence. */
+  readonly restore: "NOT_ENDED" | "PENDING" | "CONFIRMED" | "UNCONFIRMED" | "REMOVAL_FAILED";
+  readonly controller: { readonly pid: number; readonly user: string };
+}
+
 export interface AlwaysOnStatusDto {
   readonly schema: typeof ALWAYS_ON_STATUS_SCHEMA;
   readonly notice: readonly string[];
@@ -82,6 +106,7 @@ export interface AlwaysOnStatusDto {
   readonly external: { readonly soakMonitorPids: readonly number[]; readonly otherSupervisorPids: readonly number[] };
   readonly counters: { readonly ticks: number; readonly scannerRecoveries: number; readonly restarts: Readonly<Record<AlwaysOnRole, number>> };
   readonly recentIncidents: readonly IncidentRecord[];
+  readonly drill?: AlwaysOnDrillView | null;
 }
 
 const age = (iso: string | null, nowMs: number) => (iso === null ? "-" : `${Math.max(0, Math.round((nowMs - Date.parse(iso)) / 1000))}s ago`);
@@ -102,6 +127,14 @@ export function renderAlwaysOnStatus(status: AlwaysOnStatusDto, nowMs: number): 
     `  data store   ${status.dataStore}; public network ${status.network.reachable === null ? "not probed" : status.network.reachable ? "reachable" : `UNREACHABLE since ${status.network.unavailableSince ?? "?"}`}` +
       (stream === null ? "; public streams not recorded" : unreachableSince !== null ? `; public streams UNREACHABLE since ${unreachableSince}` : "")
   );
+  const drill = status.drill ?? null;
+  if (drill !== null) {
+    lines.push(
+      `  DRILL        ${drill.fault} ${drill.state} on run ${drill.runId}: started ${drill.startedAt}, restored by ${drill.expiresAt} at the latest` +
+        (drill.state === "ENDED" ? `; ended ${drill.endedAt ?? "?"} (${drill.endReason ?? "?"}), restore ${drill.restore}` : `; activation ${drill.activation}`) +
+        ` (controller pid ${drill.controller.pid}, ${drill.controller.user})`
+    );
+  }
   for (const role of ALWAYS_ON_ROLES) {
     const view = status.roles[role];
     const owned = view.owned === null ? "not owned" : `root pid ${view.owned.rootPid}${view.owned.runtimePids.length > 0 ? ` (runtime ${view.owned.runtimePids.join(",")})` : ""}`;

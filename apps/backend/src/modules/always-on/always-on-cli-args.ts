@@ -1,6 +1,7 @@
 import { SupervisorCliUsageError, parseSupervisorCliArgs } from "../native-scanner/live-shadow-supervisor-cli-args";
 import { ScannerProfileError, engineFingerprintOf, resolveScannerProfile } from "../native-scanner/scanner-profile";
 import { ALWAYS_ON_DEFAULT_PROFILE, ALWAYS_ON_DEFAULTS, ALWAYS_ON_ROLES, type AlwaysOnRole } from "./always-on-contract";
+import { ALWAYS_ON_DRILL_FAULT_NAMES, ALWAYS_ON_DRILL_MAX_SECONDS, ALWAYS_ON_DRILL_MIN_SECONDS, isDrillFault, type AlwaysOnDrillFault } from "./always-on-drill";
 
 /**
  * Arguments for `monitoring:always-on`. MONITORING ONLY: there is no account,
@@ -12,6 +13,8 @@ import { ALWAYS_ON_DEFAULT_PROFILE, ALWAYS_ON_DEFAULTS, ALWAYS_ON_ROLES, type Al
  *   stop          ask the running supervisor to stop the stack gracefully, and wait
  *   clear-latch   ask the running supervisor to clear a latched role
  *   startup-task  PRINT the Windows Task Scheduler command for a logon start (never registers anything)
+ *   drill         the operator network drill (always-on-drill.ts): start one against the running supervisor's
+ *                 generation and scanner run, restore, or show it — the ONLY way a drill can ever be requested
  */
 
 export class AlwaysOnCliUsageError extends Error {
@@ -31,6 +34,11 @@ export const ALWAYS_ON_CLI_USAGE = [
   "  monitoring:always-on clear-latch [--role backend|scanner|emitter|planner]",
   "  monitoring:always-on startup-task [--task-name TeddyAlwaysOnMonitoring] [--emitter-activate-at-eof] [--write]",
   "      (prints the Task Scheduler XML and commands; --write saves the XML outside the repository; it NEVER registers a task)",
+  `  monitoring:always-on drill start --fault <${ALWAYS_ON_DRILL_FAULT_NAMES.join("|")}>`,
+  `      --duration-seconds <${ALWAYS_ON_DRILL_MIN_SECONDS}-${ALWAYS_ON_DRILL_MAX_SECONDS}> --generation <running generation> --run-id <its scanner run id>`,
+  "      (operator network drill: public market-data transport faults inside the owned scanner and the supervisor's probes only; restored automatically at expiry)",
+  "  monitoring:always-on drill restore   (ends any drill now; also removes a drill file a stopped supervisor left behind)",
+  "  monitoring:always-on drill status",
 ].join("\n");
 
 export interface AlwaysOnRunRequest {
@@ -53,7 +61,10 @@ export type AlwaysOnCliRequest =
   | { readonly command: "status"; readonly json: boolean }
   | { readonly command: "stop"; readonly waitSeconds: number }
   | { readonly command: "clear-latch"; readonly role: AlwaysOnRole | null }
-  | { readonly command: "startup-task"; readonly taskName: string; readonly emitterActivateAtEof: boolean; readonly write: boolean };
+  | { readonly command: "startup-task"; readonly taskName: string; readonly emitterActivateAtEof: boolean; readonly write: boolean }
+  | { readonly command: "drill-start"; readonly fault: AlwaysOnDrillFault; readonly durationSeconds: number; readonly generation: number; readonly runId: string }
+  | { readonly command: "drill-restore" }
+  | { readonly command: "drill-status" };
 
 const usage = (message: string): never => {
   throw new AlwaysOnCliUsageError(message);
@@ -106,6 +117,23 @@ export function parseAlwaysOnCliArgs(argv: readonly string[]): AlwaysOnCliReques
     const taskName = values.get("--task-name") ?? "TeddyAlwaysOnMonitoring";
     if (!/^[A-Za-z][A-Za-z0-9_-]{2,63}$/.test(taskName)) usage("--task-name must be letters, digits, - or _ (3-64 characters, starting with a letter)");
     return { command: "startup-task", taskName, emitterActivateAtEof: flags.has("--emitter-activate-at-eof"), write: flags.has("--write") };
+  }
+  if (command === "drill") {
+    const [sub, ...drillArgs] = rest;
+    if (sub === "restore" || sub === "status") {
+      parseFlags(drillArgs, [], []);
+      return { command: sub === "restore" ? "drill-restore" : "drill-status" };
+    }
+    if (sub !== "start") return usage(sub === undefined ? "drill needs start, restore or status" : `unknown drill command: ${sub}`);
+    const { values } = parseFlags(drillArgs, ["--fault", "--duration-seconds", "--generation", "--run-id"], []);
+    const required = (name: string): string => values.get(name) ?? usage(`drill start needs ${name}`);
+    const fault = required("--fault");
+    if (!isDrillFault(fault)) usage(`--fault must be one of ${ALWAYS_ON_DRILL_FAULT_NAMES.join(", ")}`);
+    const durationSeconds = bounded(required("--duration-seconds"), "--duration-seconds", ALWAYS_ON_DRILL_MIN_SECONDS, ALWAYS_ON_DRILL_MAX_SECONDS, 0);
+    const generation = bounded(required("--generation"), "--generation", 1, 1_000_000_000, 0);
+    const runId = required("--run-id");
+    if (!/^\d{8}T\d{6}Z-[0-9a-f]{8}$/.test(runId)) usage("--run-id must be the scanner run id the status shows (yyyymmddThhmmssZ-xxxxxxxx)");
+    return { command: "drill-start", fault: fault as AlwaysOnDrillFault, durationSeconds, generation, runId };
   }
   if (command !== "run") return usage(command === undefined ? "a command is required" : `unknown command: ${command}`);
 
