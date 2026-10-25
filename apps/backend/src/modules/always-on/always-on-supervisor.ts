@@ -531,6 +531,7 @@ export class AlwaysOnSupervisor {
     this.reconcileChildren(tree.value, now);
     if (this.fenced) return "FENCED";
     this.endDrillWhenTargetGone(now);
+    this.removeUnauthorizedDrillFile();
     const census = monitoringCensus(tree.value, this.ownedRoots(), this.a.selfPid);
     this.latest.census = census;
     this.reportExternal(census);
@@ -2037,6 +2038,28 @@ export class AlwaysOnSupervisor {
     const child = this.children.scanner;
     if (child === null || child.pid !== d.childPid || child.sequence !== d.childSequence) this.endDrill(now, "RUN_ENDED");
     else if (!this.a.fs.exists(d.file)) this.endDrill(now, "FILE_REMOVED_EXTERNALLY");
+  }
+
+  /**
+   * A drill file beside the owned scanner's stop file that this supervisor did not write (planted directly, bypassing
+   * the request and its checks) is removed on sight and journaled: it lasts at most one supervision pass, never
+   * reaches the probes, and is never mistaken for an accepted drill. The supervisor's own file — active, or ended and
+   * awaiting a removal retry — is left to the drill's own lifecycle.
+   */
+  private removeUnauthorizedDrillFile(): void {
+    const child = this.children.scanner;
+    if (child === null || child.stopFile === null) return;
+    const unauthorized = drillFileOf(child.stopFile);
+    if (this.drill?.file === unauthorized || !this.a.fs.exists(unauthorized)) return;
+    this.removeQuietly(unauthorized);
+    const removed = !this.a.fs.exists(unauthorized);
+    this.record({
+      kind: "DRILL_UNAUTHORIZED_FILE_REMOVED",
+      role: "scanner",
+      reasonCode: removed ? "NOT_WRITTEN_BY_THIS_SUPERVISOR" : "NOT_WRITTEN_BY_THIS_SUPERVISOR_REMOVAL_FAILED",
+      detail: `a drill file this supervisor did not write was found beside the owned scanner's stop file and ${removed ? "removed" : "could NOT be removed (retried every pass; it still ends at its own expiry)"}`,
+      facts: { file: path.basename(unauthorized), removed },
+    });
   }
 
   /**

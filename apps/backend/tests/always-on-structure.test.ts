@@ -188,7 +188,7 @@ describe("the Always-On supervisor's reach", () => {
       // ...or the operator drill's own request files and its drill file (beside the owned scanner's stop file).
       expect({
         line: line.trim(),
-        allowed: /paths\.stopRequest|paths\.clearLatchRequest|paths\.drillRequest|paths\.drillRestoreRequest|paths\.stopDir|child\.stopFile|removeStopFile\(child\)|removeStopFile\(\{ stopFile \} as ChildRecord\)|removeQuietly\(d\.file\)|removeQuietly\(drillFile\)/.test(line),
+        allowed: /paths\.stopRequest|paths\.clearLatchRequest|paths\.drillRequest|paths\.drillRestoreRequest|paths\.stopDir|child\.stopFile|removeStopFile\(child\)|removeStopFile\(\{ stopFile \} as ChildRecord\)|removeQuietly\(d\.file\)|removeQuietly\(drillFile\)|removeQuietly\(unauthorized\)/.test(line),
       }).toEqual({ line: line.trim(), allowed: true });
     }
     for (const file of AO_FILES) {

@@ -1,9 +1,10 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { drillStartRequestText, type DrillStartRequest } from "../src/modules/always-on/always-on-drill";
 import { renderAlwaysOnStatus } from "../src/modules/always-on/always-on-status";
 import type { AlwaysOnSupervisor } from "../src/modules/always-on/always-on-supervisor";
-import { PublicTransportDrillGate, drillFileOf, parsePublicTransportDrill } from "../src/modules/native-scanner/public-transport-drill";
+import { PublicTransportDrillGate, drillFileOf, parsePublicTransportDrill, publicTransportDrillText } from "../src/modules/native-scanner/public-transport-drill";
 import { FakeMachine, REPO, run, startSupervisor, testConfig, until } from "./helpers/always-on-fake-machine";
 
 /**
@@ -206,6 +207,34 @@ describe("a drill request is refused — journaled, consumed, and nothing is dri
     m.lockBusy = false;
     expect(incidentsOf(m, "DRILL_REJECTED").map((i) => i.reasonCode)).toEqual(["MUTATION_AUTHORITY_BUSY"]);
     expect(drillFiles(m)).toEqual([]);
+  });
+
+  it("a drill file the supervisor did not write (planted beside the scanner's stop file, bypassing the request) is removed within one pass and journaled — it can never last", async () => {
+    const { m, supervisor } = await runningStack();
+    const child = scannerChild(m);
+    const planted = drillFileOf(child.stopFile as string);
+    m.files.set(
+      planted,
+      publicTransportDrillText({ drillId: id(777), fault: "PUBLIC_ALL_DOWN", runId: child.runId as string, generation: supervisor.currentGeneration, startedAtMs: m.now, expiresAtMs: m.now + 900_000, faults: { rest: "REFUSED", openStreams: "DROP", newStreams: "REFUSED" } })
+    );
+    await run(m, supervisor, 1);
+    expect(m.files.has(planted)).toBe(false);
+    expect(incidentsOf(m, "DRILL_UNAUTHORIZED_FILE_REMOVED").map((i) => i.facts.file)).toEqual([path.basename(planted)]);
+    expect(supervisor.status().drill ?? null).toBeNull();
+    // The probes never saw it: only an accepted drill reaches them.
+    expect(m.connectivityDrills.every((d) => d === null)).toBe(true);
+    await run(m, supervisor, 2);
+    expect(supervisor.status().roles.scanner.health?.drill).toMatchObject({ drillId: id(777), active: false });
+  });
+
+  it("the supervisor's OWN drill file (active, or ended but not yet removable) is never treated as unauthorized", async () => {
+    const { m, supervisor } = await activeDrill();
+    await run(m, supervisor, 3);
+    m.failRemove = (f) => f.endsWith(".drill");
+    m.files.set(m.paths.drillRestoreRequest, "{}");
+    await run(m, supervisor, 3);
+    expect(incidentsOf(m, "DRILL_UNAUTHORIZED_FILE_REMOVED")).toEqual([]);
+    m.failRemove = null;
   });
 
   it("a malformed request is refused with its parse reason (never partly applied)", async () => {
