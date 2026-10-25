@@ -64,8 +64,9 @@ these hold:
 - `failed`, `recovering` and `catchupPending` are all 0, and no symbol awaits
   its stream on a connection that delivers nothing;
 - membership is consistent: every placed symbol is in exactly one known state
-  (live, quarantined, awaiting its stream, recovering, pending), and their
-  number matches `selected`;
+  (live, quarantined, awaiting its stream, recovering, pending, failed), and
+  their number matches `selected`. A failed symbol stays placed and is
+  reported once, as `SYMBOLS_FAILED`;
 - the newest market message is under 3 minutes old;
 - the REST budget is not halted (418/429).
 
@@ -489,6 +490,90 @@ Observatory soak ([native-signal-quality-observatory.md](native-signal-quality-o
   `UNPARSEABLE`. The Always-On adapter already removes CR and LF.
 - **Unrelated, unchanged:** the TradingView adoption lease-theft finding and
   ENTRY_SUBMITTING recovery.
+- **Outages the connectivity probe cannot see** (found by the simulated
+  network, section 11; pinned by tests, unchanged):
+  - **Stream-only outage.** The probe checks REST only, so a WebSocket outage
+    reads as reachable. Each fresh run cannot connect and is judged degraded;
+    after 6 attempts (about 40 minutes with the backoff) the scanner
+    **latches** and stays down after the streams return, until
+    `clear-latch`.
+  - **A blip shorter than the grace period.** It is over before the first
+    probe, so no post-network heal window applies. The scanner's status,
+    written every 60 seconds, can still read degraded 90 seconds later: one
+    fresh-run recovery follows.
+  - **A REST outage restored right after a refresh attempt.** The scanner's
+    next refresh is up to one interval (5 minutes) away, longer than the
+    120-second heal window: one fresh-run recovery follows, although the
+    running scanner would have refreshed on its own.
+
+  All three are bounded and ordered. Whether to change the policy (a stream
+  check in the probe, a heal window keyed to the scanner's own reconnect and
+  refresh schedule) is an operator decision.
+
+## 11. Network fault injection (test-only)
+
+The real-machine acceptance's network step (section 9) disconnects the whole
+machine. Its recovery contract is instead proven automatically, against the
+real code, by a simulated public network. Nothing in production can select
+it: it is a test helper handed explicitly, as transports, to the objects a
+test constructs.
+
+- **`tests/helpers/simulated-public-network.ts`**: one market, one fault state,
+  three transports.
+  - The scanner's REST is `UP`, `REFUSED` (as undici: `fetch failed`,
+    `ECONNREFUSED`) or `TIMEOUT` (held for the CLI's full 20-second client
+    timeout on the simulated clock).
+  - Open streams are `UP`, `DROP` (error, then close 1006) or `SILENT`
+    (half-open).
+  - New streams are `UP`, `REFUSED` or `BLACKHOLE` (never open).
+  - The connectivity probe's fetch follows the REST fault.
+  - Every outage has a mandatory maximum duration (at most 6 hours) and
+    restores itself at that deadline. `withOutage` restores in `finally`, and
+    `dispose` restores and refuses any further use.
+  - It serves only `https://fapi.binance.com` and the production-validated
+    stream URL, and refuses anything signed, keyed or not a GET.
+- **`tests/helpers/simulated-scanner.ts`**: a real `LiveShadowSupervisor` with
+  the production CLI's own option values (FAST_RECOVERY_V1, dynamic universe,
+  REST budget, real symbol locks) on a simulated clock. Its timers wake at
+  their instants, so a backoff never skips network turns. By default it runs
+  the production engine on 1D over a short timeline. Where the real emitter
+  must bind the run, it uses the registered production profile, because the
+  emitter refuses any other engine.
+- **`tests/helpers/simulated-monitoring-machine.ts`**: the real Always-On
+  supervisor (production policy) on the fake machine, owning **real** scanner
+  processes and gating recovery on the **real** `publicBinanceReachable`.
+  - A cooperative stop runs the CLI's graceful stop. A fenced terminate kills
+    the process: its network, sockets and timers end, and its locks stay on
+    disk.
+  - Every simulated second checks five things: at most one scanner process;
+    locks held only by it, or stale; an emitter pinned only to a running
+    scanner's run; monitoring roles only; nothing signed on the network.
+
+The only production change is that `publicBinanceReachable` takes its
+transport as an optional parameter, defaulting to the real `fetch`. Structural
+tests pin that production calls it with none, and that no production module,
+environment variable or CLI option can select a fault or a simulated
+transport.
+
+**What it does not prove:** real-machine network recovery (operating-system
+sockets, DNS, TLS, Binance's own behaviour), and timings under real load. A
+real-machine Gate 4A still needs a separately approved, isolated mechanism.
+None exists in the repository. A proposed design, **not implemented**:
+
+- an operator-only `monitoring:always-on drill --duration-seconds N`
+  (N ≤ 900);
+- the drill is written as a request file that only the running supervisor of
+  the current generation consumes, like `stop.json`;
+- the supervisor hands it only to its own scanner child, through a per-spawn
+  drill file beside that child's stop file. The scanner checks the file every
+  second and fails its public transports while the file is valid: same
+  generation, same run, not expired;
+- the supervisor's probe reads the same file;
+- expiry ends the drill even if the file remains. The supervisor removes the
+  file at expiry and on shutdown, and a new generation removes stale ones;
+- the drill is never driven by an environment variable, never reaches the
+  backend, emitter, planner or account processes, and is journaled as
+  `DRILL_STARTED` and `DRILL_ENDED`.
 
 ## Tests
 
@@ -515,3 +600,14 @@ Observatory soak ([native-signal-quality-observatory.md](native-signal-quality-o
 - `tests/always-on-structure.test.ts`: the AST closure has no database, env,
   exchange client or execution module; spawn and terminate happen only through
   the fenced primitives; no route and no migration.
+- `tests/always-on-network-fault-harness.test.ts`: the simulated network itself
+  (each fault changes transport behaviour; fail-safe restoration; refusals),
+  the real probe over it, and that production cannot select it.
+- `tests/native-scanner-network-faults.test.ts`: the real scanner under REST-only,
+  stream-only, half-open, short, sustained and timing-out outages, judged every
+  second by the real health judge.
+- `tests/always-on-network-recovery.test.ts`: the supervisor's recovery contract
+  end to end over the simulated network, including a hung scanner and the three
+  outages the probe cannot see.
+- `tests/native-emitter-network-recovery.test.ts`: the real emitter across an
+  outage and a scanner recovery (cursors, replays, queue bound, every key once).
