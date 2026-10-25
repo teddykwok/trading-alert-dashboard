@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { ALWAYS_ON_DEFAULTS } from "../src/modules/always-on/always-on-contract";
+import { judgeScannerHealth } from "../src/modules/always-on/always-on-health";
 import { SUPERVISOR_DEFAULTS } from "../src/modules/native-scanner/live-shadow-supervisor-cli-args";
 import { FakeMachine, HEALTHY_UNIVERSE, run, startSupervisor, until } from "./helpers/always-on-fake-machine";
 
@@ -68,5 +69,49 @@ describe("a quiet symbol awaiting its first stream update is warming, not a fail
 
   it("contract: the warming bound outlasts the scanner's own per-symbol stale timeout, so the scanner always gets to act first", () => {
     expect(ALWAYS_ON_DEFAULTS.quarantinePersistentMs).toBeGreaterThan(SUPERVISOR_DEFAULTS.staleSymbolMs);
+  });
+});
+
+describe("a FAILED symbol is reported once, by its own code", () => {
+  // Found by the simulated network outage (native-scanner-network-faults): the real scanner keeps a FAILED symbol on
+  // its connection with readiness "FAILED" (fail() never unplaces it), and the membership check counted it again.
+  const NOW = Date.UTC(2026, 9, 23, 12, 0, 0);
+  const fresh = new Date(NOW - 5_000).toISOString();
+  const status = (detail: boolean) =>
+    JSON.stringify({
+      schema: "teddy.native-scanner.live-shadow-supervisor-status.v3",
+      runId: "r",
+      runState: "RUNNING",
+      engineFingerprint: "e",
+      pid: 7001,
+      writtenAt: new Date(NOW).toISOString(),
+      totals: { selected: 3, liveEligible: 2, quarantined: 0, awaitingStream: 0, recovering: 0, failed: 1, catchupPending: 0, reconnects: 0, backpressureEvents: 0, restRequests: 10, restHalted: false },
+      universe: { generation: 1, stale: false, exchangeCandidates: 3, capacity: { exceeded: false } },
+      symbols: [
+        { symbol: "AAAUSDT", connection: 0, status: "ATTACHED", readiness: "LIVE_ELIGIBLE", lastValidMessageAt: fresh },
+        { symbol: "BBBUSDT", connection: 0, status: "ATTACHED", readiness: "LIVE_ELIGIBLE", lastValidMessageAt: fresh },
+        { symbol: "CCCUSDT", connection: 0, status: "FAILED", readiness: "FAILED", lastValidMessageAt: null },
+      ],
+      ...(detail ? { connections: [{ index: 0, lifecycle: "OPEN", lastMessageAt: fresh }] } : {}),
+    });
+
+  it.each([
+    ["with the per-symbol detail", true],
+    ["from the compact totals", false],
+  ])("%s: SYMBOLS_FAILED, and never also MEMBERSHIP_INCONSISTENT", (_label, detail) => {
+    const health = judgeScannerHealth({ statusText: status(detail), nowMs: NOW, ownedRuntimePids: [7001], policy: ALWAYS_ON_DEFAULTS });
+    expect(health.verdict).toBe("DEGRADED");
+    expect(health.issues.map((i) => i.code)).toEqual(["SYMBOLS_FAILED"]);
+  });
+
+  it("a placed symbol in a state the scanner never reports, or a count that does not add up, is still a membership gap", () => {
+    const parsed = JSON.parse(status(true)) as { symbols: { readiness: string }[]; totals: { selected: number } };
+    parsed.symbols[2].readiness = "SOMETHING_NEW";
+    const unknown = judgeScannerHealth({ statusText: JSON.stringify(parsed), nowMs: NOW, ownedRuntimePids: [7001], policy: ALWAYS_ON_DEFAULTS });
+    expect(unknown.issues.map((i) => i.code)).toContain("MEMBERSHIP_INCONSISTENT");
+    const compact = JSON.parse(status(false)) as { totals: { selected: number } };
+    compact.totals.selected = 4;
+    const short = judgeScannerHealth({ statusText: JSON.stringify(compact), nowMs: NOW, ownedRuntimePids: [7001], policy: ALWAYS_ON_DEFAULTS });
+    expect(short.issues.map((i) => i.code)).toContain("MEMBERSHIP_INCONSISTENT");
   });
 });

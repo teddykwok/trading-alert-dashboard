@@ -194,7 +194,7 @@ export class FakeMachine {
   /**
    * The scanner's per-symbol and per-connection detail, as the real scanner writes it: connection 0 is OPEN and
    * delivering; awaiting symbols sit on it ("quiet") unless `silentAwaiting` puts them on connection 1, which has
-   * never delivered anything.
+   * never delivered anything. A FAILED symbol keeps its connection, as the real scanner's fail() never unplaces it.
    */
   private detailOf(u: ScannerShape, lastMessageAgoMs: number) {
     const detail = this.scannerDetail as { silentAwaiting: boolean };
@@ -207,7 +207,7 @@ export class FakeMachine {
     add(u.quarantined, "QUARANTINED_CURRENT_BAR", 0);
     add(u.awaitingStream, "AWAITING_STREAM", detail.silentAwaiting ? 1 : 0);
     add(u.recovering, "RECOVERING", 0, "RECOVERING");
-    add(u.failed, "FAILED", -1, "FAILED");
+    add(u.failed, "FAILED", 0, "FAILED");
     return {
       symbols,
       connections: [

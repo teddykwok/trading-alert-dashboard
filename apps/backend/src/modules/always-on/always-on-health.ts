@@ -232,8 +232,8 @@ export function judgeScannerHealth(input: {
             ? `${detail.unexplained.length} placed symbol(s) in no known state (${[...new Set(detail.unexplained)].slice(0, 5).join(", ")})`
             : null
         : (universe.liveEligible ?? 0) + (universe.quarantined ?? 0) > selected ||
-            (universe.liveEligible ?? 0) + (universe.quarantined ?? 0) + (universe.awaitingStream ?? 0) + (universe.recovering ?? 0) + (universe.catchupPending ?? 0) < selected
-          ? `selected ${selected} ≠ live ${universe.liveEligible ?? "?"} + quarantined ${universe.quarantined ?? "?"} + awaiting ${universe.awaitingStream ?? "?"} + recovering ${universe.recovering ?? "?"} + pending ${universe.catchupPending ?? "?"}`
+            (universe.liveEligible ?? 0) + (universe.quarantined ?? 0) + (universe.awaitingStream ?? 0) + (universe.recovering ?? 0) + (universe.catchupPending ?? 0) + (universe.failed ?? 0) < selected
+          ? `selected ${selected} ≠ live ${universe.liveEligible ?? "?"} + quarantined ${universe.quarantined ?? "?"} + awaiting ${universe.awaitingStream ?? "?"} + recovering ${universe.recovering ?? "?"} + pending ${universe.catchupPending ?? "?"} + failed ${universe.failed ?? "?"}`
           : null;
     if (why !== null) issues.push({ code: "MEMBERSHIP_INCONSISTENT", detail: why });
   }
@@ -249,8 +249,11 @@ export function judgeScannerHealth(input: {
   return { ...base, universe: { ...universe, awaitingStreamQuiet: detail === null ? null : detail.awaitingQuiet }, verdict, issues };
 }
 
-/** The placed symbols' readiness states a status may list; each is reported by its own code. */
-const KNOWN_PLACED_STATES: ReadonlySet<string> = new Set(["LIVE_ELIGIBLE", "QUARANTINED_CURRENT_BAR", "AWAITING_STREAM", "NOT_READY", "RECOVERING", "PENDING"]);
+/**
+ * The placed symbols' readiness states a status may list; each is reported by its own code. A FAILED symbol stays on
+ * its connection (the scanner never unplaces it) and is reported as SYMBOLS_FAILED.
+ */
+const KNOWN_PLACED_STATES: ReadonlySet<string> = new Set(["LIVE_ELIGIBLE", "QUARANTINED_CURRENT_BAR", "AWAITING_STREAM", "NOT_READY", "RECOVERING", "PENDING", "FAILED"]);
 
 /**
  * The scanner's per-symbol and per-connection detail (it lists every symbol with its connection and readiness,

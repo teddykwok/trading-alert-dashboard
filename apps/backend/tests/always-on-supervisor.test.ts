@@ -145,7 +145,8 @@ describe("scanner health, network outages and the one recovery path", () => {
     expect(s.roles.scanner.state).toBe("DEGRADED");
     expect(s.state).toBe("DEGRADED");
     expect(s.roles.scanner.health?.verdict).toBe("DEGRADED");
-    expect(s.roles.scanner.health?.issues.map((i) => i.code)).toEqual(expect.arrayContaining(["SYMBOLS_FAILED", "MEMBERSHIP_INCONSISTENT", "MARKET_DATA_STALE"]));
+    // 396 live + 128 failed = 524 selected: the failed symbols are reported once, as SYMBOLS_FAILED, not also as a membership gap.
+    expect(s.roles.scanner.health?.issues.map((i) => i.code)).toEqual(["SYMBOLS_FAILED", "MARKET_DATA_STALE"]);
   });
 
   it("8. degradation inside the grace period restarts nothing (no stop file, no spawn, not even a network probe)", async () => {
