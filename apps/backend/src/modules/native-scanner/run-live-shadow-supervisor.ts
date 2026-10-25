@@ -12,6 +12,7 @@ import { EXCHANGE_INFO_PATH, ScannerDataError, assertPublicFuturesBaseUrl, build
 import { CandidateRankHaltError, GovernedPublicTransport } from "./candidate-rank-runner";
 import { CooperativeStopUsageError, validateStopFilePath, watchCooperativeStop } from "./cooperative-stop";
 import { KlineCacheStore } from "./kline-cache";
+import { PublicTransportDrillGate, drillFileOf, drilledOpenStream, drilledPublicTransport } from "./public-transport-drill";
 import { BinanceServerClock, PublicRequestController, REQUEST_POLICY_LIMITS, type PublicHttpTransport } from "./kline-fetcher";
 import type { OpenPublicStream } from "./live-shadow-runner";
 import { LiveShadowSupervisor, NATIVE_RECOVERY_POLICY_VERSION, SupervisorConfigError, TargetNotReachedError, type MembershipChange, type SupervisorStatus } from "./live-shadow-supervisor";
@@ -178,7 +179,28 @@ async function main(): Promise<void> {
   console.log(`run id: ${runId}`);
   const baseUrl = assertPublicFuturesBaseUrl(env.BINANCE_FUTURES_REST_BASE_URL);
   const fastRecovery = options.recoveryPolicy === "FAST_RECOVERY_V1";
-  const governor = new GovernedPublicTransport(publicTransport, {
+  // The operator network drill (public-transport-drill.ts): only a run Always-On spawned (a cooperative stop file) has
+  // a drill file, beside that stop file. Without a valid, current drill for THIS run the transports are the real ones.
+  const drillGate = stopFile === null ? null : new PublicTransportDrillGate({
+    file: drillFileOf(stopFile),
+    runId,
+    readText: (file) => {
+      try {
+        return readFileSync(file, "utf8");
+      } catch {
+        return null;
+      }
+    },
+    nowMs: () => Date.now(),
+    monoMs: () => performance.now(),
+    log: (line) => console.log(`[${iso(Date.now())}] ${line}`),
+  });
+  const drilledStreams = drillGate === null ? null : drilledOpenStream(openPublicStream, drillGate, (fn) => setImmediate(fn));
+  if (drillGate !== null) {
+    drillGate.poll();
+    setInterval(() => drillGate.poll(), 1_000).unref();
+  }
+  const governor = new GovernedPublicTransport(drillGate === null ? publicTransport : drilledPublicTransport(publicTransport, drillGate), {
     maxTotalRequests: options.maxTotalRequests,
     minSpacingMs: options.minSpacingMs,
     nowMs: () => Date.now(),
@@ -254,7 +276,7 @@ async function main(): Promise<void> {
       dynamicUniverse: dynamic ? { refreshIntervalMs } : null,
     },
     {
-      openStream: openPublicStream,
+      openStream: drilledStreams?.openStream ?? openPublicStream,
       governor,
       fetchDeps,
       cache: new KlineCacheStore(assertOutsideRepository(scannerKlineCacheDir(process.env), REPO_ROOT)),
@@ -289,7 +311,9 @@ async function main(): Promise<void> {
   const runStatusFile = path.join(runDir, "status.json");
   const writeStatus = (status: SupervisorStatus) => {
     // Observational only: a failure here is logged and never touches scanning.
-    const text = `${JSON.stringify({ ...status, gitHead, pid: process.pid, writtenAt: iso(Date.now()) }, null, 2)}\n`;
+    // The drill observation only once this run has seen a drill: otherwise the status is exactly as before.
+    const drill = drillGate?.observation() ?? null;
+    const text = `${JSON.stringify({ ...status, gitHead, pid: process.pid, writtenAt: iso(Date.now()), ...(drill === null ? {} : { drill }) }, null, 2)}\n`;
     for (const [dir, file] of [
       [statusDir, statusFile],
       [runDir, runStatusFile],

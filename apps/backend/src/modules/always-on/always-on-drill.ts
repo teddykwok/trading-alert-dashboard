@@ -1,4 +1,4 @@
-import { PUBLIC_TRANSPORT_DRILL_MAX_MS, type PublicTransportDrillFaults } from "../native-scanner/public-transport-drill";
+import { PUBLIC_TRANSPORT_DRILL_MAX_MS, drillRefusedError, type PublicTransportDrillFaults } from "../native-scanner/public-transport-drill";
 import { ALWAYS_ON_REQUEST_SCHEMA } from "./always-on-contract";
 
 /**
@@ -246,6 +246,65 @@ export function controllerIsDrillCli(commandLine: string): boolean {
 export function commandLineInRepository(commandLine: string, repoRoot: string): boolean {
   const root = repoRoot.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
   return root !== "" && commandLine.replace(/\//g, "\\").toLowerCase().includes(`${root}\\`);
+}
+
+// ---------------------------------------------------------------------------
+// The supervisor's own probes during a drill: their REAL code, over a gated transport
+// ---------------------------------------------------------------------------
+
+/**
+ * The REST connectivity probe's transport during a drill: refused (exactly as undici refuses a connection) while the
+ * drill refuses public REST, otherwise the inner transport ITSELF — so with no drill the probe is byte-for-byte the
+ * production one. It can only refuse: it never sees, changes or forwards a URL.
+ */
+export function drilledProbeFetch(inner: typeof fetch, drill: DrillProbeFaults | null): typeof fetch {
+  if (drill?.rest !== "REFUSED") return inner;
+  return (() => Promise.reject(drillRefusedError())) as unknown as typeof fetch;
+}
+
+type ProbeEvent = "open" | "message" | "error" | "close";
+type ProbeListener = (event: { readonly data?: unknown }) => void;
+
+/** The WebSocket surface the stream probe uses. */
+export interface DrillProbeSocket {
+  addEventListener(type: ProbeEvent, listener: ProbeListener): void;
+  removeEventListener(type: ProbeEvent, listener: ProbeListener): void;
+  close(): void;
+}
+
+/** A socket that never touches the network: REFUSED errors then closes (1006); SILENT opens and says nothing. */
+function drillProbeSocket(fault: "REFUSED" | "SILENT"): DrillProbeSocket {
+  const listeners = new Map<ProbeEvent, Set<ProbeListener>>();
+  let closed = false;
+  queueMicrotask(() => {
+    const events: [ProbeEvent, { readonly data?: unknown; readonly code?: number }][] = fault === "REFUSED" ? [["error", {}], ["close", { code: 1006 }]] : [["open", {}]];
+    for (const [type, event] of events) {
+      if (closed) return;
+      for (const listener of [...(listeners.get(type) ?? [])]) listener(event);
+    }
+  });
+  return {
+    addEventListener: (type, listener) => {
+      const set = listeners.get(type) ?? new Set<ProbeListener>();
+      set.add(listener);
+      listeners.set(type, set);
+    },
+    removeEventListener: (type, listener) => void listeners.get(type)?.delete(listener),
+    close: () => {
+      closed = true;
+    },
+  };
+}
+
+/**
+ * The stream probe's socket opener during a drill: a network-free socket that is refused (UNREACHABLE to the probe) or
+ * silent (UNKNOWN to the probe, which never suppresses a recovery) while the drill says so; otherwise the inner opener
+ * ITSELF (undefined: the probe's own real WebSocket default).
+ */
+export function drilledProbeOpen<S extends DrillProbeSocket>(inner: ((url: string) => S) | undefined, drill: DrillProbeFaults | null): ((url: string) => S | DrillProbeSocket) | undefined {
+  const fault = drill?.stream ?? null;
+  if (fault === null) return inner;
+  return () => drillProbeSocket(fault);
 }
 
 // ---------------------------------------------------------------------------

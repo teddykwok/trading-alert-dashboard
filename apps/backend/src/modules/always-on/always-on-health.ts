@@ -115,6 +115,11 @@ export interface ScannerHealth {
    * the market-data freshness window. Null when the status carries no per-connection detail.
    */
   readonly stream: { readonly connections: number; readonly delivering: number } | null;
+  /**
+   * The scanner's own report of an operator drill (public-transport-drill.ts): the drill it last applied and whether it
+   * still applies. Absent when the status reports none — every status written before drills existed, or with none.
+   */
+  readonly drill?: { readonly drillId: string; readonly active: boolean } | null;
 }
 
 const NO_UNIVERSE: ScannerHealth["universe"] = {
@@ -160,6 +165,12 @@ function awaiting(partial: Partial<ScannerHealth> = {}): ScannerHealth {
     stream: null,
     ...partial,
   };
+}
+
+/** A drill observation the scanner wrote (its id and whether it is active), or null. */
+function drillReportOf(value: unknown): { readonly drillId: string; readonly active: boolean } | null {
+  if (!isRecord(value) || typeof value.drillId !== "string" || !/^[0-9a-f]{32}$/.test(value.drillId) || typeof value.active !== "boolean") return null;
+  return { drillId: value.drillId, active: value.active };
 }
 
 export function judgeScannerHealth(input: {
@@ -215,6 +226,10 @@ export function judgeScannerHealth(input: {
     backpressureEvents: num(totals.backpressureEvents),
     restHalted: bool(totals.restHalted),
     restRequests: num(totals.restRequests),
+    ...((): { drill?: { readonly drillId: string; readonly active: boolean } } => {
+      const drill = drillReportOf(parsed.drill);
+      return drill === null ? {} : { drill };
+    })(),
   };
   if (parsed.runState === "STOPPED") return { ...base, stream: null, verdict: "STOPPED", issues: [] };
 

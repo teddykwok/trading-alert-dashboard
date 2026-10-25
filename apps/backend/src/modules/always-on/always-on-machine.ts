@@ -12,7 +12,7 @@ import { listenerAuthority, withMutationLock, type ListenerHandle, type Mutation
 import { classifySpawnResult, parseProcessRows, parseProcessTreeRows, type Observation, type ObservedProcessNode } from "../operator/runtime-launcher";
 import { OWNERSHIP_PROOF_ATTEMPTS, type ProbeOutcome } from "../operator/worker-supervision";
 import type { AlwaysOnRole, PublicStreamProbeOutcome } from "./always-on-contract";
-import { judgeDirectoryAcl, type DrillDirectoryCheck } from "./always-on-drill";
+import { drilledProbeFetch, drilledProbeOpen, judgeDirectoryAcl, type DrillDirectoryCheck, type DrillProbeFaults } from "./always-on-drill";
 import { listenerInstanceLock, type InstanceLock } from "./always-on-ownership";
 import { alwaysOnRoleLog, type AlwaysOnPaths } from "./always-on-paths";
 import { genericEnvFilePath, type MonitoringSpawnPlan } from "./always-on-roles";
@@ -358,6 +358,22 @@ export function verifyPrivateDirectories(dirs: readonly string[]): DrillDirector
   const lines = out.value.split(/\r?\n/);
   const owner = (lines.find((line) => line.startsWith("SID|")) ?? "").slice(4).trim();
   return judgeDirectoryAcl(lines.filter((line) => !line.startsWith("SID|")).join("\n"), dirs, owner);
+}
+
+/**
+ * The supervisor's REST connectivity probe exactly as production runs it: the real fetch, which an ACTIVE operator
+ * drill (and nothing else) replaces by a refusal. With no drill this is `publicBinanceReachable()` itself.
+ */
+export function publicConnectivityProbe(drill: DrillProbeFaults | null): Promise<boolean> {
+  return publicBinanceReachable(undefined, drilledProbeFetch(fetch, drill));
+}
+
+/**
+ * The supervisor's public stream probe exactly as production runs it: the real WebSocket, which an ACTIVE operator
+ * drill (and nothing else) replaces by a refused or silent socket. With no drill this is `publicStreamReachable()` itself.
+ */
+export function publicStreamProbe(drill: DrillProbeFaults | null): Promise<PublicStreamProbeOutcome> {
+  return publicStreamReachable({ open: drilledProbeOpen(undefined, drill) });
 }
 
 export function genericEnvKeyNames(env: NodeJS.ProcessEnv): { readonly ok: true; readonly keys: string[] } | { readonly ok: false; readonly reason: string } {

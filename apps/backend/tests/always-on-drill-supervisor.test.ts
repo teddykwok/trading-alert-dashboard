@@ -109,7 +109,7 @@ describe("a drill request is refused — journaled, consumed, and nothing is dri
       const c = m.addDrillController();
       return { controller: { pid: c.pid, startedAtMs: c.startedAtMs - 60_000, user: "operator" } };
     }, "CONTROLLER_NOT_VERIFIED"],
-    ["another generation", () => ({ generation: 1 }), "GENERATION_MISMATCH"],
+    ["another generation (the fake's first is 1)", () => ({ generation: 7 }), "GENERATION_MISMATCH"],
     ["another scanner run", () => ({ runId: "20261022T000000Z-deadbeef" }), "RUN_MISMATCH"],
     ["an expired authorization", (m: FakeMachine) => ({ requestedAtMs: m.now - 61_000 }), "REQUEST_EXPIRED"],
   ])("%s → %s", async (_label, over, reasonCode) => {
@@ -167,11 +167,12 @@ describe("a drill request is refused — journaled, consumed, and nothing is dri
 
   it("while a scanner recovery runs → RECOVERY_IN_PROGRESS; while stopping → SHUTTING_DOWN", async () => {
     const { m, supervisor } = await runningStack();
+    const runId = supervisor.status().roles.scanner.runId as string; // a recovery forgets the run it replaces
     m.honourStops = false; // the old scanner takes its time to stop: the recovery stays in progress
     m.kill(m.live("emitter")[0].root);
     m.scannerBehaviour = "degraded";
     await until(m, supervisor, () => supervisor.status().state === "RECOVERING");
-    requestDrill(m, supervisor);
+    requestDrill(m, supervisor, { runId });
     await run(m, supervisor, 1, 2_000);
     expect(incidentsOf(m, "DRILL_REJECTED").map((i) => i.reasonCode)).toContain("RECOVERY_IN_PROGRESS");
 

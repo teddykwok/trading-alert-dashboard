@@ -160,13 +160,16 @@ export interface AlwaysOnAdapters {
   readonly exitCodeOf?: (pid: number) => number | null;
   readonly fs: AlwaysOnFileSystem;
   readonly http: AlwaysOnHttp;
-  /** One unsigned public Binance request (server time); true when it answered. Never a credential. */
-  readonly publicConnectivity: () => Promise<boolean>;
+  /**
+   * One unsigned public Binance request (server time); true when it answered. Never a credential. `drill` is the
+   * active operator drill's probe faults (null — always, outside a drill — the real transport untouched).
+   */
+  readonly publicConnectivity: (drill: DrillProbeFaults | null) => Promise<boolean>;
   /**
    * One unsigned public stream subscription: REACHABLE, UNREACHABLE (positive evidence of failure) or UNKNOWN.
    * Never a credential. Asked only when the scanner's own status points at its streams (streamOutageConfirmed).
    */
-  readonly publicStreamConnectivity: () => Promise<PublicStreamProbeOutcome>;
+  readonly publicStreamConnectivity: (drill: DrillProbeFaults | null) => Promise<PublicStreamProbeOutcome>;
   /**
    * The Windows ACL of the directories an operator drill relies on: private when nobody but this account, SYSTEM and
    * Administrators can write them. Asked only for a drill request; a throw is "not private".
@@ -1039,7 +1042,7 @@ export class AlwaysOnSupervisor {
     if (n.reachable !== null && n.lastProbeAtMs !== null && now - n.lastProbeAtMs < this.config.policy.connectivityProbeEveryMs) return n.reachable;
     let ok = false;
     try {
-      ok = await this.a.publicConnectivity();
+      ok = await this.a.publicConnectivity(this.drillProbeFaults(now));
     } catch {
       ok = false;
     }
@@ -1115,7 +1118,7 @@ export class AlwaysOnSupervisor {
       if (s.probing) return false;
       s.probing = true;
       try {
-        outcome = await this.a.publicStreamConnectivity();
+        outcome = await this.a.publicStreamConnectivity(this.drillProbeFaults(now));
       } catch {
         outcome = "UNKNOWN";
       } finally {
@@ -1821,6 +1824,11 @@ export class AlwaysOnSupervisor {
   private drillIsActive(now: number): boolean {
     const d = this.drill;
     return d !== null && d.endedAtMs === null && now < d.drill.expiresAtMs && this.children.scanner?.pid === d.childPid && this.children.scanner.sequence === d.childSequence;
+  }
+
+  /** What the active drill does to this supervisor's own probes (null: no active drill — the real transports). */
+  private drillProbeFaults(now: number): DrillProbeFaults | null {
+    return this.drillIsActive(now) ? (this.drill as ActiveDrill).probes : null;
   }
 
   /** The controller a request names: a live node process of THIS repository running `drill start`, its creation time matching. */
