@@ -53,6 +53,15 @@ describe("nothing outside the dedicated command can activate a drill", () => {
     for (const line of status.split(/\r?\n/).filter((l) => DRILL_MODULES.test(l))) expect(line).toMatch(/^import type /);
   });
 
+  it("the drill modules import exactly their contract and transport types — nothing that reaches a cursor, ledger, account, credential or execution path", () => {
+    const importsOf = (rel: string) => [...code(readFileSync(path.join(BACKEND, rel), "utf8")).matchAll(/^\s*import\s[^;]*?\bfrom\s+"([^"]+)"/gm)].map((m) => m[1]).sort();
+    expect(importsOf("src/modules/always-on/always-on-drill.ts")).toEqual(["../native-scanner/public-transport-drill", "./always-on-contract"]);
+    expect(importsOf("src/modules/native-scanner/public-transport-drill.ts")).toEqual(["./kline-fetcher", "./live-shadow-runner"]);
+    for (const rel of ["src/modules/always-on/always-on-drill.ts", "src/modules/native-scanner/public-transport-drill.ts"]) {
+      expect({ rel, hit: code(readFileSync(path.join(BACKEND, rel), "utf8")).match(/cursor|ledger|rebaseline|scanner-lock|acquireLiveShadowLock|apiKey|apiSecret|API_KEY|placeOrder|newOrder|createOrder|execution-worker|native-canary|binance-execution|prisma/i)?.[0] ?? null }).toEqual({ rel, hit: null });
+    }
+  });
+
   it("the drill modules open no listener, no socket of their own and no HTTP surface, and never build or rewrite a URL", () => {
     for (const rel of ["src/modules/always-on/always-on-drill.ts", "src/modules/native-scanner/public-transport-drill.ts"]) {
       const body = code(readFileSync(path.join(BACKEND, rel), "utf8"));

@@ -2,13 +2,16 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
 import type { AlwaysOnTickOutcome } from "../../src/modules/always-on/always-on-supervisor";
+import { drilledProbeFetch, drilledProbeOpen, type DrillProbeFaults } from "../../src/modules/always-on/always-on-drill";
 import { publicBinanceReachable, publicStreamReachable, type PublicStreamProbeOutcome } from "../../src/modules/always-on/always-on-machine";
 import { scannerRunManifest } from "../../src/modules/always-on/always-on-paths";
 import type { MonitoringSpawnPlan } from "../../src/modules/always-on/always-on-roles";
 import type { PublicHttpTransport } from "../../src/modules/native-scanner/kline-fetcher";
 import type { OpenPublicStream } from "../../src/modules/native-scanner/live-shadow-runner";
+import { PublicTransportDrillGate, drillFileOf, drilledOpenStream, drilledPublicTransport, parsePublicTransportDrill } from "../../src/modules/native-scanner/public-transport-drill";
 import { LIVE_SHADOW_LOCK_FILE } from "../../src/modules/native-scanner/scanner-lock";
 import { engineFingerprintOf } from "../../src/modules/native-scanner/scanner-profile";
+import { ALWAYS_ON_DEFAULTS } from "../../src/modules/always-on/always-on-contract";
 import { FakeMachine, HEALTHY_UNIVERSE, startSupervisor, testConfig } from "./always-on-fake-machine";
 import { SimulatedPublicNetwork, immediateProbeTimers, type ProbeListener, type ProbeSocketLike } from "./simulated-public-network";
 
@@ -58,6 +61,9 @@ import { FIXTURE_TIMELINE, SIM_SYMBOLS, SimulatedClock, SimulatedScanner, simula
  *     scanner wrote — on the CLI's cadence (first status one interval after
  *     start-up);
  *   - the connectivity probe is the REAL publicBinanceReachable;
+ *   - an operator drill (always-on-drill.ts) reaches these processes exactly as in production: each scanner spawned
+ *     with a stop file runs the REAL drill gate (polled every second, reading the drill file the real supervisor
+ *     wrote) around its process-local transports, and both probes run over the REAL drilled probe transports;
  *   - both go through ONE SimulatedPublicNetwork, so an outage refuses or holds
  *     their requests and drops, silences or refuses their streams.
  *
@@ -83,6 +89,8 @@ export interface ScannerProcess {
   manifestWritten: boolean;
   /** Sockets this process opened (closed silently when it is killed). */
   readonly socketIds: number[];
+  /** The process's operator-drill gate (null: no stop file, so no drill can ever apply — as in production). */
+  readonly gate: PublicTransportDrillGate | null;
 }
 
 export interface TickRecord {
@@ -129,6 +137,7 @@ export class SimulatedMonitoringMachine {
   supervisor!: Awaited<ReturnType<typeof startSupervisor>>["supervisor"];
   private nextTickAtMs = 0;
   private stopped = false;
+  private readonly orphanDrillSince = new Map<string, number>();
 
   constructor(
     readonly root: string,
@@ -155,8 +164,8 @@ export class SimulatedMonitoringMachine {
 
   async start(): Promise<void> {
     const { supervisor, started } = await startSupervisor(this.m, testConfig({ engineFingerprint: this.engineFingerprint }), {
-      publicConnectivity: () => publicBinanceReachable(5_000, this.net.fetch),
-      publicStreamConnectivity: () => this.probeStream(),
+      publicConnectivity: (drill: DrillProbeFaults | null) => publicBinanceReachable(5_000, drilledProbeFetch(this.net.fetch, drill)),
+      publicStreamConnectivity: (drill: DrillProbeFaults | null) => this.probeStream(drill),
       spawn: (plan) => {
         this.spawnPlans.push(plan);
         return (this.m.adapters().spawn as (p: MonitoringSpawnPlan) => number | null)(plan);
@@ -167,8 +176,8 @@ export class SimulatedMonitoringMachine {
     this.nextTickAtMs = this.m.now;
   }
 
-  /** The real stream probe over the simulated network, or one of its uncertain variants. */
-  probeStream(): Promise<PublicStreamProbeOutcome> {
+  /** The real stream probe over the simulated network (through the real drilled opener), or one of its uncertain variants. */
+  probeStream(drill: DrillProbeFaults | null = null): Promise<PublicStreamProbeOutcome> {
     if (this.streamProbeMode === "THROWS") {
       return publicStreamReachable({
         open: () => {
@@ -180,7 +189,7 @@ export class SimulatedMonitoringMachine {
     if (this.streamProbeMode === "INDETERMINATE") {
       return publicStreamReachable({ open: (url) => indeterminateSocket(this.net, url), timers: immediateProbeTimers });
     }
-    return publicStreamReachable({ open: this.net.openProbeSocket, timers: immediateProbeTimers });
+    return publicStreamReachable({ open: drilledProbeOpen(this.net.openProbeSocket, drill), timers: immediateProbeTimers });
   }
 
   /** Runs the whole machine for `ms` of simulated time. */
@@ -268,7 +277,7 @@ export class SimulatedMonitoringMachine {
       if (p.stopFile !== null && m.files.has(p.stopFile) && !this.scannersIgnoreStop) {
         // The cooperative stop: exactly the CLI's graceful stop, then the process exits.
         p.scanner.stop();
-        if (p.scanner.supervisor !== null) m.files.set(m.paths.scannerStatus, p.scanner.statusDocument(p.runtime));
+        if (p.scanner.supervisor !== null) m.files.set(m.paths.scannerStatus, p.scanner.statusDocument(p.runtime, this.drillReport(p)));
         p.exit = "STOPPED";
         p.exitedAtMs = m.now;
         m.kill(p.root);
@@ -279,6 +288,8 @@ export class SimulatedMonitoringMachine {
         m.kill(p.root);
         continue;
       }
+      // The CLI's once-a-second drill poll, then its tick.
+      p.gate?.poll();
       await p.scanner.step();
       if (p.scanner.state === "RUNNING") {
         p.runningSinceMs ??= m.now;
@@ -288,11 +299,17 @@ export class SimulatedMonitoringMachine {
         }
         const every = p.scanner.options.statusEverySeconds * 1_000;
         if (m.now - (p.lastStatusMs ?? p.runningSinceMs) >= every) {
-          m.files.set(m.paths.scannerStatus, p.scanner.statusDocument(p.runtime));
+          m.files.set(m.paths.scannerStatus, p.scanner.statusDocument(p.runtime, this.drillReport(p)));
           p.lastStatusMs = m.now;
         }
       }
     }
+  }
+
+  /** What the CLI adds to its status: the drill observation, once this process has seen a drill. */
+  private drillReport(p: ScannerProcess): Record<string, unknown> {
+    const drill = p.gate?.observation() ?? null;
+    return drill === null ? {} : { drill };
   }
 
   private launch(root: number, runtime: number, runId: string, stopFile: string | null): ScannerProcess {
@@ -328,7 +345,16 @@ export class SimulatedMonitoringMachine {
       socketIds.push(net.sockets[net.sockets.length - 1].id);
       return connection;
     };
-    const processNet = Object.assign(Object.create(net) as SimulatedPublicNetwork, { rest, openStream });
+    // Exactly as the CLI: a gate only for a run spawned with a stop file, wrapping the process's own transports.
+    const gate =
+      stopFile === null
+        ? null
+        : new PublicTransportDrillGate({ file: drillFileOf(stopFile), runId, readText: (f) => m.files.get(f) ?? null, nowMs: this.clock.nowMs, monoMs: this.clock.nowMs, log: () => undefined });
+    const drilled = gate === null ? null : drilledOpenStream(openStream, gate, (fn) => queueMicrotask(() => alive() && fn()));
+    const processNet = Object.assign(Object.create(net) as SimulatedPublicNetwork, {
+      rest: gate === null ? rest : drilledPublicTransport(rest, gate),
+      openStream: drilled?.openStream ?? openStream,
+    });
     const processClock = new SimulatedClock(this.clock.nowMs, () => undefined);
     // Timers of an exited process never fire.
     const sleep = (ms: number) => (alive() ? this.clock.sleep(ms) : new Promise<void>(() => undefined));
@@ -347,7 +373,7 @@ export class SimulatedMonitoringMachine {
       symbolsPerConnection: this.symbolsPerConnection,
       profile: this.timeline.profile,
     });
-    const process: ScannerProcess = { root, runtime, runId, stopFile, scanner, spawnedAtMs: m.now, exit: "RUNNING", exitedAtMs: null, runningSinceMs: null, lastStatusMs: null, manifestWritten: false, socketIds };
+    const process: ScannerProcess = { root, runtime, runId, stopFile, scanner, spawnedAtMs: m.now, exit: "RUNNING", exitedAtMs: null, runningSinceMs: null, lastStatusMs: null, manifestWritten: false, socketIds, gate };
     holder.process = process;
     return process;
   }
@@ -389,5 +415,23 @@ export class SimulatedMonitoringMachine {
       if (!["backend", "scanner", "emitter", "planner"].includes(plan.role)) this.violations.push(`${at} spawned a non-monitoring role ${plan.role}`);
     }
     if (this.net.violations.length > 0) this.violations.push(...this.net.violations.splice(0).map((v) => `${at} network: ${v}`));
+    // An operator drill never outlives its window: no gate active past its expiry, no drill file left more than one
+    // supervision pass (at most a poll interval) after it, and only ever the drill file of a running scanner's stop file.
+    for (const p of running) {
+      const report = p.gate?.observation() ?? null;
+      const file = p.stopFile === null ? null : drillFileOf(p.stopFile);
+      const parsed = file === null ? null : parsePublicTransportDrill(this.m.files.get(file) ?? null, p.runId);
+      if (report?.active && parsed?.kind === "VALID" && this.m.now >= parsed.drill.expiresAtMs) this.violations.push(`${at} drill ${report.drillId} still active past its expiry`);
+    }
+    for (const file of [...this.m.files.keys()].filter((f) => f.endsWith(".drill"))) {
+      const owner = running.find((p) => p.stopFile !== null && drillFileOf(p.stopFile) === file);
+      const parsed = owner === undefined ? null : parsePublicTransportDrill(this.m.files.get(file) ?? null, owner.runId);
+      const expiresAtMs = parsed?.kind === "VALID" ? parsed.drill.expiresAtMs : null;
+      if (expiresAtMs !== null && this.m.now > expiresAtMs + ALWAYS_ON_DEFAULTS.pollMs + 2_000) this.violations.push(`${at} drill file ${path.basename(file)} left past its expiry`);
+      if (owner === undefined) {
+        this.orphanDrillSince.set(file, this.orphanDrillSince.get(file) ?? this.m.now);
+        if (this.m.now - (this.orphanDrillSince.get(file) as number) > ALWAYS_ON_DEFAULTS.pollMs + 2_000) this.violations.push(`${at} drill file ${path.basename(file)} of no running scanner`);
+      } else this.orphanDrillSince.delete(file);
+    }
   }
 }

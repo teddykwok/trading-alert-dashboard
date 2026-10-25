@@ -183,8 +183,13 @@ describe("the production probe: public, validated, unsigned, and never switchabl
     expect(machine).toMatch(/options\.open \?\? \(\(url: string\) => new WebSocket\(url\)\)/);
     expect(machine).not.toMatch(/new WebSocket\(url,/);
     expect(machine).toMatch(/const timeoutMs = options\.timeoutMs \?\? PUBLIC_STREAM_PROBE_TIMEOUT_MS;/);
+    // Production calls it through the machine's probe: no injected transport (`open` undefined → the real WebSocket)
+    // unless an ACTIVE operator drill replaces the socket (drilledProbeOpen(undefined, null) === undefined).
     const entry = readFileSync(path.join(BACKEND, "src/modules/always-on/run-always-on-monitoring.ts"), "utf8");
-    expect(entry.match(/publicStreamReachable\([^)]*\)/g)).toEqual(["publicStreamReachable()"]);
+    expect(entry).toContain("publicStreamConnectivity: publicStreamProbe,");
+    expect(entry).not.toMatch(/publicStreamReachable\(/);
+    expect(machine).toContain("return publicStreamReachable({ open: drilledProbeOpen(undefined, drill) });");
+    expect((machine.replace(/\/\*[\s\S]*?\*\//g, "").match(/publicStreamReachable\(/g) ?? []).length).toBe(2); // its definition and that one call (comments aside)
   });
 
   it("the Always-On CLI accepts no probe, stream or outage option", () => {

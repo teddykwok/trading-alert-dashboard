@@ -304,9 +304,9 @@ export class SimulatedScanner {
     return this.supervisor.status();
   }
 
-  /** Exactly the document the CLI writes to status.json. */
-  statusDocument(pid: number = this.input.pid): string {
-    return `${JSON.stringify({ ...this.status(), gitHead: "simulated", pid, writtenAt: new Date(this.input.clock.nowMs()).toISOString() }, null, 2)}\n`;
+  /** Exactly the document the CLI writes to status.json (`extra`: what the CLI adds beside the status, e.g. a drill observation). */
+  statusDocument(pid: number = this.input.pid, extra: Record<string, unknown> = {}): string {
+    return `${JSON.stringify({ ...this.status(), gitHead: "simulated", pid, writtenAt: new Date(this.input.clock.nowMs()).toISOString(), ...extra }, null, 2)}\n`;
   }
 
   /** The CLI's graceful stop (Ctrl+C or the cooperative stop file): nothing more lands, locks are released. */

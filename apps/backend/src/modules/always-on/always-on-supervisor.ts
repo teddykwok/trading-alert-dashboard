@@ -1941,10 +1941,10 @@ export class AlwaysOnSupervisor {
       expiresAtMs: now + request.durationSeconds * 1_000,
       faults: spec.scanner,
     };
-    const file = drillFileOf(owned.stopFile as string);
+    const drillFile = drillFileOf(owned.stopFile as string);
     const wrote = await this.mutate("ALWAYS_ON_DRILL_START", (): string | null => {
       try {
-        this.a.fs.writeTextAtomic(file, publicTransportDrillText(drill));
+        this.a.fs.writeTextAtomic(drillFile, publicTransportDrillText(drill));
         return null;
       } catch (error) {
         return errorCode(error);
@@ -1961,13 +1961,13 @@ export class AlwaysOnSupervisor {
       return;
     }
     if (wrote.result !== null) {
-      this.removeQuietly(file);
+      this.removeQuietly(drillFile);
       this.rejectDrill("DRILL_FILE_WRITE_FAILED", `the drill file could not be written (${wrote.result})`, request.requestId, facts);
       return;
     }
     this.drill = {
       drill,
-      file,
+      file: drillFile,
       childPid: owned.pid,
       childSequence: owned.sequence,
       probes: spec.probes,
@@ -1990,7 +1990,7 @@ export class AlwaysOnSupervisor {
         generation: this.generation,
         startedAt: new Date(drill.startedAtMs).toISOString(),
         expiresAt: new Date(drill.expiresAtMs).toISOString(),
-        file: path.basename(file),
+        file: path.basename(drillFile),
       },
     });
   }

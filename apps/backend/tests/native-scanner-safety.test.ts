@@ -58,6 +58,8 @@ describe("the native scanner data layer", () => {
       "parity-audit-runner.ts",
       "parity-audit.ts",
       "public-request-weight.ts",
+      // Always-On operator network drill: the scanner's pure drill gate and transport wrappers (clocks injected).
+      "public-transport-drill.ts",
       "replay-cli-args.ts",
       "run-candidate-rank.ts",
       "run-compat-replay.ts",

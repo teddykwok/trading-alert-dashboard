@@ -131,9 +131,11 @@ describe("the Always-On supervisor's reach", () => {
     const code = codeOf(SUPERVISOR);
     expect((code.match(/this\.mutate\("ALWAYS_ON_ROLE_START"/g) ?? []).length).toBe(1);
     expect((code.match(/this\.mutate\("ALWAYS_ON_ROLE_STOP"/g) ?? []).length).toBe(2);
+    // The operator drill's activation (its drill file) is fenced the same way.
+    expect((code.match(/this\.mutate\("ALWAYS_ON_DRILL_START"/g) ?? []).length).toBe(1);
     // The fence is read again UNDER the lock and anything but CURRENT (superseded, or unreadable) runs nothing.
     expect(code).toMatch(/const held = await this\.a\.mutation\(action, async \(\)[^\n]* => \{\s*const fence = this\.fenceState\(\);\s*if \(fence !== "CURRENT"\) return \{ fence \};\s*return \{ fence, value: run\(\) \};/);
-    expect([...MUTATION_ACTIONS]).toEqual(expect.arrayContaining(["ALWAYS_ON_START", "ALWAYS_ON_STOP", "ALWAYS_ON_ROLE_START", "ALWAYS_ON_ROLE_STOP"]));
+    expect([...MUTATION_ACTIONS]).toEqual(expect.arrayContaining(["ALWAYS_ON_START", "ALWAYS_ON_STOP", "ALWAYS_ON_ROLE_START", "ALWAYS_ON_ROLE_STOP", "ALWAYS_ON_DRILL_START"]));
   });
 
   it("the launcher's Always-On module writes exactly two things: one request file (temporary + rename) and the supervisor's log (append, rotated)", () => {
@@ -183,7 +185,11 @@ describe("the Always-On supervisor's reach", () => {
     const calls = code.split("\n").filter((line) => /this\.(removeQuietly|removeRequest|removeStopFile)\(/.test(line));
     expect(calls.length).toBeGreaterThan(0);
     for (const line of calls) {
-      expect({ line: line.trim(), allowed: /paths\.stopRequest|paths\.clearLatchRequest|paths\.stopDir|child\.stopFile|removeStopFile\(child\)|removeStopFile\(\{ stopFile \} as ChildRecord\)/.test(line) }).toEqual({ line: line.trim(), allowed: true });
+      // ...or the operator drill's own request files and its drill file (beside the owned scanner's stop file).
+      expect({
+        line: line.trim(),
+        allowed: /paths\.stopRequest|paths\.clearLatchRequest|paths\.drillRequest|paths\.drillRestoreRequest|paths\.stopDir|child\.stopFile|removeStopFile\(child\)|removeStopFile\(\{ stopFile \} as ChildRecord\)|removeQuietly\(d\.file\)|removeQuietly\(drillFile\)/.test(line),
+      }).toEqual({ line: line.trim(), allowed: true });
     }
     for (const file of AO_FILES) {
       const code = codeOf(file);

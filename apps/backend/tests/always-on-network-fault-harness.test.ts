@@ -382,13 +382,20 @@ describe("ordinary production startup cannot activate fault injection", () => {
     expect(offenders.map((o) => o.file)).toEqual([]);
   });
 
-  it("the Always-On entrypoint wires the probe to the real transport (no argument), and the scanner entrypoint to the real fetch and WebSocket", () => {
+  it("the Always-On entrypoint wires the probe to the real transport (gated only by an ACTIVE operator drill), and the scanner entrypoint to the real fetch and WebSocket", () => {
     const always = readFileSync(path.join(BACKEND, "src/modules/always-on/run-always-on-monitoring.ts"), "utf8");
-    expect(always.match(/publicBinanceReachable\([^)]*\)/g)).toEqual(["publicBinanceReachable()"]);
+    // The entrypoint hands the supervisor the machine's production probe; outside an active operator drill it receives
+    // the real fetch ITSELF (drilledProbeFetch(fetch, null) === fetch, pinned in always-on-drill.test.ts).
+    expect(always).toContain("publicConnectivity: publicConnectivityProbe,");
+    expect(always).not.toMatch(/publicBinanceReachable\(/);
+    const machine = readFileSync(path.join(BACKEND, "src/modules/always-on/always-on-machine.ts"), "utf8");
+    expect(machine).toContain("return publicBinanceReachable(undefined, drilledProbeFetch(fetch, drill));");
+    expect((machine.replace(/\/\*[\s\S]*?\*\//g, "").match(/publicBinanceReachable\(/g) ?? []).length).toBe(2); // its definition and that one call (comments aside)
     const scanner = readFileSync(path.join(BACKEND, "src/modules/native-scanner/run-live-shadow-supervisor.ts"), "utf8");
     expect(scanner).toMatch(/const publicTransport: PublicHttpTransport = async \(url, init\) => \{\r?\n\s+const response = await fetch\(url, \{/);
     expect(scanner).toMatch(/const openPublicStream: OpenPublicStream = \(url, handlers\) => \{\r?\n\s+const socket = new WebSocket\(url\);/);
-    expect(scanner).toMatch(/openStream: openPublicStream,/);
+    // The operator drill gate wraps them only for a supervisor-spawned run (always-on-drill-structure.test.ts).
+    expect(scanner).toMatch(/openStream: drilledStreams\?\.openStream \?\? openPublicStream,/);
   });
 
   it("neither CLI accepts a fault, simulation or transport option", () => {
