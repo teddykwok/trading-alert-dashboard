@@ -4,6 +4,7 @@ import {
   ALWAYS_ON_DRILL_FAULTS,
   ALWAYS_ON_DRILL_MAX_SECONDS,
   ALWAYS_ON_DRILL_REQUEST_TTL_MS,
+  commandLineInRepository,
   controllerIsDrillCli,
   drillStartRequestText,
   drilledProbeFetch,
@@ -157,6 +158,21 @@ describe("the controller: only this repository's own `monitoring:always-on drill
     ["powershell.exe -Command echo src/modules/always-on/run-always-on-monitoring.ts drill start", false],
   ])("%s → %s", (commandLine, expected) => {
     expect(controllerIsDrillCli(commandLine)).toBe(expected);
+  });
+});
+
+describe("the controller's repository: this checkout itself, never a sibling whose path merely starts the same", () => {
+  it.each([
+    ["node --require C:\\Projects\\trading-alert-dashboard\\node_modules\\tsx\\dist\\preflight.cjs src/x.ts", "C:\\Projects\\trading-alert-dashboard", true],
+    ["node --require C:/Projects/trading-alert-dashboard/node_modules/tsx/dist/preflight.cjs src/x.ts", "C:\\Projects\\trading-alert-dashboard\\", true],
+    ["node --require c:\\projects\\TRADING-alert-dashboard\\node_modules\\x.cjs", "C:\\Projects\\trading-alert-dashboard", true],
+    // A worktree beside the main checkout shares the prefix: it is NOT this repository.
+    ["node --require C:\\Projects\\trading-alert-dashboard-wt\\always-on-x\\node_modules\\tsx\\dist\\preflight.cjs src/x.ts", "C:\\Projects\\trading-alert-dashboard", false],
+    ["node C:\\Projects\\trading-alert-dashboard.old\\x.ts", "C:\\Projects\\trading-alert-dashboard", false],
+    ["node C:\\elsewhere\\x.ts", "C:\\Projects\\trading-alert-dashboard", false],
+    ["node C:\\x.ts", "", false],
+  ])("%s in %s → %s", (commandLine, repoRoot, expected) => {
+    expect(commandLineInRepository(commandLine, repoRoot)).toBe(expected);
   });
 });
 

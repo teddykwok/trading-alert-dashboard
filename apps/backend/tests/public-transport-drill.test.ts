@@ -136,6 +136,17 @@ describe("the gate: active only for a valid, unexpired drill of this run", () =>
     expect(gate.observation()).toMatchObject({ active: false, endReason: "EXPIRED" });
   });
 
+  it("a wall clock moved FORWARDS past the expiry ends the drill at once — a clock change can shorten a drill, never lengthen it", () => {
+    const files = new Map([[DRILL_FILE, publicTransportDrillText(drill())]]);
+    const { c } = clocks();
+    const { gate } = gateOver(files, c);
+    gate.poll();
+    c.mono += 1_000; // one real second later...
+    c.wall += 3_600_000; // ...the wall clock jumped an hour ahead
+    expect(gate.faults()).toBeNull();
+    expect(gate.observation()).toMatchObject({ active: false, endReason: "EXPIRED" });
+  });
+
   it("ends when its file is removed (the supervisor's restore) and never reactivates that drill id", () => {
     const files = new Map([[DRILL_FILE, publicTransportDrillText(drill())]]);
     const { c, advance } = clocks();
