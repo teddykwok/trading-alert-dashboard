@@ -278,6 +278,59 @@ describe("restoration is deterministic and fail-safe", () => {
   });
 });
 
+describe("path-scoped REST faults and the stream probe socket", () => {
+  it("a REST fault scoped to exchangeInfo refuses only exchangeInfo; klines and server time still answer; scoping needs a REST fault and known paths", async () => {
+    const { net } = rig();
+    expect(() => net.cut({ openStreams: "DROP", restPaths: ["/fapi/v1/exchangeInfo"], maxDurationMs: 60_000 })).toThrow(/restPaths/);
+    expect(() => net.cut({ rest: "REFUSED", restPaths: ["/fapi/v1/order"], maxDurationMs: 60_000 })).toThrow(/restPaths/);
+    net.cut({ rest: "REFUSED", restPaths: ["/fapi/v1/exchangeInfo"], maxDurationMs: 60_000 });
+    await expect(net.rest("https://fapi.binance.com/fapi/v1/exchangeInfo", { headers: {} })).rejects.toBeInstanceOf(TypeError);
+    expect((await net.rest(KLINES, { headers: {} })).status).toBe(200);
+    expect(await publicBinanceReachable(5_000, net.fetch)).toBe(true);
+    expect(net.events[0].detail).toContain("rest REFUSED (/fapi/v1/exchangeInfo)");
+  });
+
+  const PROBE_URL = "wss://fstream.binance.com/market/stream?streams=btcusdt@kline_15m";
+  async function observe(net: SimulatedPublicNetwork) {
+    const seen: string[] = [];
+    const socket = net.openProbeSocket(PROBE_URL);
+    for (const type of ["open", "message", "error", "close"] as const) socket.addEventListener(type, (e) => seen.push(type === "message" ? `message:${JSON.parse(String(e.data)).data.s}` : type));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    return { seen, socket };
+  }
+
+  it("UP opens and sends one valid BTCUSDT kline; REFUSED errors and closes; BLACKHOLE never answers; SILENT opens and says nothing", async () => {
+    const { net } = rig();
+    expect((await observe(net)).seen).toEqual(["open", "message:BTCUSDT"]);
+    const refused = net.cut({ newStreams: "REFUSED", maxDurationMs: 60_000 });
+    expect((await observe(net)).seen).toEqual(["error", "close"]);
+    refused.restore();
+    const hole = net.cut({ newStreams: "BLACKHOLE", maxDurationMs: 60_000 });
+    expect((await observe(net)).seen).toEqual([]);
+    hole.restore();
+    net.cut({ openStreams: "SILENT", maxDurationMs: 60_000 });
+    expect((await observe(net)).seen).toEqual(["open"]);
+    expect(net.streamProbes.map((p) => p.outcome)).toEqual(["OK", "REFUSED", "BLACKHOLE", "SILENT"]);
+  });
+
+  it("a closed probe socket delivers nothing more; its listener count is observable; only the validated public probe URL is accepted", async () => {
+    const { net } = rig();
+    const seen: string[] = [];
+    const socket = net.openProbeSocket(PROBE_URL);
+    const listener = () => seen.push("x");
+    socket.addEventListener("open", listener);
+    expect(net.streamProbes[0].listeners()).toBe(1);
+    socket.removeEventListener("open", listener);
+    socket.close();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(seen).toEqual([]);
+    expect(net.streamProbes[0]).toMatchObject({ closed: true });
+    expect(net.streamProbes[0].listeners()).toBe(0);
+    expect(() => net.openProbeSocket("wss://fstream.binance.com/market/stream?streams=ethusdt@kline_15m")).toThrow(SimulatedNetworkViolation);
+    expect(() => net.openProbeSocket("wss://stream.binance.com/market/stream?streams=btcusdt@kline_15m")).toThrow(SimulatedNetworkViolation);
+  });
+});
+
 describe("the simulated network serves public market data only", () => {
   it("refuses any other host, signed parameters, an API-key header, a non-GET probe and a stream URL the production validator refuses", async () => {
     const { net } = rig();
@@ -289,6 +342,12 @@ describe("the simulated network serves public market data only", () => {
     expect(() => net.openStream("wss://fstream.binance.com/market/stream?streams=aaausdt@kline_15m&x=1", recorder().handlers)).toThrow(SimulatedNetworkViolation);
     expect(() => net.openStream("wss://fstream.binance.com/market/stream?streams=zzzusdt@kline_15m", recorder().handlers)).toThrow(/not a listed symbol/);
     expect(net.violations).toHaveLength(7);
+  });
+
+  it("the network events record path-scoped outages", () => {
+    const { net } = rig();
+    net.cut({ rest: "TIMEOUT", restPaths: ["/fapi/v1/klines", "/fapi/v1/exchangeInfo"], maxDurationMs: 60_000, label: "scoped" });
+    expect(net.events.map((e) => e.detail)).toEqual(["scoped: rest TIMEOUT (/fapi/v1/klines, /fapi/v1/exchangeInfo) (max 60s)"]);
   });
 });
 

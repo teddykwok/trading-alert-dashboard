@@ -25,6 +25,13 @@ import type { OpenPublicStream, StreamHandlers } from "../../src/modules/native-
  *                    | SILENT (half-open: stays OPEN, delivers nothing)
  *   new streams      UP | REFUSED (error + close, never open) | BLACKHOLE
  *                    (never answers: stays CONNECTING)
+ *   stream probe     the Always-On stream probe's one BTCUSDT subscription
+ *                    follows the stream faults: REFUSED errors and closes,
+ *                    BLACKHOLE never answers, SILENT opens and says nothing,
+ *                    UP opens and sends one valid kline
+ *
+ * A REST fault can be scoped to some paths (`restPaths`), e.g. exchangeInfo
+ * failing while klines and server time answer.
  *
  * Fail-safe: every outage carries a mandatory maximum duration (at most
  * MAX_SIMULATED_OUTAGE_MS) and restores itself when the simulated clock passes
@@ -41,6 +48,9 @@ import type { OpenPublicStream, StreamHandlers } from "../../src/modules/native-
 export const SIMULATED_REST_TIMEOUT_MS = 20_000;
 export const MAX_SIMULATED_OUTAGE_MS = 6 * 60 * 60 * 1000;
 const REST_HOST = "fapi.binance.com";
+const REST_PATHS: readonly string[] = ["/fapi/v1/time", "/fapi/v1/exchangeInfo", "/fapi/v1/klines"];
+/** The one public stream the Always-On stream probe subscribes to. */
+const PROBE_SYMBOL = "BTCUSDT";
 const M15 = 15 * 60_000;
 
 export type RestFault = "REFUSED" | "TIMEOUT";
@@ -49,6 +59,8 @@ export type NewStreamFault = "REFUSED" | "BLACKHOLE";
 
 export interface OutageSpec {
   readonly rest?: RestFault;
+  /** Limits the REST fault to these paths (e.g. only exchangeInfo); absent: every REST path. */
+  readonly restPaths?: readonly string[];
   readonly openStreams?: OpenStreamFault;
   readonly newStreams?: NewStreamFault;
   /** Mandatory: the outage restores itself once the simulated clock passes start + this. */
@@ -92,6 +104,32 @@ export interface SimulatedEvent {
   readonly kind: "OUTAGE_STARTED" | "RESTORED" | "AUTO_RESTORED" | "DISPOSED";
   readonly detail: string;
 }
+
+export type ProbeEventType = "open" | "message" | "error" | "close";
+export type ProbeListener = (event: { readonly data?: unknown; readonly code?: number }) => void;
+
+/** The WebSocket surface the Always-On stream probe uses: listeners in, close out. */
+export interface ProbeSocketLike {
+  addEventListener(type: ProbeEventType, listener: ProbeListener): void;
+  removeEventListener(type: ProbeEventType, listener: ProbeListener): void;
+  close(): void;
+}
+
+export interface SimulatedStreamProbe {
+  readonly atMs: number;
+  readonly url: string;
+  /** What the network did with it, decided by the fault state when it was opened. */
+  readonly outcome: "OK" | "REFUSED" | "BLACKHOLE" | "SILENT";
+  closed: boolean;
+  /** Listeners still registered right now (0 after a clean probe). */
+  readonly listeners: () => number;
+}
+
+/** Probe timers for tests: the timeout elapses right after the socket's own (microtask) events, never on a real clock. */
+export const immediateProbeTimers = {
+  set: (fn: () => void, _ms: number): unknown => setImmediate(fn),
+  clear: (handle: unknown): void => clearImmediate(handle as NodeJS.Immediate),
+};
 
 export class SimulatedNetworkViolation extends Error {
   constructor(message: string) {
@@ -170,6 +208,9 @@ export class SimulatedPublicNetwork {
     this.expireOutage();
     if (this.outageState !== null) throw new SimulatedNetworkViolation("an outage is already active: restore it first");
     if (spec.rest === undefined && spec.openStreams === undefined && spec.newStreams === undefined) throw new SimulatedNetworkViolation("an outage must fault at least one path");
+    if (spec.restPaths !== undefined && (spec.rest === undefined || spec.restPaths.length === 0 || spec.restPaths.some((p) => !REST_PATHS.includes(p)))) {
+      throw new SimulatedNetworkViolation(`restPaths needs a REST fault and paths among ${REST_PATHS.join(", ")}`);
+    }
     if (!Number.isFinite(spec.maxDurationMs) || spec.maxDurationMs <= 0 || spec.maxDurationMs > MAX_SIMULATED_OUTAGE_MS) {
       throw new SimulatedNetworkViolation(`an outage needs a maximum duration in (0, ${MAX_SIMULATED_OUTAGE_MS}] ms`);
     }
@@ -244,7 +285,7 @@ export class SimulatedPublicNetwork {
     const target = this.admit(url, init.headers);
     const record: SimulatedRequest = { atMs: this.nowMs(), via: "rest", path: target.pathname, symbol: target.searchParams.get("symbol"), outcome: "PENDING", settledAtMs: null };
     this.requests.push(record);
-    const fault = this.outage?.rest;
+    const fault = this.restFaultFor(target.pathname);
     if (fault === "REFUSED") return this.settle(record, "REFUSED", () => Promise.reject(refusedError()));
     if (fault === "TIMEOUT") {
       return new Promise<PublicHttpResponse>((_resolve, reject) => {
@@ -262,12 +303,19 @@ export class SimulatedPublicNetwork {
     const target = this.admit(raw, headers);
     const record: SimulatedRequest = { atMs: this.nowMs(), via: "probe", path: target.pathname, symbol: target.searchParams.get("symbol"), outcome: "PENDING", settledAtMs: null };
     this.requests.push(record);
-    const fault = this.outage?.rest;
+    const fault = this.restFaultFor(target.pathname);
     if (fault === "REFUSED") return this.settle(record, "REFUSED", () => Promise.reject(refusedError()));
     if (fault === "TIMEOUT") return this.settle(record, "TIMEOUT", () => Promise.reject(timeoutError()));
     const answer = this.serve(target);
     return this.settle(record, "OK", async () => new Response(await answer.text(), { status: answer.status }));
   }) as typeof fetch;
+
+  /** The active REST fault for this path (an outage scoped by restPaths faults only those). */
+  private restFaultFor(pathname: string): RestFault | undefined {
+    const outage = this.outage;
+    if (outage === null || outage.rest === undefined) return undefined;
+    return outage.restPaths === undefined || outage.restPaths.includes(pathname) ? outage.rest : undefined;
+  }
 
   private admit(raw: string, headers: Readonly<Record<string, string>>): URL {
     this.assertUsable();
@@ -323,6 +371,64 @@ export class SimulatedPublicNetwork {
       return respond(200, rows.map(binanceRow));
     }
     return respond(404, {});
+  }
+
+  // ---------------------------------------------------------------------------
+  // The Always-On stream probe: one public subscription, judged by the fault state when it opens
+  // ---------------------------------------------------------------------------
+
+  readonly streamProbes: SimulatedStreamProbe[] = [];
+
+  readonly openProbeSocket = (url: string): ProbeSocketLike => {
+    this.assertUsable();
+    this.expireOutage();
+    try {
+      assertPublicCombinedKlineStreamUrl(url, [PROBE_SYMBOL], "15m");
+    } catch (error) {
+      this.violate(`refused probe stream URL: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const listeners = new Map<ProbeEventType, Set<ProbeListener>>();
+    const outage = this.outage;
+    const outcome: SimulatedStreamProbe["outcome"] =
+      outage?.newStreams === "REFUSED" ? "REFUSED" : outage?.newStreams === "BLACKHOLE" ? "BLACKHOLE" : outage?.openStreams === "SILENT" ? "SILENT" : "OK";
+    const record: SimulatedStreamProbe = { atMs: this.nowMs(), url, outcome, closed: false, listeners: () => [...listeners.values()].reduce((n, set) => n + set.size, 0) };
+    this.streamProbes.push(record);
+    const emit = (type: ProbeEventType, event: { data?: unknown; code?: number }) => {
+      if (record.closed) return;
+      for (const listener of [...(listeners.get(type) ?? [])]) listener(event);
+    };
+    queueMicrotask(() => {
+      if (outcome === "REFUSED") {
+        emit("error", {});
+        emit("close", { code: 1006 });
+      } else if (outcome === "OK" || outcome === "SILENT") {
+        emit("open", {});
+        if (outcome === "OK") emit("message", { data: this.probeMessage() });
+      }
+    });
+    return {
+      addEventListener: (type, listener) => {
+        const set = listeners.get(type) ?? new Set<ProbeListener>();
+        set.add(listener);
+        listeners.set(type, set);
+      },
+      removeEventListener: (type, listener) => {
+        listeners.get(type)?.delete(listener);
+      },
+      close: () => {
+        record.closed = true;
+      },
+    };
+  };
+
+  /** A valid in-progress update of the probe symbol's current bar. */
+  private probeMessage(): string {
+    const now = this.nowMs();
+    const t = Math.floor(now / M15) * M15;
+    return JSON.stringify({
+      stream: klineStreamNameOf(PROBE_SYMBOL, "15m"),
+      data: { e: "kline", E: now, s: PROBE_SYMBOL, k: { t, T: t + M15 - 1, s: PROBE_SYMBOL, i: "15m", o: "100", c: "100.5", h: "101", l: "99", x: false } },
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -482,6 +588,6 @@ export class SimulatedPublicNetwork {
 }
 
 function describe(spec: OutageSpec): string {
-  const parts = [spec.rest && `rest ${spec.rest}`, spec.openStreams && `open streams ${spec.openStreams}`, spec.newStreams && `new streams ${spec.newStreams}`].filter(Boolean);
+  const parts = [spec.rest && `rest ${spec.rest}${spec.restPaths ? ` (${spec.restPaths.join(", ")})` : ""}`, spec.openStreams && `open streams ${spec.openStreams}`, spec.newStreams && `new streams ${spec.newStreams}`].filter(Boolean);
   return `${spec.label ? `${spec.label}: ` : ""}${parts.join(", ")} (max ${Math.round(spec.maxDurationMs / 1000)}s)`;
 }
