@@ -457,15 +457,18 @@ export class SimulatedPublicNetwork {
 
   // ---------------------------------------------------------------------------
 
+  /** An expired outage is over AT its deadline (recorded with that instant), whenever it is first observed. */
   private expireOutage(): void {
     const active = this.outageState;
-    if (active !== null && this.nowMs() >= active.deadlineMs) this.endOutage("AUTO_RESTORED", `maximum duration ${Math.round(active.spec.maxDurationMs / 1000)}s reached: restored automatically`);
+    if (active !== null && this.nowMs() >= active.deadlineMs) {
+      this.endOutage("AUTO_RESTORED", `maximum duration ${Math.round(active.spec.maxDurationMs / 1000)}s reached: restored automatically`, active.deadlineMs);
+    }
   }
 
-  private endOutage(kind: "RESTORED" | "AUTO_RESTORED", detail: string): void {
+  private endOutage(kind: "RESTORED" | "AUTO_RESTORED", detail: string, atMs: number = this.nowMs()): void {
     this.outageState = null;
     this.silentSince.clear();
-    this.events.push({ atMs: this.nowMs(), kind, detail });
+    this.events.push({ atMs, kind, detail });
   }
 
   private assertUsable(): void {
