@@ -241,6 +241,9 @@ export function judgeScannerHealth(input: {
     issues.push({ code: "NO_SYMBOLS_SELECTED", detail: "the run has no selected symbols" });
   } else {
     // Membership is the scanner's whole partition of its placed symbols; each state above is reported once, by its own code.
+    // The compact fallback (a status without per-symbol detail) has totals only, and totals.failed also counts symbols
+    // that failed before placement: there a gap can be offset by such a failure. Diagnostic only — any failure is
+    // SYMBOLS_FAILED and DEGRADED regardless — and current scanners always write the detail.
     const why =
       detail !== null
         ? detail.placed !== selected
@@ -273,8 +276,9 @@ export function judgeScannerHealth(input: {
 }
 
 /**
- * The placed symbols' readiness states a status may list; each is reported by its own code. A FAILED symbol stays on
- * its connection (the scanner never unplaces it) and is reported as SYMBOLS_FAILED.
+ * The placed symbols' readiness states a status may list; each is reported by its own code. A symbol that fails after
+ * it was placed keeps its connection (fail() does not unplace it) and is reported as SYMBOLS_FAILED; one that fails
+ * before it was ever placed (during its bootstrap) has no connection and is not a placed symbol here.
  */
 const KNOWN_PLACED_STATES: ReadonlySet<string> = new Set(["LIVE_ELIGIBLE", "QUARANTINED_CURRENT_BAR", "AWAITING_STREAM", "NOT_READY", "RECOVERING", "PENDING", "FAILED"]);
 
