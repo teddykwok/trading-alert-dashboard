@@ -224,21 +224,38 @@ describe("sustained combined outage: the documented contract, end to end", () =>
 });
 
 describe("outages the probe cannot see: the current policy, pinned so a change is visible", () => {
-  it("a 60 s blip that ends before the 90 s grace is never seen by the probe; the scanner's status (written every 60 s) still reads degraded, so the supervisor runs ONE ordered recovery — bounded, never a storm", async () => {
+  it("R2: a 60 s blip that ends before the 90 s grace costs no recovery — the degraded snapshot from before the grace deadline is not acted on, and the next status shows the scanner healed", async () => {
     const sm = await runningStack();
+    const runA = sm.liveScanner();
     const cutAt = sm.m.now;
     await sm.net.withOutage({ rest: "REFUSED", openStreams: "DROP", newStreams: "REFUSED", maxDurationMs: 90_000, label: "blip" }, async () => {
       await sm.runFor(60_000);
     });
     await sm.runFor(20 * 60_000);
     const list = since(sm, cutAt);
-    expect(kinds(list)).not.toContain("NETWORK_UNAVAILABLE/scanner");
-    expect(sm.net.requests.filter((r) => r.via === "probe").every((r) => r.outcome === "OK")).toBe(true);
-    expect(kinds(list).filter((k) => k === "SCANNER_RECOVERY_REQUESTED/scanner")).toHaveLength(1);
-    expect(kinds(list).filter((k) => k === "ROLE_STARTED/scanner")).toHaveLength(1);
-    expect(at(list, "SCANNER_RECOVERY_REQUESTED") - at(list, "SCANNER_DEGRADED")).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.degradedGraceMs);
+    expect(kinds(list)).toContain("SCANNER_DEGRADED/scanner");
+    expect(kinds(list).filter((k) => /^(SCANNER_RECOVERY_REQUESTED|ROLE_STOP_REQUESTED|ROLE_STARTED)/.test(k))).toEqual([]);
+    expect(sm.processes).toHaveLength(1);
+    expect(sm.processes[0].runId).toBe(runA?.runId);
     expect(sm.supervisor.status().state).toBe("RUNNING");
-    expect(sm.supervisor.status().roles.scanner.attempts).toBe(1);
+    expect(sm.supervisor.status().roles.scanner.attempts).toBe(0);
+    expectSafety(sm);
+  }, 240_000);
+
+  it("R2: a persistent scanner fault after a blip still recovers, on the first status written after the grace deadline", async () => {
+    const sm = await runningStack();
+    const runA = sm.liveScanner() as NonNullable<ReturnType<SimulatedMonitoringMachine["liveScanner"]>>;
+    sm.scannerStreamsBroken = (runId) => runId === runA.runId;
+    const cutAt = sm.m.now;
+    await sm.net.withOutage({ openStreams: "DROP", maxDurationMs: 2_000, label: "one drop" }, async () => {
+      await sm.runFor(1_000);
+    });
+    expect(await sm.runUntil(() => kinds(since(sm, cutAt)).includes("SCANNER_RECOVERY_REQUESTED/scanner"), 15 * 60_000)).toBe(true);
+    const list = since(sm, cutAt);
+    const delay = at(list, "SCANNER_RECOVERY_REQUESTED") - at(list, "SCANNER_DEGRADED");
+    expect(delay).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.degradedGraceMs);
+    expect(delay).toBeLessThanOrEqual(ALWAYS_ON_DEFAULTS.degradedGraceMs + runA.scanner.options.statusEverySeconds * 1_000 + ALWAYS_ON_DEFAULTS.pollMs);
+    expect(await sm.runUntil(() => kinds(since(sm, cutAt)).includes("SUPERVISOR_RETURNED_HEALTHY"), 15 * 60_000)).toBe(true);
     expectSafety(sm);
   }, 240_000);
 

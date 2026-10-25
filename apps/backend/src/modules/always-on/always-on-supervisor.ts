@@ -1014,6 +1014,20 @@ export class AlwaysOnSupervisor {
   }
 
   /**
+   * A recovery decision rests on a scanner status written at or after the grace deadline (`sinceMs` + grace): one
+   * written before it may describe an outage that is already over. A status that stops arriving is itself the evidence
+   * — STATUS_MISSING, or STATUS_STALE once older than the status freshness window — and is never delayed, so the wait
+   * is bounded by one status interval (at most that window).
+   */
+  private evidenceCoversGrace(scanner: ScannerHealth, issues: readonly string[], sinceMs: number): boolean {
+    if (issues.includes("STATUS_STALE") || issues.includes("STATUS_MISSING")) return true;
+    const writtenAtMs = scanner.writtenAt === null ? Number.NaN : Date.parse(scanner.writtenAt);
+    // An untrustworthy timestamp is already STATUS_STALE in the judge; never wait on one.
+    if (!Number.isFinite(writtenAtMs)) return true;
+    return writtenAtMs >= sinceMs + this.config.policy.degradedGraceMs;
+  }
+
+  /**
    * The scanner's OWN current evidence that its streams, and nothing else, are failing: a fresh status of our run in
    * which no connection is delivering anything, and every issue is one a stream outage explains (awaiting streams,
    * stale market data, symbols recovering). A stale or missing status, or any other issue, is never such evidence.
@@ -1310,7 +1324,11 @@ export class AlwaysOnSupervisor {
     const awaitedMs = now - (rec.awaitingSinceMs ?? now);
     if (scanner.ours && scanner.verdict === "DEGRADED") {
       rec.degradedSinceMs ??= now;
-      if (now - rec.degradedSinceMs >= this.config.policy.degradedGraceMs && (await this.networkReachable(now))) {
+      if (
+        now - rec.degradedSinceMs >= this.config.policy.degradedGraceMs &&
+        this.evidenceCoversGrace(scanner, scanner.issues.map((i) => i.code as string), rec.degradedSinceMs) &&
+        (await this.networkReachable(now))
+      ) {
         if (this.streamFailureEvidence(scanner) && (await this.streamOutageConfirmed(scanner.runId, now))) {
           // The fresh run is kept: it cannot connect because the public streams are down, not because it failed.
           this.setRole(role, "RECOVERING", "PUBLIC_STREAM_UNREACHABLE", "recovery: the fresh run cannot connect because public Binance streams are unreachable while REST answers; it is kept and no attempt is spent");
@@ -1428,6 +1446,10 @@ export class AlwaysOnSupervisor {
     const unhealthyMs = now - rt.unhealthySinceMs;
     if (unhealthyMs < p.degradedGraceMs) {
       this.setRole(role, "DEGRADED", issues[0], `degraded for ${Math.round(unhealthyMs / 1000)}s (${summary}); inside the ${Math.round(p.degradedGraceMs / 1000)}s grace period — no action`);
+      return;
+    }
+    if (!this.evidenceCoversGrace(scanner, issues, rt.unhealthySinceMs)) {
+      this.setRole(role, "DEGRADED", "AWAITING_FRESH_STATUS", `degraded (${summary}) past its grace period; waiting for a status written after the grace deadline before acting (the last one predates it)`);
       return;
     }
     if (!(await this.networkReachable(now))) {
