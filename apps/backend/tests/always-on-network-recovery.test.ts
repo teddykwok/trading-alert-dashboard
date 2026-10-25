@@ -390,7 +390,12 @@ describe("R1: a public stream-only outage is recognised by the stream probe and 
     expect(streamIncidents(list)).toEqual([]);
     expect(sm.net.streamProbes.length).toBeGreaterThan(0);
     expect(sm.net.streamProbes.every((p) => p.outcome === "OK")).toBe(true);
-    expect(list.filter((i) => i.kind === "ROLE_STARTED" && i.role === "scanner")).toHaveLength(ALWAYS_ON_DEFAULTS.maxRecoveryAttempts);
+    const starts = list.filter((i) => i.kind === "ROLE_STARTED" && i.role === "scanner").map((i) => Date.parse(i.at));
+    expect(starts).toHaveLength(ALWAYS_ON_DEFAULTS.maxRecoveryAttempts);
+    // Never a storm: each fresh run is judged for the whole grace period before the next, and the backoff grows.
+    const gaps = starts.slice(1).map((t, i) => t - starts[i]);
+    expect(gaps.every((g) => g >= ALWAYS_ON_DEFAULTS.degradedGraceMs)).toBe(true);
+    expect(gaps.at(-1) as number).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.backoffStepsMs[4]);
     expect(kinds(list)).toContain("ROLE_LATCHED/scanner");
     expect(kinds(list).filter((k) => k === "EMITTER_STARTED_ON_RUN/emitter")).toEqual([]);
     expectCleanProbes(sm);
