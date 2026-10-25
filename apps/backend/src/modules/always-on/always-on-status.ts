@@ -67,8 +67,11 @@ export interface AlwaysOnStatusDto {
     readonly reachable: boolean | null;
     readonly lastProbeAt: string | null;
     readonly unavailableSince: string | null;
-    /** The public stream path: probed only when the scanner's own status points at its streams. */
-    readonly stream: { readonly unreachableSince: string | null; readonly lastProbeAt: string | null; readonly lastProbeOutcome: PublicStreamProbeOutcome | null };
+    /**
+     * The public stream path: probed only when the scanner's own status points at its streams. Absent from an artifact
+     * written by an older supervisor (before the stream probe): readers show it as not recorded, never as healthy.
+     */
+    readonly stream?: { readonly unreachableSince: string | null; readonly lastProbeAt: string | null; readonly lastProbeOutcome: PublicStreamProbeOutcome | null } | null;
   };
   readonly roles: {
     readonly backend: AlwaysOnRoleView & { readonly healthOk: boolean | null };
@@ -92,9 +95,12 @@ export function renderAlwaysOnStatus(status: AlwaysOnStatusDto, nowMs: number): 
   lines.push(`  end-to-end   last healthy ${status.lastEndToEndHealthyAt ?? "never"}`);
   if (status.backoff !== null) lines.push(`  backoff      ${status.backoff.role} attempt ${status.backoff.attempt} not before ${status.backoff.until}`);
   if (status.lastRecovery !== null) lines.push(`  last recovery ${status.lastRecovery.at} ${status.lastRecovery.role} ${status.lastRecovery.reasonCode}: ${status.lastRecovery.outcome}`);
+  // An artifact from an older supervisor has no stream record: say so, never infer that the streams were fine.
+  const stream = status.network.stream ?? null;
+  const unreachableSince = stream?.unreachableSince ?? null;
   lines.push(
     `  data store   ${status.dataStore}; public network ${status.network.reachable === null ? "not probed" : status.network.reachable ? "reachable" : `UNREACHABLE since ${status.network.unavailableSince ?? "?"}`}` +
-      (status.network.stream.unreachableSince !== null ? `; public streams UNREACHABLE since ${status.network.stream.unreachableSince}` : "")
+      (stream === null ? "; public streams not recorded" : unreachableSince !== null ? `; public streams UNREACHABLE since ${unreachableSince}` : "")
   );
   for (const role of ALWAYS_ON_ROLES) {
     const view = status.roles[role];
