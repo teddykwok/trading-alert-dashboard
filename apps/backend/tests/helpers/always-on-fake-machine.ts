@@ -131,6 +131,14 @@ export class FakeMachine {
   /** What the public stream probe answers (THROWS: the probe itself fails), and when it was asked. */
   streamOutcome: PublicStreamProbeOutcome | "THROWS" = "REACHABLE";
   readonly streamProbes: number[] = [];
+  /** The drill faults the supervisor handed each REST / stream probe call (null: no drill — production behaviour). */
+  readonly connectivityDrills: unknown[] = [];
+  readonly streamProbeDrills: unknown[] = [];
+  /** What the Windows ACL check of the drill directories answers, and the directories it was asked about. */
+  privateDirectories: { private: true } | { private: false; reason: string } = { private: true };
+  readonly aclChecks: (readonly string[])[] = [];
+  /** The drill observation a scanner run writes into its status (null: none, exactly as a scanner without a drill). */
+  scannerDrill: ((child: { readonly root: number; readonly runId: string | null; readonly stopFile: string | null }) => Record<string, unknown> | null) | null = null;
   /** File-system faults, as Windows produces them (a reader, an editor, an indexer or antivirus holding the file). */
   failWrite: ((file: string) => boolean) | null = null;
   failRead: ((file: string) => boolean) | null = null;
@@ -150,6 +158,13 @@ export class FakeMachine {
     this.nodes.set(runtime, { pid: runtime, parentPid: root, executable: "node.exe", startedAtMs: this.now, commandLine: `node --import loader.mjs ${REPO}\\apps\\backend\\${ENTRY[plan.role].replace(/\//g, "\\")}` });
     this.spawns.push({ role: plan.role, root, runtime, plan, stopFile: arg("--stop-file"), runId, pinnedRunId: arg("--run-id"), index });
     return root;
+  }
+
+  /** An operator's `monitoring:always-on drill start` controller process of this repository (or another command line). */
+  addDrillController(commandLine = `"C:\\Program Files\\nodejs\\node.exe" --require ${REPO}\\node_modules\\tsx\\dist\\preflight.cjs src/modules/always-on/run-always-on-monitoring.ts drill start`): { pid: number; startedAtMs: number } {
+    const pid = this.nextPid++;
+    this.nodes.set(pid, { pid, parentPid: 1, executable: "node.exe", startedAtMs: this.now, commandLine });
+    return { pid, startedAtMs: this.now };
   }
 
   /** A process this supervisor did NOT start (a manual scanner, an old soak monitor, …). */
@@ -254,6 +269,10 @@ export class FakeMachine {
           capacity: { exceeded: u.capacityExceeded },
           ...(this.scannerNextRefreshAt === undefined ? {} : { nextRefreshAt: this.scannerNextRefreshAt }),
         },
+        ...((): Record<string, unknown> => {
+          const drill = this.scannerDrill?.(child) ?? null;
+          return drill === null ? {} : { drill };
+        })(),
         ...(this.scannerDetail === null ? { symbols: [{ symbol: "AAAUSDT", lastValidMessageAt: new Date(this.now - lastMessageAgoMs).toISOString() }] } : this.detailOf(u, lastMessageAgoMs)),
       })
     );
@@ -349,15 +368,25 @@ export class FakeMachine {
           return { ok: false, status: 404, body: null };
         },
       },
-      publicConnectivity: async () => {
+      // A drill fault reaches the probe as its transport would: REST refused → unreachable; streams refused → UNREACHABLE,
+      // silent → UNKNOWN (exactly what the real probes answer over the drilled transports; see always-on-drill.test.ts).
+      publicConnectivity: async (drill?: { readonly rest: string | null } | null) => {
         this.connectivityProbes += 1;
-        return this.network;
+        this.connectivityDrills.push(drill ?? null);
+        return drill?.rest === "REFUSED" ? false : this.network;
       },
-      publicStreamConnectivity: async () => {
+      publicStreamConnectivity: async (drill?: { readonly stream: string | null } | null) => {
         this.streamProbes.push(this.now);
+        this.streamProbeDrills.push(drill ?? null);
+        if (drill?.stream === "REFUSED") return "UNREACHABLE";
+        if (drill?.stream === "SILENT") return "UNKNOWN";
         const outcome = this.streamOutcome;
         if (outcome === "THROWS") throw new Error("the stream probe could not run");
         return outcome;
+      },
+      verifyPrivateDirectories: (dirs: readonly string[]) => {
+        this.aclChecks.push(dirs);
+        return this.privateDirectories;
       },
       buildVerdict: () => this.build,
       genericEnvKeyNames: () => ({ ok: true, keys: ["DATABASE_URL", "REDIS_URL", "BINANCE_FUTURES_REST_BASE_URL"] }),
