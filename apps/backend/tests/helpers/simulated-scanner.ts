@@ -6,6 +6,7 @@ import { KlineCacheStore } from "../../src/modules/native-scanner/kline-cache";
 import { BinanceServerClock, PublicRequestController, REQUEST_POLICY_LIMITS } from "../../src/modules/native-scanner/kline-fetcher";
 import { LiveShadowSupervisor, NATIVE_RECOVERY_POLICY_VERSION, type SupervisorStatus } from "../../src/modules/native-scanner/live-shadow-supervisor";
 import { FAST_RECOVERY_DEFAULTS, parseSupervisorCliArgs, type SupervisorCliOptions } from "../../src/modules/native-scanner/live-shadow-supervisor-cli-args";
+import { deriveHtfContextStartMs } from "../../src/modules/native-scanner/scanner-lineage";
 import { acquireLiveShadowLock } from "../../src/modules/native-scanner/scanner-lock";
 import {
   DEFAULT_UNIVERSE_REFRESH_MS,
@@ -55,12 +56,32 @@ export const NETWORK_FIX: ScannerProfile = {
 export const SIM_T0 = D(12, 0, 0, 30);
 export const SIM_SYMBOLS = ["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT", "龙虾USDT"];
 
-/** A deterministic market for SIM_SYMBOLS: listed before the context, bars well past any simulated horizon. */
-export function simulatedMarket(symbols: readonly string[] = SIM_SYMBOLS): SimulatedMarket & { listed: string[] } {
-  const horizon = (SIM_T0 - D(6)) / M15 + 4 * 96;
-  const series = new Map<string, NativeKline[]>(symbols.map((s, i) => [s, syntheticBars(31 + 7 * i, D(6), horizon, 1 + i * 3.5)]));
+/** Which engine a simulation runs, from where its bars start, and when it starts. */
+export interface SimulatedTimeline {
+  readonly profile: ScannerProfile;
+  /** The first bar of every symbol's series (at or before the engine's HTF context start). */
+  readonly barsStartMs: number;
+  readonly t0: number;
+}
+
+export const FIXTURE_TIMELINE: SimulatedTimeline = { profile: NETWORK_FIX, barsStartMs: D(6), t0: SIM_T0 };
+
+/**
+ * The REGISTERED production profile (TEDDY_7_ALL_ACTIVE_V1: 1D/1W/1M/3M/6M/12M) from its real HTF context start —
+ * required wherever the run must be bindable by the real emitter, whose binding refuses any engine that is not a
+ * registered profile's. A start-up replays months of bars, so it is used sparingly.
+ */
+export function productionTimeline(): SimulatedTimeline {
+  const lineage = lineageConfigOf(TEDDY_7_ALL_ACTIVE_V1.engine);
+  return { profile: TEDDY_7_ALL_ACTIVE_V1, barsStartMs: deriveHtfContextStartMs(lineage.historyStartMs, lineage.engine.enabledSourceTfs, lineage.engine.calendar), t0: Date.UTC(2026, 8, 20, 0, 0, 30) };
+}
+
+/** A deterministic market: every symbol listed before the context, bars well past any simulated horizon. */
+export function simulatedMarket(symbols: readonly string[] = SIM_SYMBOLS, timeline: SimulatedTimeline = FIXTURE_TIMELINE): SimulatedMarket & { listed: string[] } {
+  const horizon = (timeline.t0 - timeline.barsStartMs) / M15 + 4 * 96;
+  const series = new Map<string, NativeKline[]>(symbols.map((s, i) => [s, syntheticBars(31 + 7 * i, timeline.barsStartMs, horizon, 1 + i * 3.5)]));
   const listed = [...symbols];
-  return { listed, symbols: () => listed, bars: (s) => series.get(s) ?? [], onboardDateMs: () => D(5) };
+  return { listed, symbols: () => listed, bars: (s) => series.get(s) ?? [], onboardDateMs: () => timeline.barsStartMs - 86_400_000 };
 }
 
 /**
@@ -132,12 +153,14 @@ export interface SimulatedScannerInput {
   readonly isProcessAlive: (pid: number) => boolean;
   readonly processCreatedAtMs: (pid: number) => number | null;
   readonly symbolsPerConnection?: number;
+  /** The engine profile (default: NETWORK_FIX). */
+  readonly profile?: ScannerProfile;
 }
 
 export class SimulatedScanner {
   readonly logs: string[] = [];
   readonly options = productionScannerOptions();
-  readonly profile = NETWORK_FIX;
+  readonly profile: ScannerProfile;
   governor: GovernedPublicTransport | null = null;
   supervisor: LiveShadowSupervisor | null = null;
   /** Set when start-up completed: the run manifest text the CLI writes (wx) after start-up. */
@@ -147,7 +170,9 @@ export class SimulatedScanner {
   private readonly scheduled: Array<() => void> = [];
   private readonly inFlight = new Set<Promise<unknown>>();
 
-  private constructor(readonly input: SimulatedScannerInput) {}
+  private constructor(readonly input: SimulatedScannerInput) {
+    this.profile = input.profile ?? NETWORK_FIX;
+  }
 
   /**
    * Like starting the CLI process: returns at once while it reads the universe through the governed transport,

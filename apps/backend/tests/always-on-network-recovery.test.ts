@@ -1,0 +1,341 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
+
+import { ALWAYS_ON_DEFAULTS } from "../src/modules/always-on/always-on-contract";
+import { NATIVE_EXECUTION_ENABLED } from "../src/modules/native-canary/native-execution-switch";
+import { DIRTY_ENV } from "./helpers/always-on-fake-machine";
+import { SimulatedMonitoringMachine } from "./helpers/simulated-monitoring-machine";
+import { M15, SIM_SYMBOLS } from "./helpers/simulated-scanner";
+
+/**
+ * ALWAYS-ON NETWORK RECOVERY OVER A SIMULATED PUBLIC NETWORK. The real
+ * supervisor (production policy) owns REAL scanner processes and gates its
+ * recovery on the REAL connectivity probe; one simulated network serves both,
+ * and an outage changes what their transports do. These are automated
+ * simulations: they prove the recovery contract and its safety invariants
+ * against real code paths, not real-machine network recovery.
+ *
+ * Every scenario also asserts, every simulated second: one scanner process at
+ * most, symbol locks held only by it (or left stale by an exited one), an
+ * emitter only ever pinned to a running scanner's run, monitoring roles only,
+ * and no signed or keyed request on the network.
+ */
+
+const dirs: string[] = [];
+afterAll(() => {
+  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+});
+
+let machines: SimulatedMonitoringMachine[] = [];
+afterEach(async () => {
+  // Deterministic cleanup whatever happened: no fault left in place, the stack stopped through the real supervisor.
+  for (const sm of machines) {
+    sm.net.restore();
+    if (!sm.supervisorStopped) await sm.shutdown();
+    for (const p of sm.processes) p.scanner.stop();
+    sm.net.dispose();
+  }
+  machines = [];
+});
+
+interface Incident {
+  readonly at: string;
+  readonly kind: string;
+  readonly role: string | null;
+  readonly reasonCode: string | null;
+  readonly detail: string | null;
+}
+
+async function runningStack() {
+  const root = mkdtempSync(path.join(tmpdir(), "aon-net-root-"));
+  const cacheDir = mkdtempSync(path.join(tmpdir(), "aon-net-cache-"));
+  dirs.push(root, cacheDir);
+  const sm = new SimulatedMonitoringMachine(root, cacheDir);
+  machines.push(sm);
+  await sm.start();
+  expect(await sm.runUntil(() => sm.supervisor.status().state === "RUNNING", 40 * 60_000)).toBe(true);
+  await sm.runFor(3 * 60_000);
+  expect(sm.supervisor.status().state).toBe("RUNNING");
+  return sm;
+}
+
+const incidents = (sm: SimulatedMonitoringMachine) => sm.m.incidents() as unknown as Incident[];
+const since = (sm: SimulatedMonitoringMachine, fromMs: number) => incidents(sm).filter((i) => Date.parse(i.at) >= fromMs);
+const kinds = (list: readonly Incident[]) => list.map((i) => `${i.kind}${i.role ? `/${i.role}` : ""}`);
+const at = (list: readonly Incident[], kind: string, role?: string) => {
+  const found = list.find((i) => i.kind === kind && (role === undefined || i.role === role));
+  if (found === undefined) throw new Error(`no ${kind}${role ? `/${role}` : ""} incident`);
+  return Date.parse(found.at);
+};
+const nextBarClose = (ms: number) => Math.floor(ms / M15) * M15 + M15;
+
+/** The invariants every scenario must keep, checked on the final state (they were also checked every simulated second). */
+function expectSafety(sm: SimulatedMonitoringMachine) {
+  expect(sm.violations).toEqual([]);
+  expect(NATIVE_EXECUTION_ENABLED).toBe(false);
+  const status = sm.supervisor.status();
+  expect(status.nativeExecutionEnabled).toBe(false);
+  expect(status.accountExecution).toBe("NONE");
+  expect(new Set(sm.spawnPlans.map((p) => p.role))).toEqual(new Set(sm.spawnPlans.map((p) => p.role).filter((r) => ["backend", "scanner", "emitter", "planner"].includes(r))));
+  for (const plan of sm.spawnPlans) {
+    for (const name of Object.keys(DIRTY_ENV).filter((k) => /api_key|api_secret|execution_profile/i.test(k))) {
+      expect(Object.keys(plan.env).map((k) => k.toLowerCase())).not.toContain(name.toLowerCase());
+    }
+  }
+  // Public market data only: GET-only server time, exchangeInfo and klines; nothing signed, nothing keyed.
+  expect(new Set(sm.net.requests.map((r) => r.path))).toEqual(new Set(sm.net.requests.map((r) => r.path).filter((p) => ["/fapi/v1/time", "/fapi/v1/exchangeInfo", "/fapi/v1/klines"].includes(p))));
+  expect(sm.net.violations).toEqual([]);
+}
+
+describe("baseline: the stack runs on the simulated network", () => {
+  it("the real scanner's run is identified, the emitter is pinned to it, the universe refreshes, and the probe is never needed while healthy", async () => {
+    const sm = await runningStack();
+    const live = sm.liveScanner();
+    expect(live).not.toBeNull();
+    // The first refresh is due one interval after the universe the run started with was read.
+    expect(await sm.runUntil(() => (live?.scanner.status().universe?.refreshes ?? 0) >= 1, 6 * 60_000)).toBe(true);
+    // RUNNING already while WARMING (the current bar quarantined); every symbol is live from the next bar close.
+    await sm.runFor(nextBarClose(sm.m.now) - sm.m.now + 90_000);
+    const status = sm.supervisor.status();
+    expect(status.roles.scanner.health?.verdict).toBe("HEALTHY");
+    expect(status.roles.scanner.runId).toBe(live?.runId);
+    expect(status.roles.emitter.pinnedRunId).toBe(live?.runId);
+    expect(sm.m.live("emitter").map((e) => e.pinnedRunId)).toEqual([live?.runId]);
+    expect(live?.scanner.status().universe?.refreshes).toBeGreaterThanOrEqual(1);
+    expect(live?.scanner.status().totals.liveEligible).toBe(SIM_SYMBOLS.length);
+    // One probe before the scanner's first start (it is started only when public Binance answers), none while healthy.
+    const runningAt = (sm.ticks.find((t) => t.state === "RUNNING") as { atMs: number }).atMs;
+    const probes = sm.net.requests.filter((r) => r.via === "probe");
+    expect(probes.map((r) => r.outcome)).toEqual(["OK"]);
+    expect(probes[0].atMs).toBeLessThanOrEqual(sm.processes[0].spawnedAtMs);
+    expect(probes.filter((r) => r.atMs > runningAt)).toEqual([]);
+    expect(new Set(sm.lockHolders())).toEqual(new Set([live?.runtime]));
+    expectSafety(sm);
+  }, 120_000);
+});
+
+describe("sustained combined outage: the documented contract, end to end", () => {
+  it("degraded → NETWORK_UNAVAILABLE once (nothing restarted, no attempt spent) → NETWORK_RESTORED → heal window → ONE fenced recovery: emitter stopped before the scanner, a fresh run, the emitter re-pinned to it", async () => {
+    const sm = await runningStack();
+    const oldRun = sm.liveScanner();
+    // A 25-minute outage that spans a bar close by far more than the scanner's recovery attempts: its symbols FAIL.
+    await sm.runFor(nextBarClose(sm.m.now) - sm.m.now - 5 * 60_000);
+    const cutAt = sm.m.now;
+    const handle = sm.net.cut({ rest: "REFUSED", openStreams: "DROP", newStreams: "REFUSED", maxDurationMs: 30 * 60_000, label: "sustained" });
+    await sm.runFor(25 * 60_000);
+    const atRestore = sm.supervisor.status();
+    handle.restore();
+    const restoredAt = sm.m.now;
+    expect(await sm.runUntil(() => kinds(since(sm, cutAt)).includes("SUPERVISOR_RETURNED_HEALTHY"), 20 * 60_000)).toBe(true);
+    await sm.runFor(nextBarClose(sm.m.now) - sm.m.now + 2 * 60_000);
+    const list = since(sm, cutAt);
+
+    // During the outage: the outage is recognised once, and nothing is restarted or spent.
+    expect(kinds(list).filter((k) => k === "NETWORK_UNAVAILABLE/scanner")).toHaveLength(1);
+    const unavailableAt = at(list, "NETWORK_UNAVAILABLE");
+    expect(unavailableAt - at(list, "SCANNER_DEGRADED")).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.degradedGraceMs);
+    const duringOutage = list.filter((i) => Date.parse(i.at) < restoredAt);
+    expect(kinds(duringOutage).filter((k) => /^(ROLE_STARTED|ROLE_STOP_REQUESTED|ROLE_STOPPED|BACKOFF_ENTERED|SCANNER_RECOVERY_REQUESTED)/.test(k))).toEqual([]);
+    expect(atRestore.roles.scanner.attempts).toBe(0);
+    expect(atRestore.roles.scanner.state).toBe("DEGRADED");
+    expect(atRestore.roles.scanner.reasonCode).toBe("NETWORK_UNAVAILABLE");
+    for (const role of ["backend", "emitter", "planner"] as const) expect(atRestore.roles[role].state).toBe("RUNNING");
+    // The probe really went through the faulted transport, and never faster than its cadence.
+    const probes = sm.net.requests.filter((r) => r.via === "probe" && r.atMs >= cutAt && r.atMs < restoredAt);
+    expect(probes.length).toBeGreaterThan(0);
+    expect(probes.every((r) => r.outcome === "REFUSED" && r.path === "/fapi/v1/time")).toBe(true);
+    expect(probes.slice(1).every((r, i) => r.atMs - probes[i].atMs >= ALWAYS_ON_DEFAULTS.connectivityProbeEveryMs)).toBe(true);
+
+    // After restore: the network is recognised, the scanner gets its heal window, then exactly one ordered recovery.
+    const restoredSeenAt = at(list, "NETWORK_RESTORED");
+    const requestedAt = at(list, "SCANNER_RECOVERY_REQUESTED");
+    expect(requestedAt - restoredSeenAt).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.postNetworkGraceMs);
+    expect(kinds(list.filter((i) => Date.parse(i.at) >= restoredAt))).toEqual(
+      expect.arrayContaining(["NETWORK_RESTORED/scanner", "SCANNER_RECOVERY_REQUESTED/scanner", "SCANNER_RECOVERY_SUCCEEDED/scanner", "EMITTER_STARTED_ON_RUN/emitter", "SUPERVISOR_RETURNED_HEALTHY"])
+    );
+    const order = ["SCANNER_RECOVERY_REQUESTED/scanner", "ROLE_STOP_REQUESTED/emitter", "ROLE_STOPPED/emitter", "ROLE_STOP_REQUESTED/scanner", "ROLE_STOPPED/scanner", "ROLE_STARTED/scanner", "SCANNER_RUN_IDENTIFIED/scanner", "SCANNER_RECOVERY_SUCCEEDED/scanner", "ROLE_STARTED/emitter", "EMITTER_STARTED_ON_RUN/emitter"];
+    expect(kinds(list).filter((k) => order.includes(k))).toEqual(order);
+    expect(kinds(list).filter((k) => k === "SCANNER_RECOVERY_REQUESTED/scanner")).toHaveLength(1);
+
+    // One fresh run; the old one stopped cooperatively (its locks released) before the new one started.
+    expect(sm.processes).toHaveLength(2);
+    const [old, fresh] = sm.processes;
+    expect(old.runId).toBe(oldRun?.runId);
+    expect(old.exit).toBe("STOPPED");
+    expect(old.exitedAtMs as number).toBeLessThanOrEqual(fresh.spawnedAtMs);
+    expect(old.scanner.status().totals.failed).toBe(SIM_SYMBOLS.length);
+    expect(sm.supervisor.status().roles.emitter.pinnedRunId).toBe(fresh.runId);
+    expect(sm.m.live("emitter").map((e) => e.pinnedRunId)).toEqual([fresh.runId]);
+    expect(new Set(sm.lockHolders())).toEqual(new Set([fresh.runtime]));
+
+    // The fresh run is fully healthy: market data fresh, universe refreshing, every symbol live, membership coherent.
+    const s = fresh.scanner.status();
+    expect(s.totals.liveEligible).toBe(SIM_SYMBOLS.length);
+    expect(s.universe?.refreshes).toBeGreaterThanOrEqual(1);
+    expect(s.universe?.stale).toBe(false);
+    const final = sm.supervisor.status();
+    expect(final.state).toBe("RUNNING");
+    expect(final.roles.scanner.health?.issues).toEqual([]);
+    expect(Date.parse(final.lastEndToEndHealthyAt as string)).toBeGreaterThan(restoredAt);
+    expect(final.counters.restarts).toEqual({ backend: 0, scanner: 1, emitter: 1, planner: 0 });
+    expect(final.counters.scannerRecoveries).toBe(1);
+    expectSafety(sm);
+
+    // The graceful stop, through the real supervisor: emitter, scanner, planner, backend; every lock released.
+    const stopFrom = sm.m.now;
+    expect(await sm.shutdown()).toBe(true);
+    expect(kinds(since(sm, stopFrom)).filter((k) => k.startsWith("ROLE_STOPPED") || k === "SUPERVISOR_STOPPED")).toEqual(["ROLE_STOPPED/emitter", "ROLE_STOPPED/scanner", "ROLE_STOPPED/planner", "ROLE_STOPPED/backend", "SUPERVISOR_STOPPED"]);
+    expect(sm.lockHolders()).toEqual([]);
+    expect(sm.processes.every((p) => p.exit !== "RUNNING")).toBe(true);
+  }, 240_000);
+
+  it("a scanner that hangs on its cooperative stop is ended by the fenced terminate; its locks stay as stale locks of a dead process and the fresh run reclaims them — never two writers", async () => {
+    const sm = await runningStack();
+    await sm.runFor(nextBarClose(sm.m.now) - sm.m.now - 5 * 60_000);
+    const cutAt = sm.m.now;
+    sm.scannersIgnoreStop = true;
+    sm.m.honourStops = false; // the emitter hangs as well: both reach their fenced terminate
+    await sm.net.withOutage({ rest: "REFUSED", openStreams: "DROP", newStreams: "REFUSED", maxDurationMs: 30 * 60_000, label: "sustained, hung" }, async () => {
+      await sm.runFor(25 * 60_000);
+    });
+    const hung = sm.liveScanner();
+    expect(await sm.runUntil(() => sm.processes.length === 2, 15 * 60_000)).toBe(true);
+    sm.m.honourStops = true;
+    sm.scannersIgnoreStop = false;
+    expect(await sm.runUntil(() => kinds(since(sm, cutAt)).includes("SUPERVISOR_RETURNED_HEALTHY"), 15 * 60_000)).toBe(true);
+    const list = since(sm, cutAt);
+    expect(kinds(list).filter((k) => k.startsWith("ROLE_FORCE_STOPPED"))).toEqual(["ROLE_FORCE_STOPPED/emitter", "ROLE_FORCE_STOPPED/scanner"]);
+    expect(at(list, "ROLE_FORCE_STOPPED", "scanner") - at(list, "ROLE_STOP_REQUESTED", "scanner")).toBeGreaterThanOrEqual(180_000);
+    // The emitter is gone (forced) before the scanner is even asked to stop: journal order, possibly the same instant.
+    expect(kinds(list).indexOf("ROLE_FORCE_STOPPED/emitter")).toBeLessThan(kinds(list).indexOf("ROLE_STOP_REQUESTED/scanner"));
+    expect(at(list, "ROLE_FORCE_STOPPED", "emitter")).toBeLessThanOrEqual(at(list, "ROLE_STOP_REQUESTED", "scanner"));
+    const [old, fresh] = sm.processes;
+    expect(old.runId).toBe(hung?.runId);
+    expect(old.exit).toBe("KILLED");
+    expect(sm.m.terminated).toEqual(expect.arrayContaining([old.root]));
+    expect(old.exitedAtMs as number).toBeLessThanOrEqual(fresh.spawnedAtMs);
+    // The fresh run took over every symbol: the dead holder's locks were reclaimed, none is left behind.
+    expect(new Set(sm.lockHolders())).toEqual(new Set([fresh.runtime]));
+    expect(fresh.scanner.status().totals.failed).toBe(0);
+    expectSafety(sm);
+  }, 240_000);
+});
+
+describe("outages the probe cannot see: the current policy, pinned so a change is visible", () => {
+  it("a 60 s blip that ends before the 90 s grace is never seen by the probe; the scanner's status (written every 60 s) still reads degraded, so the supervisor runs ONE ordered recovery — bounded, never a storm", async () => {
+    const sm = await runningStack();
+    const cutAt = sm.m.now;
+    await sm.net.withOutage({ rest: "REFUSED", openStreams: "DROP", newStreams: "REFUSED", maxDurationMs: 90_000, label: "blip" }, async () => {
+      await sm.runFor(60_000);
+    });
+    await sm.runFor(20 * 60_000);
+    const list = since(sm, cutAt);
+    expect(kinds(list)).not.toContain("NETWORK_UNAVAILABLE/scanner");
+    expect(sm.net.requests.filter((r) => r.via === "probe").every((r) => r.outcome === "OK")).toBe(true);
+    expect(kinds(list).filter((k) => k === "SCANNER_RECOVERY_REQUESTED/scanner")).toHaveLength(1);
+    expect(kinds(list).filter((k) => k === "ROLE_STARTED/scanner")).toHaveLength(1);
+    expect(at(list, "SCANNER_RECOVERY_REQUESTED") - at(list, "SCANNER_DEGRADED")).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.degradedGraceMs);
+    expect(sm.supervisor.status().state).toBe("RUNNING");
+    expect(sm.supervisor.status().roles.scanner.attempts).toBe(1);
+    expectSafety(sm);
+  }, 240_000);
+
+  it("a stream-only outage looks reachable to the REST probe: fresh runs that cannot connect are retried on the backoff and the scanner LATCHES after its attempts — it stays latched (monitoring down) after the streams return, until an operator clears it", async () => {
+    const sm = await runningStack();
+    const cutAt = sm.m.now;
+    const handle = sm.net.cut({ openStreams: "DROP", newStreams: "REFUSED", maxDurationMs: 50 * 60_000, label: "streams only" });
+    expect(await sm.runUntil(() => sm.supervisor.status().roles.scanner.latched, 50 * 60_000)).toBe(true);
+    const latchedAt = sm.m.now;
+    handle.restore();
+    await sm.runFor(20 * 60_000);
+    const list = since(sm, cutAt);
+    expect(kinds(list)).not.toContain("NETWORK_UNAVAILABLE/scanner");
+    const starts = list.filter((i) => i.kind === "ROLE_STARTED" && i.role === "scanner").map((i) => Date.parse(i.at));
+    expect(starts).toHaveLength(ALWAYS_ON_DEFAULTS.maxRecoveryAttempts);
+    // Never a storm: each fresh run is judged for the whole grace period before the next, and the backoff grows.
+    const gaps = starts.slice(1).map((t, i) => t - starts[i]);
+    expect(gaps.every((g) => g >= ALWAYS_ON_DEFAULTS.degradedGraceMs)).toBe(true);
+    expect(gaps.at(-1) as number).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.backoffStepsMs[4]);
+    expect(kinds(list)).toContain("ROLE_LATCHED/scanner");
+    expect(kinds(list)).toContain("SUPERVISOR_LATCHED");
+    // No emitter is ever pinned to a run that never became healthy.
+    expect(kinds(list).filter((k) => k === "EMITTER_STARTED_ON_RUN/emitter")).toEqual([]);
+    // After the streams return the latch holds: nothing restarts on its own.
+    const after = sm.supervisor.status();
+    expect(after.state).toBe("LATCHED");
+    expect(after.roles.scanner.latched).toBe(true);
+    expect(list.filter((i) => Date.parse(i.at) > latchedAt && i.kind === "ROLE_STARTED")).toEqual([]);
+    expect(after.counters.restarts.backend).toBe(0);
+    expect(after.counters.restarts.planner).toBe(0);
+    expectSafety(sm);
+  }, 300_000);
+
+  it("a REST-only outage: the universe goes stale, the probe sees the outage (no restart while it lasts); restored just after a refresh attempt, the scanner's next scheduled refresh can fall outside the heal window", async () => {
+    const sm = await runningStack();
+    const cutAt = sm.m.now;
+    const handle = sm.net.cut({ rest: "REFUSED", maxDurationMs: 50 * 60_000, label: "REST only" });
+    const live = sm.liveScanner();
+    const failures = () => live?.scanner.status().universe?.refreshFailures ?? 0;
+    // Wait for UNIVERSE_STALE to be seen and the outage recognised, then restore right after a refresh attempt has
+    // FAILED (all its transient retries spent), so the next one is a whole interval away.
+    expect(await sm.runUntil(() => kinds(since(sm, cutAt)).includes("NETWORK_UNAVAILABLE/scanner"), 20 * 60_000)).toBe(true);
+    const seen = failures();
+    expect(await sm.runUntil(() => failures() > seen, 6 * 60_000)).toBe(true);
+    await sm.runFor(5_000);
+    handle.restore();
+    const restoredAt = sm.m.now;
+    const nextRefresh = Date.parse(live?.scanner.status().universe?.nextRefreshAt as string);
+    expect(nextRefresh - restoredAt).toBeGreaterThan(ALWAYS_ON_DEFAULTS.postNetworkGraceMs + ALWAYS_ON_DEFAULTS.connectivityProbeEveryMs);
+    await sm.runFor(15 * 60_000);
+    const list = since(sm, cutAt);
+    expect(at(list, "SCANNER_DEGRADED")).toBeGreaterThanOrEqual(cutAt);
+    expect(list.find((i) => i.kind === "SCANNER_DEGRADED")?.reasonCode).toBe("UNIVERSE_STALE");
+    expect(kinds(list.filter((i) => Date.parse(i.at) < restoredAt)).filter((k) => /^(ROLE_STARTED|ROLE_STOP_REQUESTED)/.test(k))).toEqual([]);
+    // Observed policy: the stale universe outlasts the heal window, so a fresh run is started although the running
+    // scanner would have refreshed on its own at `nextRefresh`. Bounded: one recovery.
+    expect(kinds(list).filter((k) => k === "SCANNER_RECOVERY_REQUESTED/scanner")).toHaveLength(1);
+    expect(at(list, "SCANNER_RECOVERY_REQUESTED")).toBeLessThan(nextRefresh);
+    expect(sm.supervisor.status().state).toBe("RUNNING");
+    expectSafety(sm);
+  }, 240_000);
+});
+
+describe("detection is never hidden by an outage", () => {
+  it("a planner failure that appears during an outage is reported as a delta (not restarted for it), next to the network incident", async () => {
+    const sm = await runningStack();
+    const cutAt = sm.m.now;
+    await sm.net.withOutage({ rest: "REFUSED", openStreams: "DROP", newStreams: "REFUSED", maxDurationMs: 10 * 60_000, label: "outage + planner error" }, async () => {
+      await sm.runFor(3 * 60_000);
+      sm.m.plans = { ...sm.m.plans, ERROR: (sm.m.plans.ERROR ?? 0) + 1 };
+      await sm.runFor(3 * 60_000);
+    });
+    const list = since(sm, cutAt);
+    expect(kinds(list)).toContain("NETWORK_UNAVAILABLE/scanner");
+    expect(kinds(list)).toContain("PLANNER_FAILURE_DELTA_INCREASED/planner");
+    expect(sm.supervisor.status().roles.planner.state).toBe("DEGRADED");
+    expect(sm.supervisor.status().counters.restarts.planner).toBe(0);
+    expectSafety(sm);
+  }, 240_000);
+});
+
+describe("restoration and cleanup always happen", () => {
+  it("a scenario that fails mid-outage still leaves the network restored, and the stack stops gracefully with every lock released", async () => {
+    const sm = await runningStack();
+    await expect(
+      sm.net.withOutage({ rest: "REFUSED", openStreams: "DROP", newStreams: "REFUSED", maxDurationMs: 10 * 60_000, label: "aborted" }, async () => {
+        await sm.runFor(2 * 60_000);
+        throw new Error("the scenario failed mid-outage");
+      })
+    ).rejects.toThrow("the scenario failed mid-outage");
+    expect(sm.net.outage).toBeNull();
+    expect(sm.net.events.map((e) => e.kind)).toEqual(["OUTAGE_STARTED", "RESTORED"]);
+    expect(await sm.shutdown()).toBe(true);
+    expect(sm.supervisor.status().state).toBe("STOPPED");
+    expect(sm.lockHolders()).toEqual([]);
+    expect(sm.processes.every((p) => p.exit !== "RUNNING")).toBe(true);
+    expect([...sm.m.nodes.values()].filter((n) => n.parentPid !== 1)).toEqual([]);
+    expectSafety(sm);
+  }, 240_000);
+});
