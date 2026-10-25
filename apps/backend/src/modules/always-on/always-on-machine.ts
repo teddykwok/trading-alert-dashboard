@@ -239,10 +239,13 @@ export const realHttp: AlwaysOnHttp = {
   },
 };
 
-/** One unsigned public request (server time, weight 1). True only for a well-formed answer. */
-export async function publicBinanceReachable(timeoutMs = 5_000): Promise<boolean> {
+/**
+ * One unsigned public request (server time, weight 1). True only for a well-formed answer.
+ * `fetchImpl` is the transport: the real fetch in production; tests inject a simulated network, never a switch.
+ */
+export async function publicBinanceReachable(timeoutMs = 5_000, fetchImpl: typeof fetch = fetch): Promise<boolean> {
   try {
-    const response = await fetch(buildPublicFuturesUrl("https://fapi.binance.com", SERVER_TIME_PATH), { method: "GET", redirect: "error", signal: AbortSignal.timeout(timeoutMs) });
+    const response = await fetchImpl(buildPublicFuturesUrl("https://fapi.binance.com", SERVER_TIME_PATH), { method: "GET", redirect: "error", signal: AbortSignal.timeout(timeoutMs) });
     if (!response.ok) return false;
     parseServerTimePayload(await response.json());
     return true;
