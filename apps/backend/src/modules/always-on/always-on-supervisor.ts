@@ -430,6 +430,20 @@ export class AlwaysOnSupervisor {
     for (const name of this.a.fs.listDir(this.a.paths.stopDir)) {
       if (name.endsWith(".stop") && !keep.has(name)) this.removeQuietly(path.join(this.a.paths.stopDir, name));
     }
+    // A drill never outlives the generation that started it (its supervisor crashed, or was fenced before cleaning up):
+    // every drill file is removed, and an adopted scanner's own gate ends the fault within a second.
+    const staleDrills = this.a.fs.listDir(this.a.paths.stopDir).filter((name) => name.toLowerCase().endsWith(".drill"));
+    for (const name of staleDrills) this.removeQuietly(path.join(this.a.paths.stopDir, name));
+    if (staleDrills.length > 0) {
+      const notRemoved = staleDrills.filter((name) => this.a.fs.exists(path.join(this.a.paths.stopDir, name)));
+      this.record({
+        kind: "DRILL_STALE_REMOVED",
+        role: "scanner",
+        reasonCode: notRemoved.length === 0 ? "NEW_GENERATION" : "NEW_GENERATION_REMOVAL_FAILED",
+        detail: `${staleDrills.length - notRemoved.length} drill file(s) left by an earlier generation removed${notRemoved.length > 0 ? `; ${notRemoved.length} could not be removed and end at their own expiry` : ""}`,
+        facts: { files: staleDrills.join(","), notRemoved: notRemoved.join(",") || null },
+      });
+    }
     this.lastTickAtMs = now;
     this.writeStatus();
     return { ok: true, generation: this.generation };
@@ -516,6 +530,7 @@ export class AlwaysOnSupervisor {
 
     this.reconcileChildren(tree.value, now);
     if (this.fenced) return "FENCED";
+    this.endDrillWhenTargetGone(now);
     const census = monitoringCensus(tree.value, this.ownedRoots(), this.a.selfPid);
     this.latest.census = census;
     this.reportExternal(census);
@@ -523,6 +538,7 @@ export class AlwaysOnSupervisor {
     if (this.shutdown) {
       await this.consumeDrillStart(null, now);
       await this.advanceShutdown(now);
+      this.superviseDrillRestore(null, now);
       this.writeStatus();
       return this.shutdown.done ? "STOPPED" : this.fenced ? "FENCED" : "CONTINUE";
     }
@@ -562,6 +578,7 @@ export class AlwaysOnSupervisor {
     this.latest.emitter = emitter;
     const planner = this.judgePlanner(plannerStatus, plans, now);
     this.latest.planner = planner;
+    this.superviseDrillRestore(scanner, now);
 
     // ---- decisions, in dependency order ----
     await this.superviseBackend(backendOk, census, now);
@@ -590,6 +607,8 @@ export class AlwaysOnSupervisor {
   /** Begin a graceful stop of everything this generation owns (emitter → scanner → planner → backend). */
   requestShutdown(reasonCode: string): void {
     if (this.shutdown !== null || this.fenced || this.detached) return;
+    // The drill ends FIRST: nothing is stopped while a fault is still applied.
+    this.endDrill(this.a.now(), "SHUTDOWN");
     this.shutdown = { reasonCode, requestedAtMs: this.a.now(), done: false };
     this.recovery = null;
     this.state = "STOPPING";
@@ -605,6 +624,8 @@ export class AlwaysOnSupervisor {
    */
   detach(reasonCode: string): void {
     if (this.detached || this.fenced || this.shutdown?.done) return;
+    // The children keep running; the fault does not.
+    this.endDrill(this.a.now(), "DETACHED");
     this.detached = true;
     this.state = "STOPPED";
     this.reasonCode = reasonCode;
@@ -642,6 +663,8 @@ export class AlwaysOnSupervisor {
 
   private becomeFenced(): AlwaysOnTickOutcome {
     if (!this.fenced) {
+      // Its own drill file only (named after this generation's child): removing it can only end a fault.
+      this.endDrill(this.a.now(), "FENCED");
       this.fenced = true;
       this.state = "STOPPED";
       this.reasonCode = "FENCED_BY_NEWER_GENERATION";
@@ -1790,6 +1813,8 @@ export class AlwaysOnSupervisor {
   }
 
   private consumeRequests(now: number): void {
+    const d = this.drill;
+    if (d !== null && d.endedAtMs === null && now >= d.drill.expiresAtMs) this.endDrill(now, "EXPIRED");
     const stopText = this.a.fs.readText(this.a.paths.stopRequest);
     if (stopText !== null) {
       const removed = this.removeRequest(this.a.paths.stopRequest);
@@ -1797,6 +1822,21 @@ export class AlwaysOnSupervisor {
       // Honoured even when its file could not be removed: a shutdown is requested once (idempotent).
       if (target === null || target === this.generation) this.requestShutdown("OPERATOR_STOP_REQUEST");
       else if (removed) this.a.log(`a stop request for generation ${target} was ignored (this is generation ${this.generation})`);
+    }
+    // A restore is honoured even unparseable, and whichever generation reads it: it can only end a fault.
+    const restoreText = this.a.fs.readText(this.a.paths.drillRestoreRequest);
+    if (restoreText !== null) {
+      const removed = this.removeRequest(this.a.paths.drillRestoreRequest);
+      const active = this.drill !== null && this.drill.endedAtMs === null;
+      if (removed) {
+        this.record({
+          kind: "DRILL_RESTORE_REQUESTED",
+          role: "scanner",
+          reasonCode: active ? "ENDED_ACTIVE_DRILL" : "NO_ACTIVE_DRILL",
+          detail: active ? "operator restore: the active drill ends now" : "operator restore: no drill is active (nothing to end)",
+        });
+      }
+      if (active) this.endDrill(now, "OPERATOR_RESTORE");
     }
     const clearText = this.a.fs.readText(this.a.paths.clearLatchRequest);
     // Applied once, and only after its file is gone: re-applying it every tick would defeat latching.
@@ -1953,6 +1993,99 @@ export class AlwaysOnSupervisor {
         file: path.basename(file),
       },
     });
+  }
+
+  /**
+   * Ends the drill once (any later end is a no-op): removes its file and records whether it is gone. Removing the file
+   * can only end the fault; the scanner's own gate also ends it at its expiry whatever happens here.
+   */
+  private endDrill(now: number, reason: string): void {
+    const d = this.drill;
+    if (d === null || d.endedAtMs !== null) return;
+    d.endedAtMs = now;
+    d.endReason = reason;
+    d.fileRemoved = this.removeDrillFile(d);
+    d.restore = d.fileRemoved ? "PENDING" : "REMOVAL_FAILED";
+    this.record({
+      kind: "DRILL_ENDED",
+      role: "scanner",
+      reasonCode: reason,
+      detail: `operator drill ${d.drill.fault} on run ${d.drill.runId} ended (${reason.toLowerCase().replace(/_/g, " ")}); ${d.fileRemoved ? "its drill file is removed" : "its drill file could NOT be removed yet (retried every pass; the scanner still ends it at its expiry)"}`,
+      facts: {
+        drillId: d.drill.drillId,
+        fault: d.drill.fault,
+        runId: d.drill.runId,
+        generation: d.drill.generation,
+        startedAt: new Date(d.drill.startedAtMs).toISOString(),
+        expiresAt: new Date(d.drill.expiresAtMs).toISOString(),
+        endedAt: new Date(now).toISOString(),
+        fileRemoved: d.fileRemoved,
+      },
+    });
+  }
+
+  /** True only when the drill file is provably gone afterwards. */
+  private removeDrillFile(d: ActiveDrill): boolean {
+    this.removeQuietly(d.file);
+    return !this.a.fs.exists(d.file);
+  }
+
+  /** The drill's scanner child is gone or replaced, or its file vanished: the drill is over for this generation. */
+  private endDrillWhenTargetGone(now: number): void {
+    const d = this.drill;
+    if (d === null || d.endedAtMs !== null) return;
+    const child = this.children.scanner;
+    if (child === null || child.pid !== d.childPid || child.sequence !== d.childSequence) this.endDrill(now, "RUN_ENDED");
+    else if (!this.a.fs.exists(d.file)) this.endDrill(now, "FILE_REMOVED_EXTERNALLY");
+  }
+
+  /**
+   * Activation and restoration are confirmed only by the scanner's OWN evidence: a status of the drilled run written
+   * after the event that reports the drill applied / no longer applied (or, for a restore, the drilled process gone).
+   * Without it within the status freshness window the state reads UNCONFIRMED — never a claimed success. A drill file
+   * that could not be removed is retried on every pass.
+   */
+  private superviseDrillRestore(scanner: ScannerHealth | null, now: number): void {
+    const d = this.drill;
+    if (d === null) return;
+    const freshMs = this.config.policy.scannerStatusFreshMs;
+    const child = this.children.scanner;
+    const childAlive = child !== null && child.pid === d.childPid && child.sequence === d.childSequence;
+    const writtenAtMs = scanner?.writtenAt ? Date.parse(scanner.writtenAt) : Number.NaN;
+    const report = childAlive && scanner !== null && scanner.ours && scanner.runId === d.drill.runId && Number.isFinite(writtenAtMs) ? { writtenAtMs, drill: scanner.drill ?? null } : null;
+    if (d.activation === "PENDING") {
+      if (report !== null && report.writtenAtMs >= d.drill.startedAtMs && report.drill?.drillId === d.drill.drillId) {
+        d.activation = "CONFIRMED";
+        this.record({ kind: "DRILL_ACTIVATION_CONFIRMED", role: "scanner", reasonCode: "SCANNER_REPORTS_DRILL", detail: `the scanner run ${d.drill.runId} reports drill ${d.drill.fault} applied`, facts: { drillId: d.drill.drillId } });
+      } else if (now - d.drill.startedAtMs >= freshMs) {
+        d.activation = "UNCONFIRMED";
+        this.record({ kind: "DRILL_ACTIVATION_UNCONFIRMED", role: "scanner", reasonCode: "NO_SCANNER_REPORT", detail: `the scanner run ${d.drill.runId} has not reported the drill within ${Math.round(freshMs / 1000)}s`, facts: { drillId: d.drill.drillId } });
+      }
+    }
+    if (d.endedAtMs === null) return;
+    if (d.fileRemoved === false) {
+      d.fileRemoved = this.removeDrillFile(d);
+      if (d.fileRemoved && d.restore === "REMOVAL_FAILED") d.restore = "PENDING";
+    }
+    if (d.restore === "CONFIRMED") return;
+    const confirm = (reasonCode: string, why: string) => {
+      d.restore = "CONFIRMED";
+      this.record({ kind: "DRILL_RESTORE_CONFIRMED", role: "scanner", reasonCode, detail: `operator drill ${d.drill.fault} is over: ${why}`, facts: { drillId: d.drill.drillId, secondsAfterEnd: Math.round((now - (d.endedAtMs as number)) / 1000) } });
+    };
+    if (!childAlive) {
+      confirm("SCANNER_RUN_ENDED", "the drilled scanner process has ended (its transports with it)");
+      return;
+    }
+    // "No drill" proves the end only from a scanner that has shown it reports drills (it confirmed the activation).
+    const inactive = report !== null && report.writtenAtMs >= d.endedAtMs && (report.drill !== null ? report.drill.drillId !== d.drill.drillId || !report.drill.active : d.activation === "CONFIRMED");
+    if (inactive) {
+      confirm("SCANNER_REPORTS_INACTIVE", `the scanner run ${d.drill.runId} reports the drill no longer applied`);
+      return;
+    }
+    if (d.restore !== "UNCONFIRMED" && d.restore !== "REMOVAL_FAILED" && now - d.endedAtMs >= freshMs) {
+      d.restore = "UNCONFIRMED";
+      this.record({ kind: "DRILL_RESTORE_UNCONFIRMED", role: "scanner", reasonCode: "NO_SCANNER_REPORT", detail: `the scanner has not reported the drill over within ${Math.round(freshMs / 1000)}s of its end; it is NOT claimed restored`, facts: { drillId: d.drill.drillId } });
+    }
   }
 
   /** The status view of the drill (null: none was ever accepted by this generation). */

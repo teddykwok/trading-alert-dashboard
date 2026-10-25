@@ -368,7 +368,9 @@ describe("every drill ends — automatically, on request, and on every way out",
   });
 
   it("a supervisor that crashed mid-drill: the next generation removes every leftover drill file at start (DRILL_STALE_REMOVED); the adopted scanner's fault ends", async () => {
-    const { m } = await activeDrill();
+    const { m, supervisor } = await activeDrill();
+    await run(m, supervisor, 1); // the scanner applies the drill
+    expect(supervisor.status().drill?.activation).toBe("CONFIRMED");
     const file = drillFileOfScanner(m);
     // No cleanup ran: the process just died. A new generation starts on the same machine and adopts the scanner.
     const next = await startSupervisor(m);
@@ -386,6 +388,7 @@ describe("every drill ends — automatically, on request, and on every way out",
     const file = drillFileOfScanner(m);
     const oldRun = scannerChild(m).runId;
     m.kill(scannerChild(m).root);
+    await run(m, supervisor, 1); // the exit is noticed
     await until(m, supervisor, () => supervisor.status().state === "RUNNING");
     expect(scannerChild(m).runId).not.toBe(oldRun);
     expect(incidentsOf(m, "DRILL_ENDED").map((i) => i.reasonCode)).toEqual(["RUN_ENDED"]);
