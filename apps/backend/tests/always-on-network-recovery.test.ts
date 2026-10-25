@@ -259,7 +259,7 @@ describe("outages the probe cannot see: the current policy, pinned so a change i
     expectSafety(sm);
   }, 240_000);
 
-  it("a REST-only outage: the universe goes stale, the probe sees the outage (no restart while it lasts); restored just after a refresh attempt, the scanner's next scheduled refresh can fall outside the heal window", async () => {
+  it("R3: a REST-only outage restored right after a failed refresh: the stale universe gets the scanner's next refresh — no recovery, the scanner heals by itself", async () => {
     const sm = await runningStack();
     const cutAt = sm.m.now;
     const handle = sm.net.cut({ rest: "REFUSED", maxDurationMs: 50 * 60_000, label: "REST only" });
@@ -279,12 +279,33 @@ describe("outages the probe cannot see: the current policy, pinned so a change i
     const list = since(sm, cutAt);
     expect(at(list, "SCANNER_DEGRADED")).toBeGreaterThanOrEqual(cutAt);
     expect(list.find((i) => i.kind === "SCANNER_DEGRADED")?.reasonCode).toBe("UNIVERSE_STALE");
-    expect(kinds(list.filter((i) => Date.parse(i.at) < restoredAt)).filter((k) => /^(ROLE_STARTED|ROLE_STOP_REQUESTED)/.test(k))).toEqual([]);
-    // Observed policy: the stale universe outlasts the heal window, so a fresh run is started although the running
-    // scanner would have refreshed on its own at `nextRefresh`. Bounded: one recovery.
-    expect(kinds(list).filter((k) => k === "SCANNER_RECOVERY_REQUESTED/scanner")).toHaveLength(1);
-    expect(at(list, "SCANNER_RECOVERY_REQUESTED")).toBeLessThan(nextRefresh);
+    expect(kinds(list).filter((k) => /^(SCANNER_RECOVERY_REQUESTED|ROLE_STOP_REQUESTED|ROLE_STARTED)/.test(k))).toEqual([]);
+    expect(kinds(list)).toContain("NETWORK_RESTORED/scanner");
+    expect(sm.processes).toHaveLength(1);
+    expect(live?.scanner.status().universe?.stale).toBe(false);
+    expect(Date.parse(live?.scanner.status().universe?.lastSuccessAt as string)).toBeGreaterThanOrEqual(nextRefresh);
     expect(sm.supervisor.status().state).toBe("RUNNING");
+    expect(sm.supervisor.status().roles.scanner.attempts).toBe(0);
+    expectSafety(sm);
+  }, 240_000);
+
+  it("R3: REST answers again but exchangeInfo keeps failing: the stale universe is recovered within the cap (restoration + refresh interval + 60 s)", async () => {
+    const sm = await runningStack();
+    const cutAt = sm.m.now;
+    const full = sm.net.cut({ rest: "REFUSED", maxDurationMs: 50 * 60_000, label: "REST only" });
+    expect(await sm.runUntil(() => kinds(since(sm, cutAt)).includes("NETWORK_UNAVAILABLE/scanner"), 20 * 60_000)).toBe(true);
+    // REST comes back for the probe and klines; only exchangeInfo still fails, so the universe cannot refresh.
+    full.restore();
+    const scoped = sm.net.cut({ rest: "REFUSED", restPaths: ["/fapi/v1/exchangeInfo"], maxDurationMs: 30 * 60_000, label: "exchangeInfo only" });
+    expect(await sm.runUntil(() => kinds(since(sm, cutAt)).includes("SCANNER_RECOVERY_REQUESTED/scanner"), 15 * 60_000)).toBe(true);
+    scoped.restore(); // the fresh run can read its universe
+    const list = since(sm, cutAt);
+    const restoredSeen = at(list, "NETWORK_RESTORED");
+    const requested = at(list, "SCANNER_RECOVERY_REQUESTED");
+    expect(requested - restoredSeen).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.postNetworkGraceMs);
+    expect(requested - restoredSeen).toBeLessThanOrEqual(ALWAYS_ON_DEFAULTS.universeRefreshHealMaxMs + ALWAYS_ON_DEFAULTS.pollMs + 60_000);
+    expect(await sm.runUntil(() => kinds(since(sm, cutAt)).includes("SUPERVISOR_RETURNED_HEALTHY"), 15 * 60_000)).toBe(true);
+    expect(kinds(since(sm, cutAt)).filter((k) => k === "SCANNER_RECOVERY_REQUESTED/scanner")).toHaveLength(1);
     expectSafety(sm);
   }, 240_000);
 });

@@ -109,6 +109,8 @@ export class FakeMachine {
   scannerBehaviour: ScannerBehaviour = "healthy";
   scannerUniverse: ScannerShape = HEALTHY_UNIVERSE;
   scannerLastMessageAgoMs = 5_000;
+  /** The status's universe.nextRefreshAt, written as given (undefined: absent), so tests can send invalid values too. */
+  scannerNextRefreshAt: unknown = undefined;
   /** Null: the compact status. Otherwise the full per-symbol / per-connection detail the real scanner writes. */
   scannerDetail: { silentAwaiting: boolean } | null = null;
   /** The engine fingerprint each scanner run (by its spawn index) reports. */
@@ -245,7 +247,13 @@ export class FakeMachine {
         pid: child.runtime,
         writtenAt: new Date(writtenAt).toISOString(),
         totals: { selected: u.selected, liveEligible: u.liveEligible, quarantined: u.quarantined, failed: u.failed, recovering: u.recovering, awaitingStream: u.awaitingStream, catchupPending: 0, reconnects: 7, backpressureEvents: 0, restRequests: 600, restHalted: false },
-        universe: { generation: 3, stale: u.stale, exchangeCandidates: u.exchangeCandidates, capacity: { exceeded: u.capacityExceeded } },
+        universe: {
+          generation: 3,
+          stale: u.stale,
+          exchangeCandidates: u.exchangeCandidates,
+          capacity: { exceeded: u.capacityExceeded },
+          ...(this.scannerNextRefreshAt === undefined ? {} : { nextRefreshAt: this.scannerNextRefreshAt }),
+        },
         ...(this.scannerDetail === null ? { symbols: [{ symbol: "AAAUSDT", lastValidMessageAt: new Date(this.now - lastMessageAgoMs).toISOString() }] } : this.detailOf(u, lastMessageAgoMs)),
       })
     );

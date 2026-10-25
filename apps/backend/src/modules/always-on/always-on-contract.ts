@@ -102,6 +102,13 @@ export const ALWAYS_ON_DEFAULTS = Object.freeze({
   degradedGraceMs: 90_000,
   /** After connectivity returns, how long the scanner gets to heal itself before a fresh run is started. */
   postNetworkGraceMs: 120_000,
+  /**
+   * After a confirmed restore, a universe that is stale (and nothing else) may wait for the scanner's own next refresh
+   * plus this margin — its refreshes are a whole interval apart, longer than the heal window above.
+   */
+  universeRefreshHealMarginMs: 60_000,
+  /** ...but never longer than this after the restore: the profile's universe refresh interval (300 s) plus the margin. */
+  universeRefreshHealMaxMs: 360_000,
   /** How often the public connectivity probe may run while the scanner is degraded. */
   connectivityProbeEveryMs: 30_000,
   /** Restart backoff steps (attempt 1, 2, 3, …; the last step repeats). */

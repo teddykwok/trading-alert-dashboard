@@ -102,6 +102,8 @@ export interface ScannerHealth {
      */
     readonly awaitingStreamQuiet: number | null;
     readonly catchupPending: number | null;
+    /** When the scanner schedules its next universe refresh (a valid timestamp, as reported; null otherwise). */
+    readonly nextRefreshAt: string | null;
   };
   readonly lastMarketDataAt: string | null;
   readonly reconnects: number | null;
@@ -128,7 +130,15 @@ const NO_UNIVERSE: ScannerHealth["universe"] = {
   awaitingStream: null,
   awaitingStreamQuiet: null,
   catchupPending: null,
+  nextRefreshAt: null,
 };
+
+/** A timestamp string that parses; future instants allowed (callers bound them). */
+function timestampOf(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
 
 function awaiting(partial: Partial<ScannerHealth> = {}): ScannerHealth {
   return {
@@ -189,6 +199,7 @@ export function judgeScannerHealth(input: {
     awaitingStream: num(totals.awaitingStream),
     awaitingStreamQuiet: null,
     catchupPending: num(totals.catchupPending),
+    nextRefreshAt: universeRaw ? timestampOf(universeRaw.nextRefreshAt) : null,
   };
   const base = {
     ours: true,

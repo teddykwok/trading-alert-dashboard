@@ -1014,6 +1014,21 @@ export class AlwaysOnSupervisor {
   }
 
   /**
+   * After a confirmed restore, a universe that is stale and NOTHING else may wait for the scanner's own next refresh
+   * (its refreshes are a whole interval apart, longer than the heal window): until that refresh + the margin, never
+   * later than the restore + the cap. Null — the existing heal window alone — for any other issue, no confirmed
+   * restore, or a next refresh the status does not give as a valid timestamp; one in the past yields no extension.
+   */
+  private universeRefreshDeadline(scanner: ScannerHealth, issues: readonly string[]): number | null {
+    const restoredAtMs = this.network.restoredAtMs;
+    if (restoredAtMs === null || issues.length !== 1 || issues[0] !== "UNIVERSE_STALE") return null;
+    const nextMs = scanner.universe.nextRefreshAt === null ? Number.NaN : Date.parse(scanner.universe.nextRefreshAt);
+    if (!Number.isFinite(nextMs)) return null;
+    const p = this.config.policy;
+    return Math.min(nextMs + p.universeRefreshHealMarginMs, restoredAtMs + p.universeRefreshHealMaxMs);
+  }
+
+  /**
    * A recovery decision rests on a scanner status written at or after the grace deadline (`sinceMs` + grace): one
    * written before it may describe an outage that is already over. A status that stops arriving is itself the evidence
    * — STATUS_MISSING, or STATUS_STALE once older than the status freshness window — and is never delayed, so the wait
@@ -1462,6 +1477,11 @@ export class AlwaysOnSupervisor {
     }
     if (this.network.restoredAtMs !== null && now - this.network.restoredAtMs < p.postNetworkGraceMs) {
       this.setRole(role, "DEGRADED", "NETWORK_RESTORED_SCANNER_HEALING", `the network returned ${Math.round((now - this.network.restoredAtMs) / 1000)}s ago; the scanner gets ${Math.round(p.postNetworkGraceMs / 1000)}s to heal itself`);
+      return;
+    }
+    const universeDeadline = this.universeRefreshDeadline(scanner, issues);
+    if (universeDeadline !== null && now < universeDeadline) {
+      this.setRole(role, "DEGRADED", "UNIVERSE_REFRESH_PENDING", `the network returned and only the universe is stale; the scanner's next refresh gets until ${new Date(universeDeadline).toISOString()} before a fresh run is started`);
       return;
     }
     if (rt.latched) return;
