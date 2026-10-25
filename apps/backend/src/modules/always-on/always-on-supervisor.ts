@@ -16,6 +16,7 @@ import {
   type AlwaysOnRole,
   type AlwaysOnRoleState,
   type AlwaysOnSupervisorState,
+  type PublicStreamProbeOutcome,
 } from "./always-on-contract";
 import {
   judgeEmitterHealth,
@@ -149,6 +150,11 @@ export interface AlwaysOnAdapters {
   readonly http: AlwaysOnHttp;
   /** One unsigned public Binance request (server time); true when it answered. Never a credential. */
   readonly publicConnectivity: () => Promise<boolean>;
+  /**
+   * One unsigned public stream subscription: REACHABLE, UNREACHABLE (positive evidence of failure) or UNKNOWN.
+   * Never a credential. Asked only when the scanner's own status points at its streams (streamOutageConfirmed).
+   */
+  readonly publicStreamConnectivity: () => Promise<PublicStreamProbeOutcome>;
   readonly buildVerdict: () => BuildVerdict;
   /** The KEY NAMES the generic env file declares (never a value), or why it could not be read. */
   readonly genericEnvKeyNames: () => { readonly ok: true; readonly keys: string[] } | { readonly ok: false; readonly reason: string };
@@ -160,6 +166,20 @@ type StopPurpose = "RESTART" | "SUPERSEDED" | "RECOVERY" | "SHUTDOWN";
 
 /** The generation fence as read from disk. UNKNOWN (the file could not be read) pauses mutations; it never fences. */
 type FenceState = "CURRENT" | "SUPERSEDED" | "UNKNOWN";
+
+/**
+ * The public stream path. A probe answer is kept for one probe cadence, and only for the run whose evidence asked for
+ * it (null: no running scanner), so a stale or another run's answer never decides anything.
+ */
+interface StreamPathState {
+  unavailableSinceMs: number | null;
+  lastProbe: { readonly atMs: number; readonly runId: string | null; readonly outcome: PublicStreamProbeOutcome } | null;
+  probing: boolean;
+}
+const freshStreamPath = (): StreamPathState => ({ unavailableSinceMs: null, lastProbe: null, probing: false });
+
+/** The only scanner issues a public stream outage explains. Any other issue keeps the normal recovery path. */
+const STREAM_EXPLAINED_ISSUES: ReadonlySet<string> = new Set(["AWAITING_STREAM", "MARKET_DATA_STALE", "SYMBOLS_RECOVERING"]);
 
 /** An error's code for the journal (an fs code such as EPERM, or the error's name) — never its message. */
 function errorCode(error: unknown): string {
@@ -266,6 +286,7 @@ export class AlwaysOnSupervisor {
     unavailableSinceMs: null,
     restoredAtMs: null,
   };
+  private stream: StreamPathState = freshStreamPath();
   private dataStore: "AVAILABLE" | "UNAVAILABLE" | "UNKNOWN" = "UNKNOWN";
   private lastTickAtMs: number | null = null;
   /** When supervision last resumed after a clock gap (sleep / hibernate): no status older than this proves a hang. */
@@ -421,6 +442,7 @@ export class AlwaysOnSupervisor {
       }
       this.resumedAtMs = now;
       this.network = { reachable: null, lastProbeAtMs: null, unavailableSinceMs: null, restoredAtMs: null };
+      this.stream = freshStreamPath();
     }
     this.lastTickAtMs = now;
     this.consumeRequests(now);
@@ -991,6 +1013,69 @@ export class AlwaysOnSupervisor {
     return ok;
   }
 
+  /**
+   * The scanner's OWN current evidence that its streams, and nothing else, are failing: a fresh status of our run in
+   * which no connection is delivering anything, and every issue is one a stream outage explains (awaiting streams,
+   * stale market data, symbols recovering). A stale or missing status, or any other issue, is never such evidence.
+   */
+  private streamFailureEvidence(scanner: ScannerHealth): boolean {
+    if (!scanner.ours || scanner.verdict !== "DEGRADED" || scanner.stream === null) return false;
+    if (scanner.stream.connections === 0 || scanner.stream.delivering > 0) return false;
+    const codes = scanner.issues.map((i) => i.code as string);
+    return codes.length > 0 && codes.every((code) => STREAM_EXPLAINED_ISSUES.has(code)) && (codes.includes("AWAITING_STREAM") || codes.includes("MARKET_DATA_STALE"));
+  }
+
+  /**
+   * True only when the public stream probe positively confirms a stream outage (UNREACHABLE). The probe runs at most
+   * once per probe cadence, never concurrently, and its answer is reused only within that cadence for the same run
+   * (`runId`; null when no scanner runs). UNKNOWN, a failing probe, or a busy one is never a confirmation: the caller
+   * then takes its existing recovery path. A REACHABLE answer after a confirmed outage records its end and opens the
+   * post-network heal window.
+   */
+  private async streamOutageConfirmed(runId: string | null, now: number): Promise<boolean> {
+    const s = this.stream;
+    let outcome: PublicStreamProbeOutcome;
+    const last = s.lastProbe;
+    if (last !== null && last.runId === runId && now - last.atMs < this.config.policy.connectivityProbeEveryMs) {
+      outcome = last.outcome;
+    } else {
+      if (s.probing) return false;
+      s.probing = true;
+      try {
+        outcome = await this.a.publicStreamConnectivity();
+      } catch {
+        outcome = "UNKNOWN";
+      } finally {
+        s.probing = false;
+      }
+      s.lastProbe = { atMs: now, runId, outcome };
+    }
+    if (outcome === "UNREACHABLE") {
+      if (s.unavailableSinceMs === null) {
+        s.unavailableSinceMs = now;
+        this.record({
+          kind: "NETWORK_UNAVAILABLE",
+          role: "scanner",
+          reasonCode: "PUBLIC_STREAM_UNREACHABLE",
+          detail: "public Binance streams are unreachable while REST answers: no scanner restart is attempted (and no attempt is spent) until they return",
+        });
+      }
+      return true;
+    }
+    if (outcome === "REACHABLE") this.endStreamOutage(now, "the public stream probe connects again");
+    return false;
+  }
+
+  /** A confirmed stream outage is over: journaled once, and the scanner gets the post-network heal window. */
+  private endStreamOutage(now: number, why: string): void {
+    const since = this.stream.unavailableSinceMs;
+    if (since === null) return;
+    this.stream.unavailableSinceMs = null;
+    this.network.restoredAtMs = now;
+    const downSeconds = Math.round((now - since) / 1000);
+    this.record({ kind: "NETWORK_RESTORED", role: "scanner", reasonCode: "PUBLIC_STREAM_REACHABLE", detail: `public Binance streams are back after ${downSeconds}s (${why})`, facts: { downSeconds } });
+  }
+
   /** Our scanner reports a run whose engine is not the profile's: no emitter may ever be pinned to it. */
   private runOfAnotherEngine(scanner: ScannerHealth): boolean {
     return scanner.ours && scanner.runId !== null && scanner.engineFingerprint !== this.config.engineFingerprint;
@@ -1174,6 +1259,11 @@ export class AlwaysOnSupervisor {
         this.setRole(role, "DEGRADED", "NETWORK_UNAVAILABLE", "recovery waits: public Binance is unreachable, so a fresh run could not start (no attempt is spent)");
         return;
       }
+      // Only while an outage the probe confirmed is still confirmed: a fresh run could not connect (no attempt spent).
+      if (this.stream.unavailableSinceMs !== null && (await this.streamOutageConfirmed(null, now))) {
+        this.setRole(role, "DEGRADED", "PUBLIC_STREAM_UNREACHABLE", "recovery waits: public Binance streams are unreachable while REST answers, so a fresh run could not connect (no attempt is spent)");
+        return;
+      }
       if (!this.gateOpen(role, now)) {
         this.setRole(role, "BACKOFF", "RESTART_BACKOFF", `recovery: the next scanner start is allowed at ${new Date(rt.nextAttemptAtMs).toISOString()}`);
         return;
@@ -1213,6 +1303,7 @@ export class AlwaysOnSupervisor {
       });
       this.lastRecovery = { at: new Date(now).toISOString(), role, reasonCode: rec.reasonCode, reason: rec.reason, outcome: `SUCCEEDED (run ${this.scannerRun.runId})` };
       this.recovery = null;
+      this.endStreamOutage(now, "the fresh run's streams deliver");
       this.markHealthy(role, now, scanner.verdict === "WARMING" ? "WARMING" : "HEALTHY", "fresh run healthy");
       return;
     }
@@ -1220,6 +1311,11 @@ export class AlwaysOnSupervisor {
     if (scanner.ours && scanner.verdict === "DEGRADED") {
       rec.degradedSinceMs ??= now;
       if (now - rec.degradedSinceMs >= this.config.policy.degradedGraceMs && (await this.networkReachable(now))) {
+        if (this.streamFailureEvidence(scanner) && (await this.streamOutageConfirmed(scanner.runId, now))) {
+          // The fresh run is kept: it cannot connect because the public streams are down, not because it failed.
+          this.setRole(role, "RECOVERING", "PUBLIC_STREAM_UNREACHABLE", "recovery: the fresh run cannot connect because public Binance streams are unreachable while REST answers; it is kept and no attempt is spent");
+          return;
+        }
         const restoredAtMs = this.network.restoredAtMs;
         if (restoredAtMs !== null && now - restoredAtMs < this.config.policy.postNetworkGraceMs) {
           // As on the normal path: connectivity just returned, so the fresh run gets time to reconnect first.
@@ -1310,6 +1406,7 @@ export class AlwaysOnSupervisor {
     } else rt.warmingSinceMs = null;
     if (issues.length === 0) {
       rt.unhealthySinceMs = null;
+      this.endStreamOutage(now, "the scanner's streams deliver again");
       this.network.restoredAtMs = null;
       this.markHealthy(
         role,
@@ -1335,6 +1432,10 @@ export class AlwaysOnSupervisor {
     }
     if (!(await this.networkReachable(now))) {
       this.setRole(role, "DEGRADED", "NETWORK_UNAVAILABLE", `degraded (${summary}) and public Binance is unreachable: waiting for the network (no restart, no attempt spent)`);
+      return;
+    }
+    if (this.streamFailureEvidence(scanner) && (await this.streamOutageConfirmed(scanner.runId, now))) {
+      this.setRole(role, "DEGRADED", "PUBLIC_STREAM_UNREACHABLE", `degraded (${summary}) and public Binance streams are unreachable while REST answers: waiting for them (no restart, no attempt spent)`);
       return;
     }
     if (this.network.restoredAtMs !== null && now - this.network.restoredAtMs < p.postNetworkGraceMs) {
@@ -1772,6 +1873,11 @@ export class AlwaysOnSupervisor {
         reachable: this.network.reachable,
         lastProbeAt: this.network.lastProbeAtMs === null ? null : new Date(this.network.lastProbeAtMs).toISOString(),
         unavailableSince: this.network.unavailableSinceMs === null ? null : new Date(this.network.unavailableSinceMs).toISOString(),
+        stream: {
+          unreachableSince: this.stream.unavailableSinceMs === null ? null : new Date(this.stream.unavailableSinceMs).toISOString(),
+          lastProbeAt: this.stream.lastProbe === null ? null : new Date(this.stream.lastProbe.atMs).toISOString(),
+          lastProbeOutcome: this.stream.lastProbe?.outcome ?? null,
+        },
       },
       roles: {
         backend: { ...this.roleView("backend"), healthOk: this.latest.backendOk },

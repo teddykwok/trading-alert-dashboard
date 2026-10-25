@@ -2,6 +2,7 @@ import path from "node:path";
 
 import { ALWAYS_ON_DEFAULTS, type AlwaysOnPolicy, type AlwaysOnRole } from "../../src/modules/always-on/always-on-contract";
 import { alwaysOnPaths, emitterCommitStatus, scannerRunManifest, type AlwaysOnPaths } from "../../src/modules/always-on/always-on-paths";
+import type { PublicStreamProbeOutcome } from "../../src/modules/always-on/always-on-machine";
 import type { MonitoringSpawnPlan } from "../../src/modules/always-on/always-on-roles";
 import { AlwaysOnSupervisor, type AlwaysOnAdapters, type AlwaysOnConfig } from "../../src/modules/always-on/always-on-supervisor";
 import type { BuildVerdict } from "../../src/modules/operator/generic-backend-nonwatch-launcher";
@@ -125,6 +126,9 @@ export class FakeMachine {
   readonly paths: AlwaysOnPaths = alwaysOnPaths({ LOCALAPPDATA: LOCAL });
   readonly httpCalls: string[] = [];
   connectivityProbes = 0;
+  /** What the public stream probe answers (THROWS: the probe itself fails), and when it was asked. */
+  streamOutcome: PublicStreamProbeOutcome | "THROWS" = "REACHABLE";
+  readonly streamProbes: number[] = [];
   /** File-system faults, as Windows produces them (a reader, an editor, an indexer or antivirus holding the file). */
   failWrite: ((file: string) => boolean) | null = null;
   failRead: ((file: string) => boolean) | null = null;
@@ -340,6 +344,12 @@ export class FakeMachine {
       publicConnectivity: async () => {
         this.connectivityProbes += 1;
         return this.network;
+      },
+      publicStreamConnectivity: async () => {
+        this.streamProbes.push(this.now);
+        const outcome = this.streamOutcome;
+        if (outcome === "THROWS") throw new Error("the stream probe could not run");
+        return outcome;
       },
       buildVerdict: () => this.build,
       genericEnvKeyNames: () => ({ ok: true, keys: ["DATABASE_URL", "REDIS_URL", "BINANCE_FUTURES_REST_BASE_URL"] }),

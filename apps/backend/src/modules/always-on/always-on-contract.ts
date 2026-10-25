@@ -47,6 +47,9 @@ export const ALWAYS_ON_ROLE_LABELS: Readonly<Record<AlwaysOnRole, string>> = Obj
 export const ALWAYS_ON_SUPERVISOR_STATES = Object.freeze(["STARTING", "RUNNING", "DEGRADED", "RECOVERING", "BACKOFF", "LATCHED", "STOPPING", "STOPPED"] as const);
 export type AlwaysOnSupervisorState = (typeof ALWAYS_ON_SUPERVISOR_STATES)[number];
 
+/** The public stream probe's answer: UNREACHABLE only on positive evidence of failure; UNKNOWN never suppresses a recovery. */
+export type PublicStreamProbeOutcome = "REACHABLE" | "UNREACHABLE" | "UNKNOWN";
+
 /**
  * One role.
  *

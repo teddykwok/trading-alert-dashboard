@@ -4,12 +4,14 @@ import { createServer } from "node:net";
 import path from "node:path";
 
 import { SERVER_TIME_PATH, buildPublicFuturesUrl, parseServerTimePayload } from "../native-scanner/binance-public-futures";
+import { klineStreamNameOf } from "../native-scanner/exchange-symbol";
+import { buildPublicCombinedKlineStreamUrl, parseCombinedStreamEnvelope, parseKlineStreamPayload } from "../native-scanner/live-kline-stream";
 import { buildProcessProbeQuery, parseEnvFileStrict } from "../operator/dual-account-topology";
 import { assessNonWatchBuild, type BuildVerdict } from "../operator/generic-backend-nonwatch-launcher";
 import { listenerAuthority, withMutationLock, type ListenerHandle, type MutationAction, type WithAuthorityResult } from "../operator/mutation-lock";
 import { classifySpawnResult, parseProcessRows, parseProcessTreeRows, type Observation, type ObservedProcessNode } from "../operator/runtime-launcher";
 import { OWNERSHIP_PROOF_ATTEMPTS, type ProbeOutcome } from "../operator/worker-supervision";
-import type { AlwaysOnRole } from "./always-on-contract";
+import type { AlwaysOnRole, PublicStreamProbeOutcome } from "./always-on-contract";
 import { listenerInstanceLock, type InstanceLock } from "./always-on-ownership";
 import { alwaysOnRoleLog, type AlwaysOnPaths } from "./always-on-paths";
 import { genericEnvFilePath, type MonitoringSpawnPlan } from "./always-on-roles";
@@ -252,6 +254,89 @@ export async function publicBinanceReachable(timeoutMs = 5_000, fetchImpl: typeo
   } catch {
     return false;
   }
+}
+
+/** The one public stream the stream probe subscribes to: always trading, so a healthy stream speaks within seconds. */
+export const PUBLIC_STREAM_PROBE_SYMBOL = "BTCUSDT";
+/** Bounds the whole probe: the handshake and the first valid message. */
+export const PUBLIC_STREAM_PROBE_TIMEOUT_MS = 10_000;
+
+export type { PublicStreamProbeOutcome };
+
+/** The part of a WebSocket the probe uses. */
+export interface StreamProbeSocket {
+  addEventListener(type: "open" | "message" | "error" | "close", listener: (event: { readonly data?: unknown }) => void): void;
+  removeEventListener(type: "open" | "message" | "error" | "close", listener: (event: { readonly data?: unknown }) => void): void;
+  close(): void;
+}
+
+export interface StreamProbeTimers {
+  set(fn: () => void, ms: number): unknown;
+  clear(handle: unknown): void;
+}
+
+const realTimers: StreamProbeTimers = { set: (fn, ms) => setTimeout(fn, ms), clear: (handle) => clearTimeout(handle as NodeJS.Timeout) };
+
+/**
+ * One unsigned public stream subscription (BTCUSDT 15m klines, the production-validated combined stream URL, no
+ * protocols, no headers). REACHABLE only on a valid kline message of that stream. UNREACHABLE only on positive
+ * evidence of failure: an error or a close before such a message, or no handshake at all within the timeout.
+ * UNKNOWN for anything else — a socket that cannot be constructed, one that opens but proves nothing in time, or a
+ * message it cannot read — and UNKNOWN never suppresses a recovery. Every path removes the listeners, clears the
+ * timer and closes the socket. `open` and `timers` are the transport: real in production; tests inject a simulated
+ * network, never a switch.
+ */
+export function publicStreamReachable(options: { readonly timeoutMs?: number; readonly open?: (url: string) => StreamProbeSocket; readonly timers?: StreamProbeTimers } = {}): Promise<PublicStreamProbeOutcome> {
+  const timeoutMs = options.timeoutMs ?? PUBLIC_STREAM_PROBE_TIMEOUT_MS;
+  const timers = options.timers ?? realTimers;
+  const url = buildPublicCombinedKlineStreamUrl([PUBLIC_STREAM_PROBE_SYMBOL], "15m");
+  const stream = klineStreamNameOf(PUBLIC_STREAM_PROBE_SYMBOL, "15m");
+  let socket: StreamProbeSocket;
+  try {
+    socket = (options.open ?? ((url: string) => new WebSocket(url)))(url);
+  } catch {
+    return Promise.resolve("UNKNOWN");
+  }
+  return new Promise<PublicStreamProbeOutcome>((resolve) => {
+    let opened = false;
+    let unreadable = false;
+    let settled = false;
+    const onOpen = () => {
+      opened = true;
+    };
+    const onMessage = (event: { readonly data?: unknown }) => {
+      try {
+        const envelope = parseCombinedStreamEnvelope(typeof event.data === "string" ? event.data : "");
+        if (envelope.stream !== stream) throw new Error("another stream");
+        parseKlineStreamPayload(envelope.data, PUBLIC_STREAM_PROBE_SYMBOL, "15m");
+        finish("REACHABLE");
+      } catch {
+        unreadable = true;
+      }
+    };
+    // Something answered that could not be read: indeterminate, whatever happens next.
+    const onFailure = () => finish(unreadable ? "UNKNOWN" : "UNREACHABLE");
+    const listeners = [
+      ["open", onOpen],
+      ["message", onMessage],
+      ["error", onFailure],
+      ["close", onFailure],
+    ] as const;
+    const timer = timers.set(() => finish(opened || unreadable ? "UNKNOWN" : "UNREACHABLE"), timeoutMs);
+    function finish(outcome: PublicStreamProbeOutcome): void {
+      if (settled) return;
+      settled = true;
+      timers.clear(timer);
+      for (const [type, listener] of listeners) socket.removeEventListener(type, listener);
+      try {
+        socket.close();
+      } catch {
+        // Already closed or never connected: nothing to release.
+      }
+      resolve(outcome);
+    }
+    for (const [type, listener] of listeners) socket.addEventListener(type, listener);
+  });
 }
 
 export function genericEnvKeyNames(env: NodeJS.ProcessEnv): { readonly ok: true; readonly keys: string[] } | { readonly ok: false; readonly reason: string } {

@@ -6,6 +6,7 @@ import {
   type AlwaysOnRole,
   type AlwaysOnRoleState,
   type AlwaysOnSupervisorState,
+  type PublicStreamProbeOutcome,
 } from "./always-on-contract";
 import type { EmitterHealth, PlannerBaseline, PlannerHealth, ScannerHealth } from "./always-on-health";
 import type { IncidentRecord } from "./always-on-journal";
@@ -62,7 +63,13 @@ export interface AlwaysOnStatusDto {
   readonly lastRecovery: { readonly at: string; readonly role: AlwaysOnRole; readonly reasonCode: string; readonly reason: string; readonly outcome: string } | null;
   readonly backoff: { readonly role: AlwaysOnRole; readonly attempt: number; readonly until: string } | null;
   readonly dataStore: "AVAILABLE" | "UNAVAILABLE" | "UNKNOWN";
-  readonly network: { readonly reachable: boolean | null; readonly lastProbeAt: string | null; readonly unavailableSince: string | null };
+  readonly network: {
+    readonly reachable: boolean | null;
+    readonly lastProbeAt: string | null;
+    readonly unavailableSince: string | null;
+    /** The public stream path: probed only when the scanner's own status points at its streams. */
+    readonly stream: { readonly unreachableSince: string | null; readonly lastProbeAt: string | null; readonly lastProbeOutcome: PublicStreamProbeOutcome | null };
+  };
   readonly roles: {
     readonly backend: AlwaysOnRoleView & { readonly healthOk: boolean | null };
     readonly scanner: AlwaysOnRoleView & { readonly runId: string | null; readonly engineFingerprint: string | null; readonly runBindable: boolean; readonly health: ScannerHealth | null };
@@ -85,7 +92,10 @@ export function renderAlwaysOnStatus(status: AlwaysOnStatusDto, nowMs: number): 
   lines.push(`  end-to-end   last healthy ${status.lastEndToEndHealthyAt ?? "never"}`);
   if (status.backoff !== null) lines.push(`  backoff      ${status.backoff.role} attempt ${status.backoff.attempt} not before ${status.backoff.until}`);
   if (status.lastRecovery !== null) lines.push(`  last recovery ${status.lastRecovery.at} ${status.lastRecovery.role} ${status.lastRecovery.reasonCode}: ${status.lastRecovery.outcome}`);
-  lines.push(`  data store   ${status.dataStore}; public network ${status.network.reachable === null ? "not probed" : status.network.reachable ? "reachable" : `UNREACHABLE since ${status.network.unavailableSince ?? "?"}`}`);
+  lines.push(
+    `  data store   ${status.dataStore}; public network ${status.network.reachable === null ? "not probed" : status.network.reachable ? "reachable" : `UNREACHABLE since ${status.network.unavailableSince ?? "?"}`}` +
+      (status.network.stream.unreachableSince !== null ? `; public streams UNREACHABLE since ${status.network.stream.unreachableSince}` : "")
+  );
   for (const role of ALWAYS_ON_ROLES) {
     const view = status.roles[role];
     const owned = view.owned === null ? "not owned" : `root pid ${view.owned.rootPid}${view.owned.runtimePids.length > 0 ? ` (runtime ${view.owned.runtimePids.join(",")})` : ""}`;

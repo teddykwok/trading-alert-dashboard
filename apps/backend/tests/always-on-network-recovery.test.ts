@@ -242,36 +242,6 @@ describe("outages the probe cannot see: the current policy, pinned so a change i
     expectSafety(sm);
   }, 240_000);
 
-  it("a stream-only outage looks reachable to the REST probe: fresh runs that cannot connect are retried on the backoff and the scanner LATCHES after its attempts — it stays latched (monitoring down) after the streams return, until an operator clears it", async () => {
-    const sm = await runningStack();
-    const cutAt = sm.m.now;
-    const handle = sm.net.cut({ openStreams: "DROP", newStreams: "REFUSED", maxDurationMs: 50 * 60_000, label: "streams only" });
-    expect(await sm.runUntil(() => sm.supervisor.status().roles.scanner.latched, 50 * 60_000)).toBe(true);
-    const latchedAt = sm.m.now;
-    handle.restore();
-    await sm.runFor(20 * 60_000);
-    const list = since(sm, cutAt);
-    expect(kinds(list)).not.toContain("NETWORK_UNAVAILABLE/scanner");
-    const starts = list.filter((i) => i.kind === "ROLE_STARTED" && i.role === "scanner").map((i) => Date.parse(i.at));
-    expect(starts).toHaveLength(ALWAYS_ON_DEFAULTS.maxRecoveryAttempts);
-    // Never a storm: each fresh run is judged for the whole grace period before the next, and the backoff grows.
-    const gaps = starts.slice(1).map((t, i) => t - starts[i]);
-    expect(gaps.every((g) => g >= ALWAYS_ON_DEFAULTS.degradedGraceMs)).toBe(true);
-    expect(gaps.at(-1) as number).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.backoffStepsMs[4]);
-    expect(kinds(list)).toContain("ROLE_LATCHED/scanner");
-    expect(kinds(list)).toContain("SUPERVISOR_LATCHED");
-    // No emitter is ever pinned to a run that never became healthy.
-    expect(kinds(list).filter((k) => k === "EMITTER_STARTED_ON_RUN/emitter")).toEqual([]);
-    // After the streams return the latch holds: nothing restarts on its own.
-    const after = sm.supervisor.status();
-    expect(after.state).toBe("LATCHED");
-    expect(after.roles.scanner.latched).toBe(true);
-    expect(list.filter((i) => Date.parse(i.at) > latchedAt && i.kind === "ROLE_STARTED")).toEqual([]);
-    expect(after.counters.restarts.backend).toBe(0);
-    expect(after.counters.restarts.planner).toBe(0);
-    expectSafety(sm);
-  }, 300_000);
-
   it("a REST-only outage: the universe goes stale, the probe sees the outage (no restart while it lasts); restored just after a refresh attempt, the scanner's next scheduled refresh can fall outside the heal window", async () => {
     const sm = await runningStack();
     const cutAt = sm.m.now;
@@ -299,6 +269,108 @@ describe("outages the probe cannot see: the current policy, pinned so a change i
     expect(at(list, "SCANNER_RECOVERY_REQUESTED")).toBeLessThan(nextRefresh);
     expect(sm.supervisor.status().state).toBe("RUNNING");
     expectSafety(sm);
+  }, 240_000);
+});
+
+describe("R1: a public stream-only outage is recognised by the stream probe and never exhausts the scanner's attempts", () => {
+  const streamIncidents = (list: readonly Incident[]) => list.filter((i) => i.reasonCode === "PUBLIC_STREAM_UNREACHABLE" || i.reasonCode === "PUBLIC_STREAM_REACHABLE").map((i) => `${i.kind}:${i.reasonCode}`);
+  const restarts = (list: readonly Incident[]) => kinds(list).filter((k) => /^(SCANNER_RECOVERY_REQUESTED|ROLE_STOP_REQUESTED|ROLE_STARTED|BACKOFF_ENTERED|ROLE_LATCHED)/.test(k));
+  /** Every probe socket closed with no listener left; probes never faster than their cadence. */
+  function expectCleanProbes(sm: SimulatedMonitoringMachine) {
+    const probes = sm.net.streamProbes;
+    expect(probes.every((p) => p.closed && p.listeners() === 0)).toBe(true);
+    expect(probes.slice(1).every((p, i) => p.atMs - probes[i].atMs >= ALWAYS_ON_DEFAULTS.connectivityProbeEveryMs)).toBe(true);
+  }
+
+  it("45 minutes without public streams (REST fine): NETWORK_UNAVAILABLE (PUBLIC_STREAM_UNREACHABLE) once, no fresh run and no attempt spent, the scanner and its emitter kept; when the streams return the scanner heals itself — no recovery at all", async () => {
+    const sm = await runningStack();
+    const runA = sm.liveScanner();
+    const cutAt = sm.m.now;
+    let atRestore = sm.supervisor.status();
+    await sm.net.withOutage({ openStreams: "DROP", newStreams: "REFUSED", maxDurationMs: 50 * 60_000, label: "streams only" }, async () => {
+      await sm.runFor(45 * 60_000);
+      atRestore = sm.supervisor.status();
+    });
+    const restoredAt = sm.m.now;
+    await sm.runFor(nextBarClose(sm.m.now) - sm.m.now + 10 * 60_000);
+    const list = since(sm, cutAt);
+    expect(streamIncidents(list)[0]).toBe("NETWORK_UNAVAILABLE:PUBLIC_STREAM_UNREACHABLE");
+    expect(streamIncidents(list).filter((k) => k.startsWith("NETWORK_UNAVAILABLE"))).toHaveLength(1);
+    expect(streamIncidents(list)).toContain("NETWORK_RESTORED:PUBLIC_STREAM_REACHABLE");
+    expect(list.filter((i) => i.reasonCode === "PUBLIC_BINANCE_UNREACHABLE")).toEqual([]);
+    expect(restarts(list)).toEqual([]);
+    expect(atRestore.roles.scanner).toMatchObject({ state: "DEGRADED", reasonCode: "PUBLIC_STREAM_UNREACHABLE", attempts: 0, latched: false });
+    expect(atRestore.roles.emitter.state).toBe("RUNNING");
+    expect(sm.processes).toHaveLength(1);
+    expect(sm.processes[0].runId).toBe(runA?.runId);
+    expect(sm.processes[0].exit).toBe("RUNNING");
+    const probesDuring = sm.net.streamProbes.filter((p) => p.atMs >= cutAt && p.atMs < restoredAt);
+    expect(probesDuring.length).toBeGreaterThan(0);
+    expect(probesDuring.every((p) => p.outcome === "REFUSED")).toBe(true);
+    expect(sm.net.streamProbes.length).toBeLessThanOrEqual(Math.ceil((45 * 60_000) / ALWAYS_ON_DEFAULTS.connectivityProbeEveryMs) + 4);
+    expectCleanProbes(sm);
+    const final = sm.supervisor.status();
+    expect(final.state).toBe("RUNNING");
+    expect(final.roles.scanner.health?.verdict).toBe("HEALTHY");
+    expect(final.roles.scanner.attempts).toBe(0);
+    expectSafety(sm);
+  }, 300_000);
+
+  it("streams return but the kept scanner cannot reconnect: NETWORK_RESTORED, the heal window, then ONE ordered recovery to a fresh run with the emitter re-pinned to it", async () => {
+    const sm = await runningStack();
+    const runA = sm.liveScanner() as NonNullable<ReturnType<SimulatedMonitoringMachine["liveScanner"]>>;
+    const cutAt = sm.m.now;
+    await sm.net.withOutage({ openStreams: "DROP", newStreams: "REFUSED", maxDurationMs: 20 * 60_000, label: "streams only" }, async () => {
+      await sm.runFor(15 * 60_000);
+    });
+    sm.scannerStreamsBroken = (runId) => runId === runA.runId;
+    expect(await sm.runUntil(() => kinds(since(sm, cutAt)).includes("SUPERVISOR_RETURNED_HEALTHY"), 20 * 60_000)).toBe(true);
+    const list = since(sm, cutAt);
+    expect(kinds(list).filter((k) => k === "SCANNER_RECOVERY_REQUESTED/scanner")).toHaveLength(1);
+    const restoredSeen = Date.parse((list.find((i) => i.reasonCode === "PUBLIC_STREAM_REACHABLE") as Incident).at);
+    expect(at(list, "SCANNER_RECOVERY_REQUESTED") - restoredSeen).toBeGreaterThanOrEqual(ALWAYS_ON_DEFAULTS.postNetworkGraceMs);
+    const order = ["SCANNER_RECOVERY_REQUESTED/scanner", "ROLE_STOP_REQUESTED/emitter", "ROLE_STOPPED/emitter", "ROLE_STOP_REQUESTED/scanner", "ROLE_STOPPED/scanner", "ROLE_STARTED/scanner", "SCANNER_RECOVERY_SUCCEEDED/scanner", "EMITTER_STARTED_ON_RUN/emitter"];
+    expect(kinds(list).filter((k) => order.includes(k))).toEqual(order);
+    const fresh = sm.liveScanner();
+    expect(fresh?.runId).not.toBe(runA.runId);
+    expect(sm.supervisor.status().roles.emitter.pinnedRunId).toBe(fresh?.runId);
+    expect(sm.supervisor.status().roles.scanner.attempts).toBe(1);
+    expectCleanProbes(sm);
+    expectSafety(sm);
+  }, 300_000);
+
+  it("a scanner-LOCAL stream failure while public streams answer is never an outage: the probe says REACHABLE, and the bounded recovery and its latch work exactly as before", async () => {
+    const sm = await runningStack();
+    const cutAt = sm.m.now;
+    sm.scannerStreamsBroken = () => true;
+    // One instant of dropped connections; from then on every reconnect fails inside the scanner, the network is fine.
+    await sm.net.withOutage({ openStreams: "DROP", maxDurationMs: 2_000, label: "one drop" }, async () => {
+      await sm.runFor(1_000);
+    });
+    expect(await sm.runUntil(() => sm.supervisor.status().roles.scanner.latched, 60 * 60_000)).toBe(true);
+    const list = since(sm, cutAt);
+    expect(streamIncidents(list)).toEqual([]);
+    expect(sm.net.streamProbes.length).toBeGreaterThan(0);
+    expect(sm.net.streamProbes.every((p) => p.outcome === "OK")).toBe(true);
+    expect(list.filter((i) => i.kind === "ROLE_STARTED" && i.role === "scanner")).toHaveLength(ALWAYS_ON_DEFAULTS.maxRecoveryAttempts);
+    expect(kinds(list)).toContain("ROLE_LATCHED/scanner");
+    expect(kinds(list).filter((k) => k === "EMITTER_STARTED_ON_RUN/emitter")).toEqual([]);
+    expectCleanProbes(sm);
+    expectSafety(sm);
+  }, 300_000);
+
+  it.each([
+    ["the probe socket cannot be constructed", "THROWS" as const, { openStreams: "DROP" as const, newStreams: "REFUSED" as const }],
+    ["the probe reads something it cannot interpret", "INDETERMINATE" as const, { openStreams: "DROP" as const, newStreams: "REFUSED" as const }],
+    ["a half-open outage: the probe opens and hears nothing", "REAL" as const, { openStreams: "SILENT" as const }],
+  ])("uncertain (%s): never treated as an outage — the existing bounded recovery runs", async (_label, mode, fault) => {
+    const sm = await runningStack();
+    sm.streamProbeMode = mode;
+    const cutAt = sm.m.now;
+    sm.net.cut({ ...fault, maxDurationMs: 30 * 60_000, label: "uncertain" });
+    expect(await sm.runUntil(() => kinds(since(sm, cutAt)).includes("SCANNER_RECOVERY_REQUESTED/scanner"), 12 * 60_000)).toBe(true);
+    expect(streamIncidents(since(sm, cutAt))).toEqual([]);
+    expect(sm.violations).toEqual([]);
   }, 240_000);
 });
 

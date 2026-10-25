@@ -108,6 +108,11 @@ export interface ScannerHealth {
   readonly backpressureEvents: number | null;
   readonly restHalted: boolean | null;
   readonly restRequests: number | null;
+  /**
+   * The scanner's own stream connections: how many it lists, and how many are OPEN and delivered a message within
+   * the market-data freshness window. Null when the status carries no per-connection detail.
+   */
+  readonly stream: { readonly connections: number; readonly delivering: number } | null;
 }
 
 const NO_UNIVERSE: ScannerHealth["universe"] = {
@@ -142,6 +147,7 @@ function awaiting(partial: Partial<ScannerHealth> = {}): ScannerHealth {
     backpressureEvents: null,
     restHalted: null,
     restRequests: null,
+    stream: null,
     ...partial,
   };
 }
@@ -199,7 +205,7 @@ export function judgeScannerHealth(input: {
     restHalted: bool(totals.restHalted),
     restRequests: num(totals.restRequests),
   };
-  if (parsed.runState === "STOPPED") return { ...base, verdict: "STOPPED", issues: [] };
+  if (parsed.runState === "STOPPED") return { ...base, stream: null, verdict: "STOPPED", issues: [] };
 
   const issues: ScannerIssue[] = [];
   if (writtenAtMs === null || input.nowMs - writtenAtMs > input.policy.scannerStatusFreshMs) {
@@ -246,7 +252,13 @@ export function judgeScannerHealth(input: {
   // delivering connection). The supervisor bounds how long it may last; the scanner's own per-symbol stale timeout acts first.
   const warming = (universe.quarantined ?? 0) > 0 || (detail?.awaitingQuiet ?? 0) > 0;
   const verdict: ScannerVerdict = issues.length > 0 ? "DEGRADED" : warming ? "WARMING" : "HEALTHY";
-  return { ...base, universe: { ...universe, awaitingStreamQuiet: detail === null ? null : detail.awaitingQuiet }, verdict, issues };
+  return {
+    ...base,
+    universe: { ...universe, awaitingStreamQuiet: detail === null ? null : detail.awaitingQuiet },
+    stream: detail === null ? null : { connections: detail.connections, delivering: detail.deliveringConnections },
+    verdict,
+    issues,
+  };
 }
 
 /**
@@ -259,7 +271,11 @@ const KNOWN_PLACED_STATES: ReadonlySet<string> = new Set(["LIVE_ELIGIBLE", "QUAR
  * The scanner's per-symbol and per-connection detail (it lists every symbol with its connection and readiness,
  * and every connection with its lifecycle and last message). Null when the status carries none.
  */
-function readinessDetail(parsed: Record<string, unknown>, nowMs: number, freshMs: number): { placed: number; awaitingQuiet: number; awaitingSilent: number; unexplained: string[] } | null {
+function readinessDetail(
+  parsed: Record<string, unknown>,
+  nowMs: number,
+  freshMs: number
+): { placed: number; awaitingQuiet: number; awaitingSilent: number; unexplained: string[]; connections: number; deliveringConnections: number } | null {
   if (!Array.isArray(parsed.symbols) || !Array.isArray(parsed.connections)) return null;
   const delivering = new Map<number, boolean>();
   for (const c of parsed.connections as unknown[]) {
@@ -267,7 +283,14 @@ function readinessDetail(parsed: Record<string, unknown>, nowMs: number, freshMs
     const last = instantOf(c.lastMessageAt, nowMs);
     delivering.set(num(c.index) as number, c.lifecycle === "OPEN" && last !== null && nowMs - last <= freshMs);
   }
-  const result = { placed: 0, awaitingQuiet: 0, awaitingSilent: 0, unexplained: [] as string[] };
+  const result = {
+    placed: 0,
+    awaitingQuiet: 0,
+    awaitingSilent: 0,
+    unexplained: [] as string[],
+    connections: delivering.size,
+    deliveringConnections: [...delivering.values()].filter(Boolean).length,
+  };
   for (const s of parsed.symbols as unknown[]) {
     if (!isRecord(s) || num(s.connection) === null || typeof s.readiness !== "string") return null;
     const connection = num(s.connection) as number;

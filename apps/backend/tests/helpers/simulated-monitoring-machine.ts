@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
 import type { AlwaysOnTickOutcome } from "../../src/modules/always-on/always-on-supervisor";
-import { publicBinanceReachable } from "../../src/modules/always-on/always-on-machine";
+import { publicBinanceReachable, publicStreamReachable, type PublicStreamProbeOutcome } from "../../src/modules/always-on/always-on-machine";
 import { scannerRunManifest } from "../../src/modules/always-on/always-on-paths";
 import type { MonitoringSpawnPlan } from "../../src/modules/always-on/always-on-roles";
 import type { PublicHttpTransport } from "../../src/modules/native-scanner/kline-fetcher";
@@ -10,7 +10,37 @@ import type { OpenPublicStream } from "../../src/modules/native-scanner/live-sha
 import { LIVE_SHADOW_LOCK_FILE } from "../../src/modules/native-scanner/scanner-lock";
 import { engineFingerprintOf } from "../../src/modules/native-scanner/scanner-profile";
 import { FakeMachine, HEALTHY_UNIVERSE, startSupervisor, testConfig } from "./always-on-fake-machine";
-import { SimulatedPublicNetwork } from "./simulated-public-network";
+import { SimulatedPublicNetwork, immediateProbeTimers, type ProbeListener, type ProbeSocketLike } from "./simulated-public-network";
+
+/**
+ * A probe socket answered by something that is not Binance (a middlebox completing the handshake): it opens and
+ * delivers only an unreadable message, whatever the outage — an indeterminate answer. It still checks the URL.
+ */
+function indeterminateSocket(net: SimulatedPublicNetwork, url: string): ProbeSocketLike {
+  net.openProbeSocket(url).close(); // the production URL check, and a probe record
+  const listeners = new Map<string, Set<ProbeListener>>();
+  let closed = false;
+  queueMicrotask(() => {
+    for (const [type, event] of [
+      ["open", {}],
+      ["message", { data: "{not json" }],
+    ] as const) {
+      if (closed) return;
+      for (const listener of [...(listeners.get(type) ?? [])]) listener(event);
+    }
+  });
+  return {
+    addEventListener: (type, listener) => {
+      const set = listeners.get(type) ?? new Set<ProbeListener>();
+      set.add(listener);
+      listeners.set(type, set);
+    },
+    removeEventListener: (type, listener) => listeners.get(type)?.delete(listener),
+    close: () => {
+      closed = true;
+    },
+  };
+}
 import { FIXTURE_TIMELINE, SIM_SYMBOLS, SimulatedClock, SimulatedScanner, simulatedMarket, type SimulatedTimeline } from "./simulated-scanner";
 
 /**
@@ -86,6 +116,16 @@ export class SimulatedMonitoringMachine {
   readonly spawnPlans: MonitoringSpawnPlan[] = [];
   /** A scanner that ignores its stop file (hung): only the fenced terminate ends it. */
   scannersIgnoreStop = false;
+  /**
+   * A scanner-LOCAL stream failure for the runs it selects: their stream connections are refused inside the process
+   * (a scanner fault), while the public network — and the supervisor's own stream probe — are fine.
+   */
+  scannerStreamsBroken: (runId: string) => boolean = () => false;
+  /**
+   * The supervisor's stream probe: the REAL publicStreamReachable over the simulated network, or the same probe whose
+   * socket cannot be constructed (THROWS) or answers with something it cannot read (INDETERMINATE).
+   */
+  streamProbeMode: "REAL" | "THROWS" | "INDETERMINATE" = "REAL";
   supervisor!: Awaited<ReturnType<typeof startSupervisor>>["supervisor"];
   private nextTickAtMs = 0;
   private stopped = false;
@@ -116,6 +156,7 @@ export class SimulatedMonitoringMachine {
   async start(): Promise<void> {
     const { supervisor, started } = await startSupervisor(this.m, testConfig({ engineFingerprint: this.engineFingerprint }), {
       publicConnectivity: () => publicBinanceReachable(5_000, this.net.fetch),
+      publicStreamConnectivity: () => this.probeStream(),
       spawn: (plan) => {
         this.spawnPlans.push(plan);
         return (this.m.adapters().spawn as (p: MonitoringSpawnPlan) => number | null)(plan);
@@ -124,6 +165,22 @@ export class SimulatedMonitoringMachine {
     if (!started.ok) throw new Error(`Always-On refused to start: ${JSON.stringify(started)}`);
     this.supervisor = supervisor;
     this.nextTickAtMs = this.m.now;
+  }
+
+  /** The real stream probe over the simulated network, or one of its uncertain variants. */
+  probeStream(): Promise<PublicStreamProbeOutcome> {
+    if (this.streamProbeMode === "THROWS") {
+      return publicStreamReachable({
+        open: () => {
+          throw new Error("cannot construct a WebSocket");
+        },
+        timers: immediateProbeTimers,
+      });
+    }
+    if (this.streamProbeMode === "INDETERMINATE") {
+      return publicStreamReachable({ open: (url) => indeterminateSocket(this.net, url), timers: immediateProbeTimers });
+    }
+    return publicStreamReachable({ open: this.net.openProbeSocket, timers: immediateProbeTimers });
   }
 
   /** Runs the whole machine for `ms` of simulated time. */
@@ -248,6 +305,20 @@ export class SimulatedMonitoringMachine {
     const rest: PublicHttpTransport = (url, init) => (alive() ? net.rest(url, init) : Promise.reject(new Error("the process has exited")));
     const openStream: OpenPublicStream = (url, handlers) => {
       if (!alive()) throw new Error("the process has exited");
+      if (this.scannerStreamsBroken(runId)) {
+        // A scanner-local fault: the connection fails inside the process; the public network never sees it.
+        let closed = false;
+        queueMicrotask(() => {
+          if (closed || !alive()) return;
+          handlers.onError("local stream failure");
+          handlers.onClose("code 1006");
+        });
+        return {
+          close: () => {
+            closed = true;
+          },
+        };
+      }
       const connection = net.openStream(url, {
         onOpen: () => alive() && handlers.onOpen(),
         onMessage: (text) => alive() && handlers.onMessage(text),
