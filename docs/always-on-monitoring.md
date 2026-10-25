@@ -321,8 +321,8 @@ repository.
 | `monitoring\always-on\status.json` | `teddy.native-monitoring.always-on-status.v1`, rewritten atomically every tick |
 | `monitoring\always-on\incidents.jsonl` | Append-only (fsync) journal of transitions, never one line per poll, generation-tagged, redacted |
 | `monitoring\always-on\ownership.json` | Generation, supervisor identity, children (atomic replace) |
-| `monitoring\always-on\requests\` | `stop.json` / `clear-latch.json`, consumed by the running supervisor |
-| `monitoring\always-on\stop\` | One cooperative stop file per spawned scanner/emitter |
+| `monitoring\always-on\requests\` | `stop.json` / `clear-latch.json` / `drill.json` / `drill-restore.json`, consumed by the running supervisor |
+| `monitoring\always-on\stop\` | One cooperative stop file per spawned scanner/emitter; the owned scanner's `.drill` file beside its stop file while an operator drill is active (section 12) |
 | `logs\always-on-<role>.log`, `logs\always-on-supervisor.log` | stdout+stderr, rotated at 32 MB |
 
 The status artifact has:
@@ -348,7 +348,12 @@ Journal kinds include `SCANNER_DEGRADED`, `NETWORK_UNAVAILABLE`,
 `PLANNER_FAILURE_DELTA_INCREASED`, `BACKOFF_ENTERED`, `ROLE_LATCHED`,
 `SUPERVISOR_LATCHED`, `SUPERVISOR_RETURNED_HEALTHY`, `ROLE_CONFLICT`,
 `EXTERNAL_MONITORING_PROCESS`, `OWNERSHIP_READ_FAILED`,
-`OWNERSHIP_WRITE_FAILED` and `SUPERVISOR_TICK_FAILED`.
+`OWNERSHIP_WRITE_FAILED` and `SUPERVISOR_TICK_FAILED`. The operator drill adds
+`DRILL_REJECTED`, `DRILL_STARTED`, `DRILL_ACTIVATION_CONFIRMED` /
+`DRILL_ACTIVATION_UNCONFIRMED`, `DRILL_RESTORE_REQUESTED`, `DRILL_ENDED`,
+`DRILL_RESTORE_CONFIRMED` / `DRILL_RESTORE_UNCONFIRMED`, `DRILL_STALE_REMOVED`
+and `DRILL_UNAUTHORIZED_FILE_REMOVED` (section 12). The status artifact gains an
+optional `drill` view, present only once a generation has accepted a drill.
 
 ## 7. Commands
 
@@ -360,7 +365,13 @@ pnpm --filter @trading-alert-dashboard/backend monitoring:always-on status [--js
 pnpm --filter @trading-alert-dashboard/backend monitoring:always-on stop [--wait-seconds 600]
 pnpm --filter @trading-alert-dashboard/backend monitoring:always-on clear-latch [--role scanner]
 pnpm --filter @trading-alert-dashboard/backend monitoring:always-on startup-task [--emitter-activate-at-eof] [--write]
+pnpm --filter @trading-alert-dashboard/backend monitoring:always-on drill start --fault <FAULT> --duration-seconds <10-900> --generation <G> --run-id <run id>
+pnpm --filter @trading-alert-dashboard/backend monitoring:always-on drill restore
+pnpm --filter @trading-alert-dashboard/backend monitoring:always-on drill status
 ```
+
+The `drill` commands are the operator network drill (section 12). Never run one
+without a separately approved drill procedure.
 
 pnpm 11 passes arguments straight through. Do not insert a bare `--`.
 
@@ -439,7 +450,9 @@ Prerequisites:
    - Emitter pinned to the scanner's run id, `queue 0/10000`.
    - Planner `READY`, pending 0, Δ 0 (baseline recorded).
 2. **Temporary network loss.** Disable the network adapter, or pull the cable,
-   for about 10 minutes.
+   for about 10 minutes. (A machine-wide disconnect also cuts everything else on
+   the machine. The process-local alternative is the operator drill, section
+   12, run only under a separately approved procedure.)
    - Status: scanner `DEGRADED`, then `NETWORK_UNAVAILABLE` after the grace
      period.
    - Backend, emitter and planner stay `RUNNING`.
@@ -532,7 +545,13 @@ Observatory soak ([native-signal-quality-observatory.md](native-signal-quality-o
     only, and current scanners always write the detail. An exact fix needs a
     scanner-side count of placed failures.
   - **Recovery under real network faults is not proven on a real machine** —
-    see section 11.
+    see sections 11 and 12. The operator drill (section 12) makes a
+    process-local real-machine drill possible; it has not been run.
+- **Every `monitoring:always-on` CLI process** (status, stop, clear-latch, and
+  the drill controller while it waits for its verdict) matches the supervisor
+  entrypoint, so a running supervisor reports it once as
+  `EXTERNAL_MONITORING_PROCESS` (`OTHER_SUPERVISOR_RUNTIME`). This is
+  pre-existing and report-only: nothing is stopped or started for it.
 
 ## 11. Network fault injection (test-only)
 
@@ -584,29 +603,207 @@ test constructs.
 Both probes take their transport as an optional parameter: `fetch` for
 `publicBinanceReachable`, and the socket constructor and timers for
 `publicStreamReachable`, each defaulting to the real one. Structural tests pin
-that production calls both with none, and that no production module,
-environment variable or CLI option can select a fault or a simulated
-transport.
+that production calls both through the machine's probe functions, which pass
+the real transport itself unless an active operator drill (section 12) gates
+it. They also pin that no production module, environment variable or CLI
+option can select a simulated transport, and that only the dedicated
+`drill start` command can request a drill.
 
 **What it does not prove:** real-machine network recovery (operating-system
-sockets, DNS, TLS, Binance's own behaviour), and timings under real load. A
-real-machine Gate 4A still needs a separately approved, isolated mechanism.
-None exists in the repository. A proposed design, **not implemented**:
+sockets, DNS, TLS, Binance's own behaviour), and timings under real load. The
+mechanism for a separately approved real-machine Gate 4A is the operator
+network drill, section 12.
 
-- an operator-only `monitoring:always-on drill --duration-seconds N`
-  (N ≤ 900);
-- the drill is written as a request file that only the running supervisor of
-  the current generation consumes, like `stop.json`;
-- the supervisor hands it only to its own scanner child, through a per-spawn
-  drill file beside that child's stop file. The scanner checks the file every
-  second and fails its public transports while the file is valid: same
-  generation, same run, not expired;
-- the supervisor's probe reads the same file;
-- expiry ends the drill even if the file remains. The supervisor removes the
-  file at expiry and on shutdown, and a new generation removes stale ones;
-- the drill is never driven by an environment variable, never reaches the
-  backend, emitter, planner or account processes, and is journaled as
-  `DRILL_STARTED` and `DRILL_ENDED`.
+## 12. Operator network drill (the Gate 4A mechanism; engineered and tested, never run)
+
+A drill fails the **public, unsigned market-data transports** of the ONE
+scanner run the running supervisor owns, plus the supervisor's own two
+connectivity probes, for a bounded while. The failure happens **inside those
+processes**. Real Windows process ownership, fencing, recovery and restoration
+can then be exercised on the real machine without touching its network. No
+adapter, DNS, hosts, firewall, routing or proxy changes, no other process
+affected.
+
+It is never driven by an environment variable, a `run` or scanner option, a
+route, the frontend or the launcher. It never reaches the backend, the emitter,
+the planner, an account, a credential or anything signed. Native execution
+stays hard-disabled.
+
+### How it is isolated
+
+- **Scanner side** (`native-scanner/public-transport-drill.ts`): a gate the
+  scanner CLI builds **only** for a run Always-On spawned (it was given a
+  cooperative stop file). It watches exactly one file, `<its stop file>.drill`,
+  polls it every second and checks it on every transport use.
+  - While a valid, current drill for **its own run id** is there, it wraps the
+    scanner's real transports. These stay exactly the real `fetch` and
+    `WebSocket`.
+  - The wrappers can only **refuse, drop or silence**. No URL, host, header or
+    redirect can be expressed: the file format refuses any unknown field.
+  - A scanner started by hand has no stop file, so it has no gate at all.
+- **Supervisor side** (`always-on/always-on-drill.ts`, the supervisor): it
+  accepts the request and writes the drill file. Its two probes run their
+  unchanged code over a gated transport. Outside an active drill they receive
+  the real `fetch` / `WebSocket` itself.
+- **Nothing else reads the drill.** Only the Always-On module and the scanner
+  entrypoint import the drill modules (pinned by `always-on-drill-structure`).
+
+### Explicit local authorization
+
+```powershell
+pnpm --filter @trading-alert-dashboard/backend monitoring:always-on status        # read the generation and the scanner run id
+pnpm --filter @trading-alert-dashboard/backend monitoring:always-on drill start --fault PUBLIC_STREAMS_DOWN --duration-seconds 600 --generation 7 --run-id 20261025T030000Z-0a1b2c3d
+pnpm --filter @trading-alert-dashboard/backend monitoring:always-on drill status
+pnpm --filter @trading-alert-dashboard/backend monitoring:always-on drill restore   # end it now (idempotent)
+```
+
+`drill start` refuses unless the running supervisor is that generation and owns
+that run. It writes one request, `requests\drill.json`, naming the generation,
+the run, the fault, the duration and itself (pid and OS creation time), then
+waits for the verdict.
+
+The running supervisor consumes it once, and only after its file is gone. It
+accepts it only if every check below passes, judged in this fixed order (the
+first failure wins). Anything uncertain refuses, and every refusal is journaled
+as `DRILL_REJECTED` with its reason.
+
+| Check | Refusal |
+| --- | --- |
+| written at most 60 s ago | `REQUEST_EXPIRED` |
+| not from the future | `REQUEST_FROM_FUTURE` |
+| its id never used before | `REQUEST_REPLAYED` |
+| this generation | `GENERATION_MISMATCH` |
+| no stop in progress | `SHUTTING_DOWN` |
+| no other drill active | `DRILL_ALREADY_ACTIVE` |
+| no recovery in progress | `RECOVERY_IN_PROGRESS` |
+| an owned, identified scanner | `NO_OWNED_SCANNER` |
+| that scanner's run | `RUN_MISMATCH` |
+| that run is healthy | `SCANNER_NOT_HEALTHY` |
+| the controller is a live node process of THIS repository running exactly `run-always-on-monitoring.ts drill start`, with matching creation time | `CONTROLLER_UNOBSERVABLE` / `CONTROLLER_NOT_VERIFIED` |
+| the real Windows ACL (`Get-Acl`, read every time) of the Always-On, `requests\` and `stop\` directories grants write access to nobody but this account, SYSTEM and Administrators | `DIRECTORY_NOT_PRIVATE` |
+
+A malformed request is refused with its parse reason (`SCHEMA_INVALID`,
+`FIELD_INVALID`, `FAULT_UNKNOWN`, `DURATION_OUT_OF_BOUNDS`).
+
+Accepted, the drill file is written beside the owned scanner's stop file. It
+names that run, the catalogue faults and the window. It is written under the
+launcher's mutation lock with the generation fence re-checked
+(`ALWAYS_ON_DRILL_START`), and journaled as `DRILL_STARTED`. The launcher's
+mutation lock being busy refuses (`MUTATION_AUTHORITY_BUSY`).
+
+**The trust boundary, stated plainly:**
+
+- **What the checks stop:** other Windows accounts (the ACL), anything remote
+  (there is no listener: the supervisor's `127.0.0.1:4019` mutex drops every
+  connection), leftover or hand-written request files (no live verified
+  controller, the 60 s lifetime, generation and run binding), and accidental
+  activation (no switch exists).
+- **What they cannot stop:** code already running as the operator's own account
+  can do anything the operator can, including running `drill start`. A drill
+  file planted directly beside the scanner's stop file, bypassing the request,
+  is removed by the supervisor within one pass and journaled
+  (`DRILL_UNAUTHORIZED_FILE_REMOVED`). Until then, the TTL bounds it.
+
+### Run and generation binding
+
+- The drill file is per spawn: its name comes from that child's own stop file.
+- It names the run id, a random id fixed by that scanner process at start; the
+  scanner's gate ignores any drill for another run.
+- A replacement scanner has a new stop file and a new run id, so it can never
+  inherit a drill.
+- The supervisor hands its probes the drill's faults only while the drill is
+  active **and** its scanner child (pid and spawn sequence) is still the one it
+  was written for.
+
+### Finite duration and restoration
+
+- **Maximum TTL: 900 s** (minimum 10 s). The scanner enforces it itself. It
+  ends the drill exactly at its expiry on the wall clock **and** on a monotonic
+  deadline fixed at activation, so a wall clock moved backwards cannot extend
+  it. A file that is gone, unreadable or invalid ends it (fail-safe: inactive).
+  An ended drill id never comes back. **None of this needs the supervisor or
+  the controller to stay alive.**
+- **The supervisor ends a drill exactly once**, at the first of:
+
+  | End reason | When |
+  | --- | --- |
+  | `EXPIRED` | checked first in every pass, so it wins a same-pass race |
+  | `OPERATOR_RESTORE` | `drill restore`: honoured even unparseable, and by any running generation, because it can only end a fault; idempotent |
+  | `SHUTDOWN` | before anything is stopped |
+  | `DETACHED` | the console was closed |
+  | `FENCED` | a newer generation owns the stack; only this generation's own file is removed |
+  | `RUN_ENDED` | the scanner child exited or was replaced |
+  | `FILE_REMOVED_EXTERNALLY` | the drill file disappeared |
+
+- **A new generation removes every leftover drill file at start**
+  (`DRILL_STALE_REMOVED`). A crashed supervisor's drill therefore ends within a
+  second of the next start, and at its TTL in any case.
+  `drill restore` also removes leftover drill files when no supervisor runs.
+- **Ending removes the drill file** and records whether it is provably gone. A
+  file that cannot be removed is retried every pass and reads `REMOVAL_FAILED`.
+- **Confirmation comes only from the scanner's own status** of the drilled run,
+  written after the event (or, for a restore, from the drilled process having
+  ended). Without it within the status freshness window (180 s) the drill reads
+  `UNCONFIRMED`. **A restore is never claimed without evidence.**
+- Restoration never touches a scanner lock, cursor, checkpoint, ledger or
+  incident.
+
+### Faults
+
+| Fault | Scanner | Supervisor probes | Expected recovery path |
+| --- | --- | --- | --- |
+| `PUBLIC_REST_DOWN` | REST refused | REST probe refused | REST outage: `NETWORK_UNAVAILABLE`, nothing restarted; after the restore the heal window and the R3 universe extension |
+| `PUBLIC_STREAMS_DISCONNECT` | open streams dropped once | untouched | the scanner reconnects by itself |
+| `PUBLIC_STREAMS_NEW_REFUSED` | new connections refused | stream probe refused | invisible until a reconnect is needed |
+| `PUBLIC_STREAMS_DOWN` | open dropped + new refused | stream probe refused | R1 hold (`PUBLIC_STREAM_UNREACHABLE`), nothing spent; heals after the end |
+| `PUBLIC_ALL_DOWN` | REST + streams | both refused | combined outage; a short one (< 90 s) costs nothing (R2) |
+| `PUBLIC_STREAMS_HALF_OPEN` | streams silent | stream probe silent (UNKNOWN) | UNKNOWN never holds: the normal bounded recovery; the fresh run is not drilled |
+| `SCANNER_LOCAL_STREAMS` | open dropped + new refused | untouched (REACHABLE) | a scanner-local fault: ONE ordered recovery; the drill ends with the old run |
+
+### What a drill can prove, and what needs separate evidence
+
+**It can prove, on the real machine:**
+
+- the real supervisor's ownership, fencing, cooperative and fenced stops;
+- the real recovery sequence (emitter stopped first, a fresh run, the emitter
+  re-pinned) and its backoff accounting;
+- the R1/R2/R3 decisions on real status files and real probes;
+- real restoration: after the drill the very same real `fetch` and
+  `WebSocket` reconnect to Binance;
+- real logs, journal and status artifacts.
+
+**It does NOT prove:**
+
+- operating-system failures: adapter down, DNS failure, TLS errors, routing,
+  proxy, sleep and resume on a network change;
+- Binance-side failures: 5xx, 418/429, partial outages, slow handshakes;
+- REST **timeouts** (a drill refuses at once; a held connection is not
+  simulated);
+- failures of the backend, emitter, planner or database during an outage;
+- latch exhaustion by a persistent scanner-local fault. A drill never survives
+  a run replacement, so it proves one recovery cycle, not six;
+- a half-open outage the probe can *confirm*: by design it reads UNKNOWN.
+
+These need their own evidence (the simulated network of section 11 covers
+timeouts, half-open sockets and latching against real code).
+
+### Operational precautions before a real drill
+
+- Only with a separately approved procedure.
+- Start from `RUNNING` with every role healthy, Account A/B **OFF**, nothing
+  listening on 4001/4002, and no manual scanner, emitter or planner.
+- Use the generation and run id from `monitoring:always-on status`
+  immediately before.
+- Prefer short durations first (`PUBLIC_ALL_DOWN` 60 s, then
+  `PUBLIC_STREAMS_DOWN` 600 s).
+- Keep `drill restore` ready.
+- After each drill:
+  - read `drill status` for `restore CONFIRMED`;
+  - `stop\*.drill` must be empty;
+  - in the journal, `DRILL_STARTED` and `DRILL_ENDED` should be the only drill
+    lines (no `DRILL_UNAUTHORIZED_FILE_REMOVED`, no `UNCONFIRMED`);
+  - expect no cursor rebaseline and `ledgerDuplicates` 0.
+- Expect real Binance traffic to resume at the end: the restore is real.
 
 ## Tests
 
@@ -655,3 +852,26 @@ None exists in the repository. A proposed design, **not implemented**:
 - `tests/always-on-universe-heal.test.ts`: a stale universe after a confirmed
   restore waits for the scanner's next refresh, capped; anything untrustworthy
   or additional keeps the existing window.
+- `tests/public-transport-drill.test.ts`: the scanner's drill gate and
+  transports. It covers:
+  - the file format and its refusals;
+  - activation, exact expiry and the monotonic bound;
+  - fail-safe ends;
+  - REST refused like a dead network, never forwarded;
+  - streams dropped, refused or silenced.
+- `tests/always-on-drill.test.ts`: the fault catalogue, strict request parsing,
+  the fixed-order judgement, the controller check, the ACL judge, and the real
+  probes over the drilled transports.
+- `tests/always-on-drill-supervisor.test.ts`: the drill in the real supervisor
+  on the fake machine. It covers:
+  - every refusal, and activation under the mutation lock;
+  - the TTL, idempotent restore, removal failure and unconfirmed states;
+  - shutdown, detach, fencing and next-generation cleanup;
+  - a replaced run, a planted file, races and the audit trail.
+- `tests/always-on-drill-structure.test.ts`: no switch anywhere (environment,
+  `run`, scanner, startup task, route, frontend, launcher); only the allowed
+  importers; and the real CLI without a supervisor.
+- `tests/always-on-drill-recovery.test.ts`: the drill end to end over real
+  scanner processes and the real probes. It covers R1, R2 and R3, a
+  scanner-local fault, half-open, a scanner dying mid-drill, and a graceful
+  stop mid-drill.
