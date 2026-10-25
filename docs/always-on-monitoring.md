@@ -128,6 +128,11 @@ spending attempts.
 ## 3. Network outages and the one recovery path
 
 1. The scanner is DEGRADED. During the 90-second grace period nothing happens.
+   After it, nothing is decided on a status written before the grace deadline:
+   the scanner writes its status every 60 seconds, so an older snapshot may
+   describe an outage that is already over (`AWAITING_FRESH_STATUS`). A status
+   that stops arriving is itself the evidence (`STATUS_MISSING`, or
+   `STATUS_STALE` after 180 seconds) and is never delayed.
 2. After the grace period, one unsigned public request (`GET
    https://fapi.binance.com/fapi/v1/time`, at most every 30 seconds) checks for
    the network.
@@ -135,6 +140,23 @@ spending attempts.
      reads `NETWORK_UNAVAILABLE`.
    - **Reachable again:** the scanner gets 120 seconds to heal itself. So does
      the fresh run of a recovery that is still starting up.
+   - **REST answers but the streams may not:** when the scanner's own fresh
+     status shows no connection delivering anything, and only stream-explained
+     issues (awaiting streams, stale market data, symbols recovering), one
+     public stream probe runs (at most every 30 seconds): a BTCUSDT 15m kline
+     subscription to the production-validated URL, no headers, 10 seconds at
+     most. Only a confirmed outage (an error or close before a valid message,
+     or no handshake at all) holds the scanner: `PUBLIC_STREAM_UNREACHABLE`,
+     nothing restarted, no attempt spent, the scanner and its emitter kept, a
+     fresh run never started into it and never failed for it. When the
+     streams return, the 120-second heal window applies. A probe that is
+     uncertain (it cannot be built, opens but hears nothing, or reads something
+     it cannot interpret) or that connects (the fault is the scanner's own)
+     never holds anything: the normal recovery and latch follow.
+   - **Only the universe is stale:** after a confirmed restore, the scanner's
+     own next refresh (its `universe.nextRefreshAt`) gets 60 more seconds, never
+     beyond the restore + 360 seconds (`UNIVERSE_REFRESH_PENDING`). Any other
+     issue, or no valid next-refresh time, keeps the 120-second window.
 3. Still degraded after that, a single fenced **recovery** runs:
    - stop the owned emitter, cooperatively (it persists its processed cursors);
    - stop the owned scanner, cooperatively (its status and checkpoints persist);
@@ -490,25 +512,27 @@ Observatory soak ([native-signal-quality-observatory.md](native-signal-quality-o
   `UNPARSEABLE`. The Always-On adapter already removes CR and LF.
 - **Unrelated, unchanged:** the TradingView adoption lease-theft finding and
   ENTRY_SUBMITTING recovery.
-- **Outages the connectivity probe cannot see** (found by the simulated
-  network, section 11; pinned by tests, unchanged):
-  - **Stream-only outage.** The probe checks REST only, so a WebSocket outage
-    reads as reachable. Each fresh run cannot connect and is judged degraded;
-    after 6 attempts (about 40 minutes with the backoff) the scanner
-    **latches** and stays down after the streams return, until
-    `clear-latch`.
-  - **A blip shorter than the grace period.** It is over before the first
-    probe, so no post-network heal window applies. The scanner's status,
-    written every 60 seconds, can still read degraded 90 seconds later: one
-    fresh-run recovery follows.
-  - **A REST outage restored right after a refresh attempt.** The scanner's
-    next refresh is up to one interval (5 minutes) away, longer than the
-    120-second heal window: one fresh-run recovery follows, although the
-    running scanner would have refreshed on its own.
+- **Three outages the REST probe could not see** (found by the simulated
+  network, section 11) are resolved by `fix/always-on-recovery-resilience`
+  (section 3):
+  - a stream-only outage no longer spends attempts and latches the scanner;
+  - a blip shorter than the grace period no longer costs a recovery;
+  - a REST outage restored right after a refresh attempt waits for the next
+    refresh.
 
-  All three are bounded and ordered. Whether to change the policy (a stream
-  check in the probe, a heal window keyed to the scanner's own reconnect and
-  refresh schedule) is an operator decision.
+  What remains:
+  - **A half-open stream outage** (connections open, no data) answers the
+    stream probe UNKNOWN by design (it cannot be told from a quiet stream), so
+    it keeps the normal bounded recovery and latch.
+  - **A REST outage longer than the scanner's 45-minute start-up deadline while
+    a fresh run is starting** still fails that run when the deadline passes
+    (pre-existing).
+  - **The compact membership fallback** (a status without per-symbol detail)
+    can offset a gap with a symbol that failed before placement; diagnostic
+    only, and current scanners always write the detail. An exact fix needs a
+    scanner-side count of placed failures.
+  - **Recovery under real network faults is not proven on a real machine** —
+    see section 11.
 
 ## 11. Network fault injection (test-only)
 
@@ -526,7 +550,11 @@ test constructs.
   - Open streams are `UP`, `DROP` (error, then close 1006) or `SILENT`
     (half-open).
   - New streams are `UP`, `REFUSED` or `BLACKHOLE` (never open).
-  - The connectivity probe's fetch follows the REST fault.
+  - The connectivity probe's fetch follows the REST fault, which can be scoped
+    to some paths (`restPaths`, e.g. only exchangeInfo).
+  - The stream probe's socket follows the stream faults (`REFUSED` errors and
+    closes, `BLACKHOLE` never answers, `SILENT` opens and says nothing), and
+    every probe socket and its remaining listeners are recorded.
   - Every outage has a mandatory maximum duration (at most 6 hours) and
     restores itself at that deadline. `withOutage` restores in `finally`, and
     `dispose` restores and refuses any further use.
@@ -541,7 +569,11 @@ test constructs.
   emitter refuses any other engine.
 - **`tests/helpers/simulated-monitoring-machine.ts`**: the real Always-On
   supervisor (production policy) on the fake machine, owning **real** scanner
-  processes and gating recovery on the **real** `publicBinanceReachable`.
+  processes and gating recovery on the **real** `publicBinanceReachable` and
+  `publicStreamReachable`.
+  - It can make a run's streams fail inside the scanner (a scanner-local fault,
+    the network fine), and make the stream probe unconstructable or answered
+    by something unreadable.
   - A cooperative stop runs the CLI's graceful stop. A fenced terminate kills
     the process: its network, sockets and timers end, and its locks stay on
     disk.
@@ -549,9 +581,10 @@ test constructs.
     locks held only by it, or stale; an emitter pinned only to a running
     scanner's run; monitoring roles only; nothing signed on the network.
 
-The only production change is that `publicBinanceReachable` takes its
-transport as an optional parameter, defaulting to the real `fetch`. Structural
-tests pin that production calls it with none, and that no production module,
+Both probes take their transport as an optional parameter: `fetch` for
+`publicBinanceReachable`, and the socket constructor and timers for
+`publicStreamReachable`, each defaulting to the real one. Structural tests pin
+that production calls both with none, and that no production module,
 environment variable or CLI option can select a fault or a simulated
 transport.
 
@@ -607,7 +640,18 @@ None exists in the repository. A proposed design, **not implemented**:
   stream-only, half-open, short, sustained and timing-out outages, judged every
   second by the real health judge.
 - `tests/always-on-network-recovery.test.ts`: the supervisor's recovery contract
-  end to end over the simulated network, including a hung scanner and the three
-  outages the probe cannot see.
+  end to end over the simulated network, including a hung scanner, a 45-minute
+  stream-only outage, a scanner-local stream fault, uncertain stream probes, a
+  sub-grace blip and a stale universe after a REST outage.
 - `tests/native-emitter-network-recovery.test.ts`: the real emitter across an
   outage and a scanner recovery (cursors, replays, queue bound, every key once).
+- `tests/always-on-stream-probe.test.ts`: the public stream probe's outcomes, its
+  cleanup on every path, the production endpoint and the absence of a switch.
+- `tests/always-on-stream-gate.test.ts`: when a stream outage holds a recovery
+  (both signals agree) and when it never does (uncertain, stale, another run's
+  answer, another issue, a connection still delivering).
+- `tests/always-on-fresh-evidence.test.ts`: a recovery rests on a status written
+  after the grace deadline; a missing or stale status is never delayed.
+- `tests/always-on-universe-heal.test.ts`: a stale universe after a confirmed
+  restore waits for the scanner's next refresh, capped; anything untrustworthy
+  or additional keeps the existing window.
