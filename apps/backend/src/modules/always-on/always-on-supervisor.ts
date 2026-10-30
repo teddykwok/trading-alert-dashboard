@@ -2085,6 +2085,14 @@ export class AlwaysOnSupervisor {
         this.record({ kind: "DRILL_ACTIVATION_UNCONFIRMED", role: "scanner", reasonCode: "NO_SCANNER_REPORT", detail: `the scanner run ${d.drill.runId} has not reported the drill within ${Math.round(freshMs / 1000)}s`, facts: { drillId: d.drill.drillId } });
       }
     }
+    // The scanner no longer applies this drill: its fail-safe gate ended it (a file it could not read), or, once it had
+    // confirmed this drill, it moved on to another (its file overwritten). The drill ends here too, so the probes are
+    // never left drilled on evidence that no longer holds. Before that confirmation another drill's report is an older
+    // one, about nothing here; a status written before this drill started says nothing about it either.
+    const scannerDrill = report !== null && report.writtenAtMs >= d.drill.startedAtMs ? report.drill : null;
+    if (d.endedAtMs === null && scannerDrill !== null && (scannerDrill.drillId === d.drill.drillId ? !scannerDrill.active : d.activation === "CONFIRMED")) {
+      this.endDrill(now, "SCANNER_ENDED");
+    }
     if (d.endedAtMs === null) return;
     if (d.fileRemoved === false) {
       d.fileRemoved = this.removeDrillFile(d);
@@ -2100,7 +2108,8 @@ export class AlwaysOnSupervisor {
       return;
     }
     // "No drill" proves the end only from a scanner that has shown it reports drills (it confirmed the activation).
-    const inactive = report !== null && report.writtenAtMs >= d.endedAtMs && (report.drill !== null ? report.drill.drillId !== d.drill.drillId || !report.drill.active : d.activation === "CONFIRMED");
+    // A report of ANOTHER active drill is no restoration either: the scanner's transports are still failing.
+    const inactive = report !== null && report.writtenAtMs >= d.endedAtMs && (report.drill !== null ? !report.drill.active : d.activation === "CONFIRMED");
     if (inactive) {
       confirm("SCANNER_REPORTS_INACTIVE", `the scanner run ${d.drill.runId} reports the drill no longer applied`);
       return;

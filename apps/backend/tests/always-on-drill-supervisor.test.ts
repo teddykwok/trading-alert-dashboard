@@ -5,7 +5,7 @@ import { drillStartRequestText, type DrillStartRequest } from "../src/modules/al
 import { renderAlwaysOnStatus } from "../src/modules/always-on/always-on-status";
 import type { AlwaysOnSupervisor } from "../src/modules/always-on/always-on-supervisor";
 import { PublicTransportDrillGate, drillFileOf, parsePublicTransportDrill, publicTransportDrillText } from "../src/modules/native-scanner/public-transport-drill";
-import { FakeMachine, REPO, run, startSupervisor, testConfig, until } from "./helpers/always-on-fake-machine";
+import { FakeMachine, HEALTHY_UNIVERSE, REPO, run, startSupervisor, testConfig, until } from "./helpers/always-on-fake-machine";
 
 /**
  * THE OPERATOR NETWORK DRILL, end to end in the real supervisor on the fake
@@ -288,6 +288,11 @@ describe("an accepted drill touches exactly the owned scanner's per-spawn drill 
     await run(m, supervisor, 14);
     expect(supervisor.status().drill?.activation).toBe("UNCONFIRMED");
     expect(incidentsOf(m, "DRILL_ACTIVATION_UNCONFIRMED")).toHaveLength(1);
+    // Its silence proves no restore either: it has never shown that it reports drills at all.
+    m.files.set(m.paths.drillRestoreRequest, "{}");
+    await run(m, supervisor, 15);
+    expect(supervisor.status().drill).toMatchObject({ state: "ENDED", restore: "UNCONFIRMED" });
+    expect(incidentsOf(m, "DRILL_RESTORE_CONFIRMED")).toEqual([]);
   });
 
   it("the supervisor's REST and stream probes are handed the drill's probe faults while it is active, and NO drill afterwards", async () => {
@@ -357,6 +362,69 @@ describe("every drill ends — automatically, on request, and on every way out",
     await run(m, supervisor, 3);
     expect(drillFiles(m)).toEqual([]);
     expect(supervisor.status().drill).toMatchObject({ fileRemoved: true, restore: "CONFIRMED" });
+  });
+
+  it("the scanner ended the drill on its own (its file briefly unreadable: fail-safe): the supervisor ends it too (SCANNER_ENDED) — its probes never stay drilled after the scanner's transports are real again", async () => {
+    const { m, supervisor, request } = await activeDrill({ fault: "PUBLIC_ALL_DOWN", durationSeconds: 600 });
+    await run(m, supervisor, 1);
+    expect(supervisor.status().drill?.activation).toBe("CONFIRMED");
+    m.scannerDrill = () => ({ drillId: request.requestId, fault: "PUBLIC_ALL_DOWN", active: false, activatedAt: null, endedAt: new Date(m.now).toISOString(), endReason: "FILE_INVALID" });
+    await run(m, supervisor, 2);
+    expect(incidentsOf(m, "DRILL_ENDED").map((i) => i.reasonCode)).toEqual(["SCANNER_ENDED"]);
+    expect(supervisor.status().drill).toMatchObject({ state: "ENDED", restore: "CONFIRMED" });
+    expect(drillFiles(m)).toEqual([]);
+    m.scannerBehaviour = "degraded";
+    const before = m.connectivityDrills.length;
+    await run(m, supervisor, 10);
+    expect(m.connectivityDrills.length).toBeGreaterThan(before);
+    expect(m.connectivityDrills.slice(before).every((d) => d === null)).toBe(true);
+  });
+
+  it("the scanner applies ANOTHER drill (its file overwritten): ours ends and its file goes; another drill's report never proves ours restored — confirmed only once nothing is applied", async () => {
+    const { m, supervisor } = await activeDrill({ durationSeconds: 600 });
+    await run(m, supervisor, 1);
+    expect(supervisor.status().drill?.activation).toBe("CONFIRMED");
+    const report = (active: boolean) => () => ({ drillId: id(888), fault: "PUBLIC_ALL_DOWN", active, activatedAt: null, endedAt: null, endReason: null });
+    m.scannerDrill = report(true);
+    await run(m, supervisor, 1);
+    expect(incidentsOf(m, "DRILL_ENDED").map((i) => i.reasonCode)).toEqual(["SCANNER_ENDED"]);
+    expect(drillFiles(m)).toEqual([]);
+    expect(supervisor.status().drill?.restore).toBe("PENDING");
+    await run(m, supervisor, 14);
+    expect(supervisor.status().drill?.restore).toBe("UNCONFIRMED");
+    expect(incidentsOf(m, "DRILL_RESTORE_CONFIRMED")).toEqual([]);
+    m.scannerDrill = report(false);
+    await run(m, supervisor, 1);
+    expect(supervisor.status().drill?.restore).toBe("CONFIRMED");
+  });
+
+  it("a stale report never ends a drill: an older drill's report on an adopted scanner, a status written before the drill started, another run's status", async () => {
+    // An older drill's report: the scanner was adopted by a new generation, and still reports the drill it last applied.
+    const first = await activeDrill();
+    await run(first.m, first.supervisor, 1);
+    const next = await startSupervisor(first.m);
+    await run(first.m, next.supervisor, 2);
+    expect(next.supervisor.status().roles.scanner.health?.drill).toMatchObject({ drillId: first.request.requestId, active: false });
+    const newer = requestDrill(first.m, next.supervisor);
+    first.m.scannerDrill = () => ({ drillId: first.request.requestId, fault: "PUBLIC_ALL_DOWN", active: false, activatedAt: null, endedAt: null, endReason: "FILE_REMOVED" });
+    await run(first.m, next.supervisor, 3);
+    expect(next.supervisor.status().drill).toMatchObject({ drillId: newer.requestId, state: "ACTIVE" });
+    expect(incidentsOf(first.m, "DRILL_ENDED")).toEqual([]);
+
+    // The drill's own id, on evidence that cannot be about it: written before it started, or by another run.
+    const { m, supervisor, request } = await activeDrill();
+    const child = scannerChild(m);
+    m.scannerBehaviour = "silent";
+    m.scannerDrill = () => ({ drillId: request.requestId, fault: "PUBLIC_ALL_DOWN", active: false, activatedAt: null, endedAt: null, endReason: "EXPIRED" });
+    const startedAtMs = Date.parse(supervisor.status().drill?.startedAt as string);
+    m.writeScannerStatus(child, HEALTHY_UNIVERSE, 5_000, "RUNNING", startedAtMs - 1_000);
+    await run(m, supervisor, 1);
+    expect(incidentsOf(m, "DRILL_ENDED")).toEqual([]);
+    m.writeScannerStatus(child, HEALTHY_UNIVERSE, 5_000);
+    m.files.set(m.paths.scannerStatus, JSON.stringify({ ...(JSON.parse(m.files.get(m.paths.scannerStatus) as string) as object), runId: "20261022T000000Z-deadbeef" }));
+    await run(m, supervisor, 1);
+    expect(incidentsOf(m, "DRILL_ENDED")).toEqual([]);
+    expect(supervisor.status().drill?.state).toBe("ACTIVE");
   });
 
   it("a scanner that keeps reporting the drill active after its end: DRILL_RESTORE_UNCONFIRMED — the supervisor never claims success", async () => {

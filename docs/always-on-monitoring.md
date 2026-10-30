@@ -734,6 +734,7 @@ mutation lock being busy refuses (`MUTATION_AUTHORITY_BUSY`).
   | `FENCED` | a newer generation owns the stack; only this generation's own file is removed |
   | `RUN_ENDED` | the scanner child exited or was replaced |
   | `FILE_REMOVED_EXTERNALLY` | the drill file disappeared |
+  | `SCANNER_ENDED` | the drilled run's own status, written after the drill started, shows it no longer applies the drill: its fail-safe gate ended it (e.g. on a file it could not read), or, after confirming it, it moved on to another drill (the file was overwritten). The probes are never left drilled on evidence that no longer holds, and a restore is confirmed only once that run reports nothing applied |
 
 - **A new generation removes every leftover drill file at start**
   (`DRILL_STALE_REMOVED`). A crashed supervisor's drill therefore ends within a
