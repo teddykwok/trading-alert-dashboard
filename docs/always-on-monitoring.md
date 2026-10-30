@@ -782,10 +782,11 @@ feature, not a security boundary against software running as the operator.
   `UNCONFIRMED`. **A restore is never claimed without evidence.** Another
   drill's report proves nothing unless this drill was first confirmed applied,
   and then only if that other drill is no longer applied.
-- **A drilled probe answer can outlive a normal end.** The REST probe's answer is
-  reused for up to 30 s, and only a rollback drops it. It reads like a real outage
-  for that long, then the heal window applies. A 60-second drill at the default
-  90-second grace runs no probe during the fault.
+- **A drilled probe answer can outlive a normal end.** The REST and stream probes'
+  answers are each reused for up to 30 s (the stream probe's for the same run only),
+  and only a rollback drops them. It reads like a real outage for that long, then
+  the heal window applies. A 60-second drill at the default 90-second grace runs no
+  probe during the fault.
 - **`drill restore` proves less than its exit code suggests.** Exit 0 means no
   drill file remains. The state it prints can be from the previous pass, and the
   restore is confirmed only by the scanner's later status.
@@ -806,7 +807,9 @@ feature, not a security boundary against software running as the operator.
 
 ### What a drill can prove, and what needs separate evidence
 
-**It can prove, on the real machine:**
+**Drills as a family can prove, on the real machine** (one short drill proves far
+less: the first 60-second `PUBLIC_ALL_DOWN` does not exercise R1 or R3 end to end, and
+is a smoke test only):
 
 - the real supervisor's ownership, fencing, cooperative and fenced stops;
 - the real recovery sequence (emitter stopped first, a fresh run, the emitter
@@ -846,6 +849,11 @@ wrong profile, and is bounded as stated.
 - **File handling:** symlinks are followed, the drill file is read synchronously
   with no size limit, and `existsSync` reads any error as "gone" (a removal
   could be recorded as done; the restore still needs the scanner's evidence).
+- **A stop file without `.stop` in a hand-edited `ownership.json`** makes every pass
+  throw before the shutdown path, so a graceful stop cannot finish. Stop files are
+  read from that file only when a new generation adopts children, and a spawned child
+  always gets a `.stop` path. A first drill from a fresh generation with nothing
+  adopted excludes this. It is not excluded in general.
 
 ### Before a real drill
 
@@ -863,6 +871,11 @@ record.
   supervisor's copy of it is `roles.scanner.health.drill` in the Always-On status
   file (`status.roles.scanner.health.drill` under `status --json`).
 - `restore CONFIRMED` and `fileRemoved` true are separate facts. Require both.
+- A dead or hung supervisor leaves its status file frozen, and `drill status` does not
+  check for that. Exit 0 from `stop` is not proof of shutdown either: it also means no
+  supervisor was recorded, whatever its children are doing.
+- A pass on the first drill is not Gate 4A acceptance, not permission for the 24-hour
+  soak and not trading authorization.
 - Expect real Binance traffic to resume at the end: the restore is real.
 
 ## Tests
