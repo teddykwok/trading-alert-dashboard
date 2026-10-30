@@ -94,6 +94,16 @@ export function plannerStatusBody(over: { state?: string; consumers?: number; fa
 
 export class FakeMachine {
   now = Date.UTC(2026, 9, 23, 0, 0, 0);
+  /** A monotonic clock runs beside the wall clock (`now`): it follows every normal advance, and ignores `jumpWall`. */
+  private monoOffset = 0;
+  monoNow(): number {
+    return this.now + this.monoOffset;
+  }
+  /** The wall clock is changed (an operator, NTP): `now` jumps, the monotonic clock does not. */
+  jumpWall(deltaMs: number): void {
+    this.now += deltaMs;
+    this.monoOffset -= deltaMs;
+  }
   readonly nodes = new Map<number, ObservedProcessNode>();
   readonly files = new Map<string, string>();
   readonly spawns: Child[] = [];
@@ -310,6 +320,7 @@ export class FakeMachine {
     const files = this.files;
     return {
       now: () => this.now,
+      monoNow: () => this.monoNow(),
       selfPid,
       selfStartedAtMs: this.now,
       env: DIRTY_ENV,

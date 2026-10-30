@@ -77,6 +77,7 @@ export const INCIDENT_KINDS = Object.freeze([
   "DRILL_RESTORE_UNCONFIRMED",
   "DRILL_STALE_REMOVED",
   "DRILL_UNAUTHORIZED_FILE_REMOVED",
+  "DRILL_STATE_INCONSISTENT",
 ] as const);
 export type IncidentKind = (typeof INCIDENT_KINDS)[number];
 

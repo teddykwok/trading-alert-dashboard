@@ -6,6 +6,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { ALWAYS_ON_DEFAULTS } from "../src/modules/always-on/always-on-contract";
 import { drillStartRequestText, type AlwaysOnDrillFault } from "../src/modules/always-on/always-on-drill";
 import { NATIVE_EXECUTION_ENABLED } from "../src/modules/native-canary/native-execution-switch";
+import { drillFileOf, publicTransportDrillText } from "../src/modules/native-scanner/public-transport-drill";
 import { SimulatedMonitoringMachine } from "./helpers/simulated-monitoring-machine";
 import { M15 } from "./helpers/simulated-scanner";
 
@@ -273,6 +274,27 @@ describe("the drill ends on every way out, with the stack's own guarantees intac
     expect(sm.processes.every((p) => p.exit !== "RUNNING")).toBe(true);
     expect(sm.lockHolders()).toEqual([]);
     expect([...sm.m.files.keys()].filter((f) => f.endsWith(".drill"))).toEqual([]);
+    expectSafety(sm);
+  }, 300_000);
+
+  it("N1 on a real scanner: a file planted after a completed drill faults the run for at most one supervision pass, is journaled, and the real streams return with no recovery", async () => {
+    const sm = await runningStack();
+    const live = sm.liveScanner() as NonNullable<ReturnType<SimulatedMonitoringMachine["liveScanner"]>>;
+    const fromMs = sm.m.now;
+    await startDrill(sm, "PUBLIC_STREAMS_DISCONNECT", 30);
+    expect(await sm.runUntil(() => sm.supervisor.status().drill?.restore === "CONFIRMED", 5 * 60_000)).toBe(true);
+    const file = drillFileOf(live.stopFile as string);
+    const plantedAt = sm.m.now;
+    sm.m.files.set(file, publicTransportDrillText({ drillId: "b".repeat(32), fault: "PUBLIC_ALL_DOWN", runId: live.runId, generation: sm.supervisor.currentGeneration, startedAtMs: plantedAt, expiresAtMs: plantedAt + 900_000, faults: { rest: "REFUSED", openStreams: "DROP", newStreams: "REFUSED" } }));
+    expect(await sm.runUntil(() => !sm.m.files.has(file), ALWAYS_ON_DEFAULTS.pollMs + 2_000)).toBe(true);
+    expect(live.gate?.observation()).toMatchObject({ drillId: "b".repeat(32) });
+    await sm.runFor(5 * 60_000);
+    const list = since(sm, fromMs);
+    expect(kinds(list)).toContain("DRILL_UNAUTHORIZED_FILE_REMOVED/scanner");
+    expect(live.gate?.observation()).toMatchObject({ drillId: "b".repeat(32), active: false, endReason: "FILE_REMOVED" });
+    expect(restarts(list)).toEqual([]);
+    expect(sm.supervisor.status().state).toBe("RUNNING");
+    expect(sm.supervisor.status().drill?.restore).toBe("CONFIRMED");
     expectSafety(sm);
   }, 300_000);
 

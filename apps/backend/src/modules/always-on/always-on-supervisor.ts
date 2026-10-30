@@ -4,7 +4,7 @@ import type { BuildVerdict } from "../operator/generic-backend-nonwatch-launcher
 import type { MutationAction, WithAuthorityResult } from "../operator/mutation-lock";
 import { verifyOwnership, type Observation, type ObservedProcessNode } from "../operator/runtime-launcher";
 import { executeFencedStart, executeFencedStop, type ProbeOutcome } from "../operator/worker-supervision";
-import { drillFileOf, publicTransportDrillText, type PublicTransportDrill } from "../native-scanner/public-transport-drill";
+import { drillFileOf, parsePublicTransportDrill, publicTransportDrillText, type PublicTransportDrill } from "../native-scanner/public-transport-drill";
 import {
   ALWAYS_ON_NOTICE,
   ALWAYS_ON_OWNERSHIP_SCHEMA,
@@ -30,6 +30,7 @@ import {
   type ScannerHealth,
 } from "./always-on-health";
 import {
+  ALWAYS_ON_DRILL_CLOCK_SKEW_MS,
   ALWAYS_ON_DRILL_FAULTS,
   commandLineInRepository,
   controllerIsDrillCli,
@@ -145,6 +146,8 @@ export interface AlwaysOnHttp {
 
 export interface AlwaysOnAdapters {
   readonly now: () => number;
+  /** A monotonic clock, never moved by a wall-clock change. Only an operator drill's own lifetime is measured on it. */
+  readonly monoNow: () => number;
   /** This supervisor's own pid and OS creation time. */
   readonly selfPid: number;
   readonly selfStartedAtMs: number;
@@ -213,6 +216,15 @@ interface ActiveDrill {
   readonly childSequence: number;
   readonly probes: DrillProbeFaults;
   readonly controller: DrillController;
+  /** The drill's lifetime on the monotonic clock: a wall clock moved back cannot extend it. */
+  readonly startedMonoMs: number;
+  readonly monoDeadlineMs: number;
+  /** The wall and monotonic clocks read together, to notice the wall clock moving back. */
+  wallAnchorMs: number;
+  monoAnchorMs: number;
+  /** When the wall clock was last found moved back: only a status written since then is evidence of anything. */
+  rollbackAtMs: number | null;
+  endedMonoMs: number | null;
   endedAtMs: number | null;
   endReason: string | null;
   fileRemoved: boolean | null;
@@ -330,6 +342,9 @@ export class AlwaysOnSupervisor {
   private drill: ActiveDrill | null = null;
   /** Every drill request id this generation has judged: an authorization is used once. */
   private readonly drillRequestIds = new Set<string>();
+  /** Drill state inconsistencies already journaled (one line per fact, never one per poll). */
+  private readonly drillInconsistenciesNoted = new Set<string>();
+  private readonly drillFileNoted = new Set<string>();
   private dataStore: "AVAILABLE" | "UNAVAILABLE" | "UNKNOWN" = "UNKNOWN";
   private lastTickAtMs: number | null = null;
   /** When supervision last resumed after a clock gap (sleep / hibernate): no status older than this proves a hang. */
@@ -531,7 +546,7 @@ export class AlwaysOnSupervisor {
     this.reconcileChildren(tree.value, now);
     if (this.fenced) return "FENCED";
     this.endDrillWhenTargetGone(now);
-    this.removeUnauthorizedDrillFile();
+    this.reconcileDrillFile();
     const census = monitoringCensus(tree.value, this.ownedRoots(), this.a.selfPid);
     this.latest.census = census;
     this.reportExternal(census);
@@ -579,6 +594,7 @@ export class AlwaysOnSupervisor {
     this.latest.emitter = emitter;
     const planner = this.judgePlanner(plannerStatus, plans, now);
     this.latest.planner = planner;
+    this.reconcileScannerDrillReport(scanner);
     this.superviseDrillRestore(scanner, now);
 
     // ---- decisions, in dependency order ----
@@ -1814,8 +1830,7 @@ export class AlwaysOnSupervisor {
   }
 
   private consumeRequests(now: number): void {
-    const d = this.drill;
-    if (d !== null && d.endedAtMs === null && now >= d.drill.expiresAtMs) this.endDrill(now, "EXPIRED");
+    this.superviseDrillClock(now);
     const stopText = this.a.fs.readText(this.a.paths.stopRequest);
     if (stopText !== null) {
       const removed = this.removeRequest(this.a.paths.stopRequest);
@@ -1861,10 +1876,39 @@ export class AlwaysOnSupervisor {
   // The operator network drill (always-on-drill.ts)
   // ---------------------------------------------------------------------------
 
+  /**
+   * A drill ends at its expiry on whichever clock reaches it first, checked first in every pass so the truest reason
+   * wins a race. The wall clock found moved back (beyond a small correction) makes the drill's times untrustworthy: it
+   * ends now, a probe answer cached under the old clock is dropped, and only a status written since then is evidence.
+   */
+  private superviseDrillClock(now: number): void {
+    const d = this.drill;
+    if (d === null) return;
+    const mono = this.a.monoNow();
+    if (d.endedAtMs === null && (now >= d.drill.expiresAtMs || mono >= d.monoDeadlineMs)) this.endDrill(now, "EXPIRED");
+    const backMs = mono - d.monoAnchorMs - (now - d.wallAnchorMs);
+    if (backMs <= ALWAYS_ON_DRILL_CLOCK_SKEW_MS) return;
+    d.wallAnchorMs = now;
+    d.monoAnchorMs = mono;
+    d.rollbackAtMs = now;
+    this.network.lastProbeAtMs = null;
+    this.stream.lastProbe = null;
+    if (d.endedAtMs === null) this.endDrill(now, "CLOCK_ROLLBACK");
+    else if (d.restore !== "CONFIRMED") this.noteDrillInconsistency("WALL_CLOCK_MOVED_BACK", `the wall clock moved back about ${Math.round(backMs / 1000)}s before the restore was confirmed; only a status written since then counts`, { drillId: d.drill.drillId });
+  }
+
+  /** Journals one drill state inconsistency once (it is a fact to report, not a decision). */
+  private noteDrillInconsistency(reasonCode: string, detail: string, facts: Record<string, string | number | null>): void {
+    const key = `${reasonCode}:${JSON.stringify(facts)}`;
+    if (this.drillInconsistenciesNoted.has(key)) return;
+    this.drillInconsistenciesNoted.add(key);
+    this.record({ kind: "DRILL_STATE_INCONSISTENT", role: "scanner", reasonCode, detail, facts });
+  }
+
   /** A drill is active from its acceptance until it ends (and never past its expiry or its scanner child). */
   private drillIsActive(now: number): boolean {
     const d = this.drill;
-    return d !== null && d.endedAtMs === null && now < d.drill.expiresAtMs && this.children.scanner?.pid === d.childPid && this.children.scanner.sequence === d.childSequence;
+    return d !== null && d.endedAtMs === null && now < d.drill.expiresAtMs && this.a.monoNow() < d.monoDeadlineMs && this.children.scanner?.pid === d.childPid && this.children.scanner.sequence === d.childSequence;
   }
 
   /** What the active drill does to this supervisor's own probes (null: no active drill — the real transports). */
@@ -1966,6 +2010,7 @@ export class AlwaysOnSupervisor {
       this.rejectDrill("DRILL_FILE_WRITE_FAILED", `the drill file could not be written (${wrote.result})`, request.requestId, facts);
       return;
     }
+    const mono = this.a.monoNow();
     this.drill = {
       drill,
       file: drillFile,
@@ -1973,6 +2018,12 @@ export class AlwaysOnSupervisor {
       childSequence: owned.sequence,
       probes: spec.probes,
       controller: request.controller,
+      startedMonoMs: mono,
+      monoDeadlineMs: mono + request.durationSeconds * 1_000,
+      wallAnchorMs: now,
+      monoAnchorMs: mono,
+      rollbackAtMs: null,
+      endedMonoMs: null,
       endedAtMs: null,
       endReason: null,
       fileRemoved: null,
@@ -2004,6 +2055,7 @@ export class AlwaysOnSupervisor {
     const d = this.drill;
     if (d === null || d.endedAtMs !== null) return;
     d.endedAtMs = now;
+    d.endedMonoMs = this.a.monoNow();
     d.endReason = reason;
     d.fileRemoved = this.removeDrillFile(d);
     d.restore = d.fileRemoved ? "PENDING" : "REMOVAL_FAILED";
@@ -2041,25 +2093,66 @@ export class AlwaysOnSupervisor {
   }
 
   /**
-   * A drill file beside the owned scanner's stop file that this supervisor did not write (planted directly, bypassing
-   * the request and its checks) is removed on sight and journaled: it lasts at most one supervision pass, never
-   * reaches the probes, and is never mistaken for an accepted drill. The supervisor's own file — active, or ended and
-   * awaiting a removal retry — is left to the drill's own lifecycle.
+   * The file at the owned scanner's drill path, every pass. The supervisor's own file is left to the drill's lifecycle
+   * only while that drill is active or its removal is being retried; a completed drill vouches for nothing.
+   *
+   * Anything else there was not written by this supervisor (planted, bypassing the request and its checks). A file the
+   * scanner's gate would apply — it names exactly this run — is removed and journaled: it lasts at most one supervision
+   * pass and never reaches the probes. A file the gate ignores (another run's, invalid) or that cannot be judged (it
+   * cannot be read, this run is not identified yet) has no proven owner: it is journaled once and left in place.
    */
-  private removeUnauthorizedDrillFile(): void {
+  private reconcileDrillFile(): void {
     const child = this.children.scanner;
     if (child === null || child.stopFile === null) return;
     const unauthorized = drillFileOf(child.stopFile);
-    if (this.drill?.file === unauthorized || !this.a.fs.exists(unauthorized)) return;
+    const own = this.drill;
+    if (own !== null && own.file === unauthorized && (own.endedAtMs === null || own.fileRemoved === false)) return;
+    if (!this.a.fs.exists(unauthorized)) {
+      this.drillFileNoted.clear();
+      return;
+    }
+    const file = path.basename(unauthorized);
+    const note = (reasonCode: string, detail: string) => {
+      if (this.drillFileNoted.has(reasonCode)) return;
+      this.drillFileNoted.add(reasonCode);
+      this.record({ kind: "DRILL_STATE_INCONSISTENT", role: "scanner", reasonCode, detail: `${detail}; it was left in place`, facts: { file } });
+    };
+    const text = this.a.fs.readText(unauthorized);
+    if (text === null) return note("FILE_UNREADABLE", "a drill file this supervisor did not write cannot be read");
+    const runId = this.scannerRun?.runId ?? null;
+    if (runId === null) return note("RUN_NOT_IDENTIFIED", "a drill file this supervisor did not write was found before the owned scanner's run is identified");
+    const verdict = parsePublicTransportDrill(text, runId);
+    if (verdict.kind === "INVALID" && verdict.reason === "RUN_MISMATCH") return note("FILE_OF_ANOTHER_RUN", `a drill file naming another run was found at run ${runId}'s path (its gate ignores it)`);
+    if (verdict.kind !== "VALID") return note("FILE_INVALID", "an invalid drill file was found at the owned scanner's path (its gate ignores it)");
     this.removeQuietly(unauthorized);
     const removed = !this.a.fs.exists(unauthorized);
+    if (!removed && this.drillFileNoted.has("REMOVAL_FAILED")) return;
+    if (removed) this.drillFileNoted.clear();
+    else this.drillFileNoted.add("REMOVAL_FAILED");
     this.record({
       kind: "DRILL_UNAUTHORIZED_FILE_REMOVED",
       role: "scanner",
       reasonCode: removed ? "NOT_WRITTEN_BY_THIS_SUPERVISOR" : "NOT_WRITTEN_BY_THIS_SUPERVISOR_REMOVAL_FAILED",
-      detail: `a drill file this supervisor did not write was found beside the owned scanner's stop file and ${removed ? "removed" : "could NOT be removed (retried every pass; it still ends at its own expiry)"}`,
-      facts: { file: path.basename(unauthorized), removed },
+      detail: `a drill file this supervisor did not write, naming run ${runId}, was found beside the owned scanner's stop file and ${removed ? "removed" : "could NOT be removed (retried every pass; it still ends at its own expiry)"}`,
+      facts: { file, drillId: verdict.drill.drillId, runId, removed },
     });
+  }
+
+  /**
+   * The owned scanner reports a drill applied that is not this generation's: nothing this supervisor accepted. Reported
+   * once, whatever the file says; a restore confirmed earlier is withdrawn, because it said nothing about this fault.
+   * Only a status of the owned scanner written since the relevant start counts.
+   */
+  private reconcileScannerDrillReport(scanner: ScannerHealth): void {
+    const reported = scanner.ours ? (scanner.drill ?? null) : null;
+    if (reported === null || !reported.active) return;
+    const d = this.drill;
+    if (reported.drillId === d?.drill.drillId) return;
+    const writtenAtMs = scanner.writtenAt === null ? Number.NaN : Date.parse(scanner.writtenAt);
+    if (!(writtenAtMs >= (d === null ? this.startedAtMs : (d.rollbackAtMs ?? d.drill.startedAtMs)))) return;
+    this.noteDrillInconsistency("SCANNER_REPORTS_UNEXPECTED_DRILL", `the owned scanner reports drill ${reported.drillId} applied, which this supervisor did not accept`, { reportedDrillId: reported.drillId, runId: scanner.runId });
+    const child = this.children.scanner;
+    if (d !== null && d.restore === "CONFIRMED" && child !== null && child.pid === d.childPid && child.sequence === d.childSequence) d.restore = "UNCONFIRMED";
   }
 
   /**
@@ -2076,11 +2169,14 @@ export class AlwaysOnSupervisor {
     const childAlive = child !== null && child.pid === d.childPid && child.sequence === d.childSequence;
     const writtenAtMs = scanner?.writtenAt ? Date.parse(scanner.writtenAt) : Number.NaN;
     const report = childAlive && scanner !== null && scanner.ours && scanner.runId === d.drill.runId && Number.isFinite(writtenAtMs) ? { writtenAtMs, drill: scanner.drill ?? null } : null;
+    const mono = this.a.monoNow();
+    // A status written after `ms` — or, the wall clock having moved back, after that: earlier instants mean nothing now.
+    const writtenSince = (ms: number) => report !== null && report.writtenAtMs >= (d.rollbackAtMs ?? ms);
     if (d.activation === "PENDING") {
-      if (report !== null && report.writtenAtMs >= d.drill.startedAtMs && report.drill?.drillId === d.drill.drillId) {
+      if (writtenSince(d.drill.startedAtMs) && report?.drill?.drillId === d.drill.drillId) {
         d.activation = "CONFIRMED";
         this.record({ kind: "DRILL_ACTIVATION_CONFIRMED", role: "scanner", reasonCode: "SCANNER_REPORTS_DRILL", detail: `the scanner run ${d.drill.runId} reports drill ${d.drill.fault} applied`, facts: { drillId: d.drill.drillId } });
-      } else if (now - d.drill.startedAtMs >= freshMs) {
+      } else if (mono - d.startedMonoMs >= freshMs) {
         d.activation = "UNCONFIRMED";
         this.record({ kind: "DRILL_ACTIVATION_UNCONFIRMED", role: "scanner", reasonCode: "NO_SCANNER_REPORT", detail: `the scanner run ${d.drill.runId} has not reported the drill within ${Math.round(freshMs / 1000)}s`, facts: { drillId: d.drill.drillId } });
       }
@@ -2089,7 +2185,7 @@ export class AlwaysOnSupervisor {
     // confirmed this drill, it moved on to another (its file overwritten). The drill ends here too, so the probes are
     // never left drilled on evidence that no longer holds. Before that confirmation another drill's report is an older
     // one, about nothing here; a status written before this drill started says nothing about it either.
-    const scannerDrill = report !== null && report.writtenAtMs >= d.drill.startedAtMs ? report.drill : null;
+    const scannerDrill = report !== null && writtenSince(d.drill.startedAtMs) ? report.drill : null;
     if (d.endedAtMs === null && scannerDrill !== null && (scannerDrill.drillId === d.drill.drillId ? !scannerDrill.active : d.activation === "CONFIRMED")) {
       this.endDrill(now, "SCANNER_ENDED");
     }
@@ -2101,20 +2197,21 @@ export class AlwaysOnSupervisor {
     if (d.restore === "CONFIRMED") return;
     const confirm = (reasonCode: string, why: string) => {
       d.restore = "CONFIRMED";
-      this.record({ kind: "DRILL_RESTORE_CONFIRMED", role: "scanner", reasonCode, detail: `operator drill ${d.drill.fault} is over: ${why}`, facts: { drillId: d.drill.drillId, secondsAfterEnd: Math.round((now - (d.endedAtMs as number)) / 1000) } });
+      this.record({ kind: "DRILL_RESTORE_CONFIRMED", role: "scanner", reasonCode, detail: `operator drill ${d.drill.fault} is over: ${why}`, facts: { drillId: d.drill.drillId, secondsAfterEnd: Math.round((mono - (d.endedMonoMs as number)) / 1000) } });
     };
     if (!childAlive) {
       confirm("SCANNER_RUN_ENDED", "the drilled scanner process has ended (its transports with it)");
       return;
     }
-    // "No drill" proves the end only from a scanner that has shown it reports drills (it confirmed the activation).
-    // A report of ANOTHER active drill is no restoration either: the scanner's transports are still failing.
-    const inactive = report !== null && report.writtenAtMs >= d.endedAtMs && (report.drill !== null ? !report.drill.active : d.activation === "CONFIRMED");
+    // "No drill" proves the end only from a scanner that has shown it reports drills (it confirmed the activation), and
+    // so does another drill's end: before that confirmation it is an older drill's report, about nothing here. A report
+    // of ANOTHER active drill is no restoration either: the scanner's transports are still failing.
+    const inactive = report !== null && writtenSince(d.endedAtMs) && (report.drill !== null && report.drill.drillId === d.drill.drillId ? !report.drill.active : d.activation === "CONFIRMED" && report.drill?.active !== true);
     if (inactive) {
       confirm("SCANNER_REPORTS_INACTIVE", `the scanner run ${d.drill.runId} reports the drill no longer applied`);
       return;
     }
-    if (d.restore !== "UNCONFIRMED" && d.restore !== "REMOVAL_FAILED" && now - d.endedAtMs >= freshMs) {
+    if (d.restore !== "UNCONFIRMED" && d.restore !== "REMOVAL_FAILED" && mono - (d.endedMonoMs as number) >= freshMs) {
       d.restore = "UNCONFIRMED";
       this.record({ kind: "DRILL_RESTORE_UNCONFIRMED", role: "scanner", reasonCode: "NO_SCANNER_REPORT", detail: `the scanner has not reported the drill over within ${Math.round(freshMs / 1000)}s of its end; it is NOT claimed restored`, facts: { drillId: d.drill.drillId } });
     }

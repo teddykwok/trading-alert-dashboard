@@ -351,6 +351,7 @@ async function run(paths: AlwaysOnPaths, request: AlwaysOnRunRequest): Promise<n
     },
     {
       now: () => Date.now(),
+      monoNow: () => performance.now(),
       selfPid: process.pid,
       selfStartedAtMs: selfStart,
       env: process.env,

@@ -135,6 +135,10 @@ export function renderAlwaysOnStatus(status: AlwaysOnStatusDto, nowMs: number): 
         ` (controller pid ${drill.controller.pid}, ${drill.controller.user})`
     );
   }
+  const reported = status.roles.scanner.health?.drill ?? null;
+  if (reported?.active === true && reported.drillId !== drill?.drillId) {
+    lines.push(`  DRILL        WARNING: the scanner reports drill ${reported.drillId} applied, which this supervisor has NOT accepted`);
+  }
   for (const role of ALWAYS_ON_ROLES) {
     const view = status.roles[role];
     const owned = view.owned === null ? "not owned" : `root pid ${view.owned.rootPid}${view.owned.runtimePids.length > 0 ? ` (runtime ${view.owned.runtimePids.join(",")})` : ""}`;

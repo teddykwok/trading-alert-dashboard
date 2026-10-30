@@ -27,7 +27,7 @@ function honourDrills(m: FakeMachine): void {
     if (child.stopFile === null || child.runId === null) return null;
     let gate = gates.get(child.root);
     if (gate === undefined) {
-      gate = new PublicTransportDrillGate({ file: drillFileOf(child.stopFile), runId: child.runId, readText: (f) => m.files.get(f) ?? null, nowMs: () => m.now, monoMs: () => m.now, log: () => undefined });
+      gate = new PublicTransportDrillGate({ file: drillFileOf(child.stopFile), runId: child.runId, readText: (f) => m.files.get(f) ?? null, nowMs: () => m.now, monoMs: () => m.monoNow(), log: () => undefined });
       gates.set(child.root, gate);
     }
     gate.poll();
@@ -60,6 +60,7 @@ function requestDrill(m: FakeMachine, supervisor: AlwaysOnSupervisor, over: Part
 }
 
 const scannerChild = (m: FakeMachine) => m.live("scanner")[0];
+const request0 = (supervisor: AlwaysOnSupervisor) => supervisor.status().drill?.drillId as string;
 const drillFileOfScanner = (m: FakeMachine) => drillFileOf(scannerChild(m).stopFile as string);
 const drillFiles = (m: FakeMachine) => [...m.files.keys()].filter((f) => f.endsWith(".drill"));
 const incidentsOf = (m: FakeMachine, kind: string) => m.incidents().filter((i) => i.kind === kind) as unknown as { reasonCode: string; facts: Record<string, unknown>; generation: number }[];
@@ -532,5 +533,272 @@ describe("the audit trail", () => {
     for (const secret of ["never-inherited", "postgresql://", "account-a-identifier"]) expect(text).not.toContain(secret);
     const ended = incidentsOf(m, "DRILL_ENDED")[0];
     expect(ended.facts).toMatchObject({ drillId: expect.any(String), fault: "PUBLIC_ALL_DOWN", startedAt: expect.any(String), expiresAt: expect.any(String), endedAt: expect.any(String), fileRemoved: true });
+  });
+});
+
+// ===========================================================================
+// N1: a run that already had a drill is still watched
+// ===========================================================================
+
+const plant = (m: FakeMachine, supervisor: AlwaysOnSupervisor, n: number, runId = scannerChild(m).runId as string) =>
+  m.files.set(
+    drillFileOfScanner(m),
+    publicTransportDrillText({ drillId: id(n), fault: "PUBLIC_ALL_DOWN", runId, generation: supervisor.currentGeneration, startedAtMs: m.now, expiresAtMs: m.now + 900_000, faults: { rest: "REFUSED", openStreams: "DROP", newStreams: "REFUSED" } })
+  );
+const inconsistencies = (m: FakeMachine) => incidentsOf(m, "DRILL_STATE_INCONSISTENT").map((i) => i.reasonCode);
+
+async function completedDrill() {
+  const stack = await activeDrill({ durationSeconds: 30 });
+  await stack.supervisor.tick();
+  stack.m.now += 45_000;
+  await run(stack.m, stack.supervisor, 2);
+  expect(stack.supervisor.status().drill).toMatchObject({ state: "ENDED", restore: "CONFIRMED" });
+  return stack;
+}
+
+describe("N1: a completed drill's path stays watched, and a past restore never vouches for a new fault", () => {
+  it("a file planted after a completed drill is removed and journaled; the restore is withdrawn while the scanner applies it, and confirmed again once its own report says nothing is applied", async () => {
+    const { m, supervisor } = await completedDrill();
+    const file = drillFileOfScanner(m);
+    plant(m, supervisor, 901);
+    await run(m, supervisor, 1);
+    expect(m.files.has(file)).toBe(false);
+    expect(incidentsOf(m, "DRILL_UNAUTHORIZED_FILE_REMOVED").map((i) => i.facts.file)).toEqual([path.basename(file)]);
+    expect(inconsistencies(m)).toEqual(["SCANNER_REPORTS_UNEXPECTED_DRILL"]);
+    expect(supervisor.status().drill?.restore).toBe("UNCONFIRMED");
+    await run(m, supervisor, 1);
+    expect(supervisor.status().roles.scanner.health?.drill).toMatchObject({ drillId: id(901), active: false });
+    expect(supervisor.status().drill?.restore).toBe("CONFIRMED");
+    expect(m.connectivityDrills.every((d) => d === null)).toBe(true);
+  });
+
+  it("no accepted drill at all: a scanner reporting one is flagged, and the status says it was not accepted (never a quiet healthy line)", async () => {
+    const { m, supervisor } = await runningStack();
+    m.scannerDrill = () => ({ drillId: id(902), fault: "PUBLIC_ALL_DOWN", active: true, activatedAt: null, endedAt: null, endReason: null });
+    await run(m, supervisor, 3);
+    expect(inconsistencies(m)).toEqual(["SCANNER_REPORTS_UNEXPECTED_DRILL"]);
+    expect(renderAlwaysOnStatus(supervisor.status(), m.now).some((l) => l.includes("DRILL") && l.includes(id(902)) && l.includes("NOT accepted"))).toBe(true);
+  });
+
+  it("a status written before this drill started, naming an older drill as applied, raises nothing and withdraws nothing: it says nothing about now", async () => {
+    const { m, supervisor } = await activeDrill({ durationSeconds: 600 });
+    const child = scannerChild(m);
+    const startedAtMs = Date.parse(supervisor.status().drill?.startedAt as string);
+    m.scannerBehaviour = "silent";
+    m.scannerDrill = () => ({ drillId: id(907), fault: "PUBLIC_ALL_DOWN", active: true, activatedAt: null, endedAt: null, endReason: null });
+    m.writeScannerStatus(child, HEALTHY_UNIVERSE, 5_000, "RUNNING", startedAtMs - 1_000);
+    await run(m, supervisor, 1);
+    expect(inconsistencies(m)).toEqual([]);
+    expect(supervisor.status().drill?.state).toBe("ACTIVE");
+  });
+
+  it("a legitimate drill, from request to confirmed restore, raises no inconsistency; nor does its removal retry", async () => {
+    const { m, supervisor } = await activeDrill({ durationSeconds: 60 });
+    await run(m, supervisor, 3);
+    m.failRemove = (f) => f.endsWith(".drill");
+    await run(m, supervisor, 4);
+    expect(supervisor.status().drill).toMatchObject({ state: "ENDED", fileRemoved: false });
+    m.failRemove = null;
+    await run(m, supervisor, 3);
+    expect(supervisor.status().drill).toMatchObject({ fileRemoved: true, restore: "CONFIRMED" });
+    expect(inconsistencies(m)).toEqual([]);
+    expect(incidentsOf(m, "DRILL_UNAUTHORIZED_FILE_REMOVED")).toEqual([]);
+  });
+
+  it("a file naming ANOTHER run at the scanner's path is inert to its gate: never deleted, journaled once; another child's file is not even looked at", async () => {
+    const { m, supervisor } = await completedDrill();
+    const file = drillFileOfScanner(m);
+    const elsewhere = path.join(m.paths.stopDir, "scanner-g9-s9.drill");
+    m.files.set(elsewhere, "{}");
+    plant(m, supervisor, 903, "20261022T000000Z-deadbeef");
+    await run(m, supervisor, 3);
+    expect(m.files.has(file)).toBe(true);
+    expect(m.files.has(elsewhere)).toBe(true);
+    expect(inconsistencies(m)).toEqual(["FILE_OF_ANOTHER_RUN"]);
+    expect(incidentsOf(m, "DRILL_UNAUTHORIZED_FILE_REMOVED")).toEqual([]);
+    expect(supervisor.status().roles.scanner.health?.drill).toMatchObject({ drillId: request0(supervisor), active: false });
+    expect(supervisor.status().drill?.restore).toBe("CONFIRMED");
+  });
+
+  it.each([
+    ["an invalid file", (m: FakeMachine) => m.files.set(drillFileOfScanner(m), "{half-written"), "FILE_INVALID"],
+    ["an unreadable file", (m: FakeMachine) => {
+      m.files.set(drillFileOfScanner(m), "{}");
+      m.failRead = (f) => f.endsWith(".drill");
+    }, "FILE_UNREADABLE"],
+  ])("%s: fail closed — kept, journaled once, nothing claimed about it", async (_label, arrange, reason) => {
+    const { m, supervisor } = await runningStack();
+    const file = drillFileOfScanner(m);
+    arrange(m);
+    await run(m, supervisor, 3);
+    m.failRead = null;
+    expect(m.files.has(file)).toBe(true);
+    expect(inconsistencies(m)).toEqual([reason]);
+    expect(incidentsOf(m, "DRILL_UNAUTHORIZED_FILE_REMOVED")).toEqual([]);
+  });
+
+  it("a planted file that cannot be removed is journaled once, retried every pass, and journaled again when it goes", async () => {
+    const { m, supervisor } = await runningStack();
+    const file = drillFileOfScanner(m);
+    plant(m, supervisor, 904);
+    m.failRemove = (f) => f.endsWith(".drill");
+    await run(m, supervisor, 3);
+    expect(incidentsOf(m, "DRILL_UNAUTHORIZED_FILE_REMOVED").map((i) => i.reasonCode)).toEqual(["NOT_WRITTEN_BY_THIS_SUPERVISOR_REMOVAL_FAILED"]);
+    m.failRemove = null;
+    await run(m, supervisor, 1);
+    expect(m.files.has(file)).toBe(false);
+    expect(incidentsOf(m, "DRILL_UNAUTHORIZED_FILE_REMOVED").map((i) => i.reasonCode)).toEqual(["NOT_WRITTEN_BY_THIS_SUPERVISOR_REMOVAL_FAILED", "NOT_WRITTEN_BY_THIS_SUPERVISOR"]);
+  });
+
+  it("the replaced run's file at the replacement's path cannot touch the replacement, and an accepted drill replaces it", async () => {
+    const { m, supervisor } = await activeDrill();
+    const oldRun = scannerChild(m).runId as string;
+    m.kill(scannerChild(m).root);
+    await run(m, supervisor, 1);
+    await until(m, supervisor, () => supervisor.status().state === "RUNNING");
+    plant(m, supervisor, 905, oldRun);
+    await run(m, supervisor, 2);
+    expect(supervisor.status().roles.scanner.health?.drill ?? null).toBeNull();
+    expect(inconsistencies(m)).toEqual(["FILE_OF_ANOTHER_RUN"]);
+    const accepted = requestDrill(m, supervisor, { durationSeconds: 30 });
+    await run(m, supervisor, 2);
+    expect(supervisor.status().drill).toMatchObject({ drillId: accepted.requestId, state: "ACTIVE", activation: "CONFIRMED" });
+    expect(supervisor.status().roles.scanner.health?.drill).toMatchObject({ drillId: accepted.requestId, active: true });
+  });
+});
+
+// ===========================================================================
+// N4: the wall clock moves during a drill
+// ===========================================================================
+
+describe("N4: a wall clock moved backwards never keeps a drill alive", () => {
+  const HOUR = 3_600_000;
+
+  it("an hour back mid-drill: the drill ends at once (CLOCK_ROLLBACK), its file goes, the probes are real, and the restore is confirmed exactly once on the scanner's own report", async () => {
+    const { m, supervisor } = await activeDrill({ durationSeconds: 600 });
+    await run(m, supervisor, 1);
+    m.jumpWall(-HOUR);
+    await run(m, supervisor, 3);
+    expect(incidentsOf(m, "DRILL_ENDED").map((i) => i.reasonCode)).toEqual(["CLOCK_ROLLBACK"]);
+    expect(drillFiles(m)).toEqual([]);
+    expect(supervisor.status().drill).toMatchObject({ state: "ENDED", fileRemoved: true, restore: "CONFIRMED" });
+    expect(incidentsOf(m, "DRILL_RESTORE_CONFIRMED")).toHaveLength(1);
+    expect(supervisor.status().roles.scanner.health?.drill).toMatchObject({ active: false });
+    await run(m, supervisor, 20);
+    expect(incidentsOf(m, "DRILL_ENDED")).toHaveLength(1);
+  });
+
+  it("a drilled probe's answer cached before the rollback does not hold the scanner: the next probe is real, with no drill", async () => {
+    const { m, supervisor } = await activeDrill({ fault: "PUBLIC_ALL_DOWN", durationSeconds: 600 });
+    m.scannerBehaviour = "degraded";
+    await run(m, supervisor, 12);
+    expect(supervisor.status().roles.scanner.reasonCode).toBe("NETWORK_UNAVAILABLE");
+    m.scannerBehaviour = "healthy";
+    m.jumpWall(-HOUR);
+    await run(m, supervisor, 2);
+    const before = m.connectivityDrills.length;
+    m.scannerBehaviour = "degraded";
+    await run(m, supervisor, 8);
+    expect(m.connectivityDrills.length).toBeGreaterThan(before);
+    expect(m.connectivityDrills.slice(before).every((d) => d === null)).toBe(true);
+    expect(supervisor.status().roles.scanner.reasonCode).not.toBe("NETWORK_UNAVAILABLE");
+  });
+
+  it("the clock moves back after the drill ended, before its restore was confirmed: the scanner's later report still confirms it, despite its older-looking timestamp", async () => {
+    const { m, supervisor } = await activeDrill({ durationSeconds: 600 });
+    await run(m, supervisor, 1);
+    m.files.set(m.paths.drillRestoreRequest, "{}");
+    const honest = m.scannerDrill;
+    m.scannerDrill = () => null; // no status with the end in it yet
+    m.scannerBehaviour = "silent";
+    await run(m, supervisor, 1);
+    expect(supervisor.status().drill?.state).toBe("ENDED");
+    m.scannerDrill = honest;
+    m.scannerBehaviour = "healthy";
+    m.jumpWall(-HOUR);
+    await run(m, supervisor, 3);
+    expect(supervisor.status().drill?.restore).toBe("CONFIRMED");
+    expect(incidentsOf(m, "DRILL_RESTORE_CONFIRMED")).toHaveLength(1);
+    expect(inconsistencies(m)).toEqual(["WALL_CLOCK_MOVED_BACK"]);
+  });
+
+  it("evidence that cannot prove it, after a rollback: nothing confirmed — a silent scanner reads UNCONFIRMED on the monotonic clock (no wait for the wall clock to catch up), and another active drill is no restoration", async () => {
+    const silent = await runningStack();
+    silent.m.scannerDrill = () => null;
+    requestDrill(silent.m, silent.supervisor, { durationSeconds: 600 });
+    await run(silent.m, silent.supervisor, 2);
+    silent.m.jumpWall(-HOUR);
+    await run(silent.m, silent.supervisor, 15);
+    expect(silent.supervisor.status().drill).toMatchObject({ state: "ENDED", activation: "UNCONFIRMED", restore: "UNCONFIRMED" });
+    expect(incidentsOf(silent.m, "DRILL_RESTORE_CONFIRMED")).toEqual([]);
+
+    const other = await activeDrill({ durationSeconds: 600 });
+    await run(other.m, other.supervisor, 1);
+    other.m.jumpWall(-HOUR);
+    other.m.scannerDrill = () => ({ drillId: id(906), fault: "PUBLIC_ALL_DOWN", active: true, activatedAt: null, endedAt: null, endReason: null });
+    await run(other.m, other.supervisor, 15);
+    expect(other.supervisor.status().drill?.restore).toBe("UNCONFIRMED");
+    expect(incidentsOf(other.m, "DRILL_RESTORE_CONFIRMED")).toEqual([]);
+  });
+
+  it("a rollback after the end, with the scanner still reporting the drill applied: UNCONFIRMED on the monotonic clock, with no wait for the wall clock to catch up", async () => {
+    const { m, supervisor, request } = await activeDrill({ durationSeconds: 600 });
+    await run(m, supervisor, 1);
+    m.files.set(m.paths.drillRestoreRequest, "{}");
+    m.scannerDrill = () => ({ drillId: request.requestId, fault: "PUBLIC_ALL_DOWN", active: true, activatedAt: null, endedAt: null, endReason: null });
+    await run(m, supervisor, 1);
+    m.jumpWall(-HOUR);
+    await run(m, supervisor, 14);
+    expect(supervisor.status().drill).toMatchObject({ state: "ENDED", restore: "UNCONFIRMED" });
+    expect(incidentsOf(m, "DRILL_RESTORE_CONFIRMED")).toEqual([]);
+  });
+
+  it("a previous generation's drill report restores nothing: a scanner still reporting that older drill never confirms this one", async () => {
+    const first = await activeDrill();
+    await run(first.m, first.supervisor, 1);
+    const next = await startSupervisor(first.m);
+    await run(first.m, next.supervisor, 2);
+    requestDrill(first.m, next.supervisor, { durationSeconds: 600 });
+    first.m.scannerDrill = () => ({ drillId: first.request.requestId, fault: "PUBLIC_ALL_DOWN", active: false, activatedAt: null, endedAt: null, endReason: "FILE_REMOVED" });
+    await run(first.m, next.supervisor, 2);
+    first.m.files.set(first.m.paths.drillRestoreRequest, "{}");
+    await run(first.m, next.supervisor, 15);
+    expect(next.supervisor.status().drill).toMatchObject({ state: "ENDED", restore: "UNCONFIRMED" });
+    expect(incidentsOf(first.m, "DRILL_RESTORE_CONFIRMED")).toEqual([]);
+  });
+
+  it("the TTL holds on the monotonic clock: a small correction (inside the tolerance) changes nothing and the drill still ends on time; so do manual restore, shutdown and a crash after a rollback", async () => {
+    const small = await activeDrill({ durationSeconds: 60 });
+    small.m.jumpWall(-3_000);
+    await run(small.m, small.supervisor, 3);
+    expect(small.supervisor.status().drill?.state).toBe("ACTIVE");
+    await run(small.m, small.supervisor, 1); // 60 s on the monotonic clock; the wall clock reads 57 s
+    expect(incidentsOf(small.m, "DRILL_ENDED").map((i) => i.reasonCode)).toEqual(["EXPIRED"]);
+
+    const restore = await activeDrill({ durationSeconds: 600 });
+    restore.m.jumpWall(-HOUR);
+    restore.m.files.set(restore.m.paths.drillRestoreRequest, "{}");
+    await run(restore.m, restore.supervisor, 2);
+    expect(incidentsOf(restore.m, "DRILL_ENDED")).toHaveLength(1);
+
+    const stop = await activeDrill({ durationSeconds: 600 });
+    stop.m.jumpWall(-HOUR);
+    stop.supervisor.requestShutdown("OPERATOR_STOP_REQUEST");
+    await run(stop.m, stop.supervisor, 3, 2_000);
+    expect(incidentsOf(stop.m, "DRILL_ENDED").map((i) => i.reasonCode)).toEqual(["SHUTDOWN"]);
+    expect(drillFiles(stop.m)).toEqual([]);
+
+    const crash = await activeDrill({ durationSeconds: 600 });
+    crash.m.jumpWall(-HOUR);
+    await startSupervisor(crash.m);
+    expect(drillFiles(crash.m)).toEqual([]);
+  });
+
+  it("ordinary clocks are unchanged: a forward jump only ends a drill early (EXPIRED, never a rollback), and normal progress raises nothing", async () => {
+    const { m, supervisor } = await activeDrill({ durationSeconds: 600 });
+    m.jumpWall(HOUR);
+    await run(m, supervisor, 2);
+    expect(incidentsOf(m, "DRILL_ENDED").map((i) => i.reasonCode)).toEqual(["EXPIRED"]);
+    expect(inconsistencies(m)).toEqual([]);
   });
 });
