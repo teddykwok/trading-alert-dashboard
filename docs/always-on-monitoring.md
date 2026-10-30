@@ -658,14 +658,15 @@ pnpm --filter @trading-alert-dashboard/backend monitoring:always-on drill restor
 ```
 
 `drill start` refuses unless the running supervisor is that generation and owns
-that run. It writes one request, `requests\drill.json`, naming the generation,
-the run, the fault, the duration and itself (pid and OS creation time), then
-waits for the verdict.
+that run. That refusal is the CLI's own, printed and not journaled: nothing was
+requested. Otherwise it writes one request, `requests\drill.json`, naming the
+generation, the run, the fault, the duration and itself (pid and OS creation
+time), then waits for the verdict.
 
 The running supervisor consumes it once, and only after its file is gone. It
 accepts it only if every check below passes, judged in this fixed order (the
-first failure wins). Anything uncertain refuses, and every refusal is journaled
-as `DRILL_REJECTED` with its reason.
+first failure wins). Anything uncertain refuses, and every refusal by the
+supervisor is journaled as `DRILL_REJECTED` with its reason.
 
 | Check | Refusal |
 | --- | --- |
@@ -718,7 +719,8 @@ feature, not a security boundary against software running as the operator.
     once (`DRILL_STATE_INCONSISTENT`) and left in place; an accepted drill
     replaces it, and the next generation removes it.
   - The scanner reporting a drill this generation did not accept is journaled
-    (`SCANNER_REPORTS_UNEXPECTED_DRILL`), shown by the status, and withdraws an
+    (`DRILL_STATE_INCONSISTENT`, reason `SCANNER_REPORTS_UNEXPECTED_DRILL`), shown
+    by the status, and withdraws an
     earlier `restore CONFIRMED` until its own report shows nothing applied.
     The status is written every 60 s, so a fault shorter than that may never
     appear in a report.
@@ -780,6 +782,13 @@ feature, not a security boundary against software running as the operator.
   `UNCONFIRMED`. **A restore is never claimed without evidence.** Another
   drill's report proves nothing unless this drill was first confirmed applied,
   and then only if that other drill is no longer applied.
+- **A drilled probe answer can outlive a normal end.** The REST probe's answer is
+  reused for up to 30 s, and only a rollback drops it. It reads like a real outage
+  for that long, then the heal window applies. A 60-second drill at the default
+  90-second grace runs no probe during the fault.
+- **`drill restore` proves less than its exit code suggests.** Exit 0 means no
+  drill file remains. The state it prints can be from the previous pass, and the
+  restore is confirmed only by the scanner's later status.
 - Restoration never touches a scanner lock, cursor, checkpoint, ledger or
   incident.
 
@@ -791,7 +800,7 @@ feature, not a security boundary against software running as the operator.
 | `PUBLIC_STREAMS_DISCONNECT` | open streams dropped once | untouched | the scanner reconnects by itself |
 | `PUBLIC_STREAMS_NEW_REFUSED` | new connections refused | stream probe refused | invisible until a reconnect is needed |
 | `PUBLIC_STREAMS_DOWN` | open dropped + new refused | stream probe refused | R1 hold (`PUBLIC_STREAM_UNREACHABLE`), nothing spent; heals after the end |
-| `PUBLIC_ALL_DOWN` | REST + streams | both refused | combined outage; a short one (< 90 s) costs nothing (R2) |
+| `PUBLIC_ALL_DOWN` | REST + streams | both refused | combined outage; a short one (< 90 s) cost no recovery at 6 simulated symbols (R2). At the full universe it may cost one ordered recovery, because catching up can outlast the grace period |
 | `PUBLIC_STREAMS_HALF_OPEN` | streams silent | stream probe silent (UNKNOWN) | UNKNOWN never holds: the normal bounded recovery; the fresh run is not drilled |
 | `SCANNER_LOCAL_STREAMS` | open dropped + new refused | untouched (REACHABLE) | a scanner-local fault: ONE ordered recovery; the drill ends with the old run |
 
@@ -838,22 +847,22 @@ wrong profile, and is bounded as stated.
   with no size limit, and `existsSync` reads any error as "gone" (a removal
   could be recorded as done; the restore still needs the scanner's evidence).
 
-### Operational precautions before a real drill
+### Before a real drill
 
-- Only with a separately approved procedure.
-- Start from `RUNNING` with every role healthy, Account A/B **OFF**, nothing
-  listening on 4001/4002, and no manual scanner, emitter or planner.
-- Use the generation and run id from `monitoring:always-on status`
-  immediately before.
-- Prefer short durations first (`PUBLIC_ALL_DOWN` 60 s, then
-  `PUBLIC_STREAMS_DOWN` 600 s).
-- Keep `drill restore` ready.
-- After each drill:
-  - read `drill status` for `restore CONFIRMED`;
-  - `stop\*.drill` must be empty;
-  - in the journal, `DRILL_STARTED` and `DRILL_ENDED` should be the only drill
-    lines (no `DRILL_UNAUTHORIZED_FILE_REMOVED`, no `UNCONFIRMED`);
-  - expect no cursor rebaseline and `ledgerDuplicates` 0.
+Only with a separately approved procedure. The first real-machine drill, one
+60-second `PUBLIC_ALL_DOWN`, follows
+[always-on-first-drill-runbook.md](always-on-first-drill-runbook.md): preflight,
+activation, the journal lines to expect, validation, abort and the evidence
+record.
+
+- A normal drill journals `DRILL_STARTED`, `DRILL_ACTIVATION_CONFIRMED`,
+  `DRILL_ENDED` and `DRILL_RESTORE_CONFIRMED`. Activation can be confirmed after
+  the end, because the scanner writes its status every 60 s.
+- `drill status` shows the supervisor's view only. The scanner's own report is
+  `drill` in its `live-shadow-supervisor\runs\<run id>\status.json`; the
+  supervisor's copy of it is `roles.scanner.health.drill` in the Always-On status
+  file (`status.roles.scanner.health.drill` under `status --json`).
+- `restore CONFIRMED` and `fileRemoved` true are separate facts. Require both.
 - Expect real Binance traffic to resume at the end: the restore is real.
 
 ## Tests
