@@ -260,7 +260,7 @@ function Read-ScannerLog($symbols, $sinceIso) {
       }
     }
   }
-  if (-not $found) { $problem = 'no scanner role log' }
+  if ((-not $found) -and ($null -eq $problem)) { $problem = 'no scanner role log' }
   [pscustomobject]@{ problem = $problem; runs = $runs; bySymbol = $bySymbol }
 }
 function New-Verdict($kind, $why, $producer) { [pscustomobject]@{ kind = $kind; why = $why; producer = $producer } }
@@ -277,6 +277,7 @@ function Get-AlertVerdict($x, $c) {
   if (($e.kind -cne 'LIVE_IMMEDIATE_OBSERVATION') -or ($e.eventId -cne $id) -or ($e.symbol -cne $symbol) -or ($e.marketType -cne 'USDM_PERPETUAL') -or ($e.chartInterval -cne '15m') -or ($e.classification -cne 'SHADOW_LIVE_ONLY') -or ($e.actionable -ne $false) -or ($null -eq $barMs) -or ($e.barOpenTimeMs -ne $barMs) -or ($null -eq $eventMs) -or ($e.exchangeEventTimeMs -ne $eventMs)) { return New-Verdict 'UNDETERMINED' 'source record does not match the alert' }
   if ((($seen -isnot [int]) -and ($seen -isnot [long])) -or ($seen -le 0)) { return New-Verdict 'UNDETERMINED' 'firstObservedAtMs missing or invalid' }
   if (($barMs % 900000) -ne 0) { return New-Verdict 'UNDETERMINED' 'bar not on a 15-minute boundary' }
+  if ($eventMs -lt $barMs) { return New-Verdict 'UNDETERMINED' 'its event time is before its own bar opened' }
   if ([Math]::Abs($seen - $eventMs) -gt 31000) { return New-Verdict 'UNDETERMINED' "local and Binance clocks differ by $($seen - $eventMs) ms on this record" }
   if ($seen -lt $c.activatedMs) {
     $storedMs = Get-InstantMs $x.observedAt
@@ -298,6 +299,7 @@ function Get-AlertVerdict($x, $c) {
   if ($barMs -lt $last.eligibleMs) { return New-Verdict 'VIOLATION' 'observed on a bar opened before its own live-eligible boundary' $producer }
   if (($null -ne $end) -and ($end.atMs -lt $seen)) { return New-Verdict 'UNDETERMINED' 'observed after its session ended, with no new readiness line' }
   if (($last.atMs -lt $c.activatedMs) -and ($null -eq $end)) { return New-Verdict 'UNDETERMINED' 'observed after activation on a session armed before it, with no recorded end' }
+  if ($last.atMs -lt $c.activatedMs) { [void]$c.armedEarlier.Add("$($x.alertId): +$($seen - $c.activatedMs) ms") }
   if ($producer -ceq $c.liveRun) {
     $row = $c.liveRows[$symbol]
     if ($row -and $row.stateDir -and ($row.stateDir -cne (Get-SymbolSegment $symbol))) { return New-Verdict 'UNDETERMINED' "the scanner status names another lane: $($row.stateDir)" }
@@ -310,9 +312,51 @@ function Get-AlertVerdict($x, $c) {
   } else { $c.unavailable++ }
   New-Verdict 'CHECKED' $null $producer
 }
-function Test-AlertBars($items, $DrilledRunId, $ReplacementRunId, [switch]$RecoveryOccurred) {
-  $rows = @($items | Where-Object { $null -ne $_ })
-  $problems = @(); $checked = 0; $byDrilled = 0; $byReplacement = 0; $violations = @(); $undetermined = @(); $before = @(); $late = @()
+function Test-WholeNumber($value) { ($value -is [int]) -or ($value -is [long]) }
+function Get-AlertPageProblem($p, $offset, $sinceMs, $endMs, $total, $MaxRows) {
+  $w = $p.window; $s = $p.sample; $g = $p.pagination
+  if (((Get-InstantMs $w.soakStart) -ne $sinceMs) -or ((Get-InstantMs $w.soakEnd) -ne $endMs) -or ((Get-InstantMs $w.asOf) -ne $endMs) -or ($w.scope -cne 'ALL') -or ($null -eq (Get-InstantMs $w.soakStart)) -or ($null -eq (Get-InstantMs $w.asOf))) { return 'the response window is missing or is not the one requested' }
+  if ($s.truncated -isnot [bool]) { return 'sample.truncated is missing or not a boolean' }
+  if ($s.truncated) { return "sample.truncated: the window holds more than the API's $($s.limit) alerts" }
+  if ((-not (Test-WholeNumber $g.offset)) -or (-not (Test-WholeNumber $g.pageSize)) -or (-not (Test-WholeNumber $g.total)) -or ($g.hasMore -isnot [bool]) -or ($g.sort -cne 'TRIGGERED_ASC')) { return 'pagination is missing or has invalid fields' }
+  if (($g.offset -ne $offset) -or ($g.pageSize -ne 100)) { return "the page answered offset $($g.offset), size $($g.pageSize), not the offset $offset, size 100 requested" }
+  if (($g.total -lt 0) -or ($g.total -gt $MaxRows)) { return "pagination.total $($g.total) is outside 0 to $MaxRows" }
+  if ((Test-WholeNumber $s.evaluated) -and ($s.evaluated -ne $g.total)) { return "pagination.total $($g.total) differs from sample.evaluated $($s.evaluated)" }
+  if (-not (Test-WholeNumber $s.evaluated)) { return 'sample.evaluated is missing or invalid' }
+  if (($null -ne $total) -and ($g.total -ne $total)) { return "pagination.total changed between pages, $total to $($g.total)" }
+  if ($p.items -isnot [array]) { return 'items is missing or not a list' }
+  $expected = [Math]::Max(0, [Math]::Min(100, $g.total - $offset))
+  if ($p.items.Count -ne $expected) { return "offset $offset of total $($g.total) returned $($p.items.Count) rows, expected $expected" }
+  if ($g.hasMore -ne (($offset + 100) -lt $g.total)) { return "hasMore $($g.hasMore) contradicts offset $offset of total $($g.total)" }
+  $null
+}
+function Get-AlertsSince($sinceIso, $MaxPages = 20, $MaxRows = 2000) {
+  $rows = New-Object Collections.ArrayList; $seen = @{}; $total = $null; $pages = 0; $offset = 0; $reason = $null; $last = ''; $more = $true
+  $now = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+  $sinceMs = if ("$sinceIso" -cmatch '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$') { Get-InstantMs $sinceIso } else { $null }
+  $endMs = Get-InstantMs $now
+  if ($null -eq $sinceMs) { $reason = "no valid start time was given ('$sinceIso'); nothing was requested" }
+  while ($more -and ($null -eq $reason)) {
+    if ($pages -ge $MaxPages) { $reason = "stopped at the limit of $MaxPages pages with more to read"; break }
+    $pages++; $p = $null
+    try { $p = Invoke-RestMethod -Uri "http://127.0.0.1:4000/api/signal-quality/signals?soakStart=$sinceIso&soakEnd=$now&asOf=$now&sort=TRIGGERED_ASC&pageSize=100&offset=$offset" -TimeoutSec 120 -ErrorAction Stop }
+    catch { $reason = "page $pages (offset $offset) failed: $($_.Exception.Message)"; break }
+    $problem = Get-AlertPageProblem $p $offset $sinceMs $endMs $total $MaxRows
+    if ($problem) { $reason = "page $pages (offset $offset): $problem"; break }
+    $total = $p.pagination.total
+    foreach ($item in $p.items) {
+      if (($item.alertId -isnot [string]) -or ($item.alertId -eq '') -or ($item.triggeredAt -isnot [string])) { $reason = "page $pages (offset $offset): a row has no valid alertId or triggeredAt"; break }
+      if ($seen.ContainsKey($item.alertId)) { $reason = "page $pages (offset $offset): alert $($item.alertId) was returned twice"; break }
+      if ([string]::CompareOrdinal($item.triggeredAt, $last) -lt 0) { $reason = "page $pages (offset $offset): rows are out of order"; break }
+      $seen[$item.alertId] = $true; $last = $item.triggeredAt; [void]$rows.Add($item)
+    }
+    $offset += 100; $more = $p.pagination.hasMore
+  }
+  if (($null -eq $reason) -and ($rows.Count -ne $total)) { $reason = "collected $($rows.Count) rows of total $total" }
+  [pscustomobject]@{ contract = 'GET_ALERTS_SINCE_V1'; complete = ($null -eq $reason); rows = $rows.ToArray(); rowCount = $rows.Count; reason = $reason; since = $sinceIso; asOf = $now; total = $total; pages = $pages }
+}
+function Test-AlertBars($Fetch, $DrilledRunId, $ReplacementRunId, [switch]$RecoveryOccurred) {
+  $rows = @(); $problems = @(); $checked = 0; $byDrilled = 0; $byReplacement = 0; $violations = @(); $undetermined = @(); $before = @(); $late = @()
   $drilled = Get-ScannerOwn $DrilledRunId
   $activatedMs = Get-InstantMs $drilled.drill.activatedAt; $drilledStartMs = Get-InstantMs $drilled.startedAt; $replacementMs = $null
   if (($null -eq $activatedMs) -or ($null -eq $drilledStartMs)) { $problems += 'the drilled run has no usable startedAt or drill.activatedAt' }
@@ -322,6 +366,13 @@ function Test-AlertBars($items, $DrilledRunId, $ReplacementRunId, [switch]$Recov
     elseif ($replacementMs -le $activatedMs) { $problems += 'the replacement started before activation: clock or run mismatch' }
     elseif (($null -eq (Get-InstantMs $drilled.writtenAt)) -or ((Get-InstantMs $drilled.writtenAt) -gt $replacementMs)) { $problems += 'the drilled run has no usable writtenAt, or wrote status after the replacement started: clock change or overlap' }
   }
+  if ("$($Fetch.contract)" -cne 'GET_ALERTS_SINCE_V1') { $problems += 'the input is not a Get-AlertsSince result' }
+  elseif ($Fetch.complete -isnot [bool]) { $problems += 'the alert fetch does not say whether it is complete' }
+  elseif (-not $Fetch.complete) { $problems += "the alert fetch is incomplete: $($Fetch.reason)" }
+  elseif (($Fetch.rows -isnot [array]) -or ($Fetch.rowCount -ne $Fetch.rows.Count)) { $problems += 'the alert fetch rows do not match its count' }
+  elseif (($null -eq $activatedMs) -or ((Get-InstantMs $Fetch.since) -ne $activatedMs)) { $problems += "the alert fetch starts at '$($Fetch.since)', not at this drill's activation" }
+  elseif ((Get-InstantMs $Fetch.asOf) -le [Math]::Max([double](Get-InstantMs $drilled.drill.endedAt), [double]$replacementMs)) { $problems += 'the alert fetch was taken before the drill ended or the replacement started' }
+  else { $rows = @($Fetch.rows | Where-Object { $null -ne $_ }) }
   $c = $null
   if (($rows.Count -gt 0) -and ($problems.Count -eq 0)) {
     $fingerprint = "$((Read-Json (Join-Path $aon 'status.json')).roles.scanner.engineFingerprint)"
@@ -337,7 +388,7 @@ function Test-AlertBars($items, $DrilledRunId, $ReplacementRunId, [switch]$Recov
       $liveRun = $expected[-1]; $live = Get-ScannerOwn $liveRun; $liveRows = @{}
       if ($null -ne $live) { foreach ($s in @($live.symbols)) { if ($null -ne $s) { $liveRows["$($s.symbol)"] = $s } } }
       $c = [pscustomobject]@{ fingerprint = $fingerprint; lanes = @{}; log = $log; activatedMs = $activatedMs; drilledStartMs = $drilledStartMs; replacementMs = $replacementMs; recovery = [bool]$RecoveryOccurred
-        drilledRun = $DrilledRunId; replacementRun = $ReplacementRunId; liveRun = $liveRun; liveRows = $liveRows; liveWrittenMs = (Get-InstantMs $live.writtenAt); matched = 0; unavailable = 0 }
+        drilledRun = $DrilledRunId; replacementRun = $ReplacementRunId; liveRun = $liveRun; liveRows = $liveRows; liveWrittenMs = (Get-InstantMs $live.writtenAt); matched = 0; unavailable = 0; armedEarlier = (New-Object Collections.ArrayList) }
       foreach ($x in $rows) {
         $v = Get-AlertVerdict $x $c
         switch ($v.kind) {
@@ -354,16 +405,9 @@ function Test-AlertBars($items, $DrilledRunId, $ReplacementRunId, [switch]$Recov
   $repeatedEvents = @($rows | Where-Object { $_.shadowEventId } | Group-Object shadowEventId | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
   $manyBefore = $before.Count -gt 10
   $result = if ($violations.Count -gt 0) { 'VIOLATION' } elseif (($problems.Count -gt 0) -or ($undetermined.Count -gt 0) -or ($late.Count -gt 0) -or ($repeated.Count -gt 0) -or ($repeatedEvents.Count -gt 0) -or $manyBefore) { 'UNDETERMINED' } elseif ($checked -eq 0) { 'NOTHING TO CHECK' } else { 'NO VIOLATION FOUND' }
-  [pscustomobject]@{ result = $result; checked = $checked; producedByDrilledRun = $byDrilled; producedByReplacementRun = $byReplacement; violations = ($violations -join '; '); undetermined = ($undetermined -join '; '); evidenceProblems = ($problems -join '; ')
-    observedBeforeFault = $before.Count; manyBeforeFault = $manyBefore; lateDelivered = ($late -join '; '); repeatedDeliveryKeys = ($repeated -join ','); repeatedEventIds = ($repeatedEvents -join ',')
+  [pscustomobject]@{ result = $result; alertFetch = $(if ($Fetch.complete -eq $true) { "complete: $($Fetch.rowCount) rows to $($Fetch.asOf)" } else { 'NOT COMPLETE' }); checked = $checked; producedByDrilledRun = $byDrilled; producedByReplacementRun = $byReplacement; violations = ($violations -join '; '); undetermined = ($undetermined -join '; '); evidenceProblems = ($problems -join '; ')
+    onPreFaultSession = $(if ($c) { $c.armedEarlier -join '; ' } else { '' }); observedBeforeFault = $before.Count; manyBeforeFault = $manyBefore; lateDelivered = ($late -join '; '); repeatedDeliveryKeys = ($repeated -join ','); repeatedEventIds = ($repeatedEvents -join ',')
     liveEligibleMatched = $(if ($c) { $c.matched } else { 0 }); liveEligibleUnavailable = $(if ($c) { $c.unavailable } else { 0 }); replayOrDuplicatesDecidedHere = 'NO: see section F rows 12 to 14' } | Format-List
-}
-function Get-AlertsSince($sinceIso) {
-  $end = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture); $offset = 0
-  do {
-    $page = Invoke-RestMethod "http://127.0.0.1:4000/api/signal-quality/signals?soakStart=$sinceIso&soakEnd=$end&sort=TRIGGERED_ASC&pageSize=100&offset=$offset"
-    $page.items; $offset += 100
-  } while ($page.pagination.hasMore)
 }
 function Show-DrillFiles {
   "requests: $(@(Get-ChildItem (Join-Path $aon 'requests') -File).Name -join ',')"
@@ -768,17 +812,49 @@ After a self-heal:
 
 ```powershell
 $activatedAt = (Get-ScannerOwn '<drilled runId>').drill.activatedAt
-$a = Get-AlertsSince $activatedAt
-Test-AlertBars $a '<drilled runId>'
+$fetch = Get-AlertsSince $activatedAt
+Test-AlertBars $fetch '<drilled runId>'
 ```
 
 After one recovery:
 
 ```powershell
 $activatedAt = (Get-ScannerOwn '<drilled runId>').drill.activatedAt
-$a = Get-AlertsSince $activatedAt
-Test-AlertBars $a '<drilled runId>' '<replacement runId>' -RecoveryOccurred
+$fetch = Get-AlertsSince $activatedAt
+Test-AlertBars $fetch '<drilled runId>' '<replacement runId>' -RecoveryOccurred
 ```
+
+**Reading the alerts.** `Get-AlertsSince` returns one result object, and
+`Test-AlertBars` accepts nothing else: a plain list or an empty value reads
+`UNDETERMINED`.
+
+| Property | Meaning |
+| --- | --- |
+| `complete` | True only if every page was read and checked |
+| `rows`, `rowCount` | The alerts collected, and how many. Do not use the rows when `complete` is false |
+| `reason` | Why it is not complete |
+| `since`, `asOf`, `total`, `pages` | The window requested, the API's `pagination.total`, and the requests made |
+
+**A failed read is never "no alerts".** `complete` is false, and row 18 reads
+`UNDETERMINED`, on a refused connection, a timeout (120 s a page) or an HTTP error; a
+response that is not the expected JSON; a window, `scope`, `sort`, offset or page size
+differing from the request; missing or mistyped pagination; `sample.truncated`; `total`
+differing from `sample.evaluated`, changing between pages, or not matching the rows
+returned; `hasMore` contradicting them; a repeated `alertId`; rows out of order; or more
+than 20 pages or 2000 rows (the API's own limits, and 2000 rows is exactly 20 pages).
+`Test-AlertBars` also refuses a fetch that does not start at this drill's activation, or
+that was taken before the drill ended or the replacement started.
+
+**There are no retries.** The first failed page ends the read, so it cannot loop or
+collect a stale page twice. To try again, run the `Get-AlertsSince` line again: it starts
+from the first page. If it stays incomplete, the row is INCONCLUSIVE.
+
+**The API has no snapshot.** Pages are separate requests, and an evaluation is reused
+for only 15 s. The helper pins one `asOf`, so later alerts stay out of the window, and any
+change it can see makes the read incomplete. An alert committed late with an earlier
+time, swapped for another between pages so that `total` and the order still hold, would
+not be seen. A complete read means complete by these checks. It proves neither recovery
+nor ledger safety, and zero rows is only "no alert was stored in the window".
 
 **The evidence, and where each item comes from:**
 
@@ -787,7 +863,7 @@ Test-AlertBars $a '<drilled runId>' '<replacement runId>' -RecoveryOccurred
 | `shadowEventId` on an alert | The `eventId` of the scanner record behind it: a hash of lineage, symbol, bar, signal, timeframe and level, with no clock in it. The scanner writes one identity once, across runs | Alert API |
 | `firstObservedAtMs` | **The local clock, read by the scanner in the same step that writes the record.** It is not in the alert. **The record does not name its run** | `live-shadow-engines\<first 24 of engine fingerprint>\USDM_PERPETUAL\<symbol segment>\15m\events.jsonl`. The segment is the symbol if it is 3 to 30 of `A-Z0-9` and not a Windows device name, otherwise `u-` and the lower-case hex of its UTF-8 bytes |
 | `READINESS_ESTABLISHED` line | Local time, symbol, and the `live eligible from` boundary that session got. **This is the per-symbol history**, and it survives the scanner | `logs\always-on-scanner.log` (and `.log.1`: it rotates at 32 MB when a role starts). A `run id:` line opens each run. This is an operator log, not a versioned format: a line that does not match counts as absent |
-| `DETACHED`, `FAILED`, `QUARANTINED`, `INACTIVE` lines | Local time that symbol's session ended | The same log |
+| `DETACHED`, `FAILED`, `QUARANTINED`, `INACTIVE` lines | Local time that symbol's session was turned off. **Not the network disconnect**: at activation the scanner stamps `activatedAt`, then marks its sockets dropped so no new message is accepted. Each session ends only when the deferred close is handled, and messages already queued can be handled until then. The line can be later than the drop, and nothing here gives the exact instant the connection failed | The same log |
 | `liveEligibleFrom` | **The current value only**, for one symbol in one run, in that run's status file. It holds no history, a later reconnect replaces it, and it is empty when the session is not ready or the scanner has stopped. So it only cross-checks the log's latest line, and is never used to judge a past alert | `scanner\live-shadow-supervisor\runs\<runId>\status.json`, `symbols[]` |
 | `startedAt`, `drill.activatedAt` | Local clock, written by each scanner into its own file. **Never substitute the supervisor's or the emitter's time** | `Get-ScannerOwn` |
 | `triggeredAt` | Binance's event time. **It never decides the producer or a violation.** It must match the record, and is used only to detect clock trouble | Alert API |
@@ -810,7 +886,7 @@ symbol, bar, `triggeredAt`, market and interval match the alert:
 | before `activatedAt`, stored over 15 minutes later, or before the drilled run started | A late or re-delivered record | `lateDelivered`: `UNDETERMINED` |
 | at or after the replacement's `startedAt`, bar opened before the next boundary after it | No session of that run could be eligible | `VIOLATION` |
 | at or after `activatedAt`, bar opened before the last readiness line's `live eligible from` | The session refuses such a bar | `VIOLATION` |
-| at or after `activatedAt`, on a session armed before activation, its end logged at or after the observation | A message handled in the moment before the drop completed: valid | Checked |
+| at or after `activatedAt`, on a session armed before activation, its end logged at or after the observation | By the log that session was still armed, so the bar rule holds | Checked, and listed in `onPreFaultSession` |
 | as above, but no end logged, or an end logged before the observation with no new readiness | Contradicts the session's lifecycle, or a line is missing | `UNDETERMINED` |
 | no readiness line, or one in another run | Cannot be attributed | `UNDETERMINED` |
 | otherwise | Eligible, on evidence from its own run | Checked |
@@ -819,12 +895,13 @@ symbol, bar, `triggeredAt`, market and interval match the alert:
 
 | `result` | Meaning | Row 18 |
 | --- | --- | --- |
-| `NO VIOLATION FOUND` | Every judged alert was attributed and passed. **Limited to the rules above, not universal replay safety** | Passes, with rows 12 to 14 still required |
+| `NO VIOLATION FOUND` | The fetch was complete, and every judged alert was attributed and passed. **Limited evidence for the rules above, not universal replay safety** | Passes, with rows 12 to 14 still required |
 | `VIOLATION` | An alert's own records and logs show a bar its session could not be eligible on | FAIL. Capture the alert, its lane record and its log lines |
 | `UNDETERMINED` | Missing, contradictory or ambiguous evidence | INCONCLUSIVE, unless each listed item is explained in writing from other evidence. **Never an automatic PASS** |
-| `NOTHING TO CHECK` | No alert was judged | Passes with a note that it proved nothing |
+| `NOTHING TO CHECK` | The fetch was complete, and no alert was judged: none in the window, or only `observedBeforeFault` ones | Passes with a note that it proved nothing, neither recovery nor ledger safety. **A failed fetch never reads this** |
 
-**`UNDETERMINED` also reads for:** a missing, malformed or repeating lane log; a
+**`UNDETERMINED` also reads for:** an incomplete or invalid alert fetch; a missing,
+malformed or repeating lane log; a
 missing `shadowEventId` or `firstObservedAtMs`; a record that does not match its alert;
 no usable run file; a scanner log that is missing, over 64 MB, or whose runs do not end
 in the expected ids; a repeated `deliveryKey` or `shadowEventId`; `liveEligibleFrom`
@@ -852,10 +929,19 @@ recovery journal. The 15 minutes and the 10 are operator policy.
 - Only alerts in the API are judged. It says nothing about an observation that was
   never delivered, or about one that should have been.
 - Do **not** reject an alert because its bar has not closed: alerts fire on open bars.
+- `onPreFaultSession` shows how long after `activatedAt` such an observation came. It
+  does not change the result: a long gap means that symbol's connection outlived the
+  drop, which is not a bar violation. More than a few seconds is unexpected; read it
+  with row 9 (operator judgement).
+- A record whose event time is before its own bar reads `UNDETERMINED`. The emitter's
+  strict log reader already refuses such a record, so this case does not show that
+  production accepts one. The helper checks only the fields it relies on and is not a
+  full validator of the log.
 - Reads are limited to the lanes of the alerts listed and the two scanner log files,
   each at most 64 MB. A larger file reads `UNDETERMINED`; it is not read in part.
 - `Get-AlertsSince` reads the Signal Quality API, which loads public market data for
-  its outcomes, so use it only at validation. It needs a healthy backend.
+  its outcomes, so use it only at validation. It needs a healthy backend, and without
+  one its result is incomplete.
 
 A row that cannot be shown makes the result INCONCLUSIVE, not PASS.
 
@@ -1024,9 +1110,10 @@ Recovery outcome: SELF-HEAL / ONE ORDERED RECOVERY / OTHER
   Force-stopped role (or none):
 
 REST: restRequests before / after / new run:
-Alerts: created before / after; Test-AlertBars result / checked / producedByDrilledRun / producedByReplacementRun:
+Alerts: created before / after; fetch complete / rowCount / total / pages / asOf / reason:
+  Test-AlertBars result / alertFetch / checked / producedByDrilledRun / producedByReplacementRun:
   violations / undetermined / evidenceProblems:
-  observedBeforeFault / manyBeforeFault / lateDelivered / repeatedDeliveryKeys / repeatedEventIds:
+  onPreFaultSession / observedBeforeFault / manyBeforeFault / lateDelivered / repeatedDeliveryKeys / repeatedEventIds:
   liveEligibleMatched / liveEligibleUnavailable:
   First alert after the drill (symbol, triggeredAt, barStart, emitter-pinned runId):
 Ledger: ledgerDuplicates status / soak-health / old run:
@@ -1098,7 +1185,8 @@ operator or an administrator can do anything the operator can.
   as a recovery on this machine, and needs its own approval.
 - **The new helpers have run only against stopped-machine files.** `Show-Liveness`,
   `Show-Shutdown`, `Show-ScannerOwn` and `Test-AlertBars` were tested on stopped state
-  and synthetic records. `Get-AlertsSince` has never run against a live backend, and
+  and synthetic records. `Get-AlertsSince` has run only against a mock built on the API's real page and query
+  code, never against a live backend, and
   the live fields have never been exercised, including `liveEligibleFrom` with values
   in it.
 - **The readiness history is an operator log.** Row 18 reads its text. A changed line
