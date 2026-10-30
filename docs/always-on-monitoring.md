@@ -351,8 +351,8 @@ Journal kinds include `SCANNER_DEGRADED`, `NETWORK_UNAVAILABLE`,
 `OWNERSHIP_WRITE_FAILED` and `SUPERVISOR_TICK_FAILED`. The operator drill adds
 `DRILL_REJECTED`, `DRILL_STARTED`, `DRILL_ACTIVATION_CONFIRMED` /
 `DRILL_ACTIVATION_UNCONFIRMED`, `DRILL_RESTORE_REQUESTED`, `DRILL_ENDED`,
-`DRILL_RESTORE_CONFIRMED` / `DRILL_RESTORE_UNCONFIRMED`, `DRILL_STALE_REMOVED`
-and `DRILL_UNAUTHORIZED_FILE_REMOVED` (section 12). The status artifact gains an
+`DRILL_RESTORE_CONFIRMED` / `DRILL_RESTORE_UNCONFIRMED`, `DRILL_STALE_REMOVED`,
+`DRILL_UNAUTHORIZED_FILE_REMOVED` and `DRILL_STATE_INCONSISTENT` (section 12). The status artifact gains an
 optional `drill` view, present only once a generation has accepted a drill.
 
 ## 7. Commands
@@ -691,18 +691,41 @@ launcher's mutation lock with the generation fence re-checked
 (`ALWAYS_ON_DRILL_START`), and journaled as `DRILL_STARTED`. The launcher's
 mutation lock being busy refuses (`MUTATION_AUTHORITY_BUSY`).
 
-**The trust boundary, stated plainly:**
+**The trust boundary, stated plainly.** This is an operator-controlled test
+feature, not a security boundary against software running as the operator.
 
-- **What the checks stop:** other Windows accounts (the ACL), anything remote
-  (there is no listener: the supervisor's `127.0.0.1:4019` mutex drops every
-  connection), leftover or hand-written request files (no live verified
-  controller, the 60 s lifetime, generation and run binding), and accidental
-  activation (no switch exists).
-- **What they cannot stop:** code already running as the operator's own account
-  can do anything the operator can, including running `drill start`. A drill
-  file planted directly beside the scanner's stop file, bypassing the request,
-  is removed by the supervisor within one pass and journaled
-  (`DRILL_UNAUTHORIZED_FILE_REMOVED`). Until then, the TTL bounds it.
+- **What the checks stop:** other non-admin Windows accounts (the ACL), anything
+  remote (there is no listener: the supervisor's `127.0.0.1:4019` mutex drops
+  every connection), leftover request files (no live controller, the 60 s
+  lifetime, generation and run binding), and accidental activation (no switch
+  exists).
+- **What they cannot stop:** code already running as the operator's own account,
+  or as an administrator, can do anything the operator can.
+  - It can run `drill start`, or request a drill itself. The controller check
+    matches a process's shape (a node command line and its creation time). A
+    look-alike local command passes it. It is **not** cryptographic
+    authentication; it rejects leftovers and accidents, not an adversary.
+  - It can write a valid drill file directly: the scanner's gate trusts a
+    well-formed file naming its run id, and run ids are in the status files.
+- **Planted files:** every pass, the supervisor reconciles the file at the owned
+  scanner's drill path, including after a completed drill. A completed drill
+  vouches for nothing.
+  - A file the gate would apply (it names exactly this run) is removed and
+    journaled (`DRILL_UNAUTHORIZED_FILE_REMOVED`). It can fault the scanner for
+    up to one supervision pass, about 15 s.
+  - A file the gate ignores (another run's, invalid) or that cannot be judged
+    (unreadable, run not yet identified) has no proven owner. It is journaled
+    once (`DRILL_STATE_INCONSISTENT`) and left in place; an accepted drill
+    replaces it, and the next generation removes it.
+  - The scanner reporting a drill this generation did not accept is journaled
+    (`SCANNER_REPORTS_UNEXPECTED_DRILL`), shown by the status, and withdraws an
+    earlier `restore CONFIRMED` until its own report shows nothing applied.
+    The status is written every 60 s, so a fault shorter than that may never
+    appear in a report.
+- **Without a supervisor nothing removes a planted file.** The 900 s TTL applies
+  **per drill, authorized or forged**: repeated forged files with fresh ids can
+  keep a scanner faulted indefinitely. That costs market data, and the alerts it
+  would have produced, but reaches no order path.
 
 ### Run and generation binding
 
@@ -717,10 +740,10 @@ mutation lock being busy refuses (`MUTATION_AUTHORITY_BUSY`).
 
 ### Finite duration and restoration
 
-- **Maximum TTL: 900 s** (minimum 10 s). The scanner enforces it itself. It
-  ends the drill exactly at its expiry on the wall clock **and** on a monotonic
-  deadline fixed at activation, so a wall clock moved backwards cannot extend
-  it. A file that is gone, unreadable or invalid ends it (fail-safe: inactive).
+- **Maximum TTL: 900 s per drill** (minimum 10 s). The scanner enforces it
+  itself. It ends the drill exactly at its expiry on the wall clock **and** on a
+  monotonic deadline fixed at activation, so a wall clock moved backwards cannot
+  extend it. A file that is gone, unreadable or invalid ends it (fail-safe: inactive).
   An ended drill id never comes back. **None of this needs the supervisor or
   the controller to stay alive.**
 - **The supervisor ends a drill exactly once**, at the first of:
@@ -733,9 +756,18 @@ mutation lock being busy refuses (`MUTATION_AUTHORITY_BUSY`).
   | `DETACHED` | the console was closed |
   | `FENCED` | a newer generation owns the stack; only this generation's own file is removed |
   | `RUN_ENDED` | the scanner child exited or was replaced |
+  | `CLOCK_ROLLBACK` | the wall clock moved back by more than 5 s against the monotonic clock: the drill's times can no longer be trusted |
   | `FILE_REMOVED_EXTERNALLY` | the drill file disappeared |
   | `SCANNER_ENDED` | the drilled run's own status, written after the drill started, shows it no longer applies the drill: its fail-safe gate ended it (e.g. on a file it could not read), or, after confirming it, it moved on to another drill (the file was overwritten). The probes are never left drilled on evidence that no longer holds, and a restore is confirmed only once that run reports nothing applied |
 
+- **The supervisor measures a drill's lifetime on a monotonic clock too.** A
+  rollback ends the drill at once and drops any probe answer cached under the old
+  clock. Only a status written since then counts as evidence, and the
+  confirmation windows run on the monotonic clock, so nothing waits for the wall
+  clock to catch up. A correction of 5 s or less changes nothing. A rollback is
+  noticed at the next pass. This covers the drill only: the supervisor's other
+  timers (for example the degraded grace period) still use the wall clock and can
+  be delayed by a rollback, drill or no drill.
 - **A new generation removes every leftover drill file at start**
   (`DRILL_STALE_REMOVED`). A crashed supervisor's drill therefore ends within a
   second of the next start, and at its TTL in any case.
@@ -745,7 +777,9 @@ mutation lock being busy refuses (`MUTATION_AUTHORITY_BUSY`).
 - **Confirmation comes only from the scanner's own status** of the drilled run,
   written after the event (or, for a restore, from the drilled process having
   ended). Without it within the status freshness window (180 s) the drill reads
-  `UNCONFIRMED`. **A restore is never claimed without evidence.**
+  `UNCONFIRMED`. **A restore is never claimed without evidence.** Another
+  drill's report proves nothing unless this drill was first confirmed applied,
+  and then only if that other drill is no longer applied.
 - Restoration never touches a scanner lock, cursor, checkpoint, ledger or
   incident.
 
@@ -787,6 +821,22 @@ mutation lock being busy refuses (`MUTATION_AUTHORITY_BUSY`).
 
 These need their own evidence (the simulated network of section 11 covers
 timeouts, half-open sockets and latching against real code).
+
+### Known limits, none blocking a first supervised drill
+
+Each of these needs deliberate action as the operator's account, or an already
+wrong profile, and is bounded as stated.
+
+- **A file overwriting an active drill before its activation is confirmed** is
+  not noticed until that drill ends. It is journaled if the scanner reports it,
+  and removed with the drill's own file.
+- **A second drill can be accepted while the first's file removal is failing.**
+  That drill's restore evidence is then lost; the new file replaces the old one.
+- **The ACL check** does not look at the directory owner or at parent folders,
+  and happens only when a request is judged. The scanner never checks ACLs.
+- **File handling:** symlinks are followed, the drill file is read synchronously
+  with no size limit, and `existsSync` reads any error as "gone" (a removal
+  could be recorded as done; the restore still needs the scanner's evidence).
 
 ### Operational precautions before a real drill
 
