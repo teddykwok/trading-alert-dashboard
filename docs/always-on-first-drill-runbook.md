@@ -160,9 +160,17 @@ function Show-State {
     scannerReportsDrill = if ($h.drill) { "$($h.drill.drillId) active=$($h.drill.active)" } else { 'none' }
   } | Format-List
 }
+function Get-ScannerOwn($runId) {
+  $file = Join-Path $scan "live-shadow-supervisor\runs\$runId\status.json"
+  if ((-not $runId) -or (-not (Test-Path $file))) { return $null }
+  $f = Read-Json $file
+  if ($f.runId -ne $runId) { return $null }
+  $f
+}
 function Show-ScannerOwn($runId) {
-  $f = Read-Json (Join-Path $scan "live-shadow-supervisor\runs\$runId\status.json")
-  [pscustomobject]@{ runId = $f.runId; runState = $f.runState; pid = $f.pid; gitHead = $f.gitHead; writtenAt = $f.writtenAt; restRequests = $f.totals.restRequests
+  $f = Get-ScannerOwn $runId
+  if ($null -eq $f) { "NO USABLE STATUS for scanner run '$runId': its evidence is not established"; return }
+  [pscustomobject]@{ runId = $f.runId; runState = $f.runState; startedAt = $f.startedAt; pid = $f.pid; gitHead = $f.gitHead; writtenAt = $f.writtenAt; restRequests = $f.totals.restRequests
     drillId = $f.drill.drillId; fault = $f.drill.fault; active = $f.drill.active; activatedAt = $f.drill.activatedAt; endedAt = $f.drill.endedAt; endReason = $f.drill.endReason } | Format-List
 }
 function Show-Journal($generation, $sinceIso, [switch]$Facts) {
@@ -198,13 +206,31 @@ function Show-Shutdown($generation) {
     monitoringProcesses = (@($procs).ProcessId -join ','); listeners = $listeners
     verdict = if (-not $done) { 'INCOMPLETE' } elseif ($stopped -eq 'emitter,scanner,planner,backend' -and $other -eq '') { 'COMPLETE' } else { 'COMPLETE, NOT CLEAN' } } | Format-List
 }
-function Get-NextBarOpenMs($iso) { [long]([Math]::Ceiling([DateTimeOffset]::Parse($iso, [Globalization.CultureInfo]::InvariantCulture).ToUnixTimeMilliseconds() / 900000) * 900000) }
-function Test-AlertBars($items, $activatedAtIso, $freshRunId, $freshRunStartedAtIso) {
-  $cutoffMs = [DateTimeOffset]::Parse($activatedAtIso, [Globalization.CultureInfo]::InvariantCulture).ToUnixTimeMilliseconds() + 5000
-  $first = Get-NextBarOpenMs $activatedAtIso; $fresh = if ($freshRunStartedAtIso) { Get-NextBarOpenMs $freshRunStartedAtIso } else { $first }
-  $after = @($items | Where-Object { [DateTimeOffset]::Parse($_.triggeredAt, [Globalization.CultureInfo]::InvariantCulture).ToUnixTimeMilliseconds() -ge $cutoffMs })
-  $bad = @($after | Where-Object { (-not $_.barStart) -or ([DateTimeOffset]::Parse($_.barStart, [Globalization.CultureInfo]::InvariantCulture).ToUnixTimeMilliseconds() -lt $(if ($_.runId -eq $freshRunId) { $fresh } else { $first })) })
-  [pscustomobject]@{ alertsAfterActivation = $after.Count; barStartTooEarly = $bad.Count; alertIds = (@($bad).alertId -join ',') } | Format-List
+function Get-InstantMs($iso) { try { [DateTimeOffset]::Parse($iso, [Globalization.CultureInfo]::InvariantCulture).ToUnixTimeMilliseconds() } catch { $null } }
+function Get-NextBarOpenMs($ms) { [long]([Math]::Ceiling($ms / 900000) * 900000) }
+function Test-AlertBars($items, $activatedAtIso, $ReplacementStartedAt, [switch]$RecoveryOccurred) {
+  $skewMs = 5000; $ok = @(); $tooEarly = @(); $undetermined = @(); $nearEdge = @(); $before = @()
+  $activatedMs = Get-InstantMs $activatedAtIso; $replacementMs = Get-InstantMs $ReplacementStartedAt
+  $firstBar = if ($null -ne $activatedMs) { Get-NextBarOpenMs $activatedMs } else { $null }
+  $replacementBar = if ($null -ne $replacementMs) { Get-NextBarOpenMs $replacementMs } else { $null }
+  $rows = @($items | Where-Object { $null -ne $_ })
+  foreach ($x in $rows) {
+    $t = Get-InstantMs $x.triggeredAt; $b = Get-InstantMs $x.barStart
+    if (($null -eq $activatedMs) -or ($null -eq $t)) { $undetermined += $x.alertId; continue }
+    if ($t -lt $activatedMs) { $before += $x.alertId; continue }
+    if (($null -eq $b) -or ($b -gt ($t + $skewMs))) { $undetermined += $x.alertId; continue }
+    if ($t -lt ($activatedMs + $skewMs)) { if ($b -ge $firstBar) { $ok += $x.alertId } else { $nearEdge += $x.alertId }; continue }
+    if ($b -lt $firstBar) { $tooEarly += $x.alertId; continue }
+    if (-not $RecoveryOccurred) { $ok += $x.alertId; continue }
+    if ($null -eq $replacementMs) { $undetermined += $x.alertId; continue }
+    if ($t -ge ($replacementMs + $skewMs)) { if ($b -lt $replacementBar) { $tooEarly += $x.alertId } else { $ok += $x.alertId }; continue }
+    if (($t -lt ($replacementMs - $skewMs)) -or ($b -ge $replacementBar)) { $ok += $x.alertId } else { $undetermined += $x.alertId }
+  }
+  $repeated = @($rows | Where-Object { $_.deliveryKey } | Group-Object deliveryKey | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+  $timesMissing = ($null -eq $activatedMs) -or ($RecoveryOccurred -and ($null -eq $replacementMs))
+  $result = if ($tooEarly.Count -gt 0) { 'VIOLATION' } elseif ($timesMissing -or ($undetermined.Count -gt 0) -or ($nearEdge.Count -gt 0) -or ($repeated.Count -gt 0)) { 'UNDETERMINED' } elseif ($ok.Count -eq 0) { 'NOTHING TO CHECK' } else { 'NO VIOLATION FOUND' }
+  [pscustomobject]@{ result = $result; ok = $ok.Count; barStartTooEarly = ($tooEarly -join ','); undetermined = ($undetermined -join ','); nearActivationEdge = ($nearEdge -join ',')
+    triggeredBeforeActivation = $before.Count; repeatedDeliveryKeys = ($repeated -join ','); replayOrDuplicatesDecidedHere = 'NO: see section F rows 12 to 14' } | Format-List
 }
 function Get-AlertsSince($sinceIso) {
   $end = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture); $offset = 0
@@ -343,7 +369,7 @@ below means nothing without it.
 
 | # | Check | How | Required |
 | --- | --- | --- | --- |
-| 10 | No conflict, latch or recovery | `Show-State` | `recoveries` 0, `latched` false, every `externalPids` list empty, no role in `CONFLICT`, `LATCHED`, `BACKOFF` or `RECOVERING` |
+| 10 | No conflict, latch or recovery | `Show-State` | `recoveries` 0, `latched` false, no role in `CONFLICT`, `LATCHED`, `BACKOFF` or `RECOVERING`. Every `externalPids` list empty: a CLI you just ran can stay listed until the supervisor's next pass, so re-read after about 15 s. A pid still listed, or one you cannot attribute, is an unexpected process: escalate, and never kill it |
 | 11 | Stable baseline (operator policy) | `Show-State`, `Show-Journal <G> ''` | `RUNNING` for at least 30 continuous minutes, including at least one 15-minute close, with no `SCANNER_DEGRADED` since `SUPERVISOR_RETURNED_HEALTHY` |
 | 12 | Fresh, drill-capable run | `Show-Journal <G> '' -Facts`, then `Show-ScannerOwn <runId>` | In this generation `SUPERVISOR_STARTED` has `"adopted":0` in its facts, there is no `CHILD_ADOPTED`, and the scanner's `ROLE_STARTED` reads `INITIAL_START`. The scanner's own `gitHead` equals the approved SHA. **An adopted scanner may have no drill gate and is not acceptable** |
 | 13 | Healthy now | `Show-State` | `state` `RUNNING (ALL_ROLES_HEALTHY)`, `verdict` `HEALTHY`, `attempts` 0, `ours` true, `failed`, `recovering` 0, `universeStale` false |
@@ -409,20 +435,27 @@ Set `$since` to the `DRILL_STARTED` time, then repeat every 15 to 30 seconds:
 Show-Liveness; Show-State; Show-DrillFiles; Show-Journal <G> $since
 ```
 
-Expected timeline. `T` is `DRILL_STARTED`. The timings come from the code's
-intervals, not from a real run.
+Expected timeline. `T` is `DRILL_STARTED`. Rows are in order of when each is first
+expected, and their ranges overlap. Every time is an approximation from the code's
+intervals, not a measurement from a real run and not a deadline.
 
-| When | What |
-| --- | --- |
-| T | `DRILL_STARTED`; `state` of the drill `ACTIVE`; one `.drill` file |
-| within 1 s | The scanner applies it: `public transport drill <id> ACTIVE` in `logs\always-on-scanner.log`. All its connections drop, and every symbol detaches |
-| up to about T+75 s | The scanner's next status (written every 60 s) is read on the next pass (every 15 s): `SCANNER_DEGRADED`, usually, and `DRILL_ACTIVATION_CONFIRMED`, which may land after `DRILL_ENDED` |
-| T+60 s | The scanner's gate ends the fault itself, at the expiry |
-| up to about T+75 s | `DRILL_ENDED` (`EXPIRED`); the file is removed |
-| up to about T+150 s | First status written after the end: `DRILL_RESTORE_CONFIRMED` |
-| from about T+60 s | REST catch-up can start as soon as REST answers, for each symbol, without waiting for its stream |
-| about T+105 s | The latest usual reconnect: reconnect delays are 5, 10, 30 and 60 s, so a connection may not retry until well after the fault ends |
-| about T+105 to T+240 s | The first moment a recovery can be decided: degradation is first seen on a pass after `T`, then 90 s of grace, then a status written after it |
+| Approx. time | What | Kind |
+| --- | --- | --- |
+| T | `DRILL_STARTED`; the drill's `state` `ACTIVE`; one `.drill` file | Required, first |
+| within 1 s | The scanner applies it: `public transport drill <id> ACTIVE` in `logs\always-on-scanner.log`. All its connections drop, and every symbol detaches | Expected |
+| T+15 to T+75 s | The scanner's next status (written every 60 s) is read on the next pass (every 15 s): `SCANNER_DEGRADED` | Optional: usual, but a status may never catch the fault |
+| T+15 to T+75 s or later | `DRILL_ACTIVATION_CONFIRMED`. **It may land after `DRILL_ENDED`**, because of when the status was written | Required, order free |
+| T+60 s | The scanner's gate ends the fault itself, at the expiry | Expected |
+| from T+60 s | REST catch-up can start for each symbol once REST answers, without waiting for its stream | Illustrative |
+| T+60 to T+75 s | `DRILL_ENDED` (`EXPIRED`); the file is removed | Required |
+| by about T+150 s | First status written after the end: `DRILL_RESTORE_CONFIRMED` | Required, last of the four |
+| by about T+105 s | The latest usual reconnect. Delays are 5, 10, 30 and 60 s, so a connection may not retry until well after the fault ends | Estimate |
+| about T+105 to T+240 s | The first moment a recovery can be decided: degradation is first seen on a pass after `T`, then 90 s of grace, then a status written after it | Estimate |
+| about T+190 s or later | REST catch-up of all symbols may finish (section E) | Estimate |
+
+Only these orders are required: `DRILL_STARTED` first, `DRILL_ENDED` before
+`DRILL_RESTORE_CONFIRMED`, and `DRILL_RESTORE_CONFIRMED` last of the four. Nothing
+else here is a fixed sequence.
 
 During this time, **all of these are expected and are not abort triggers:**
 scanner and supervisor state `DEGRADED`, `SYMBOLS_RECOVERING`,
@@ -497,15 +530,21 @@ measured with 6 simulated symbols, which says nothing about timing at 522 symbol
 about 11 connections.
 
 REST catch-up does not wait for streams: each symbol's job starts once REST answers,
-from about T+60 s, while connections retry separately. At most **2 catch-up jobs**
-run at once (`restConcurrency`), new ones start from a loop that ticks about once a
-second, and requests are spaced at least 250 ms apart within 300 weight per minute.
+from about T+60 s, while connections retry separately. Under the default
+`FAST_RECOVERY_V1` policy, **4 symbol workers** (`restConcurrency`) catch up at once,
+started from a loop that ticks about once a second. Across them, **at most 2 HTTP
+requests are in flight**, starts are at least 250 ms apart, and the budget is 300
+weight per minute. The Gate 3 log shows the same: "<= 2 in flight … 4 symbol
+worker(s)".
 
-**These are estimates, not guaranteed timings.** If the one-second loop is the
-limiting driver, 522 symbols at 2 per second take about 4.4 minutes; if only the
-250 ms spacing limits it, about 2.2 minutes. That finishes between about T+190 s and
-T+320 s, against a decision between T+105 s and T+240 s. **One recovery is a
-realistic result, and so is self-heal.** Only the real run can say which.
+**This is an estimate, not a deadline or a guarantee.** With one request per symbol,
+522 symbols at about 4 per second take about 2.2 minutes, so catch-up may finish
+around T+190 s. That is close to the best case: replaying bars, slow responses, or a
+worker still busy at the next tick can only lengthen it. A recovery can be decided
+between about T+105 s and T+240 s, and a status must show nothing recovering by then.
+**Self-heal and one ordered recovery are both possible at 522 symbols, and this
+estimate does not promise that no scanner restart is needed.** Only the real run can
+say which.
 
 Two outcomes are acceptable. **Neither is automatically PASS**; each must still
 pass section F.
@@ -578,9 +617,9 @@ written after the event has appeared.
 | 13 | Cursors | `Save-Cursors after`, `Compare-Cursors before after` | `missing`, `wentBack`, `activationChanged` all 0 |
 | 14 | No rebaseline | `rebaseline-before.txt` and `rebaseline-after.txt` in the evidence folder | Equal counts |
 | 15 | Planner | `Show-State` | `deltaJobs`, `deltaPlans` 0; `pending` returns to 0; no `PLANNER_FAILURE_DELTA_INCREASED` |
-| 16 | Ownership | `Show-State`, `Show-Machine`, `Show-Locks` | Emitter pinned to `runId`. Every `externalPids` list empty. `otherLiveNodeHolders` empty; `failed` 0 |
+| 16 | Ownership | `Show-State`, `Show-Machine`, `Show-Locks` | Emitter pinned to `runId`. `otherLiveNodeHolders` empty; `failed` 0. Every `externalPids` list empty after a re-read about 15 s later (row 0's CLI can stay listed until the next pass). A pid that persists, or ownership that cannot be established, is an abort trigger |
 | 17 | Isolation | `Show-Machine`, `Show-State` | Nothing on 4001/4002; no `execution.worker`; `authority` `NONE native=False account=NONE` |
-| 18 | Alert bars | `$a = Get-AlertsSince <activatedAt>`, then `Test-AlertBars $a <activatedAt> <new runId> <new run's startedAt>` (the last two only after a recovery) | `barStartTooEarly` 0 |
+| 18 | Alert bars | The commands below | `result` is `NO VIOLATION FOUND`, or `NOTHING TO CHECK` with a note that it proved nothing. `VIOLATION` is FAIL. `UNDETERMINED` is INCONCLUSIVE unless each listed alert is explained from other evidence |
 
 After a recovery, row 6 reads the **old** run's file. The new run has no drill
 report at all, which is correct: its gate has seen no drill. If the old scanner
@@ -592,22 +631,78 @@ then the evidence. Note it in the record.
 Never delete them.
 
 **Replay. No single field proves replay safety.** The evidence together is rows 12
-to 14 and 18, the alerts' `runId`, and `triggeredAt` against `observedAt`.
+to 14 and 18, plus `triggeredAt` against `observedAt`.
 
-Row 18 applies the source rule. `activatedAt` is the scanner's own, from
-`Show-ScannerOwn`. An alert triggered after it must be on a bar that **opened** at or
-after the next 15-minute boundary, and one from a replacement run on a bar opened at
-or after the boundary following that run's `startedAt`. **Do not reject an alert
-because its bar has not closed**: alerts fire on open bars.
+**Row 18, exact commands.** Both timestamps come from the scanners' own run files,
+shown by `Show-ScannerOwn`: `drill.activatedAt` (`activatedAt`) from the drilled run,
+and `startedAt` from the replacement run. **Never substitute the supervisor's or the
+emitter's start time.**
+
+After a self-heal:
+
+```powershell
+$activatedAt = (Get-ScannerOwn '<drilled runId>').drill.activatedAt
+$a = Get-AlertsSince $activatedAt
+Test-AlertBars $a $activatedAt
+```
+
+After one recovery:
+
+```powershell
+$activatedAt = (Get-ScannerOwn '<drilled runId>').drill.activatedAt
+$replacementStartedAt = (Get-ScannerOwn '<replacement runId>').startedAt
+$a = Get-AlertsSince $activatedAt
+Test-AlertBars $a $activatedAt -ReplacementStartedAt $replacementStartedAt -RecoveryOccurred
+```
+
+If either timestamp is empty, or `Show-ScannerOwn` prints `NO USABLE STATUS`, the
+helper cannot place the alerts. It reads `UNDETERMINED`, and no replay claim can be
+made: the row is INCONCLUSIVE.
+
+**What each field means:**
+
+| Field | Meaning |
+| --- | --- |
+| `triggeredAt` | Binance's event time for the observation, not the local clock |
+| `barStart` | When the observation's 15-minute bar **opened** |
+| `observedAt` | When the alert was stored |
+| `startedAt` | When that scanner process's supervisor object was created, before it connected. From the scanner's own status file |
+| `runId` on an alert | **The run the delivering emitter was pinned to, not necessarily the scanner that produced the observation** |
+
+Lane logs (`events.jsonl`) are shared across runs and the emitter resumes from its
+cursor. The emitter also stops before the old scanner does. So an observation from
+the old scanner can be delivered later under the replacement's `runId`, and it is
+valid. **The helper therefore never uses `runId`.**
+
+**The rule the helper applies**, using `triggeredAt`:
+
+| Alert triggered | Producer | Result |
+| --- | --- | --- |
+| before `activatedAt` | Before the fault | Counted, not judged |
+| within 5 s after `activatedAt` | Cannot be separated from the drop | `nearActivationEdge` unless its bar already passes. Look at it |
+| after that, any bar opened before the next boundary after `activatedAt` | Any | `VIOLATION`: no scanner could be eligible on that bar |
+| after that, no recovery | Drilled scanner | Passes |
+| before the replacement's `startedAt`, by more than 5 s | Old scanner: the replacement did not exist yet | Passes on the bound above |
+| after the replacement's `startedAt`, by more than 5 s | Replacement: the old scanner had exited | Must be on a bar opened at or after the next boundary after `startedAt`, otherwise `VIOLATION` |
+| within 5 s of `startedAt`, on an earlier bar than that boundary | Cannot be established | `UNDETERMINED` |
+
+The boundary comes from the session: a symbol that becomes ready is eligible only on a
+bar opening at the next 15-minute boundary or later. The order is safe because the
+supervisor starts a replacement only after the old scanner has exited. **Do not reject
+an alert because its bar has not closed**: alerts fire on open bars.
 
 Limits of this check:
 
-- It is necessary, not sufficient. A symbol that became ready later has a later first
-  eligible bar, and no status field gives that per symbol.
-- `triggeredAt` is Binance's event time and `activatedAt` is the local clock, so the
-  helper allows 5 s of difference (operator margin). Look at any alert near that edge.
-- Alerts delivered after the drop can have a `triggeredAt` before it. They are not in
-  this check: they came from before the fault.
+- It is necessary, not sufficient, and does not prove that replay is impossible. A
+  symbol that became ready later has a later first eligible bar, and no status field
+  gives that per symbol.
+- The 5 s is an operator margin for the difference between Binance's clock and the
+  local one.
+- A missing or inconsistent `barStart` or `triggeredAt` reads `UNDETERMINED`.
+- Metadata cannot settle duplicates or replay. A repeated `deliveryKey` reads
+  `UNDETERMINED` and needs the ledger checks; its absence proves nothing about them.
+- Alerts delivered after the drop can have a `triggeredAt` before it. They are counted
+  in `triggeredBeforeActivation`, not judged: they came from before the fault.
 - `Get-AlertsSince` reads the Signal Quality API, which loads public market data for
   its outcomes, so use it only at validation. It needs a healthy backend.
 
@@ -687,12 +782,15 @@ to leave it running.
    | `…could not be observed…; nothing was requested. Try again.` | 1 | Nothing was requested. Try again |
 
    **Then prove it:** run `Show-Shutdown <G>`, `Show-Machine` and `Show-DrillFiles`.
+   If the verdict is `INCOMPLETE`, wait about 30 s and read all three again. They only
+   read, and the stop can return while the supervisor is still exiting or a last
+   journal line is being written. **Only the second reading counts.**
 
    | `verdict` | Means | Do |
    | --- | --- | --- |
    | `COMPLETE` | After `SUPERVISOR_STOPPING`: `ROLE_STOPPED` for emitter, scanner, planner and backend in that order, then one `SUPERVISOR_STOPPED`. `ownership.json` has no supervisor or children. No monitoring process or listener remains | Step 4 |
    | `COMPLETE, NOT CLEAN` | Everything has stopped, but through a forced stop, an unexpected exit or a dropped record | Step 4; the drill result is at best INCONCLUSIVE |
-   | `INCOMPLETE` | Anything else | The branch below |
+   | `INCOMPLETE` on the second reading | Anything else, even if `stop` exited 0 | The branch below. It never becomes a PASS because the CLI returned 0 |
 
    A remaining drill file with no supervisor: run step 1 again, which removes it.
 
@@ -747,7 +845,7 @@ Baseline commit (main = origin/main = HEAD):
 Scanner gitHead:
 
 Generation:                      Drilled run id:
-Replacement run id (or none):
+Replacement run id (or none):    Its own startedAt:
 Drill id:                        Fault / duration: PUBLIC_ALL_DOWN / 60 s
 Requested at (UTC):              UTC minute % 15 at start:
 CLI command result + exit code:
@@ -775,8 +873,9 @@ Recovery outcome: SELF-HEAL / ONE ORDERED RECOVERY / OTHER
   Force-stopped role (or none):
 
 REST: restRequests before / after / new run:
-Alerts: created before / after; alertsAfterActivation / barStartTooEarly:
-  First alert after the drill (symbol, triggeredAt, barStart, runId):
+Alerts: created before / after; Test-AlertBars result / ok / barStartTooEarly / undetermined:
+  nearActivationEdge / triggeredBeforeActivation / repeatedDeliveryKeys:
+  First alert after the drill (symbol, triggeredAt, barStart, emitter-pinned runId):
 Ledger: ledgerDuplicates status / soak-health / old run:
 Cursors: before / after / missing / wentBack / activationChanged:
 Rebaseline files before / after:
@@ -836,8 +935,7 @@ operator or an administrator can do anything the operator can.
 - **Never executed.** `drill start` has only been tested through its parts and
   against no running supervisor. Only the real tsx command-line shape was checked,
   by a probe. A first-run surprise here is a finding, not an operator error.
-- **Timings at 522 symbols are estimates** from code intervals and earlier soak
-  ratios.
+- **Timings at 522 symbols are estimates** from code intervals, not measurements.
 - **No replay indicator**, and no CLI view of the scanner's own drill report: both
   are read from files, as above.
 - **CLI processes appear as other supervisors** in the census (cosmetic, section B).
@@ -846,6 +944,6 @@ operator or an administrator can do anything the operator can.
 - **The orphan path is unproven.** Adopt-then-stop exists in the code but is unproven
   as a recovery on this machine, and needs its own approval.
 - **The new helpers have run only against stopped-machine files.** `Show-Liveness`,
-  `Show-Shutdown` and the alert-bar check were tested on stopped state and synthetic
-  rows. `Get-AlertsSince` has never run against a live backend, and the live fields
-  have never been exercised.
+  `Show-Shutdown`, `Show-ScannerOwn` and `Test-AlertBars` were tested on stopped state
+  and synthetic records. `Get-AlertsSince` has never run against a live backend, and
+  the live fields have never been exercised.
