@@ -20,6 +20,14 @@ The first drill is a process-local activation, transport and recovery smoke test
 Full Gate 4A acceptance needs additional, separately approved real-machine
 evidence.
 
+**Safety actions always take priority over evidence collection.** Keep `drill restore`,
+`stop` and the safety checks in a **CONTROL** terminal, and alert retrieval in a separate
+**EVIDENCE** terminal ([terminals](#terminals)). Never wait for a fetch before an
+authorized restore or stop. Do not fetch alerts while a drill is active or its restoration
+is unresolved. A stalled fetch can last far longer than expected, and Ctrl+C may not end
+it promptly: leave it and go to CONTROL. A failed, cancelled or abandoned fetch is not
+row 18 evidence, and an older complete fetch does not stand in for it.
+
 **Preflight, all required** ([section B](#b-mandatory-preflight)):
 
 - written approval naming this drill; exact SHAs; clean checkout and build;
@@ -78,7 +86,9 @@ row is shown, with one acceptable
 on a real defect or contradicting evidence. **INCONCLUSIVE** when anything cannot be
 shown, or control-plane liveness cannot be established. Capture the
 [evidence record](#h-incident-evidence) in every case. Row 18 `UNDETERMINED` is never
-an automatic PASS, and a clean row 18 is not replay safety.
+an automatic PASS, and a clean row 18 is not replay safety. A fetch taken before the
+drill's end is proven and its restoration confirmed reads `UNDETERMINED`, even if it is
+complete and empty.
 
 More: [journal events](#d-journal-events),
 [residual risks](#residual-risks-and-gaps).
@@ -126,8 +136,9 @@ fails after the stack is running goes to section G.
 
 ### Session setup
 
-Paste once into the PowerShell window you will observe from. It only reads
-state, and writes only to its own evidence folder.
+Paste once into the CONTROL terminal and once into the EVIDENCE terminal
+([terminals](#terminals)). It only reads state, and writes only to its own evidence
+folder.
 
 ```powershell
 # READ-ONLY
@@ -331,11 +342,15 @@ function Get-AlertPageProblem($p, $offset, $sinceMs, $endMs, $total, $MaxRows) {
   $null
 }
 function Get-AlertsSince($sinceIso, $MaxPages = 20, $MaxRows = 2000) {
+  $script:alertFetchAttempt = [guid]::NewGuid().ToString(); $attempt = $script:alertFetchAttempt
   $rows = New-Object Collections.ArrayList; $seen = @{}; $total = $null; $pages = 0; $offset = 0; $reason = $null; $last = ''; $more = $true
   $now = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
   $sinceMs = if ("$sinceIso" -cmatch '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$') { Get-InstantMs $sinceIso } else { $null }
   $endMs = Get-InstantMs $now
-  if ($null -eq $sinceMs) { $reason = "no valid start time was given ('$sinceIso'); nothing was requested" }
+  $status = try { Read-Json (Join-Path $aon 'status.json') } catch { $null }
+  if ($terminalRole -cne 'EVIDENCE') { $reason = 'this is not the EVIDENCE terminal; nothing was requested' }
+  elseif (($status.drill.state -cne 'ENDED') -or ($status.drill.restore -cne 'CONFIRMED') -or ($status.drill.fileRemoved -ne $true)) { $reason = 'status.json does not show the drill ended with its restore confirmed and its file removed; nothing was requested' }
+  elseif ($null -eq $sinceMs) { $reason = "no valid start time was given ('$sinceIso'); nothing was requested" }
   while ($more -and ($null -eq $reason)) {
     if ($pages -ge $MaxPages) { $reason = "stopped at the limit of $MaxPages pages with more to read"; break }
     $pages++; $p = $null
@@ -353,7 +368,64 @@ function Get-AlertsSince($sinceIso, $MaxPages = 20, $MaxRows = 2000) {
     $offset += 100; $more = $p.pagination.hasMore
   }
   if (($null -eq $reason) -and ($rows.Count -ne $total)) { $reason = "collected $($rows.Count) rows of total $total" }
-  [pscustomobject]@{ contract = 'GET_ALERTS_SINCE_V1'; complete = ($null -eq $reason); rows = $rows.ToArray(); rowCount = $rows.Count; reason = $reason; since = $sinceIso; asOf = $now; total = $total; pages = $pages }
+  [pscustomobject]@{ contract = 'GET_ALERTS_SINCE_V1'; attempt = $attempt; complete = ($null -eq $reason); rows = $rows.ToArray(); rowCount = $rows.Count; reason = $reason; since = $sinceIso; asOf = $now; total = $total; pages = $pages }
+}
+function Compare-AlertFetches($First, $Second) {
+  if (($First.complete -ne $true) -or ($Second.complete -ne $true)) { return 'CANNOT COMPARE: both fetches must be complete' }
+  $firstAsOf = Get-InstantMs $First.asOf; $a = @{}; $b = @{}; $found = @()
+  foreach ($x in $First.rows) { $a[$x.alertId] = $x }
+  foreach ($x in $Second.rows) { $b[$x.alertId] = $x }
+  foreach ($x in $First.rows) { if (-not $b.ContainsKey($x.alertId)) { $found += "$($x.alertId): in the first fetch only" } elseif (($b[$x.alertId].triggeredAt -cne $x.triggeredAt) -or ($b[$x.alertId].shadowEventId -cne $x.shadowEventId)) { $found += "$($x.alertId): differs between fetches" } }
+  foreach ($x in $Second.rows) { if ((-not $a.ContainsKey($x.alertId)) -and ((Get-InstantMs $x.observedAt) -le $firstAsOf)) { $found += "$($x.alertId): stored before the first fetch's asOf, but only in the second" } }
+  if ($found.Count -gt 0) { "CONTRADICTORY: investigate, do not pick either: $($found -join '; ')" } else { 'NO CONTRADICTION FOUND: not snapshot consistency and not replay proof' }
+}
+function Get-DrillEnd($DrilledRunId, $ReplacementRunId, [switch]$RecoveryOccurred) {
+  $r = [pscustomobject]@{ state = 'NOT PROVEN'; why = $null; restored = $false; notBeforeMs = $null; endReason = $null }
+  try { $s = Read-Json (Join-Path $aon 'status.json'); $o = Read-Json (Join-Path $aon 'ownership.json'); $all = @(Get-Journal) }
+  catch { $r.why = 'status.json, ownership.json or the journal cannot be read'; return $r }
+  $d = $s.drill; $own = Get-ScannerOwn $DrilledRunId; $statusMs = Get-InstantMs $s.writtenAt
+  if ($null -eq $d) { $r.why = 'status.json names no drill'; return $r }
+  $r.endReason = $d.endReason
+  if ((-not (Test-WholeNumber $s.generation)) -or ($s.generation -ne $d.generation) -or ($s.generation -ne $o.generation)) { $r.why = 'the status, drill and ownership generations differ'; return $r }
+  if (($null -eq $statusMs) -or (([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $statusMs) -gt 60000)) { $r.why = 'status.json is over 60 s old, so it may be frozen'; return $r }
+  if ($d.runId -cne $DrilledRunId) { $r.why = "the drill belongs to run '$($d.runId)', not this one"; return $r }
+  if (($null -eq $own) -or ($own.drill.drillId -cne $d.drillId)) { $r.why = "the drilled run's own file does not name this drill"; return $r }
+  if (($d.state -cne 'ENDED') -or ($null -eq (Get-InstantMs $d.endedAt))) { $r.why = 'the supervisor does not report this drill ended'; return $r }
+  $g = @($all | Where-Object { $_.generation -eq $d.generation })
+  $mine = @($g | Where-Object { "$($_.facts.drillId)" -ceq $d.drillId })
+  $started = @($mine | Where-Object { $_.kind -ceq 'DRILL_STARTED' })
+  $ended = @($mine | Where-Object { ($_.kind -ceq 'DRILL_ENDED') -and ("$($_.facts.runId)" -ceq $DrilledRunId) })
+  $confirmed = @($mine | Where-Object { $_.kind -ceq 'DRILL_RESTORE_CONFIRMED' })
+  if (($started.Count -ne 1) -or ($ended.Count -ne 1)) { $r.why = "this generation's journal does not show this drill started and ended once on this run"; return $r }
+  $after = @($g | Where-Object { $_.seq -gt $started[0].seq })
+  if (@($after | Where-Object { $_.kind -ceq 'DRILL_STATE_INCONSISTENT' }).Count -gt 0) { $r.why = 'the journal has DRILL_STATE_INCONSISTENT since the drill started'; return $r }
+  $recovered = @($after | Where-Object { $_.kind -ceq 'SCANNER_RECOVERY_SUCCEEDED' }); $next = $null
+  if ($RecoveryOccurred) {
+    $next = Get-ScannerOwn $ReplacementRunId
+    if (($recovered.Count -ne 1) -or ("$($recovered[0].facts.runId)" -cne "$ReplacementRunId") -or ("$($recovered[0].facts.previousRunId)" -cne $DrilledRunId)) { $r.why = 'the journal does not show one recovery from this run to this replacement'; return $r }
+    if ($null -eq $next) { $r.why = "the replacement's own file is not usable"; return $r }
+    if ($next.drill.active -eq $true) { $r.why = 'the replacement reports an active drill'; return $r }
+  } elseif (@($after | Where-Object { $_.kind -in 'SCANNER_RECOVERY_REQUESTED', 'SCANNER_RECOVERY_SUCCEEDED' }).Count -gt 0) { $r.why = 'the journal shows a recovery: name the replacement and use -RecoveryOccurred'; return $r }
+  $ownEndMs = Get-InstantMs $own.drill.endedAt
+  if (($own.drill.active -eq $false) -and ($null -ne $ownEndMs)) { $r.state = 'ENDED: reported by the drilled run' }
+  elseif ($RecoveryOccurred -and ($null -eq $ownEndMs)) {
+    $identified = @($g | Where-Object { ($_.kind -ceq 'SCANNER_RUN_IDENTIFIED') -and ("$($_.facts.runId)" -ceq $DrilledRunId) })
+    $rootPid = $null
+    if ($identified.Count -eq 1) { $rootPid = (@($g | Where-Object { ($_.kind -ceq 'ROLE_STARTED') -and ($_.role -ceq 'scanner') -and ($_.seq -lt $identified[0].seq) }) | Select-Object -Last 1).facts.pid }
+    if ((-not (Test-WholeNumber $rootPid)) -or (-not (Test-WholeNumber $own.pid))) { $r.why = 'the journal does not tie a scanner start to this run, or its file has no pid'; return $r }
+    $stops = @($after | Where-Object { ($_.kind -ceq 'ROLE_STOPPED') -and ($_.role -ceq 'scanner') -and ($_.facts.pid -eq $rootPid) })
+    if ($stops.Count -ne 1) { $r.why = "no single ROLE_STOPPED for this run's root process"; return $r }
+    if ($stops[0].seq -ge $recovered[0].seq) { $r.why = 'the old run stopped after the recovery succeeded'; return $r }
+    if (($confirmed.Count -eq 0) -or ($confirmed[-1].reasonCode -cne 'SCANNER_RUN_ENDED')) { $r.why = 'the restore was not confirmed by SCANNER_RUN_ENDED'; return $r }
+    if (($next.pid -eq $own.pid) -or ((Get-InstantMs $next.startedAt) -lt (Get-InstantMs $stops[0].at))) { $r.why = 'the replacement does not follow the old run'; return $r }
+    if (@(Get-CimInstance Win32_Process -Filter "ProcessId=$($own.pid) OR ProcessId=$rootPid").Count -gt 0) { $r.why = "the drilled run's process or its root process is still present"; return $r }
+    $r.state = 'ENDED: the drilled run exited, by journal and process evidence'
+  } else { $r.why = "the drilled run's own file does not report the drill over"; return $r }
+  $files = @(Get-ChildItem (Join-Path $aon 'stop') -File -Filter '*.drill' -ErrorAction SilentlyContinue)
+  $r.restored = ($d.restore -ceq 'CONFIRMED') -and ($d.fileRemoved -eq $true) -and ($confirmed.Count -ge 1) -and ($files.Count -eq 0)
+  $times = @((Get-InstantMs $d.endedAt), $ownEndMs, $(if ($confirmed.Count -gt 0) { Get-InstantMs $confirmed[-1].at }), $(if ($next) { Get-InstantMs $next.startedAt }))
+  $r.notBeforeMs = ($times | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
+  $r
 }
 function Test-AlertBars($Fetch, $DrilledRunId, $ReplacementRunId, [switch]$RecoveryOccurred) {
   $rows = @(); $problems = @(); $checked = 0; $byDrilled = 0; $byReplacement = 0; $violations = @(); $undetermined = @(); $before = @(); $late = @()
@@ -366,12 +438,16 @@ function Test-AlertBars($Fetch, $DrilledRunId, $ReplacementRunId, [switch]$Recov
     elseif ($replacementMs -le $activatedMs) { $problems += 'the replacement started before activation: clock or run mismatch' }
     elseif (($null -eq (Get-InstantMs $drilled.writtenAt)) -or ((Get-InstantMs $drilled.writtenAt) -gt $replacementMs)) { $problems += 'the drilled run has no usable writtenAt, or wrote status after the replacement started: clock change or overlap' }
   }
+  $end = Get-DrillEnd $DrilledRunId $ReplacementRunId -RecoveryOccurred:$RecoveryOccurred
   if ("$($Fetch.contract)" -cne 'GET_ALERTS_SINCE_V1') { $problems += 'the input is not a Get-AlertsSince result' }
+  elseif (("$($Fetch.attempt)" -ceq '') -or ($Fetch.attempt -cne $script:alertFetchAttempt)) { $problems += 'this is not the latest fetch attempt in this terminal: a later attempt started, and it may have failed or been abandoned' }
   elseif ($Fetch.complete -isnot [bool]) { $problems += 'the alert fetch does not say whether it is complete' }
   elseif (-not $Fetch.complete) { $problems += "the alert fetch is incomplete: $($Fetch.reason)" }
   elseif (($Fetch.rows -isnot [array]) -or ($Fetch.rowCount -ne $Fetch.rows.Count)) { $problems += 'the alert fetch rows do not match its count' }
   elseif (($null -eq $activatedMs) -or ((Get-InstantMs $Fetch.since) -ne $activatedMs)) { $problems += "the alert fetch starts at '$($Fetch.since)', not at this drill's activation" }
-  elseif ((Get-InstantMs $Fetch.asOf) -le [Math]::Max([double](Get-InstantMs $drilled.drill.endedAt), [double]$replacementMs)) { $problems += 'the alert fetch was taken before the drill ended or the replacement started' }
+  elseif ($end.state -ceq 'NOT PROVEN') { $problems += "the drill's end is not proven: $($end.why)" }
+  elseif (-not $end.restored) { $problems += 'the drill has ended, but its restoration is not confirmed' }
+  elseif ((Get-InstantMs $Fetch.asOf) -le $end.notBeforeMs) { $problems += 'the alert fetch was taken before the drill ended, its restore was confirmed or the replacement started' }
   else { $rows = @($Fetch.rows | Where-Object { $null -ne $_ }) }
   $c = $null
   if (($rows.Count -gt 0) -and ($problems.Count -eq 0)) {
@@ -405,7 +481,8 @@ function Test-AlertBars($Fetch, $DrilledRunId, $ReplacementRunId, [switch]$Recov
   $repeatedEvents = @($rows | Where-Object { $_.shadowEventId } | Group-Object shadowEventId | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
   $manyBefore = $before.Count -gt 10
   $result = if ($violations.Count -gt 0) { 'VIOLATION' } elseif (($problems.Count -gt 0) -or ($undetermined.Count -gt 0) -or ($late.Count -gt 0) -or ($repeated.Count -gt 0) -or ($repeatedEvents.Count -gt 0) -or $manyBefore) { 'UNDETERMINED' } elseif ($checked -eq 0) { 'NOTHING TO CHECK' } else { 'NO VIOLATION FOUND' }
-  [pscustomobject]@{ result = $result; alertFetch = $(if ($Fetch.complete -eq $true) { "complete: $($Fetch.rowCount) rows to $($Fetch.asOf)" } else { 'NOT COMPLETE' }); checked = $checked; producedByDrilledRun = $byDrilled; producedByReplacementRun = $byReplacement; violations = ($violations -join '; '); undetermined = ($undetermined -join '; '); evidenceProblems = ($problems -join '; ')
+  $overall = if ($result -notin 'NO VIOLATION FOUND', 'NOTHING TO CHECK') { 'NO: read row 18' } elseif ($end.endReason -cne 'EXPIRED') { "NO: the end reason is $($end.endReason), see row 1" } else { 'ONLY WITH EVERY OTHER SECTION F ROW' }
+  [pscustomobject]@{ result = $result; overallPassPermitted = $overall; drillEnd = $end.state; restorationConfirmed = $end.restored; alertFetch = $(if ($Fetch.complete -eq $true) { "complete: $($Fetch.rowCount) rows to $($Fetch.asOf)" } else { 'NOT COMPLETE' }); checked = $checked; producedByDrilledRun = $byDrilled; producedByReplacementRun = $byReplacement; violations = ($violations -join '; '); undetermined = ($undetermined -join '; '); evidenceProblems = ($problems -join '; ')
     onPreFaultSession = $(if ($c) { $c.armedEarlier -join '; ' } else { '' }); observedBeforeFault = $before.Count; manyBeforeFault = $manyBefore; lateDelivered = ($late -join '; '); repeatedDeliveryKeys = ($repeated -join ','); repeatedEventIds = ($repeatedEvents -join ',')
     liveEligibleMatched = $(if ($c) { $c.matched } else { 0 }); liveEligibleUnavailable = $(if ($c) { $c.unavailable } else { 0 }); replayOrDuplicatesDecidedHere = 'NO: see section F rows 12 to 14' } | Format-List
 }
@@ -450,6 +527,46 @@ cosmetic when the pid is a CLI you just ran; any other pid is an abort trigger.
 The `status.json` file holds the status at its top level. The output of
 `monitoring:always-on status --json` wraps it, so the same field there is
 `status.<path>`, beside `supervisorRunning`.
+
+### Terminals
+
+Use three separate PowerShell windows. **Safety actions always take priority over
+evidence collection.**
+
+| Terminal | Used for | Rule |
+| --- | --- | --- |
+| SUPERVISOR | `monitoring:always-on run` only | No input. Do not press Ctrl+C in it or close it during the drill |
+| CONTROL | `drill start`, `drill restore`, `stop`, `drill status`, and the `Show-*` checks | Never an alert API request. `Get-AlertsSince` refuses to send one here |
+| EVIDENCE | `Get-AlertsSince`, `Test-AlertBars`, `Compare-AlertFetches`, and the `soak-health` request in row 12 | Nothing here is a safety action. Also run once in this terminal: `$terminalRole = 'EVIDENCE'` |
+
+1. Start no evidence collection while the drill is active or its restoration is
+   unresolved. `Get-AlertsSince` sends nothing unless `status.json` shows the drill ended,
+   its restore `CONFIRMED` and its file removed. That file can be frozen, so this check
+   does not replace `Test-AlertBars` or row 0.
+2. Never wait for a fetch before an authorized restore or stop. CONTROL stays free, and
+   an abort trigger is acted on there at once.
+3. Never start a second drill while restoration is unresolved.
+
+`drill restore` and `stop` need none of the pasted helpers. If CONTROL is ever
+unavailable, they run from any new PowerShell window at the repository root.
+
+**Abandoning a fetch.** A fetch has no overall time limit (see
+[reading the alerts](#reading-the-alerts)). If one seems stuck, or anything needs
+attention:
+
+1. Go to CONTROL and do what the situation requires. Do not wait for the fetch.
+2. In EVIDENCE, press Ctrl+C once if you wish. It may end the fetch at once, or only after
+   several minutes. Measured offline: 0.1 s with no response yet, about 292 s with a
+   response body that had stopped.
+3. If you need the window back sooner, close the **EVIDENCE** window. It holds only a
+   read-only request. The rule against closing a console applies to SUPERVISOR.
+4. Record the fetch as abandoned. It is not evidence for row 18. Row 18 stays
+   `UNDETERMINED` until a new attempt completes, and no new attempt is needed if the
+   drill is being aborted.
+
+Closing EVIDENCE loses its pasted helpers and variables. Paste the session setup again in
+a new window and set `$terminalRole` again. Do not stop any process other than by closing
+that window.
 
 ### Control-plane liveness
 
@@ -516,7 +633,7 @@ start would consume it. Do not delete it by hand; report it.
 
 ### Starting the stack (only under the approval)
 
-Open a separate console, keep it open, and do not press Ctrl+C or close it
+Open the SUPERVISOR console, keep it open, and do not press Ctrl+C or close it
 during the drill. A first Ctrl+C stops the stack. A second one, or closing the
 window, leaves the children running without a supervisor.
 
@@ -526,7 +643,7 @@ $env:PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN = 'false'
 pnpm --filter @trading-alert-dashboard/backend monitoring:always-on run --emitter-activate-at-eof
 ```
 
-Set the same environment variable in the observing window. It stops pnpm
+Set the same environment variable in the CONTROL terminal. It stops pnpm
 reinstalling dependencies in the middle of a run
 ([native-planner-worker.md](native-planner-worker.md)). Without
 `--emitter-activate-at-eof`, a lane with no production cursor refuses COMMIT, for
@@ -547,7 +664,7 @@ below means nothing without it.
 | 15 | Identity | `Show-State` | Note `generation` and `runId` within the last minute before activation |
 | 16 | Same checkout | `(Read-Json (Join-Path $aon 'ownership.json')).repoRoot` | Equals `$repo`. Run the CLI from there; a worktree is refused (`CONTROLLER_NOT_VERIFIED`) |
 | 17 | Distance from bar close (operator policy) | `(Get-Date).ToUniversalTime().Minute % 15` | **3 to 7**, leaving about 7 minutes or more before the next close. Otherwise wait |
-| 18 | Restore and stop ready | Section G open, the commands below ready in the observing window | The operator can run them immediately |
+| 18 | Restore and stop ready | Section G open, the commands below ready in the CONTROL terminal, and a separate EVIDENCE terminal open | The operator can run them immediately. CONTROL never runs an alert request |
 
 Before activation also run `Save-Cursors before`, `Show-Locks` and record
 `Show-State`. `WARMING` in check 13 is not a failure: it is normal until the first
@@ -562,7 +679,7 @@ is fine for checks 13, 15 and 17. Stopping needs no drill: section G, step 3.
 
 ## C. Activation
 
-Run only once, from `$repo`, in the observing window:
+Run only once, from `$repo`, in the CONTROL terminal:
 
 ```powershell
 Set-Location C:\Projects\trading-alert-dashboard
@@ -599,7 +716,7 @@ active, so it will not protect you from starting one during an unresolved restor
 
 ### Observing the fault
 
-Set `$since` to the `DRILL_STARTED` time, then repeat every 15 to 30 seconds:
+In CONTROL, set `$since` to the `DRILL_STARTED` time, then repeat every 15 to 30 seconds:
 
 ```powershell
 Show-Liveness; Show-State; Show-DrillFiles; Show-Journal <G> $since
@@ -783,13 +900,13 @@ written after the event has appeared.
 | 9 | Public connections back | `Show-State` | `streams` all delivering; `reconnects` higher than before (self-heal) or a new count (new run) |
 | 10 | Scanner and supervisor agree | `Show-State` | Role state and `verdict` consistent. `runId` equals the run in the scanner's `live-shadow-supervisor\status.json` |
 | 11 | Stable condition (operator policy) | `Show-Liveness`, `Show-State`, `Show-Journal` | Liveness holds throughout. `RUNNING`, `HEALTHY`, `failed`, `recovering` 0, for **30 continuous minutes** and at least two closes after returning healthy. After a recovery, `attempts` returns to 0 |
-| 12 | No duplicates | `Show-State`; `Invoke-RestMethod http://127.0.0.1:4000/api/signal-quality/soak-health` `.emitter.ledgerDuplicates`; after a recovery also `ledgerDuplicates` in `scanner\native-emitter\runs\<old runId>\status-commit.json` | 0 in all |
+| 12 | No duplicates | `Show-State`; in EVIDENCE, `Invoke-RestMethod http://127.0.0.1:4000/api/signal-quality/soak-health` `.emitter.ledgerDuplicates`; after a recovery also `ledgerDuplicates` in `scanner\native-emitter\runs\<old runId>\status-commit.json` | 0 in all |
 | 13 | Cursors | `Save-Cursors after`, `Compare-Cursors before after` | `missing`, `wentBack`, `activationChanged` all 0 |
 | 14 | No rebaseline | `rebaseline-before.txt` and `rebaseline-after.txt` in the evidence folder | Equal counts |
 | 15 | Planner | `Show-State` | `deltaJobs`, `deltaPlans` 0; `pending` returns to 0; no `PLANNER_FAILURE_DELTA_INCREASED` |
 | 16 | Ownership | `Show-State`, `Show-Machine`, `Show-Locks` | Emitter pinned to `runId`. `otherLiveNodeHolders` empty; `failed` 0. Every `externalPids` list empty after a re-read about 15 s later (row 0's CLI can stay listed until the next pass). A pid that persists, or ownership that cannot be established, is an abort trigger |
 | 17 | Isolation | `Show-Machine`, `Show-State` | Nothing on 4001/4002; no `execution.worker`; `authority` `NONE native=False account=NONE` |
-| 18 | Alert bars and provenance | The commands below | `result` is `NO VIOLATION FOUND`, or `NOTHING TO CHECK` with a note that it proved nothing. `VIOLATION` is FAIL. `UNDETERMINED` is INCONCLUSIVE unless each listed item is explained in writing from other evidence. This row never settles replay on its own |
+| 18 | Alert bars and provenance | The commands below | Run last, in EVIDENCE, once rows 1 to 6 hold. `result` is `NO VIOLATION FOUND`, or `NOTHING TO CHECK` with a note that it proved nothing. `VIOLATION` is FAIL. `UNDETERMINED` is INCONCLUSIVE unless each listed item is explained in writing from other evidence. A problem with the fetch or the drill's end cannot be explained away: it needs a new complete fetch. This row never settles replay on its own |
 
 After a recovery, row 6 reads the **old** run's file. The new run has no drill
 report at all, which is correct: its gate has seen no drill. If the old scanner
@@ -804,14 +921,20 @@ Never delete them.
 to 14 and 18, read with `observedBeforeFault` and `lateDelivered`. A clean row 18 says
 nothing about ledger idempotency or cursor integrity.
 
-**Row 18, exact commands.** Run them while the scanner is still running: its
-`liveEligibleFrom` values are empty once it stops. The helper reads the run ids' own
-status files, the lane logs and the scanner's role log, and writes nothing.
+**Row 18, exact commands. Safety actions always take priority over this row:** if an
+abort trigger appears, go to CONTROL and section G, whatever the fetch is doing. Run these
+in the EVIDENCE terminal, only after rows 1 to 6 hold, and while the scanner is still
+running: its `liveEligibleFrom` values are empty once it stops. The helpers read
+`status.json`, `ownership.json`, the journal, the run ids' own status files, the lane logs
+and the scanner's role log, and write nothing. The fetch itself sends one read request per
+page. Keep `$fetch = $null` on the line before each fetch, so that a failed or cancelled
+attempt leaves nothing to reuse.
 
 After a self-heal:
 
 ```powershell
 $activatedAt = (Get-ScannerOwn '<drilled runId>').drill.activatedAt
+$fetch = $null
 $fetch = Get-AlertsSince $activatedAt
 Test-AlertBars $fetch '<drilled runId>'
 ```
@@ -820,13 +943,15 @@ After one recovery:
 
 ```powershell
 $activatedAt = (Get-ScannerOwn '<drilled runId>').drill.activatedAt
+$fetch = $null
 $fetch = Get-AlertsSince $activatedAt
 Test-AlertBars $fetch '<drilled runId>' '<replacement runId>' -RecoveryOccurred
 ```
 
-**Reading the alerts.** `Get-AlertsSince` returns one result object, and
-`Test-AlertBars` accepts nothing else: a plain list or an empty value reads
-`UNDETERMINED`.
+#### Reading the alerts
+
+`Get-AlertsSince` returns one result object, and `Test-AlertBars` accepts nothing else: a
+plain list or an empty value reads `UNDETERMINED`.
 
 | Property | Meaning |
 | --- | --- |
@@ -834,27 +959,104 @@ Test-AlertBars $fetch '<drilled runId>' '<replacement runId>' -RecoveryOccurred
 | `rows`, `rowCount` | The alerts collected, and how many. Do not use the rows when `complete` is false |
 | `reason` | Why it is not complete |
 | `since`, `asOf`, `total`, `pages` | The window requested, the API's `pagination.total`, and the requests made |
+| `attempt` | Identifies this attempt. `Test-AlertBars` accepts only this terminal's latest one |
 
 **A failed read is never "no alerts".** `complete` is false, and row 18 reads
-`UNDETERMINED`, on a refused connection, a timeout (120 s a page) or an HTTP error; a
+`UNDETERMINED`, on a refused connection, a timeout or an HTTP error; a
 response that is not the expected JSON; a window, `scope`, `sort`, offset or page size
 differing from the request; missing or mistyped pagination; `sample.truncated`; `total`
 differing from `sample.evaluated`, changing between pages, or not matching the rows
 returned; `hasMore` contradicting them; a repeated `alertId`; rows out of order; or more
 than 20 pages or 2000 rows (the API's own limits, and 2000 rows is exactly 20 pages).
-`Test-AlertBars` also refuses a fetch that does not start at this drill's activation, or
-that was taken before the drill ended or the replacement started.
+`Test-AlertBars` also refuses a fetch that does not start at this drill's activation, that
+is not the latest attempt, or that was taken before the end, restore or replacement
+evidence below.
+
+**No overall time limit can be guaranteed.** `-TimeoutSec 120` covers only the wait for
+the response to begin. It does not limit the whole request:
+
+| Measured offline in PowerShell 5.1 | Outcome |
+| --- | --- |
+| No response begins | About 120 s, then a timeout: incomplete |
+| A response begins, then its body stops | About 300 s, then a timeout: incomplete |
+| A body keeps arriving slowly | No timeout. It ran past 120 s and completed normally |
+
+The limit of 20 pages limits the number of requests, not the elapsed time, and each page
+can take as long as the table shows. **A stalled fetch can last substantially longer than
+expected.** A normal read should take seconds, but that has not been measured against a
+live backend. Follow [abandoning a fetch](#terminals) rather than waiting.
 
 **There are no retries.** The first failed page ends the read, so it cannot loop or
-collect a stale page twice. To try again, run the `Get-AlertsSince` line again: it starts
-from the first page. If it stays incomplete, the row is INCONCLUSIVE.
+collect a stale page twice. To try again, run the `$fetch = $null` and `Get-AlertsSince`
+lines again: the read starts from the first page. If it stays incomplete, the row is
+INCONCLUSIVE.
+
+**A cancelled or abandoned fetch is never reused.** A cancelled assignment leaves the
+variable as it was, which is why `$fetch` is reset first. Each `Get-AlertsSince` also marks
+a new attempt before it does anything else, so even an older complete result kept in
+another variable reads `UNDETERMINED` once a later attempt has started. Run `Test-AlertBars`
+straight after the fetch it judges: it cannot tell how much has happened since a complete
+fetch's `asOf`.
 
 **The API has no snapshot.** Pages are separate requests, and an evaluation is reused
 for only 15 s. The helper pins one `asOf`, so later alerts stay out of the window, and any
-change it can see makes the read incomplete. An alert committed late with an earlier
-time, swapped for another between pages so that `total` and the order still hold, would
-not be seen. A complete read means complete by these checks. It proves neither recovery
-nor ledger safety, and zero rows is only "no alert was stored in the window".
+change it can see makes the read incomplete. An alert committed after the last page with
+a time inside the window would not be seen. Nor would one swapped for another between
+pages so that `total` and the order still hold; that can make a read skip an alert.
+`complete` means consistent with the checked API contract, **not a stable database
+snapshot**. It is not proof that no alert was missed, and it proves neither recovery nor
+ledger safety. Zero rows means only "no matching alerts were visible in this completed
+retrieval", not that none was ever stored.
+
+**An optional second fetch.** A second complete retrieval a little later can add evidence.
+It is not required, and agreement is neither snapshot consistency nor replay proof:
+
+```powershell
+$first = $fetch
+$fetch = $null
+$fetch = Get-AlertsSince $activatedAt
+Compare-AlertFetches $first $fetch
+```
+
+Then judge the second with `Test-AlertBars`. New alerts stored after the first `asOf` are
+normal. `CONTRADICTORY` means the row is INCONCLUSIVE until investigated. Do not choose
+whichever fetch reads cleaner.
+
+#### Proving the drill ended
+
+**A fetch cannot be judged clean until the drill has conclusively ended and the fetch
+belongs to the post-drill evidence window.** Until then `Test-AlertBars` does not judge
+the rows, so a violation among them is not lost: it is judged when a later fetch is.
+
+The helper reads `status.json`, `ownership.json`, this generation's journal and the runs'
+own files. `drill restore`, its exit code, the supervisor's `restore CONFIRMED` or
+`fileRemoved` alone never prove the end.
+
+| State | Evidence required | `drillEnd` |
+| --- | --- | --- |
+| Drill active: `endedAt` null on the running scanner | None can pass | `NOT PROVEN`: `UNDETERMINED` |
+| Reported ended by the drilled run | Its own file has this `drillId`, `active` false and `endedAt` set. The supervisor agrees (`state` `ENDED`, same run and generation) and the journal has one `DRILL_STARTED` and one `DRILL_ENDED` for this drill and run | `ENDED: reported by the drilled run` |
+| Old run exited in an ordered recovery without writing its end | All the previous row except the old file's end, plus: one `SCANNER_RECOVERY_SUCCEEDED` from this run to the named replacement; `SCANNER_RUN_IDENTIFIED` for this run, and the scanner's `ROLE_STARTED` before it, which gives the root process; one `ROLE_STOPPED` for that root process, before the recovery succeeded (the journal records the root process, the run's file the worker under it, and their pids differ); `DRILL_RESTORE_CONFIRMED` with `SCANNER_RUN_ENDED`; a replacement with its own file, another `pid`, a start after that stop and no active drill; and neither old process present | `ENDED: the drilled run exited, by journal and process evidence` |
+| Anything ambiguous, for example `ROLE_FORCE_STOPPED`, a reused `pid`, or restore recorded while the running scanner still reports the drill active | | `NOT PROVEN`: `UNDETERMINED` |
+| Another generation or run; a `status.json` over 60 s old; any `DRILL_STATE_INCONSISTENT` since the start; a recovery recorded without `-RecoveryOccurred` | These never count | `NOT PROVEN`: `UNDETERMINED` |
+
+A replacement's status says nothing about the old run's restoration: it is used only to
+identify the replacement. No end time is made up. In the exit case the old file's empty
+`endedAt` stays empty, and the supervisor's end time and journal times only order the
+fetch.
+
+**Later checks, once the end is proven:**
+
+| Situation | `result` | `overallPassPermitted` |
+| --- | --- | --- |
+| Restoration not confirmed (`restore` not `CONFIRMED`, `fileRemoved` not true, no `DRILL_RESTORE_CONFIRMED`, or a drill file present) | `UNDETERMINED` | NO |
+| `asOf` not after the end, the restore confirmation and the replacement's start, even if complete and empty | `UNDETERMINED` | NO |
+| Clean, but the supervisor's end reason is not `EXPIRED` | As judged | NO, see row 1. `SCANNER_ENDED` and the others keep their section D decisions |
+| Clean, end reason `EXPIRED` | `NO VIOLATION FOUND` or `NOTHING TO CHECK` | Only with every other section F row |
+
+`overallPassPermitted` can only withhold a PASS. It never grants one, and it does not
+replace rows 0 to 17. Of the liveness evidence, the helper reads only the age of
+`status.json`.
 
 **The evidence, and where each item comes from:**
 
@@ -895,12 +1097,13 @@ symbol, bar, `triggeredAt`, market and interval match the alert:
 
 | `result` | Meaning | Row 18 |
 | --- | --- | --- |
-| `NO VIOLATION FOUND` | The fetch was complete, and every judged alert was attributed and passed. **Limited evidence for the rules above, not universal replay safety** | Passes, with rows 12 to 14 still required |
+| `NO VIOLATION FOUND` | The fetch was complete and taken after the proven end and restoration, and every judged alert was attributed and passed. **Limited evidence for the rules above, not universal replay safety** | Passes, with rows 12 to 14 still required |
 | `VIOLATION` | An alert's own records and logs show a bar its session could not be eligible on | FAIL. Capture the alert, its lane record and its log lines |
-| `UNDETERMINED` | Missing, contradictory or ambiguous evidence | INCONCLUSIVE, unless each listed item is explained in writing from other evidence. **Never an automatic PASS** |
-| `NOTHING TO CHECK` | The fetch was complete, and no alert was judged: none in the window, or only `observedBeforeFault` ones | Passes with a note that it proved nothing, neither recovery nor ledger safety. **A failed fetch never reads this** |
+| `UNDETERMINED` | Missing, contradictory or ambiguous evidence, including a fetch that is failed, abandoned or not the latest, or a drill whose end or restoration is not established | INCONCLUSIVE, unless each listed item is explained in writing from other evidence. **Never an automatic PASS** |
+| `NOTHING TO CHECK` | The fetch was complete and taken after the proven end and restoration, and no alert was judged: none visible in that retrieval, or only `observedBeforeFault` ones | Passes with a note that it proved nothing, neither recovery nor ledger safety. **A failed fetch never reads this** |
 
-**`UNDETERMINED` also reads for:** an incomplete or invalid alert fetch; a missing,
+**`UNDETERMINED` also reads for:** an incomplete, invalid or superseded alert fetch; a
+drill end or restoration not established; a missing,
 malformed or repeating lane log; a
 missing `shadowEventId` or `firstObservedAtMs`; a record that does not match its alert;
 no usable run file; a scanner log that is missing, over 64 MB, or whose runs do not end
@@ -940,8 +1143,8 @@ recovery journal. The 15 minutes and the 10 are operator policy.
 - Reads are limited to the lanes of the alerts listed and the two scanner log files,
   each at most 64 MB. A larger file reads `UNDETERMINED`; it is not read in part.
 - `Get-AlertsSince` reads the Signal Quality API, which loads public market data for
-  its outcomes, so use it only at validation. It needs a healthy backend, and without
-  one its result is incomplete.
+  its outcomes, so use it only at validation, in EVIDENCE. It needs a healthy backend, and
+  without one its result is incomplete.
 
 A row that cannot be shown makes the result INCONCLUSIVE, not PASS.
 
@@ -977,7 +1180,7 @@ to leave it running.
 - cursors going backwards, a new rebaseline file, or any change to locks, cursors,
   checkpoints, ledger or journals that the running stack did not make.
 
-**Procedure, in this order:**
+**Procedure, in this order, in the CONTROL terminal:**
 
 1. **If a drill shows `ACTIVE`, a `.drill` file exists, or restore is unresolved:**
 
@@ -1054,8 +1257,9 @@ to leave it running.
 - delete or edit scanner locks, cursors, checkpoints, the ledger, journals,
   `ownership.json` or request files by hand;
 - run `taskkill` or `Stop-Process` on any monitoring process;
-- close the console or press Ctrl+C twice as a shortcut, since that leaves the
-  children unsupervised;
+- close the SUPERVISOR console or press Ctrl+C twice in it as a shortcut, since that leaves
+  the children unsupervised;
+- wait for an alert fetch before any step here. Leave it in EVIDENCE;
 - run `clear-latch` to get past a latch during this drill;
 - run `native-alerts:rebaseline-cursors`;
 - call an unresolved drill PASS or leave it out of the record.
@@ -1111,7 +1315,8 @@ Recovery outcome: SELF-HEAL / ONE ORDERED RECOVERY / OTHER
 
 REST: restRequests before / after / new run:
 Alerts: created before / after; fetch complete / rowCount / total / pages / asOf / reason:
-  Test-AlertBars result / alertFetch / checked / producedByDrilledRun / producedByReplacementRun:
+  Any fetch abandoned or cancelled (when, why); second fetch and Compare-AlertFetches (or none):
+  Test-AlertBars result / overallPassPermitted / drillEnd / restorationConfirmed / alertFetch / checked / producedByDrilledRun / producedByReplacementRun:
   violations / undetermined / evidenceProblems:
   onPreFaultSession / observedBeforeFault / manyBeforeFault / lateDelivered / repeatedDeliveryKeys / repeatedEventIds:
   liveEligibleMatched / liveEligibleUnavailable:
@@ -1189,5 +1394,12 @@ operator or an administrator can do anything the operator can.
   code, never against a live backend, and
   the live fields have never been exercised, including `liveEligibleFrom` with values
   in it.
+- **`Get-AlertsSince` has no overall time limit.** Only the wait for a response to begin
+  is limited. The CONTROL and EVIDENCE split, not a timeout, is what keeps it from
+  delaying a safety action. Apart from the helper's own refusal, that split is an operator
+  rule.
+- **The evidence helpers need a running supervisor.** `Get-DrillEnd` has been exercised
+  only on synthetic files shaped from the source, and refuses a `status.json` over 60 s
+  old. After a stop it reads `NOT PROVEN`, which is why row 18 runs first.
 - **The readiness history is an operator log.** Row 18 reads its text. A changed line
   format would read `UNDETERMINED`, not a false pass, but the format has no contract.
