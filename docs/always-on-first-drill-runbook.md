@@ -56,7 +56,8 @@ refusal; `Show-Liveness` not `ESTABLISHED`; `DRILL_UNAUTHORIZED_FILE_REMOVED` or
 any account or execution process, or a listener on 4001/4002; `CONFLICT`; a second
 recovery or any latch; no `DRILL_RESTORE_CONFIRMED` about 5 minutes after expiry.
 
-**Restore first** ([section G](#g-abort-and-rollback)):
+**Restore first** ([section G](#g-abort-and-rollback)), in CONTROL. A new window needs
+[two setup lines first](#terminals):
 
 ```powershell
 pnpm --filter @trading-alert-dashboard/backend monitoring:always-on drill restore
@@ -86,7 +87,10 @@ row is shown, with one acceptable
 on a real defect or contradicting evidence. **INCONCLUSIVE** when anything cannot be
 shown, or control-plane liveness cannot be established. Capture the
 [evidence record](#h-incident-evidence) in every case. Row 18 `UNDETERMINED` is never
-an automatic PASS, and a clean row 18 is not replay safety. A fetch taken before the
+an automatic PASS. A written explanation can resolve only an individual alert, from cited
+evidence: never a failed fetch, an unproven drill end or restoration, or an abort trigger
+([resolving `UNDETERMINED`](#resolving-undetermined)). A clean row 18 waives no abort
+trigger and is not replay safety. A fetch taken before the
 drill's end is proven and its restoration confirmed reads `UNDETERMINED`, even if it is
 complete and empty.
 
@@ -548,7 +552,17 @@ evidence collection.**
 3. Never start a second drill while restoration is unresolved.
 
 `drill restore` and `stop` need none of the pasted helpers. If CONTROL is ever
-unavailable, they run from any new PowerShell window at the repository root.
+unavailable, open a new PowerShell window and run these two lines before the command:
+
+```powershell
+Set-Location C:\Projects\trading-alert-dashboard
+$env:PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN = 'false'
+```
+
+A new window has neither. Without the variable, pnpm's pre-run check installs dependencies
+before the command if it finds them out of sync, with the stack running
+([native-planner-worker.md](native-planner-worker.md)). The variable skips only that check,
+and nothing is installed. It does not replace preflight check 3.
 
 **Abandoning a fetch.** A fetch has no overall time limit (see
 [reading the alerts](#reading-the-alerts)). If one seems stuck, or anything needs
@@ -906,13 +920,16 @@ written after the event has appeared.
 | 15 | Planner | `Show-State` | `deltaJobs`, `deltaPlans` 0; `pending` returns to 0; no `PLANNER_FAILURE_DELTA_INCREASED` |
 | 16 | Ownership | `Show-State`, `Show-Machine`, `Show-Locks` | Emitter pinned to `runId`. `otherLiveNodeHolders` empty; `failed` 0. Every `externalPids` list empty after a re-read about 15 s later (row 0's CLI can stay listed until the next pass). A pid that persists, or ownership that cannot be established, is an abort trigger |
 | 17 | Isolation | `Show-Machine`, `Show-State` | Nothing on 4001/4002; no `execution.worker`; `authority` `NONE native=False account=NONE` |
-| 18 | Alert bars and provenance | The commands below | Run last, in EVIDENCE, once rows 1 to 6 hold. `result` is `NO VIOLATION FOUND`, or `NOTHING TO CHECK` with a note that it proved nothing. `VIOLATION` is FAIL. `UNDETERMINED` is INCONCLUSIVE unless each listed item is explained in writing from other evidence. A problem with the fetch or the drill's end cannot be explained away: it needs a new complete fetch. This row never settles replay on its own |
+| 18 | Alert bars and provenance | The commands below | Run last, in EVIDENCE, once rows 1 to 6 hold. `result` is `NO VIOLATION FOUND`, or `NOTHING TO CHECK` with a note that it proved nothing. `VIOLATION` is FAIL. `UNDETERMINED` is INCONCLUSIVE. Only an individual alert can be resolved in writing, from cited independent evidence ([resolving `UNDETERMINED`](#resolving-undetermined)). A problem with the fetch, the drill's end or its restoration cannot be explained away: it needs the proof and a new complete fetch. This row never settles replay on its own |
 
 After a recovery, row 6 reads the **old** run's file. The new run has no drill
 report at all, which is correct: its gate has seen no drill. If the old scanner
 stopped before writing an inactive report, its file can still read `active` true.
-`DRILL_RESTORE_CONFIRMED` with `SCANNER_RUN_ENDED`, plus that `pid` being gone, is
-then the evidence. Note it in the record.
+`DRILL_RESTORE_CONFIRMED` with `SCANNER_RUN_ENDED`, plus both of that run's processes
+being gone, is then the evidence: the worker (`pid` in its file) and the scanner's root
+process (`facts.pid` of the `ROLE_STARTED` before the run's `SCANNER_RUN_IDENTIFIED`, the
+pid its `ROLE_STOPPED` names). They differ, so never take one for the other. `Get-DrillEnd`
+checks both ([proving the drill ended](#proving-the-drill-ended)). Note it in the record.
 
 `locks` may exceed `heldByScanner`: old lock files stay behind and are harmless.
 Never delete them.
@@ -1019,8 +1036,8 @@ Compare-AlertFetches $first $fetch
 ```
 
 Then judge the second with `Test-AlertBars`. New alerts stored after the first `asOf` are
-normal. `CONTRADICTORY` means the row is INCONCLUSIVE until investigated. Do not choose
-whichever fetch reads cleaner.
+normal. `CONTRADICTORY` means the row is INCONCLUSIVE until investigated from the records;
+a written note alone does not clear it. Do not choose whichever fetch reads cleaner.
 
 #### Proving the drill ended
 
@@ -1037,8 +1054,15 @@ own files. `drill restore`, its exit code, the supervisor's `restore CONFIRMED` 
 | Drill active: `endedAt` null on the running scanner | None can pass | `NOT PROVEN`: `UNDETERMINED` |
 | Reported ended by the drilled run | Its own file has this `drillId`, `active` false and `endedAt` set. The supervisor agrees (`state` `ENDED`, same run and generation) and the journal has one `DRILL_STARTED` and one `DRILL_ENDED` for this drill and run | `ENDED: reported by the drilled run` |
 | Old run exited in an ordered recovery without writing its end | All the previous row except the old file's end, plus: one `SCANNER_RECOVERY_SUCCEEDED` from this run to the named replacement; `SCANNER_RUN_IDENTIFIED` for this run, and the scanner's `ROLE_STARTED` before it, which gives the root process; one `ROLE_STOPPED` for that root process, before the recovery succeeded (the journal records the root process, the run's file the worker under it, and their pids differ); `DRILL_RESTORE_CONFIRMED` with `SCANNER_RUN_ENDED`; a replacement with its own file, another `pid`, a start after that stop and no active drill; and neither old process present | `ENDED: the drilled run exited, by journal and process evidence` |
-| Anything ambiguous, for example `ROLE_FORCE_STOPPED`, a reused `pid`, or restore recorded while the running scanner still reports the drill active | | `NOT PROVEN`: `UNDETERMINED` |
+| Anything ambiguous: the old run wrote no end and the exit proof above is incomplete, for example `ROLE_FORCE_STOPPED` in place of `ROLE_STOPPED`, or a reused `pid`; or restore recorded while the running scanner still reports the drill active | | `NOT PROVEN`: `UNDETERMINED` |
 | Another generation or run; a `status.json` over 60 s old; any `DRILL_STATE_INCONSISTENT` since the start; a recovery recorded without `-RecoveryOccurred` | These never count | `NOT PROVEN`: `UNDETERMINED` |
+
+`drillEnd` reports only the evidence for the drill's end, not how the run stopped. If the
+old run had written its own end before a `ROLE_FORCE_STOPPED`, that report stands:
+`drillEnd` reads `ENDED: reported by the drilled run`, and `result` can be clean. If it had
+not, `drillEnd` reads `NOT PROVEN`. Either way the forced stop keeps its own decision: the
+overall result is at best INCONCLUSIVE (sections E and H), and a clean helper result does
+not override it.
 
 A replacement's status says nothing about the old run's restoration: it is used only to
 identify the replacement. No end time is made up. In the exit case the old file's empty
@@ -1055,8 +1079,9 @@ fetch.
 | Clean, end reason `EXPIRED` | `NO VIOLATION FOUND` or `NOTHING TO CHECK` | Only with every other section F row |
 
 `overallPassPermitted` can only withhold a PASS. It never grants one, and it does not
-replace rows 0 to 17. Of the liveness evidence, the helper reads only the age of
-`status.json`.
+replace rows 0 to 17 or the abort triggers. `NO: read row 18` sends you to that row's rules,
+under which only an individual alert can be resolved. No explanation changes `NO: the end
+reason is …`. Of the liveness evidence, the helper reads only the age of `status.json`.
 
 **The evidence, and where each item comes from:**
 
@@ -1099,8 +1124,28 @@ symbol, bar, `triggeredAt`, market and interval match the alert:
 | --- | --- | --- |
 | `NO VIOLATION FOUND` | The fetch was complete and taken after the proven end and restoration, and every judged alert was attributed and passed. **Limited evidence for the rules above, not universal replay safety** | Passes, with rows 12 to 14 still required |
 | `VIOLATION` | An alert's own records and logs show a bar its session could not be eligible on | FAIL. Capture the alert, its lane record and its log lines |
-| `UNDETERMINED` | Missing, contradictory or ambiguous evidence, including a fetch that is failed, abandoned or not the latest, or a drill whose end or restoration is not established | INCONCLUSIVE, unless each listed item is explained in writing from other evidence. **Never an automatic PASS** |
+| `UNDETERMINED` | Missing, contradictory or ambiguous evidence, about the fetch, the drill's end or restoration, or individual alerts | INCONCLUSIVE until resolved as set out in [resolving `UNDETERMINED`](#resolving-undetermined). **Never an automatic PASS** |
 | `NOTHING TO CHECK` | The fetch was complete and taken after the proven end and restoration, and no alert was judged: none visible in that retrieval, or only `observedBeforeFault` ones | Passes with a note that it proved nothing, neither recovery nor ledger safety. **A failed fetch never reads this** |
+
+#### Resolving `UNDETERMINED`
+
+`Test-AlertBars` prints `evidenceProblems` and the per-alert lists separately. They are
+resolved differently, and a written note is never proof by itself.
+
+| What reads `UNDETERMINED` | Can a written explanation clear it? | What resolves it |
+| --- | --- | --- |
+| **The fetch**, in `evidenceProblems`: failed, abandoned or cancelled, incomplete, truncated, superseded by a newer attempt, taken before the drill's proven end, restore confirmation or replacement's start, or not matching this drill's activation, run or generation | **No** | A new complete fetch, correctly scoped and taken once those conditions hold. Without one, row 18 is not shown: INCONCLUSIVE |
+| **The drill's end or restoration**, in `evidenceProblems`: missing, ambiguous, inconsistent or not proven | **No** | The proof in [proving the drill ended](#proving-the-drill-ended), then a new complete fetch. Without it, INCONCLUSIVE or FAIL under section H |
+| **Anything else in `evidenceProblems`**, such as an unusable scanner log or run file. No alert was judged | **No** | The commands reading without the problem. Otherwise row 18 is not shown: INCONCLUSIVE |
+| **An individual alert**: an item in `undetermined`, `lateDelivered`, `repeatedDeliveryKeys` or `repeatedEventIds`, or `manyBeforeFault` | **Only with independent evidence** for that specific item | The record cites the evidence itself, such as the lane record, log lines, journal lines, cursors and rows 12 to 14, and that evidence settles the item. Without it: INCONCLUSIVE |
+
+- `VIOLATION` is FAIL and cannot be explained away.
+- An authorized restore or stop never waits for any of this. If one came before row 18, no
+  fetch is needed to finish it: the row is not shown, and the result is INCONCLUSIVE or FAIL
+  under section H.
+- **A clean `result` waives nothing.** An abort trigger that stands, a forced stop or any
+  other failed check keeps its own decision, whatever this helper printed. The helper reads
+  few of them.
 
 **`UNDETERMINED` also reads for:** an incomplete, invalid or superseded alert fetch; a
 drill end or restoration not established; a missing,
@@ -1180,7 +1225,8 @@ to leave it running.
 - cursors going backwards, a new rebaseline file, or any change to locks, cursors,
   checkpoints, ledger or journals that the running stack did not make.
 
-**Procedure, in this order, in the CONTROL terminal:**
+**Procedure, in this order, in the CONTROL terminal** (if it is unavailable, in a new window
+set up as in [terminals](#terminals))**:**
 
 1. **If a drill shows `ACTIVE`, a `.drill` file exists, or restore is unresolved:**
 
@@ -1318,6 +1364,7 @@ Alerts: created before / after; fetch complete / rowCount / total / pages / asOf
   Any fetch abandoned or cancelled (when, why); second fetch and Compare-AlertFetches (or none):
   Test-AlertBars result / overallPassPermitted / drillEnd / restorationConfirmed / alertFetch / checked / producedByDrilledRun / producedByReplacementRun:
   violations / undetermined / evidenceProblems:
+  Per-alert items resolved (alert, evidence cited), or none:
   onPreFaultSession / observedBeforeFault / manyBeforeFault / lateDelivered / repeatedDeliveryKeys / repeatedEventIds:
   liveEligibleMatched / liveEligibleUnavailable:
   First alert after the drill (symbol, triggeredAt, barStart, emitter-pinned runId):
@@ -1339,13 +1386,16 @@ DECISION: PASS / FAIL / INCONCLUSIVE
 Reason:
 ```
 
-- **PASS:** every section F row shown, one acceptable outcome from section E, no
-  abort trigger.
+- **PASS:** every mandatory check meets its own criteria: every section F row shown, one
+  acceptable outcome from section E, no abort trigger. A written note cannot stand in for an
+  absent or failed check. Row 18 allows one thing only: an individual alert resolved from
+  cited evidence ([resolving `UNDETERMINED`](#resolving-undetermined)).
 - **FAIL:** an abort trigger for a real defect, a failure listed in section E, or
   evidence contradicting restoration, ownership or isolation.
-- **INCONCLUSIVE:** a row that cannot be shown, control-plane liveness that cannot be
-  established, a coincident real outage, a clock rollback, a sleep or resume, a forced
-  stop, or an operator restore. It proves less; it is not a pass.
+- **INCONCLUSIVE:** a row that cannot be shown, including row 18 when no valid fetch or
+  proven drill end exists or an authorized restore or stop came first; control-plane
+  liveness that cannot be established, a coincident real outage, a clock rollback, a sleep
+  or resume, a forced stop, or an operator restore. It proves less; it is not a pass.
 
 An INCOMPLETE shutdown is recorded beside the decision and is never a PASS. Whatever
 the decision, it is the result of this smoke test only: **it is not Gate 4A
