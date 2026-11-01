@@ -30,7 +30,9 @@ row 18 evidence, and an older complete fetch does not stand in for it.
 
 **Preflight, all required** ([section B](#b-mandatory-preflight)):
 
-- written approval naming this drill; exact SHAs; clean checkout and build;
+- written approval naming this drill; exact SHAs; clean checkout and build (check 3, or
+  its [bounded exception](#check-3-exception-first-gate-4a-p2-baseline-only) where that
+  applies);
 - Account A/B off; nothing on 4001/4002; no execution workers;
   `NATIVE_EXECUTION_ENABLED = false as const`;
 - no drill files, pending requests or unresolved earlier drill;
@@ -56,11 +58,12 @@ refusal; `Show-Liveness` not `ESTABLISHED`; `DRILL_UNAUTHORIZED_FILE_REMOVED` or
 any account or execution process, or a listener on 4001/4002; `CONFLICT`; a second
 recovery or any latch; no `DRILL_RESTORE_CONFIRMED` about 5 minutes after expiry.
 
-**Restore first** ([section G](#g-abort-and-rollback)), in CONTROL. A new window needs
-[two setup lines first](#terminals):
+**Restore first** ([section G](#g-abort-and-rollback)), in CONTROL or a new window. These
+commands need no pnpm and no internet ([direct commands](#direct-control-commands)):
 
 ```powershell
-pnpm --filter @trading-alert-dashboard/backend monitoring:always-on drill restore
+Set-Location C:\Projects\trading-alert-dashboard\apps\backend
+node node_modules/tsx/dist/cli.mjs src/modules/always-on/run-always-on-monitoring.ts drill restore
 ```
 
 Exit 0 means no drill file remains, **not** that the restore is confirmed.
@@ -68,7 +71,8 @@ Exit 0 means no drill file remains, **not** that the restore is confirmed.
 **Stop only if the restore is not clean, or another trigger stands:**
 
 ```powershell
-pnpm --filter @trading-alert-dashboard/backend monitoring:always-on stop --wait-seconds 600
+Set-Location C:\Projects\trading-alert-dashboard\apps\backend
+node node_modules/tsx/dist/cli.mjs src/modules/always-on/run-always-on-monitoring.ts stop --wait-seconds 600
 ```
 
 Exit 0 is **not** proof of shutdown. Proof is `Show-Shutdown <G>` reading `COMPLETE`.
@@ -551,18 +555,10 @@ evidence collection.**
    an abort trigger is acted on there at once.
 3. Never start a second drill while restoration is unresolved.
 
-`drill restore` and `stop` need none of the pasted helpers. If CONTROL is ever
-unavailable, open a new PowerShell window and run these two lines before the command:
-
-```powershell
-Set-Location C:\Projects\trading-alert-dashboard
-$env:PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN = 'false'
-```
-
-A new window has neither. Without the variable, pnpm's pre-run check installs dependencies
-before the command if it finds them out of sync, with the stack running
-([native-planner-worker.md](native-planner-worker.md)). The variable skips only that check,
-and nothing is installed. It does not replace preflight check 3.
+`status`, `drill status`, `drill restore` and `stop` need none of the pasted helpers, and
+no pnpm: use the [direct commands](#direct-control-commands). If CONTROL is unavailable,
+or EVIDENCE has stalled, open a new PowerShell window and run them there. Do not touch
+SUPERVISOR, and do not wait for EVIDENCE.
 
 **Abandoning a fetch.** A fetch has no overall time limit (see
 [reading the alerts](#reading-the-alerts)). If one seems stuck, or anything needs
@@ -581,6 +577,92 @@ attention:
 Closing EVIDENCE loses its pasted helpers and variables. Paste the session setup again in
 a new window and set `$terminalRole` again. Do not stop any process other than by closing
 that window.
+
+### Direct CONTROL commands
+
+This is the primary path for `status`, `drill status`, `drill restore` and `stop`.
+Wherever this runbook names one of those four, including as `monitoring:always-on`, run
+the form below. It overrides the pnpm forms listed in
+[always-on-monitoring.md](always-on-monitoring.md) for this drill.
+
+In any CONTROL window, first:
+
+```powershell
+Set-Location C:\Projects\trading-alert-dashboard\apps\backend
+```
+
+Then run only the line you need. Read-only:
+
+```powershell
+node node_modules/tsx/dist/cli.mjs src/modules/always-on/run-always-on-monitoring.ts status
+node node_modules/tsx/dist/cli.mjs src/modules/always-on/run-always-on-monitoring.ts drill status
+```
+
+End a drill:
+
+```powershell
+node node_modules/tsx/dist/cli.mjs src/modules/always-on/run-always-on-monitoring.ts drill restore
+```
+
+Stop the stack:
+
+```powershell
+node node_modules/tsx/dist/cli.mjs src/modules/always-on/run-always-on-monitoring.ts stop --wait-seconds 600
+```
+
+**Why not pnpm.** The `pnpm` on this machine is the global 11.12.0, and the repository pins
+11.21.0. Before running a script, pnpm's version switch can contact the npm registry and
+write to its metadata cache. In a network failure that can delay or block the command.
+`PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN` does not stop this: it controls only the pre-run
+install.
+
+**What the direct form is.** The same entrypoint and the same `main()` as the package
+script, through the same local tsx CLI that the supervisor uses to start its roles, from
+the same `apps\backend` directory. It uses the same liveness checks and restore logic, and
+bypasses no check. It needs no pnpm, Corepack, environment variable, install, build or
+internet access. It needs `node` on `PATH`, `%LOCALAPPDATA%` and the installed `tsx` and
+`esbuild` ([check 3a](#before-anything-is-started)). Node and tsx may write to their temp
+folders, which hold no protected state. The census note [above](#session-setup) applies
+to it too.
+
+**Source-checked, never run against this machine's live state.** Repository tests run this
+command shape for `status`, `drill status`, `drill restore` and a refused `drill start`,
+with temporary state and no supervisor. No test runs `stop` this way.
+
+**An exit code proves that the CLI ended, nothing more:**
+
+- `drill restore` exit 0 is not proof of restoration. Follow [section G](#g-abort-and-rollback),
+  step 2, including `Show-ScannerOwn`.
+- `stop` exit 0 is not proof that the supervisor and its children stopped. Follow step 3,
+  including `Show-Shutdown`.
+
+**If the command does not start.** `drill status`, `drill restore` and `stop` each print an
+`ALWAYS-ON MONITORING` banner as soon as the CLI is running, and so does `status` without
+`--json`. If that banner is missing, read the error, not `$LASTEXITCODE`, which can be left
+over from an earlier command.
+
+| What you see | Means | Do |
+| --- | --- | --- |
+| `Cannot find module` naming `tsx\dist\cli.mjs` or the entrypoint | The CLI did not start, and nothing was requested. Usually the wrong directory | Check that `Get-Location` reads exactly `C:\Projects\trading-alert-dashboard\apps\backend`. If it did not, run `Set-Location` and the command once more. Do not run from a worktree: every checkout shares the same state |
+| The same error from the right directory, `node` not recognized, or a tsx or esbuild failure before the banner | **The emergency CLI is unavailable.** Nothing was requested | The branch below |
+
+**Emergency CLI unavailable.** Do not install, build or repair dependencies, and do not
+try pnpm or another command form as a way round it. Capture the error and whatever
+`Show-*` evidence you can. Follow the INCOMPLETE branch of section G, step 3: no further
+drill action, no process killed, no drill file, lock or state removed by hand, and
+separate approval for anything else. A drill's fault still ends at its expiry on its own.
+The result is at best INCONCLUSIVE.
+
+**Commands that stay under pnpm.** `run` and `drill start` keep their pnpm form, with the
+environment variable, and are not emergency commands. Reading the source indicates that
+the direct form is compatible with both, but neither has been run that way here, so this
+runbook does not use it. If `drill start` is refused, including `CONTROLLER_NOT_VERIFIED`,
+stop as [section C](#c-activation) says. Never change the command form to get past a
+refusal. pnpm's version switch applies to them too, so a registry failure can delay or
+block either command, or fail it before it starts. Any such failure: do not start, and
+record it. A delay can also carry `drill start` past the check 17 window: record that too.
+`pnpm install; pnpm build` (check 3) and launcher item 1 (check 5) are preflight
+steps, needed only before anything is started.
 
 ### Control-plane liveness
 
@@ -630,7 +712,8 @@ them. They are this runbook's conservative judgement and can be wrong.
 | --- | --- | --- | --- |
 | 1 | Approval | The written approval | Names this real-machine drill, the fault and the duration, and says whether `--emitter-activate-at-eof` may be used |
 | 2 | Exact SHAs | `git -C $repo fetch origin`, then `git -C $repo rev-parse main origin/main HEAD` | All three equal the SHA named in the approval |
-| 3 | Clean checkout and build | `git -C $repo status --porcelain --untracked-files=all` must print nothing. Then, from `$repo`, `pnpm install; pnpm build`, and repeat the status | Build passes; still clean |
+| 3 | Clean checkout and build | `git -C $repo status --porcelain --untracked-files=all` must print nothing. Then, from `$repo`, `pnpm install; pnpm build`, and repeat the status. For the first Gate 4A-P2 baseline only, see the [bounded exception](#check-3-exception-first-gate-4a-p2-baseline-only) | Build passes; still clean |
+| 3a | Direct CONTROL commands available | The read-only block below. It runs no CLI | Every line `True`; `node` found. This does not prove that the commands work |
 | 4 | No unexpected processes | `Show-Machine` | No listeners. Every `node.exe` explained, and none running this repository's monitoring or account code. Never kill anything to pass this check |
 | 5 | Account A/B off | Launcher item **1** | Both **OFF** |
 | 6 | Native execution disabled | `git -C $repo grep -n "NATIVE_EXECUTION_ENABLED = false as const" -- apps/backend/src` | One hit, in `native-execution-switch.ts` |
@@ -645,6 +728,86 @@ while the scanner ran, section 4 of the monitoring document applies first.
 If `requests\` is not empty, **stop**. No supported command clears it, and a
 start would consume it. Do not delete it by hand; report it.
 
+Check 3a, from a window with the session setup:
+
+```powershell
+# READ-ONLY: runs no CLI
+(Get-Command node).Source
+foreach ($p in 'apps\backend\node_modules\tsx\dist\cli.mjs', 'apps\backend\src\modules\always-on\run-always-on-monitoring.ts', 'node_modules\.pnpm\@esbuild+win32-x64@*\node_modules\@esbuild\win32-x64\esbuild.exe') { Test-Path (Join-Path $repo $p) }
+```
+
+**Check 2 is not waived.** Neither Gate 4A-P2A nor P2B fetched from the remote, and an
+earlier remote confirmation is not current. A P2 authorization must approve either the
+normal fetch in check 2 or a narrowly documented substitute that the operator accepts.
+Without one, or if the remote cannot be verified: HOLD.
+
+### Check 3 exception: first Gate 4A-P2 baseline only
+
+For the first proposed Gate 4A-P2 healthy-baseline run only, the completed P1 backend build
+and verified shared/runtime artifacts may substitute for the install/root-build portion of
+check 3, subject to separate P2 runtime authorization.
+
+**This section authorizes nothing, and it is not a general waiver.** Check 3 as written
+applies to every other run. A later drill needs check 3 or its own approved exception.
+
+**Evidence, at `667b9e69c994d06d23f899c4b329bedcfa7d57e4`.** P1 ran the backend `tsc` with
+exit 0 and no diagnostics, and 700 of 700 emitted outputs matched an independent in-memory
+recompile byte for byte. Shared artifacts were checked separately. Dependencies matched the
+lockfile, and the Prisma client and runtime dependencies were present. P2A then found
+backend 349 sources and shared 22 sources, with no missing or stale outputs. These are
+static checks. Historical Batch A: 6573 passed, 17 unresolved baseline failures, 15 skipped;
+not rerun.
+
+**What this does not cover:**
+
+- `pnpm install` was NOT executed in P1, so its `postinstall` did not run either.
+- Root `pnpm build` was NOT executed in P1.
+- The frontend was not rebuilt or independently verified as current. According to static
+  dependency inspection, the proposed P2 Always-On baseline does not require that frontend
+  output.
+- `dist\src\modules\native-alerts\native-execution-integrity.js` and its map are retained,
+  unused build artifacts, unreachable from the launch path. They are not proof of a clean
+  build directory.
+
+**The exception holds only while all of these hold.** If any fails, it is invalid, and
+startup must HOLD pending separate build or dependency authorization:
+
+1. Git HEAD still exactly equals `667b9e69c994d06d23f899c4b329bedcfa7d57e4`.
+2. The main worktree is clean.
+3. The verified build artifacts still exist.
+4. Backend and shared source-to-output freshness checks still pass.
+5. Installed dependencies and the Prisma client remain available.
+6. No source, configuration or dependency change has invalidated the P1 evidence.
+7. No unrelated code change or rebuild has occurred that makes the artifact identity
+   uncertain.
+
+Merging this revision of the runbook into `main` moves HEAD away from that SHA, so
+condition 1 fails as written. The P2 authorization must settle this before any start.
+
+Read these immediately before any start, from a window with the session setup:
+
+```powershell
+# READ-ONLY: conditions 1 to 5 and the build part of 7. Condition 6 also needs the record since P1.
+git -C $repo rev-parse HEAD                                      # exactly the SHA above
+git -C $repo status --porcelain --untracked-files=all            # prints nothing
+foreach ($t in @(@('backend', 'apps\backend\src', 'apps\backend\dist\src'), @('shared', 'packages\shared\src', 'packages\shared\dist\cjs'))) {
+  $src = Join-Path $repo $t[1]; $out = Join-Path $repo $t[2]; $missing = 0; $stale = 0
+  $sources = @(Get-ChildItem $src -Recurse -File -Filter *.ts | Where-Object { $_.Name -notlike '*.d.ts' })
+  foreach ($s in $sources) {
+    $o = Join-Path $out ($s.FullName.Substring($src.Length + 1) -replace '\.ts$', '.js')
+    if (-not (Test-Path -LiteralPath $o)) { $missing++ } elseif ((Get-Item -LiteralPath $o).LastWriteTimeUtc -lt $s.LastWriteTimeUtc) { $stale++ }
+  }
+  [pscustomobject]@{ tree = $t[0]; sources = $sources.Count; missing = $missing; stale = $stale }   # missing 0, stale 0
+}
+(Get-Item (Join-Path $repo 'apps\backend\dist\src\server.js')).LastWriteTimeUtc.ToString('o')       # P1: 2026-10-31T17:14:51
+(Get-ChildItem (Join-Path $repo 'apps\backend\dist') -Recurse -File | Sort-Object LastWriteTimeUtc | Select-Object -Last 1).LastWriteTimeUtc.ToString('o')   # no later than 2026-10-31T17:14:55
+foreach ($p in 'apps\backend\node_modules\@prisma\client\package.json', 'apps\backend\node_modules\@trading-alert-dashboard\shared\package.json', 'node_modules\.pnpm\@prisma+client@*\node_modules\.prisma\client\query_engine-windows.dll.node') { Test-Path (Join-Path $repo $p) }   # every line True
+```
+
+The supervisor applies the same freshness rule when it starts: a stale backend build blocks
+the role with `BUILD_STALE`. Do not rebuild to clear it under this exception. That is a
+failed condition: HOLD.
+
 ### Starting the stack (only under the approval)
 
 Open the SUPERVISOR console, keep it open, and do not press Ctrl+C or close it
@@ -657,9 +820,10 @@ $env:PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN = 'false'
 pnpm --filter @trading-alert-dashboard/backend monitoring:always-on run --emitter-activate-at-eof
 ```
 
-Set the same environment variable in the CONTROL terminal. It stops pnpm
-reinstalling dependencies in the middle of a run
-([native-planner-worker.md](native-planner-worker.md)). Without
+The environment variable stops pnpm reinstalling dependencies in the middle of a run
+([native-planner-worker.md](native-planner-worker.md)). Set it in every window that runs a
+pnpm command, including CONTROL for `drill start`. The
+[direct commands](#direct-control-commands) do not need it. Without
 `--emitter-activate-at-eof`, a lane with no production cursor refuses COMMIT, for
 example a symbol listed while the stack was down.
 
@@ -678,7 +842,7 @@ below means nothing without it.
 | 15 | Identity | `Show-State` | Note `generation` and `runId` within the last minute before activation |
 | 16 | Same checkout | `(Read-Json (Join-Path $aon 'ownership.json')).repoRoot` | Equals `$repo`. Run the CLI from there; a worktree is refused (`CONTROLLER_NOT_VERIFIED`) |
 | 17 | Distance from bar close (operator policy) | `(Get-Date).ToUniversalTime().Minute % 15` | **3 to 7**, leaving about 7 minutes or more before the next close. Otherwise wait |
-| 18 | Restore and stop ready | Section G open, the commands below ready in the CONTROL terminal, and a separate EVIDENCE terminal open | The operator can run them immediately. CONTROL never runs an alert request |
+| 18 | Restore and stop ready | Section G open, the [direct commands](#direct-control-commands) ready in the CONTROL terminal, and a separate EVIDENCE terminal open | The operator can run them immediately. CONTROL never runs an alert request |
 
 Before activation also run `Save-Cursors before`, `Show-Locks` and record
 `Show-State`. `WARMING` in check 13 is not a failure: it is normal until the first
@@ -697,6 +861,7 @@ Run only once, from `$repo`, in the CONTROL terminal:
 
 ```powershell
 Set-Location C:\Projects\trading-alert-dashboard
+$env:PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN = 'false'
 Show-Liveness; Show-State    # liveness ESTABLISHED; recheck generation, runId and check 17
 pnpm --filter @trading-alert-dashboard/backend monitoring:always-on drill start --fault PUBLIC_ALL_DOWN --duration-seconds 60 --generation <G> --run-id <runId>
 $LASTEXITCODE
@@ -1225,14 +1390,16 @@ to leave it running.
 - cursors going backwards, a new rebaseline file, or any change to locks, cursors,
   checkpoints, ledger or journals that the running stack did not make.
 
-**Procedure, in this order, in the CONTROL terminal** (if it is unavailable, in a new window
-set up as in [terminals](#terminals))**:**
+**Procedure, in this order, in the CONTROL terminal.** If it is unavailable, use a new
+window. The [direct commands](#direct-control-commands) below need only their `Set-Location`
+line, so run them first. Paste the session setup afterwards for the `Show-*` checks. If a
+command does not start, follow [that section](#direct-control-commands); do not improvise.
 
 1. **If a drill shows `ACTIVE`, a `.drill` file exists, or restore is unresolved:**
 
    ```powershell
-   Set-Location C:\Projects\trading-alert-dashboard
-   pnpm --filter @trading-alert-dashboard/backend monitoring:always-on drill restore
+   Set-Location C:\Projects\trading-alert-dashboard\apps\backend
+   node node_modules/tsx/dist/cli.mjs src/modules/always-on/run-always-on-monitoring.ts drill restore
    $LASTEXITCODE
    ```
 
@@ -1253,7 +1420,8 @@ set up as in [terminals](#terminals))**:**
 3. **If restoration is still not clean, or any other trigger stands:**
 
    ```powershell
-   pnpm --filter @trading-alert-dashboard/backend monitoring:always-on stop --wait-seconds 600
+   Set-Location C:\Projects\trading-alert-dashboard\apps\backend
+   node node_modules/tsx/dist/cli.mjs src/modules/always-on/run-always-on-monitoring.ts stop --wait-seconds 600
    $LASTEXITCODE
    ```
 
@@ -1378,6 +1546,7 @@ Isolation: 4001/4002 listeners, execution workers, authority line:
 Stable condition: RUNNING + HEALTHY from ____ to ____ (30 min, closes seen):
 Final state of the stack:
 Shutdown proof: stop output + exit / Show-Shutdown verdict / remaining processes:
+Direct CONTROL commands: used (which) / did not start (error):
 Abort triggers hit, and steps taken:
 Outstanding incidents:
 Protected-state changes not made by the running stack:
@@ -1430,6 +1599,10 @@ operator or an administrator can do anything the operator can.
 - **Never executed.** `drill start` has only been tested through its parts and
   against no running supervisor. Only the real tsx command-line shape was checked,
   by a probe. A first-run surprise here is a finding, not an operator error.
+- **The direct CONTROL commands have never run against live state.** Their source path was
+  checked offline. Real restore and stop behaviour remains a runtime unknown.
+- **`run` and `drill start` still go through pnpm**, including its version switch. The
+  registry behaviour of that switch was read from source, not measured.
 - **Timings at 522 symbols are estimates** from code intervals, not measurements.
 - **No replay indicator**, and no CLI view of the scanner's own drill report: both
   are read from files, as above.
