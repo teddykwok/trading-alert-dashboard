@@ -743,12 +743,31 @@ Without one, or if the remote cannot be verified: HOLD.
 
 ### Check 3 exception: first Gate 4A-P2 baseline only
 
-For the first proposed Gate 4A-P2 healthy-baseline run only, the completed P1 backend build
-and verified shared/runtime artifacts may substitute for the install/root-build portion of
-check 3, subject to separate P2 runtime authorization.
+For the first separately authorized Gate 4A-P2 healthy-baseline session only, the completed
+P1 backend build and verified shared/runtime artifacts may substitute for the
+install/root-build portion of check 3, subject to separate P2 runtime authorization. The P1
+build evidence remains anchored to commit `667b9e69c994d06d23f899c4b329bedcfa7d57e4`.
 
-**This section authorizes nothing, and it is not a general waiver.** Check 3 as written
-applies to every other run. A later drill needs check 3 or its own approved exception.
+The runtime checkout may use an explicitly approved documentation-only descendant, provided
+its exact SHA is named in the P2 authorization, all intervening changes are reviewed
+documentation changes only, the original build inputs and safety settings remain unchanged,
+and the verified artifacts and dependencies remain valid. Otherwise HOLD.
+
+**This section authorizes nothing, and it is not a general waiver.** It does not take effect
+because it is committed or merged: using the P1 evidence needs explicit P2 authorization.
+Check 3 as written remains the general procedure. A later drill or a new session does not
+inherit this exception, and needs check 3 or its own approved exception.
+
+**Two different commits:**
+
+| Name | Commit |
+| --- | --- |
+| P1 build-evidence baseline | Always `667b9e69c994d06d23f899c4b329bedcfa7d57e4`. Never moved to a later commit |
+| Approved P2 runtime HEAD | The exact SHA named in the P2 authorization: the baseline itself, or a documentation-only descendant. This runbook names no descendant, and none is accepted automatically |
+
+The SHA in checks 2 and 12 is the runtime HEAD: the scanner reads its `gitHead` from the
+checkout. This exception does not replace check 2. If `main`, `origin/main` and HEAD are not
+all that SHA, HOLD, even if every condition below holds.
 
 **Evidence, at `667b9e69c994d06d23f899c4b329bedcfa7d57e4`.** P1 ran the backend `tsc` with
 exit 0 and no diagnostics, and 700 of 700 emitted outputs matched an independent in-memory
@@ -762,9 +781,9 @@ not rerun.
 
 - `pnpm install` was NOT executed in P1, so its `postinstall` did not run either.
 - Root `pnpm build` was NOT executed in P1.
-- The frontend was not rebuilt or independently verified as current. According to static
-  dependency inspection, the proposed P2 Always-On baseline does not require that frontend
-  output.
+- The frontend was not rebuilt or independently verified as current. P2A found, by static
+  dependency inspection, that the proposed four-role Always-On baseline does not require
+  that frontend output.
 - `dist\src\modules\native-alerts\native-execution-integrity.js` and its map are retained,
   unused build artifacts, unreachable from the launch path. They are not proof of a clean
   build directory.
@@ -772,23 +791,31 @@ not rerun.
 **The exception holds only while all of these hold.** If any fails, it is invalid, and
 startup must HOLD pending separate build or dependency authorization:
 
-1. Git HEAD still exactly equals `667b9e69c994d06d23f899c4b329bedcfa7d57e4`.
-2. The main worktree is clean.
-3. The verified build artifacts still exist.
-4. Backend and shared source-to-output freshness checks still pass.
-5. Installed dependencies and the Prisma client remain available.
-6. No source, configuration or dependency change has invalidated the P1 evidence.
-7. No unrelated code change or rebuild has occurred that makes the artifact identity
-   uncertain.
-
-Merging this revision of the runbook into `main` moves HEAD away from that SHA, so
-condition 1 fails as written. The P2 authorization must settle this before any start.
+1. The P2 authorization explicitly identifies the exact runtime HEAD, and Git HEAD equals it.
+2. The P1 baseline is an ancestor of that HEAD.
+3. Every intervening commit is part of the reviewed and authorized documentation integration.
+4. The cumulative diff from the P1 baseline changes only Markdown paths that the authorization
+   explicitly approves.
+5. Backend, shared, scanner, emitter, planner and all other executable source remain identical
+   to the P1 baseline.
+6. Build configuration, dependency manifests, lockfiles, generated-source inputs and safety
+   configuration remain unchanged.
+7. The runtime worktree is clean.
+8. Backend and shared compiled artifacts remain present and valid.
+9. Installed dependencies and Prisma artifacts remain available and consistent.
+10. Existing source-to-artifact freshness and identity checks still pass.
+11. No unapproved rebuild or dependency repair has invalidated the P1 evidence.
 
 Read these immediately before any start, from a window with the session setup:
 
 ```powershell
-# READ-ONLY: conditions 1 to 5 and the build part of 7. Condition 6 also needs the record since P1.
-git -C $repo rev-parse HEAD                                      # exactly the SHA above
+# READ-ONLY: what files can show of the conditions. Conditions 3 and 11 also need the record since P1.
+$p1 = '667b9e69c994d06d23f899c4b329bedcfa7d57e4'
+$runtimeHead = '<exact SHA named in the P2 authorization>'
+git -C $repo rev-parse HEAD                                      # exactly $runtimeHead
+git -C $repo merge-base --is-ancestor $p1 $runtimeHead; $LASTEXITCODE   # 0
+git -C $repo log -m --name-only --format='%H %s' "$p1..$runtimeHead"    # only reviewed commits, only approved Markdown paths
+git -C $repo diff --name-only $p1 $runtimeHead                   # only approved Markdown paths
 git -C $repo status --porcelain --untracked-files=all            # prints nothing
 foreach ($t in @(@('backend', 'apps\backend\src', 'apps\backend\dist\src'), @('shared', 'packages\shared\src', 'packages\shared\dist\cjs'))) {
   $src = Join-Path $repo $t[1]; $out = Join-Path $repo $t[2]; $missing = 0; $stale = 0
@@ -802,6 +829,8 @@ foreach ($t in @(@('backend', 'apps\backend\src', 'apps\backend\dist\src'), @('s
 (Get-Item (Join-Path $repo 'apps\backend\dist\src\server.js')).LastWriteTimeUtc.ToString('o')       # P1: 2026-10-31T17:14:51
 (Get-ChildItem (Join-Path $repo 'apps\backend\dist') -Recurse -File | Sort-Object LastWriteTimeUtc | Select-Object -Last 1).LastWriteTimeUtc.ToString('o')   # no later than 2026-10-31T17:14:55
 foreach ($p in 'apps\backend\node_modules\@prisma\client\package.json', 'apps\backend\node_modules\@trading-alert-dashboard\shared\package.json', 'node_modules\.pnpm\@prisma+client@*\node_modules\.prisma\client\query_engine-windows.dll.node') { Test-Path (Join-Path $repo $p) }   # every line True
+((Get-Content -Raw (Join-Path $repo 'pnpm-lock.yaml')) -replace "`r`n", "`n") -ceq ((Get-Content -Raw (Join-Path $repo 'node_modules\.pnpm\lock.yaml')) -replace "`r`n", "`n")   # True
+Select-String -Path (Join-Path $root 'env\*.env'), (Join-Path $repo 'apps\backend\.env') -Pattern '^EXECUTION_(GLOBAL_KILL_SWITCH|LIVE_ENTRY_ENABLED|PROTECTION_READY|FILL_RUNTIME_ENABLED)=' | ForEach-Object { "$($_.Filename) $($_.Line)" }   # kill switch true, the other three false, in every file
 ```
 
 The supervisor applies the same freshness rule when it starts: a stale backend build blocks
@@ -1497,6 +1526,7 @@ GATE 4A FIRST DRILL RECORD
 Approval reference:
 Operator:
 Baseline commit (main = origin/main = HEAD):
+P1 build-evidence baseline (only if the check 3 exception was authorized):
 Scanner gitHead:
 
 Generation:                      Drilled run id:
