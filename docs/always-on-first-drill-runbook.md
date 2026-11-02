@@ -857,22 +857,41 @@ if ($treesRead -ne 2) { $hold += "only $treesRead of 2 source trees were checked
 (Get-ChildItem (Join-Path $repo 'apps\backend\dist') -Recurse -File | Sort-Object LastWriteTimeUtc | Select-Object -Last 1).LastWriteTimeUtc.ToString('o')   # no later than 2026-10-31T17:14:55
 foreach ($p in 'apps\backend\node_modules\@prisma\client\package.json', 'apps\backend\node_modules\@trading-alert-dashboard\shared\package.json', 'node_modules\.pnpm\@prisma+client@*\node_modules\.prisma\client\query_engine-windows.dll.node') { Test-Path (Join-Path $repo $p) }   # every line True
 ((Get-Content -Raw (Join-Path $repo 'pnpm-lock.yaml')) -replace "`r`n", "`n") -ceq ((Get-Content -Raw (Join-Path $repo 'node_modules\.pnpm\lock.yaml')) -replace "`r`n", "`n")   # True
-$requiredFlags = [ordered]@{ EXECUTION_GLOBAL_KILL_SWITCH = 'true'; EXECUTION_LIVE_ENTRY_ENABLED = 'false'; EXECUTION_PROTECTION_READY = 'false'; EXECUTION_FILL_RUNTIME_ENABLED = 'false' }
-$dotenvLine = [regex]::new('(?:^|^)\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(\s*''(?:\\''|[^''])*''|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?(?:$|$)', 'Multiline, ECMAScript')   # dotenv's own LINE pattern
-foreach ($e in @(@('generic.env', $root, 'env\generic.env', $true), @('account-a.env', $root, 'env\account-a.env', $true), @('account-b.env', $root, 'env\account-b.env', $true), @('apps/backend/.env', $repo, 'apps\backend\.env', $false))) {
-  $raw = $null
-  try { $raw = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes((Join-Path $e[1] $e[2]))) } catch { $hold += "$($e[0]): the file cannot be read as UTF-8" }
-  if ($null -eq $raw) { continue }
-  if ($raw -match '[\u2028\u2029]|\r(?!\n)') { $hold += "$($e[0]): the file holds U+2028, U+2029 or a lone CR"; continue }
-  $text = $raw.TrimStart([char]0xFEFF) -replace '\r\n', "`n"
-  $found = @($dotenvLine.Matches($text))
-  foreach ($key in $requiredFlags.Keys) {
-    $want = $requiredFlags[$key]
-    $decls = @($found | Where-Object { $_.Groups[1].Value -ieq $key })
-    $mentions = @($text -split "`n" | Where-Object { $_ -match "(?<![\w.-])$key(?![\w.-])" -and $_ -notmatch '^\s*#' })
-    $why = if ($decls.Count -eq 0) { 'missing' } elseif ($decls.Count -gt 1) { 'declared more than once' } elseif ($decls[0].Groups[1].Value -cne $key) { 'wrong letter case' } elseif ($mentions.Count -ne 1) { 'another line mentions it' } elseif (-not [string]::Equals(($decls[0].Groups[2].Value.Trim([char[]]" `t`n`v`f") -creplace '^([''"`])([\s\S]*)\1$', '$2'), $want)) { 'not the required value' } elseif ($e[3] -and $mentions[0] -cnotmatch "^\s*$key=\s*(?:$want|`"$want`"|'$want')\s*$") { 'the launcher parser would refuse or misread it' } else { $null }
-    if ($why) { $hold += "$($e[0]) ${key}: $why"; "$($e[0]) $key HOLD" } else { $validFlags++; "$($e[0]) $key OK" }
+$flagCheck = @'
+const fs = require('node:fs'), path = require('node:path'), [anchor, ...args] = process.argv.slice(1);
+const want = { EXECUTION_GLOBAL_KILL_SWITCH: 'true', EXECUTION_LIVE_ENTRY_ENABLED: 'false', EXECUTION_PROTECTION_READY: 'false', EXECUTION_FILL_RUNTIME_ENABLED: 'false' };
+const load = require('node:module').createRequire(anchor), dotenvFile = fs.realpathSync(load.resolve('dotenv'));
+const fromRepo = path.relative(fs.realpathSync(path.join(anchor, '..', '..', '..')), dotenvFile);
+if (fromRepo.startsWith('..') || path.isAbsolute(fromRepo)) process.exit(3);   // not this checkout's dotenv
+if (load('dotenv/package.json').version !== '16.6.1') process.exit(4);   // not the lockfile's version
+const { parse } = load('dotenv'), out = [];
+for (let i = 0; i + 1 < args.length; i += 2) {
+  let text = null, parsed = null, lines = [], bad = null;
+  try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(args[i + 1])); } catch { bad = 'unreadable-or-invalid-utf8'; }
+  if (!bad && /[\u2028\u2029]|\r(?!\n)/.test(text)) bad = 'line-separator-or-lone-cr';
+  if (!bad) { parsed = parse(text); lines = text.replace(/^\uFEFF/, '').split(/\r?\n/); }
+  for (const key of Object.keys(want)) {
+    const named = lines.filter((line) => line.toUpperCase().includes(key));
+    const why = bad || (named.length === 0 ? 'no-declaration' : named.length > 1 ? 'repeated-or-mentioned-elsewhere' : named[0] !== key + '=' + want[key] ? 'not-canonical-or-wrong-value' : parsed[key] !== want[key] ? 'dotenv-disagrees' : null);
+    out.push(args[i] + ' ' + key + (why ? ' HOLD ' + why : ' OK'));
   }
+}
+process.stdout.write(out.join('\n') + '\n');
+'@
+$flagWant = @(foreach ($a in 'generic.env', 'account-a.env', 'account-b.env', 'apps/backend/.env') { foreach ($k in 'EXECUTION_GLOBAL_KILL_SWITCH', 'EXECUTION_LIVE_ENTRY_ENABLED', 'EXECUTION_PROTECTION_READY', 'EXECUTION_FILL_RUNTIME_ENABLED') { "$a $k" } })
+$flagLines = @()
+try {
+  $flagArgs = @((Join-Path $repo 'apps\backend\package.json'), 'generic.env', (Join-Path $root 'env\generic.env'), 'account-a.env', (Join-Path $root 'env\account-a.env'), 'account-b.env', (Join-Path $root 'env\account-b.env'), 'apps/backend/.env', (Join-Path $repo 'apps\backend\.env'))
+  $nodeExe = @(Get-Command node -CommandType Application -ErrorAction Stop)[0].Source
+  $global:LASTEXITCODE = -1; $flagLines = @(& $nodeExe --no-warnings -e $flagCheck -- $flagArgs)
+  if ($global:LASTEXITCODE -ne 0) { $hold += "the flag check failed (node exit $global:LASTEXITCODE)" }
+} catch { $hold += "the flag check could not run: $($_.Exception.Message)" }
+if ($flagLines.Count -ne 16) { $hold += "the flag check printed $($flagLines.Count) records, expected 16" }
+for ($r = 0; $r -lt 16; $r++) {
+  $line = if ($r -lt $flagLines.Count) { [string]$flagLines[$r] } else { '' }
+  if ([string]::Equals($line, "$($flagWant[$r]) OK")) { $validFlags++; $line }
+  elseif ($line.StartsWith("$($flagWant[$r]) HOLD ", [StringComparison]::Ordinal) -and $line -cmatch ' HOLD [a-z0-9-]+$') { $hold += $line; $line }
+  else { $hold += "$($flagWant[$r]): no valid record from the flag check" }
 }
 if ($validFlags -ne 16) { $hold += "only $validFlags of 16 execution flag declarations are valid" }
 if ($hold.Count -gt 0) { $hold | ForEach-Object { "HOLD: $_" } } else { 'No automatic HOLD; mandatory manual checks and separate P2 authorization still required.' }
@@ -901,15 +920,33 @@ quotes a path holding a control character, quote or backslash, so it cannot equa
 path. An approved path must be in `$eligiblePaths` and must have changed in the range.
 `$approvedPaths` is an authorization input: never fill it from Git's output.
 
-The execution flags are a **static configuration gate**. Each of the four files must hold
-exactly one valid declaration of each of the four keys, 16 in all. Every file is read with
-dotenv's own pattern, which accepts leading whitespace and `export`. The three files under
-`env\` must also satisfy the launcher's stricter parser, which refuses `export` and would
-misread an inline comment. A file that is not valid UTF-8, or that holds U+2028, U+2029 or a
-lone CR, reads `HOLD`, because JavaScript and .NET split lines differently on those
-characters. This does not prove the environment of a running process, where an
-inherited variable beats a file. Effective Account A/B and execution safety checks belong to
-the separately authorized P2 runtime preflight.
+The execution flags are a **static configuration gate**. A short read-only `node` step reads
+the four files and prints only key names and fixed reason codes. It uses the dotenv installed
+for `$repo\apps\backend`, because this runbook must not emulate dotenv's grammar in another
+regex engine: that once reported all four flags present when dotenv lost them inside a
+multi-line value. It needs no pnpm or registry, imports no application module, and changes no
+process environment.
+
+Each of the four keys, in each of the four files, must pass both of these, 16 in all:
+
+1. **Exactly one line names the key, and it is exactly `KEY=value`.** Any other line naming the
+   key in any letter case, including a comment or an unrelated value, reads `HOLD`. So do
+   quotes, `export`, a colon, indentation, an inline comment and trailing whitespace. This is
+   deliberately narrower than dotenv: it is the form the launcher's strict parser reads the
+   same way, and it is the form all four files use.
+2. **dotenv's parsed value equals the required value.** A line that a multi-line value swallowed
+   reads `dotenv-disagrees`.
+
+A file that is missing, unreadable or not valid UTF-8, or that holds U+2028, U+2029 or a lone
+CR, reads `HOLD`. So does a missing `node` or dotenv, a dotenv outside `$repo` or other than the
+lockfile's 16.6.1, a nonzero `node` exit, and any missing or malformed record. A later success
+cannot clear any of them.
+
+This does not prove that the launcher accepts a whole `env\` file: it also refuses an unrelated
+malformed line, such as an `export`, when it starts. That refusal is a HOLD. It also does not
+prove the environment of a running process, where an inherited variable beats a file. Effective
+Account A/B and execution safety checks belong to the separately authorized P2 runtime
+preflight.
 
 The counts of 349 and 22 show that no source file was added or moved away. They do not show
 that the contents match. Source-to-output freshness checks compare file modification times,
