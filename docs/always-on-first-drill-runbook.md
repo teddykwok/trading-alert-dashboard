@@ -812,26 +812,57 @@ Read these immediately before any start, from a window with the session setup:
 # READ-ONLY: what files can show of the conditions. Conditions 3 and 11 also need the record since P1.
 $p1 = '667b9e69c994d06d23f899c4b329bedcfa7d57e4'
 $runtimeHead = '<exact SHA named in the P2 authorization>'
-git -C $repo rev-parse HEAD                                      # exactly $runtimeHead
-git -C $repo merge-base --is-ancestor $p1 $runtimeHead; $LASTEXITCODE   # 0
-git -C $repo log -m --name-only --format='%H %s' "$p1..$runtimeHead"    # only reviewed commits, only approved Markdown paths
-git -C $repo diff --name-only $p1 $runtimeHead                   # only approved Markdown paths
-git -C $repo status --porcelain --untracked-files=all            # prints nothing
-foreach ($t in @(@('backend', 'apps\backend\src', 'apps\backend\dist\src'), @('shared', 'packages\shared\src', 'packages\shared\dist\cjs'))) {
+$approvedCommits = @('<every full commit SHA in the approved range, merges included, from the P2 authorization>')   # @() only when $runtimeHead is $p1
+$approvedPaths = @('<every Markdown path approved in the P2 authorization>')   # @() only when $runtimeHead is $p1
+$hold = @()
+if (-not $repo -or -not $root) { $hold += 'the session setup is missing' }
+if ($runtimeHead -cnotmatch '^[0-9a-f]{40}$') { $hold += 'runtimeHead is missing or not a full SHA' } else {
+  foreach ($c in $approvedCommits) { if ($c -cnotmatch '^[0-9a-f]{40}$') { $hold += "approved commit is not a full SHA: $c" } }
+  foreach ($f in $approvedPaths) { if ($f -cnotmatch '\.md$') { $hold += "approved path is not Markdown: $f" } }
+  $head = git -C $repo rev-parse HEAD; $head                     # exactly $runtimeHead
+  if ($LASTEXITCODE -ne 0 -or $head -cne $runtimeHead) { $hold += 'HEAD is not the approved SHA, or Git failed' }
+  git -C $repo merge-base --is-ancestor $p1 $runtimeHead
+  if ($LASTEXITCODE -ne 0) { $hold += "P1 is not proven an ancestor of runtimeHead (git exit $LASTEXITCODE)" }
+  $history = @(git -C $repo log -m --no-renames --name-only --format='%H %s' "$p1..$runtimeHead"); $history   # only reviewed commits, only approved Markdown paths
+  if ($LASTEXITCODE -ne 0) { $hold += "the history check failed (git exit $LASTEXITCODE)" }
+  $commits = @($history | Where-Object { $_ -cmatch '^[0-9a-f]{40} ' } | ForEach-Object { $_.Substring(0, 40) } | Select-Object -Unique)
+  foreach ($c in $commits) { if ($approvedCommits -cnotcontains $c) { $hold += "commit not approved: $c" } }
+  foreach ($c in $approvedCommits) { if ($commits -cnotcontains $c) { $hold += "approved commit not in the range: $c" } }
+  if ($runtimeHead -cne $p1 -and $commits.Count -eq 0) { $hold += 'no history was read for a runtimeHead other than P1' }
+  $changed = @(git -C $repo diff --no-renames --name-only $p1 $runtimeHead); $changed   # only approved Markdown paths
+  if ($LASTEXITCODE -ne 0) { $hold += "the cumulative diff failed (git exit $LASTEXITCODE)" }
+  foreach ($f in @(@($history | Where-Object { $_ -and $_ -cnotmatch '^[0-9a-f]{40} ' }) + $changed | Select-Object -Unique)) { if ($approvedPaths -cnotcontains $f) { $hold += "path not approved: $f" } }
+  $dirty = @(git -C $repo status --porcelain --untracked-files=all); $dirty   # prints nothing
+  if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) { $hold += 'the worktree is not clean, or Git failed' }
+}
+foreach ($t in @(@('backend', 'apps\backend\src', 'apps\backend\dist\src', 349), @('shared', 'packages\shared\src', 'packages\shared\dist\cjs', 22))) {
   $src = Join-Path $repo $t[1]; $out = Join-Path $repo $t[2]; $missing = 0; $stale = 0
-  $sources = @(Get-ChildItem $src -Recurse -File -Filter *.ts | Where-Object { $_.Name -notlike '*.d.ts' })
+  $sources = @(if ($src -and (Test-Path -LiteralPath $src -PathType Container)) { Get-ChildItem $src -Recurse -File -Filter *.ts | Where-Object { $_.Name -notlike '*.d.ts' } })
   foreach ($s in $sources) {
     $o = Join-Path $out ($s.FullName.Substring($src.Length + 1) -replace '\.ts$', '.js')
     if (-not (Test-Path -LiteralPath $o)) { $missing++ } elseif ((Get-Item -LiteralPath $o).LastWriteTimeUtc -lt $s.LastWriteTimeUtc) { $stale++ }
   }
-  [pscustomobject]@{ tree = $t[0]; sources = $sources.Count; missing = $missing; stale = $stale }   # missing 0, stale 0
+  [pscustomobject]@{ tree = $t[0]; sources = $sources.Count; missing = $missing; stale = $stale }   # sources 349 and 22, missing 0, stale 0
+  if ("$($sources.Count)" -cne "$($t[3])" -or $missing -ne 0 -or $stale -ne 0) { $hold += "$($t[0]): $($sources.Count) sources, expected $($t[3]); missing $missing; stale $stale" }
 }
 (Get-Item (Join-Path $repo 'apps\backend\dist\src\server.js')).LastWriteTimeUtc.ToString('o')       # P1: 2026-10-31T17:14:51
 (Get-ChildItem (Join-Path $repo 'apps\backend\dist') -Recurse -File | Sort-Object LastWriteTimeUtc | Select-Object -Last 1).LastWriteTimeUtc.ToString('o')   # no later than 2026-10-31T17:14:55
 foreach ($p in 'apps\backend\node_modules\@prisma\client\package.json', 'apps\backend\node_modules\@trading-alert-dashboard\shared\package.json', 'node_modules\.pnpm\@prisma+client@*\node_modules\.prisma\client\query_engine-windows.dll.node') { Test-Path (Join-Path $repo $p) }   # every line True
 ((Get-Content -Raw (Join-Path $repo 'pnpm-lock.yaml')) -replace "`r`n", "`n") -ceq ((Get-Content -Raw (Join-Path $repo 'node_modules\.pnpm\lock.yaml')) -replace "`r`n", "`n")   # True
 Select-String -Path (Join-Path $root 'env\*.env'), (Join-Path $repo 'apps\backend\.env') -Pattern '^EXECUTION_(GLOBAL_KILL_SWITCH|LIVE_ENTRY_ENABLED|PROTECTION_READY|FILL_RUNTIME_ENABLED)=' | ForEach-Object { "$($_.Filename) $($_.Line)" }   # kill switch true, the other three false, in every file
+if ($hold.Count -gt 0) { $hold | ForEach-Object { "HOLD: $_" } } else { 'No HOLD from the Git and source-count checks. Read every other line against its comment. This is not authorization.' }
 ```
+
+**Any printed `HOLD` is a failed condition, whatever the other lines show.** A Git error or a
+missing source directory reads `HOLD`, never an empty result. `--no-renames` makes Git list
+both paths of a rename: without it, a source file or lockfile renamed to Markdown shows only
+its Markdown path.
+
+The counts of 349 and 22 show that no source file was added or moved away. They do not show
+that the contents match. Source-to-output freshness checks compare file modification times,
+not compiled content. The P1 byte-for-byte build evidence and the separately approved Git
+source identity remain necessary; timestamp freshness alone is insufficient. This check does
+not repeat the P1 comparison.
 
 The supervisor applies the same freshness rule when it starts: a stale backend build blocks
 the role with `BUILD_STALE`. Do not rebuild to clear it under this exception. That is a
