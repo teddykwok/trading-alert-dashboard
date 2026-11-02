@@ -815,27 +815,28 @@ $runtimeHead = '<exact SHA named in the P2 authorization>'
 $approvedCommits = @('<every full commit SHA in the approved range, merges included, from the P2 authorization>')   # @() only when $runtimeHead is $p1
 $approvedPaths = @('<every Markdown path approved in the P2 authorization>')   # @() only when $runtimeHead is $p1
 $eligiblePaths = @('docs/always-on-first-drill-runbook.md')   # the only path this exception can approve
-$hold = @(); $head = $null; $history = $null; $changed = $null; $dirty = $null; $commits = @(); $touched = @(); $treesRead = 0; $validFlags = 0
+$hold = @(); $head = $null; $history = $null; $changed = $null; $dirty = $null; $commits = $null; $touched = @(); $treesRead = 0; $validFlags = 0
 if (-not $repo -or -not $root) { $hold += 'the session setup is missing' }
 if (-not (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) { $hold += 'the git executable cannot be resolved' }
 if ($runtimeHead -cnotmatch '^[0-9a-f]{40}$') { $hold += 'runtimeHead is missing or not a full SHA' } else { try {
   foreach ($c in $approvedCommits) { if ($c -cnotmatch '^[0-9a-f]{40}$') { $hold += "approved commit is not a full SHA: $c" } }
-  foreach ($f in $approvedPaths) { if ($eligiblePaths -cnotcontains $f) { $hold += "approved path is not eligible: $f" } }
+  foreach ($f in $approvedPaths) { if ([Array]::IndexOf([string[]]@($eligiblePaths), [string]$f) -lt 0) { $hold += "approved path is not eligible: $f" } }   # IndexOf is ordinal: -contains and -ceq ignore invisible characters
   $global:LASTEXITCODE = -1; $head = git -C $repo rev-parse HEAD; $head                     # exactly $runtimeHead
   if ($global:LASTEXITCODE -ne 0 -or $head -cne $runtimeHead) { $hold += 'HEAD is not the approved SHA, or Git failed' }
   $global:LASTEXITCODE = -1; git -C $repo merge-base --is-ancestor $p1 $runtimeHead
   if ($global:LASTEXITCODE -ne 0) { $hold += "P1 is not proven an ancestor of runtimeHead (git exit $global:LASTEXITCODE)" }
-  $global:LASTEXITCODE = -1; $history = @(git -C $repo log -m --no-renames --name-only --format='%H %s' "$p1..$runtimeHead"); $history   # only reviewed commits, only approved paths
-  if ($global:LASTEXITCODE -ne 0 -or $null -eq $history) { $hold += "the history check failed (git exit $global:LASTEXITCODE)" }
-  $commits = @($history | Where-Object { $_ -cmatch '^[0-9a-f]{40} ' } | ForEach-Object { $_.Substring(0, 40) } | Select-Object -Unique)
-  foreach ($c in $commits) { if ($approvedCommits -cnotcontains $c) { $hold += "commit not approved: $c" } }
+  $global:LASTEXITCODE = -1; $commits = @(git -C $repo rev-list "$p1..$runtimeHead"); $commits   # only reviewed commits
+  if ($global:LASTEXITCODE -ne 0 -or $null -eq $commits) { $hold += "the commit list failed (git exit $global:LASTEXITCODE)" }
+  foreach ($c in $commits) { if ($c -cnotmatch '^[0-9a-f]{40}$' -or $approvedCommits -cnotcontains $c) { $hold += "commit not approved: $c" } }
   foreach ($c in $approvedCommits) { if ($commits -cnotcontains $c) { $hold += "approved commit not in the range: $c" } }
-  if ($runtimeHead -cne $p1 -and $commits.Count -eq 0) { $hold += 'no history was read for a runtimeHead other than P1' }
+  if ($runtimeHead -cne $p1 -and @($commits).Count -eq 0) { $hold += 'no history was read for a runtimeHead other than P1' }
+  $global:LASTEXITCODE = -1; $history = @(git -C $repo log -m --no-renames --name-only --format= "$p1..$runtimeHead"); $history   # paths only: only approved paths
+  if ($global:LASTEXITCODE -ne 0 -or $null -eq $history) { $hold += "the history check failed (git exit $global:LASTEXITCODE)" }
   $global:LASTEXITCODE = -1; $changed = @(git -C $repo diff --no-renames --name-only $p1 $runtimeHead); $changed   # only approved paths
   if ($global:LASTEXITCODE -ne 0 -or $null -eq $changed) { $hold += "the cumulative diff failed (git exit $global:LASTEXITCODE)" }
-  $touched = @(@($history | Where-Object { $_ -and $_ -cnotmatch '^[0-9a-f]{40} ' }) + @($changed) | Select-Object -Unique)
-  foreach ($f in $touched) { if ($approvedPaths -cnotcontains $f) { $hold += "path not approved: $f" } }
-  foreach ($f in $approvedPaths) { if ($touched -cnotcontains $f) { $hold += "approved path not changed in the range: $f" } }
+  $touched = @(@($history | Where-Object { $_ }) + @($changed))
+  foreach ($f in $touched) { if ([Array]::IndexOf([string[]]@($approvedPaths), [string]$f) -lt 0) { $hold += "path not approved: $f" } }
+  foreach ($f in $approvedPaths) { if ([Array]::IndexOf([string[]]$touched, [string]$f) -lt 0) { $hold += "approved path not changed in the range: $f" } }
   if ($runtimeHead -cne $p1 -and $touched.Count -eq 0) { $hold += 'no changed path was read for a runtimeHead other than P1' }
   $global:LASTEXITCODE = -1; $dirty = @(git -C $repo status --porcelain --untracked-files=all); $dirty   # prints nothing
   if ($global:LASTEXITCODE -ne 0 -or $null -eq $dirty -or $dirty.Count -ne 0) { $hold += 'the worktree is not clean, or Git failed' }
@@ -859,15 +860,17 @@ foreach ($p in 'apps\backend\node_modules\@prisma\client\package.json', 'apps\ba
 $requiredFlags = [ordered]@{ EXECUTION_GLOBAL_KILL_SWITCH = 'true'; EXECUTION_LIVE_ENTRY_ENABLED = 'false'; EXECUTION_PROTECTION_READY = 'false'; EXECUTION_FILL_RUNTIME_ENABLED = 'false' }
 $dotenvLine = [regex]::new('(?:^|^)\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(\s*''(?:\\''|[^''])*''|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?(?:$|$)', 'Multiline, ECMAScript')   # dotenv's own LINE pattern
 foreach ($e in @(@('generic.env', $root, 'env\generic.env', $true), @('account-a.env', $root, 'env\account-a.env', $true), @('account-b.env', $root, 'env\account-b.env', $true), @('apps/backend/.env', $repo, 'apps\backend\.env', $false))) {
-  $text = $null
-  try { $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes((Join-Path $e[1] $e[2]))).TrimStart([char]0xFEFF) -replace '\r\n?', "`n" } catch { $hold += "$($e[0]): the file cannot be read" }
-  if ($null -eq $text) { continue }
+  $raw = $null
+  try { $raw = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes((Join-Path $e[1] $e[2]))) } catch { $hold += "$($e[0]): the file cannot be read as UTF-8" }
+  if ($null -eq $raw) { continue }
+  if ($raw -match '[\u2028\u2029]|\r(?!\n)') { $hold += "$($e[0]): the file holds U+2028, U+2029 or a lone CR"; continue }
+  $text = $raw.TrimStart([char]0xFEFF) -replace '\r\n', "`n"
   $found = @($dotenvLine.Matches($text))
   foreach ($key in $requiredFlags.Keys) {
     $want = $requiredFlags[$key]
     $decls = @($found | Where-Object { $_.Groups[1].Value -ieq $key })
     $mentions = @($text -split "`n" | Where-Object { $_ -match "(?<![\w.-])$key(?![\w.-])" -and $_ -notmatch '^\s*#' })
-    $why = if ($decls.Count -eq 0) { 'missing' } elseif ($decls.Count -gt 1) { 'declared more than once' } elseif ($decls[0].Groups[1].Value -cne $key) { 'wrong letter case' } elseif ($mentions.Count -ne 1) { 'another line mentions it' } elseif (($decls[0].Groups[2].Value.Trim() -creplace '^([''"`])([\s\S]*)\1$', '$2') -cne $want) { 'not the required value' } elseif ($e[3] -and $mentions[0] -cnotmatch "^\s*$key=\s*(?:$want|`"$want`"|'$want')\s*$") { 'the launcher parser would refuse or misread it' } else { $null }
+    $why = if ($decls.Count -eq 0) { 'missing' } elseif ($decls.Count -gt 1) { 'declared more than once' } elseif ($decls[0].Groups[1].Value -cne $key) { 'wrong letter case' } elseif ($mentions.Count -ne 1) { 'another line mentions it' } elseif (-not [string]::Equals(($decls[0].Groups[2].Value.Trim([char[]]" `t`n`v`f") -creplace '^([''"`])([\s\S]*)\1$', '$2'), $want)) { 'not the required value' } elseif ($e[3] -and $mentions[0] -cnotmatch "^\s*$key=\s*(?:$want|`"$want`"|'$want')\s*$") { 'the launcher parser would refuse or misread it' } else { $null }
     if ($why) { $hold += "$($e[0]) ${key}: $why"; "$($e[0]) $key HOLD" } else { $validFlags++; "$($e[0]) $key OK" }
   }
 }
@@ -892,15 +895,19 @@ start monitoring. P2 runtime startup and drill activation remain separately gate
 
 A Git error, an unavailable `git` or a missing source directory reads `HOLD`, never an empty
 result. `--no-renames` makes Git list both paths of a rename: without it, a source file or
-lockfile renamed to Markdown shows only its Markdown path. An approved path must be in
-`$eligiblePaths` and must have changed in the range. `$approvedPaths` is an authorization
-input: never fill it from Git's output.
+lockfile renamed to Markdown shows only its Markdown path. Commits come from `rev-list` and
+paths from a log that prints no commit lines, so a filename cannot pass as a commit. Git
+quotes a path holding a control character, quote or backslash, so it cannot equal an approved
+path. An approved path must be in `$eligiblePaths` and must have changed in the range.
+`$approvedPaths` is an authorization input: never fill it from Git's output.
 
 The execution flags are a **static configuration gate**. Each of the four files must hold
 exactly one valid declaration of each of the four keys, 16 in all. Every file is read with
 dotenv's own pattern, which accepts leading whitespace and `export`. The three files under
 `env\` must also satisfy the launcher's stricter parser, which refuses `export` and would
-misread an inline comment. This does not prove the environment of a running process, where an
+misread an inline comment. A file that is not valid UTF-8, or that holds U+2028, U+2029 or a
+lone CR, reads `HOLD`, because JavaScript and .NET split lines differently on those
+characters. This does not prove the environment of a running process, where an
 inherited variable beats a file. Effective Account A/B and execution safety checks belong to
 the separately authorized P2 runtime preflight.
 
