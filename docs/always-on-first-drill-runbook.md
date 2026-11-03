@@ -879,12 +879,21 @@ for (let i = 0; i + 1 < args.length; i += 2) {
 process.stdout.write(out.join('\n') + '\n');
 '@
 $flagWant = @(foreach ($a in 'generic.env', 'account-a.env', 'account-b.env', 'apps/backend/.env') { foreach ($k in 'EXECUTION_GLOBAL_KILL_SWITCH', 'EXECUTION_LIVE_ENTRY_ENABLED', 'EXECUTION_PROTECTION_READY', 'EXECUTION_FILL_RUNTIME_ENABLED') { "$a $k" } })
-$flagLines = @()
+$flagLines = @(); $node = $null; $nodeVersion = $null
 try {
   $flagArgs = @((Join-Path $repo 'apps\backend\package.json'), 'generic.env', (Join-Path $root 'env\generic.env'), 'account-a.env', (Join-Path $root 'env\account-a.env'), 'account-b.env', (Join-Path $root 'env\account-b.env'), 'apps/backend/.env', (Join-Path $repo 'apps\backend\.env'))
-  $nodeExe = @(Get-Command node -CommandType Application -ErrorAction Stop)[0].Source
-  $global:LASTEXITCODE = -1; $flagLines = @(& $nodeExe --no-warnings -e $flagCheck -- $flagArgs)
-  if ($global:LASTEXITCODE -ne 0) { $hold += "the flag check failed (node exit $global:LASTEXITCODE)" }
+  $nodeExe = 'C:\Program Files\nodejs\node.exe'   # the reviewed node, never a PATH lookup
+  $node = $ExecutionContext.InvokeCommand.GetCommand($nodeExe, 'Application')   # an application only: an alias or function of the same name cannot answer
+  if ($null -ne [Environment]::GetEnvironmentVariable('NODE_OPTIONS') -or @([Environment]::GetEnvironmentVariables().Keys | Where-Object { [string]::Equals([string]$_, 'NODE_OPTIONS', [StringComparison]::OrdinalIgnoreCase) }).Count -ne 0) { $hold += 'NODE_OPTIONS is set in this window, so node was not run' }   # node would run its preloads before the check
+  elseif ($null -eq $node -or -not [string]::Equals($node.Path, $nodeExe)) { $hold += "node is not at $nodeExe, so it was not run" }
+  else {
+    $global:LASTEXITCODE = -1; $nodeVersion = @(& $node --version)
+    if ($global:LASTEXITCODE -ne 0 -or $nodeVersion.Count -ne 1 -or -not [string]::Equals([string]$nodeVersion[0], 'v24.15.0')) { $hold += 'node is not the reviewed v24.15.0, so the flag check did not run' }
+    else {
+      $global:LASTEXITCODE = -1; $flagLines = @(& $node --no-warnings -e $flagCheck -- $flagArgs)
+      if ($global:LASTEXITCODE -ne 0) { $hold += "the flag check failed (node exit $global:LASTEXITCODE)" }
+    }
+  }
 } catch { $hold += "the flag check could not run: $($_.Exception.Message)" }
 if ($flagLines.Count -ne 16) { $hold += "the flag check printed $($flagLines.Count) records, expected 16" }
 for ($r = 0; $r -lt 16; $r++) {
@@ -927,6 +936,17 @@ regex engine: that once reported all four flags present when dotenv lost them in
 multi-line value. It needs no pnpm or registry, imports no application module, and changes no
 process environment.
 
+It runs only `C:\Program Files\nodejs\node.exe`, the reviewed v24.15.0, never whatever `node`
+resolves to on `PATH`, and it invokes that file as an application, so an alias or function
+cannot stand in for it. A missing file, another version or any version output other than that
+one line reads `HOLD` before the check runs. If `NODE_OPTIONS` is set at all, even empty, the
+step runs no `node` and reads `HOLD`: node would run its preloads first, and one can print
+passing records without reading a file. Do not clear it to pass. Find where it comes from,
+because everything started from this window inherits it, remove it there, and open a new
+window. The fixed path only removes lookup ambiguity. It does not prove the file's contents:
+replacing that file, or redefining commands in this window, is a same-user action outside
+this check.
+
 Each of the four keys, in each of the four files, must pass both of these, 16 in all:
 
 1. **Exactly one line names the key, and it is exactly `KEY=value`.** Any other line naming the
@@ -938,7 +958,7 @@ Each of the four keys, in each of the four files, must pass both of these, 16 in
    reads `dotenv-disagrees`.
 
 A file that is missing, unreadable or not valid UTF-8, or that holds U+2028, U+2029 or a lone
-CR, reads `HOLD`. So does a missing `node` or dotenv, a dotenv outside `$repo` or other than the
+CR, reads `HOLD`. So does a missing dotenv, a dotenv outside `$repo` or other than the
 lockfile's 16.6.1, a nonzero `node` exit, and any missing or malformed record. A later success
 cannot clear any of them.
 
